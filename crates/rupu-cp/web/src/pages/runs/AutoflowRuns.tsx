@@ -1,1071 +1,419 @@
-// Autoflow run-stream page — mirrors Runs → Workflows: the PRIMARY view is a
-// clean run list (same SortableTable shape, row click → /runs/:id). The
-// existing "Cycles" (batch view) and "Claims" (requeue/release) views are
-// kept as secondary tabs, functionality untouched.
+// Autoflow run-stream page — ONE Workflows-shaped table (spec 2026-10-14, CP
+// autoflow runs as one table): the workflow runs an autoflow launched plus
+// one failed row per attempt that never produced a recorded run, newest
+// first, row click → /runs/:id. The Cycles and Claims tables are gone (per-
+// issue cycle history is the run page's Cycles tab; claim actions live on
+// the run page and on an attempt row that has no run to open).
 //
-// One Control Language migration (Phase 2, Task E): the Runs/Cycles/Claims
-// strip is now `Segmented` in FilterBar's view slot; the host filter is the
-// shared `HostSelect allowAll`; fetch/paginate/poll for the Runs and Cycles
-// tabs is owned by `usePerHostPagedList` (per-host progressive loading, spec
-// 2026-10-01: All hosts by default, local paints at once, each remote merges
-// in as it answers). Claims stays a single lazily-fetched `usePagedList` —
-// its endpoint is local-only with no server-side pagination. Table rules
-// (fit/subject columns) applied to all three tables. Task A2's Event column,
-// `cycle_failed` detail expansion, and whole-row nav on run rows are
-// preserved verbatim.
+// Structure is `WorkflowRuns.tsx`'s — the query line, per-host loading, the
+// same components and header — with the Workflows columns
+// (`WORKFLOW_RUN_COLUMNS`) except: the Workflow cell carries the issue — or
+// an attempt's error — as its second line, and the actions column adds a
+// "show only this workflow" button (it puts `workflow:<name>` in the query)
+// and the run's PR link. An attempt row carries `attempt`; one whose `id` is
+// a history event id (no `run_recorded`) expands in place — the error,
+// cycle, worker, claim status, Requeue / Release for its claim (local host
+// only, as the claim endpoints are) — while one whose `id` is an unrecorded
+// run id (`run_recorded: false`) links to the run page, which renders
+// unpersisted runs from history.
 //
-// Find (2026-07-23 operator feedback amendment #1): one `SearchInput` in the
-// FilterBar's search slot narrows whichever tab (Runs/Cycles/Claims) is
-// currently active, client-side, over that tab's own searchable fields (see
-// `matchesAutoflowQuery` below) — composing with (not replacing) the host
-// scope select.
+// One query line filters the list and the server evaluates it (`?q=` on
+// every request, `AUTOFLOW_RUN_FIELDS`: the workflow-run fields plus
+// `issue:`, `pr:`, `kind:` and `error:`), `is:archived` switching to the
+// local archive. Fetch/paginate/poll is owned by `usePerHostQueryList`:
+// every host the query's `host:` terms allow, local painting at once and
+// each remote merging in as it answers; a host that can't report `autoflow`
+// (an older rupu) is named in the line under the bar. The problems strip
+// (`AutoflowProblems`) sits between the bar and the table, over the same
+// hosts.
 //
-// Customer scope (customers Plan 2B): the autoflow endpoints
-// (`/api/runs/autoflows{,/events}`, `/api/autoflows/claims`) take no customer
-// filter, so this page cannot narrow to one customer. While a scope is set an
-// `UnscopedNote` says so instead of passing the list off as filtered.
+// Customer scope (customers Plan 2B): as Workflows, through the same per-host
+// engine (`?customer=<slug>`). Attempt rows record no customer, so the server
+// lists none while scoped; the page says so in one line.
 
-import { useCallback, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { RefreshCw } from 'lucide-react';
-import {
-  api,
-  type AutoflowClaim,
-  type AutoflowCycleRow,
-  type AutoflowEventRow,
-  type RunStatusStr,
-} from '../../lib/api';
+import { useCallback, useMemo, useState } from 'react';
+import { ListFilter, RefreshCw } from 'lucide-react';
+import { shortIssueRef } from '../../lib/issueRef';
+import { api, type AutoflowRunRow, type ListQueryOpts } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
-import UsageChip from '../../components/UsageChip';
+import { WORKFLOW_RUN_COLUMNS } from '../../components/runs/workflowRunColumns';
+import { AutoflowProblems } from '../../components/runs/AutoflowProblems';
+import UsageBarChart from '../../components/charts/UsageBarChart';
+import { CrewChip } from '../../components/codename/CrewChip';
+import { parseCodename } from '../../lib/codename';
 import { Button } from '../../components/ui/Button';
-import { FilterBar } from '../../components/ui/FilterBar';
-import { Segmented, type SegmentedOption } from '../../components/ui/Segmented';
-import { Badge } from '../../components/ui/Badge';
-import { SearchInput } from '../../components/ui/SearchInput';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Spinner } from '../../components/ui/Spinner';
-import HostSelect, { ALL_HOSTS } from '../../components/HostSelect';
-import { RUN_STATUS_STYLES, StatusPill } from '../../components/StatusPill';
-import { usePagedList } from '../../lib/usePagedList';
-import { usePerHostPagedList, type PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
-import { PerHostFooter, PerHostStrip, perHostFooterText } from '../../components/lists/PerHostStatus';
-import { noHostAnswered, notIncluded, waitingLabel } from '../../lib/perHost/status';
+import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
+import { hostAlerts } from '../../components/query/hostAlerts';
+import { ListFooter } from '../../components/lists/ListFooter';
+import { usePerHostQueryList } from '../../lib/query/usePerHostQueryList';
+import { AUTOFLOW_RUN_FIELDS } from '../../lib/query/lists/autoflowRuns';
+import { asksArchived } from '../../lib/query/lists/workflowRuns';
+import { hostPickOf } from '../../lib/query/serverList';
+import { withTerm } from '../../lib/findingQuery/shortcut';
+import type { PerHostFetchParams } from '../../lib/perHost/usePerHostPagedList';
+import { noHostAnswered, waitingLabel } from '../../lib/perHost/status';
 import { cn } from '../../lib/cn';
-import { durationBetween, relativeTime } from '../../lib/time';
-import { formatTokens, formatCost } from '../../lib/usage';
-import { formatDuration } from '../../lib/duration';
+import { runHref } from '../../lib/runs';
 import { shortId } from '../../lib/shortId';
-import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
-import { UnscopedNote } from '../../components/customers/UnscopedNote';
+import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
+import { useScopedList } from '../../lib/useScopedList';
 
-const MODE_CLS: Record<string, string> = {
-  ask:       'bg-warn-bg text-warn ring-warn/30',
-  bypass:    'bg-ok-bg text-ok ring-ok/30',
-  readonly:  'bg-surface text-ink ring-border',
-  tick:      'bg-surface text-ink ring-border',
-  serve:     'bg-sky-50 text-sky-700 ring-sky-200',
-};
+/** A row's host for actions: the server tags every row; absent means local. */
+const hostOf = (r: AutoflowRunRow) => r.host_id ?? 'local';
 
-function ModeChip({ mode }: { mode: string }) {
-  const cls = MODE_CLS[mode] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
-      {mode}
-    </span>
-  );
-}
+/** An attempt whose `id` is a history event id: nothing to open, expands in place. */
+const expandsInPlace = (r: AutoflowRunRow) => r.attempt !== undefined && r.run_recorded === undefined;
 
-// Per-kind badge styling + human label for the events view.
-const KIND_CLS: Record<string, string> = {
-  run_launched:     'bg-ok-bg text-ok ring-ok/30',
-  awaiting_human:   'bg-warn-bg text-warn ring-warn/30',
-  awaiting_external:'bg-sky-50 text-sky-700 ring-sky-200',
-  cycle_failed:     'bg-err-bg text-err ring-err/30',
-};
-
-const KIND_LABEL: Record<string, string> = {
-  run_launched:     'launched',
-  awaiting_human:   'awaiting human',
-  awaiting_external:'awaiting external',
-  cycle_failed:     'failed',
-};
-
-function KindBadge({ kind }: { kind: string }) {
-  const cls = KIND_CLS[kind] ?? 'bg-surface text-ink ring-border';
-  const label = KIND_LABEL[kind] ?? kind.replace(/_/g, ' ');
-  return (
-    <span className={cn('inline-flex items-center whitespace-nowrap rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
-      {label}
-    </span>
-  );
-}
-
-// `cycle_failed` is a scheduling event, not a run outcome — it deliberately
-// borrows the shared StatusPill "failed" tone (rather than the plain KIND_CLS
-// treatment every other event kind uses) so it reads as visually distinct: a
-// worker-level failure, never mistaken for a run's own status.
-function CycleFailedPill() {
-  const s = RUN_STATUS_STYLES.failed;
-  const Icon = s.icon;
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 whitespace-nowrap rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5',
-        s.cls,
-      )}
-    >
-      <Icon size={10} />
-      CYCLE FAILED
-    </span>
-  );
-}
-
-// Title-case a snake_case status (e.g. `await_human` → `Await Human`).
-function titleCase(s: string): string {
-  return s
-    .split('_')
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
-}
-
-// Per-status badge styling for the claim lifecycle.
-const CLAIM_STATUS_CLS: Record<string, string> = {
-  await_human: 'bg-warn-bg text-warn ring-warn/30',
-  running:     'bg-status-running/10 text-status-running ring-status-running/30',
-  blocked:     'bg-err-bg text-err ring-err/30',
-  complete:    'bg-ok-bg text-ok ring-ok/30',
-  released:    'bg-surface text-ink ring-border',
-};
-
-function ClaimStatusBadge({ status }: { status: string }) {
-  const cls = CLAIM_STATUS_CLS[status] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
-      {titleCase(status)}
-    </span>
-  );
-}
-
-// Cycle wall-clock duration in ms (raw sort value for the Duration column).
-function cycleDurationMs(c: AutoflowCycleRow): number | null {
-  const start = Date.parse(c.started_at);
-  if (Number.isNaN(start)) return null;
-  const end = c.finished_at ? Date.parse(c.finished_at) : Date.now();
-  if (Number.isNaN(end)) return null;
-  return Math.max(0, end - start);
-}
-
-/** Build the detail link for a launched-run event, including ?host= for
- *  remote runs. `undefined` when the event has no run (e.g. an awaiting /
- *  failed signal) — SortableTable leaves those rows unlinked. */
-function eventHref(e: AutoflowEventRow): string | undefined {
-  if (!e.run_id) return undefined;
-  const hostSuffix = e.host_id && e.host_id !== 'local'
-    ? `?host=${encodeURIComponent(e.host_id)}`
-    : '';
-  return `/runs/${encodeURIComponent(e.run_id)}${hostSuffix}`;
-}
-
-// A `run_id`-bearing event is a launched run — every other kind (awaiting /
-// failed signals) is a scheduling event with nothing to show in the
-// run-shaped columns (Run / Worker / Status / tokens / Cost): those render
-// empty rather than a wall of "—" placeholders.
-function isRunEvent(e: AutoflowEventRow): boolean {
-  return Boolean(e.run_id);
-}
-
-/** Case-insensitive substring match of `query` against any of `fields`. */
-function matchesAutoflowQuery(query: string, fields: (string | null | undefined)[]): boolean {
-  if (!query) return true;
-  return fields.filter((v): v is string => Boolean(v)).some((v) => v.toLowerCase().includes(query));
-}
-
-// ---------------------------------------------------------------------------
-// Runs (launched-run events) columns — mirrors WorkflowRuns' column set
-// (Workflow / Host / Status / token + cost breakdown / Started), plus the
-// autoflow-specific Event, Issue Ref, and Worker columns.
-// ---------------------------------------------------------------------------
-
-const EVENT_COLUMNS: Column<AutoflowEventRow>[] = [
-  {
-    key: 'status',
-    header: 'Status',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.status ?? null,
-    render: (e) => {
-      if (!isRunEvent(e)) return null;
-      // `e.status` is a serialized `RunStatus` (see rupu-cp's
-      // api/run_resolve.rs) — the same lexicon `StatusPill` speaks.
-      return e.status ? (
-        <StatusPill status={e.status as RunStatusStr} />
-      ) : (
-        <span className="text-ink-mute">—</span>
-      );
-    },
-  },
-  {
-    // Second, not last. This table is where a wall of CYCLE FAILED rows is
-    // read, and the first question about a failure is WHEN — a row from
-    // nineteen hours ago is indistinguishable from a live outage without it.
-    // It was previously the 14th of 14 columns, past the horizontal scroll,
-    // which is exactly where the answer is least reachable.
-    key: 'started',
-    header: 'Started',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => (e.at ? Date.parse(e.at) : null),
-    render: (e) => <span className="text-ink-mute">{relativeTime(e.at)}</span>,
-  },
-  {
-    key: 'workflow',
-    header: 'Workflow',
-    subject: true,
-    sortable: true,
-    sortValue: (e) => e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' '),
-    titleValue: (e) => e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' '),
-    // Plain content — row-level navigation is `rowHref` (SortableTable
-    // link-wraps the whole row for non-expandable rows); an inline <Link>
-    // here would nest an <a> inside SortableTable's own <a>.
-    render: (e) => (
-      <span className="text-sm font-medium text-ink">
-        {e.workflow ?? KIND_LABEL[e.kind] ?? e.kind.replace(/_/g, ' ')}
-      </span>
-    ),
-  },
-  {
-    key: 'run',
-    header: 'Run',
-    fit: true,
-    render: (e) =>
-      e.run_id ? (
-        <span className="text-note text-ink-mute font-mono">{shortId(e.run_id)}</span>
-      ) : null,
-  },
-  {
-    key: 'kind',
-    header: 'Event',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.kind,
-    render: (e) => (e.kind === 'cycle_failed' ? <CycleFailedPill /> : <KindBadge kind={e.kind} />),
-  },
-  {
-    key: 'issue',
-    header: 'Issue Ref',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.issue_display_ref ?? null,
-    render: (e) =>
-      e.issue_display_ref ? (
-        <Badge tone="neutral" ring>
-          {e.issue_display_ref}
-        </Badge>
-      ) : (
-        <span className="text-ink-mute">—</span>
-      ),
-  },
-  {
-    key: 'worker',
-    header: 'Worker',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.worker_name ?? null,
-    render: (e) => {
-      if (!isRunEvent(e)) return null;
-      return e.worker_name ? (
-        <span className="text-ink-dim">{e.worker_name}</span>
-      ) : (
-        <span className="text-ink-mute">—</span>
-      );
-    },
-  },
-  {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.host_id ?? 'local',
-    render: (e) => (
-      <span className="text-note text-ink-mute font-mono">{e.host_id ?? 'local'}</span>
-    ),
-  },
-  {
-    key: 'in',
-    header: 'In',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.usage.input_tokens,
-    render: (e) =>
-      isRunEvent(e) ? (
-        <span className="text-ink-dim">{formatTokens(e.usage.input_tokens)}</span>
-      ) : null,
-  },
-  {
-    key: 'out',
-    header: 'Out',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.usage.output_tokens,
-    render: (e) =>
-      isRunEvent(e) ? (
-        <span className="text-ink-dim">{formatTokens(e.usage.output_tokens)}</span>
-      ) : null,
-  },
-  {
-    key: 'cached',
-    header: 'Cached',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.usage.cached_tokens,
-    render: (e) => {
-      if (!isRunEvent(e)) return null;
-      return e.usage.cached_tokens ? (
-        <span className="text-ink-dim">{formatTokens(e.usage.cached_tokens)}</span>
-      ) : (
-        <span className="text-ink-mute">—</span>
-      );
-    },
-  },
-  {
-    key: 'cost',
-    header: 'Cost',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.usage.cost_usd,
-    render: (e) =>
-      isRunEvent(e) ? (
-        <span className="inline-flex items-center justify-end gap-1 text-ink font-medium">
-          <PricingErrorMark error={e.usage.pricing_error} />
-          {formatCost(e.usage.cost_usd)}
-        </span>
-      ) : null,
-  },
-  {
-    key: 'turns',
-    header: 'Turns',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.turns ?? null,
-    render: (e) =>
-      isRunEvent(e) ? <span className="text-ink">{e.turns ? String(e.turns) : '—'}</span> : null,
-  },
-  {
-    key: 'duration',
-    header: 'Duration',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (e) => e.duration_ms ?? null,
-    render: (e) =>
-      isRunEvent(e) ? <span className="text-ink-dim">{formatDuration(e.duration_ms)}</span> : null,
-  },
-];
-
-// Expandable detail for a `cycle_failed` (or any `detail`-bearing) event —
-// mirrors the Claims tab's `last_error` treatment: small mono text in the
-// failed tone, indented in the full-width detail row SortableTable renders
-// below the row. Rows without `detail` render nothing.
-function EventDetail(e: AutoflowEventRow) {
-  if (!e.detail) return null;
-  return <div className="pl-1 text-note font-mono text-err">{e.detail}</div>;
-}
-
-// ---------------------------------------------------------------------------
-// Cycles columns
-// ---------------------------------------------------------------------------
-
-// No column here is a natural free-text "subject" (unlike the Runs/Claims
-// tables, a cycle has no single describing name — it spans `workflow_count`
-// workflows) — every column is `fit`, matching table-rules §5 for tables with
-// no dominant descriptive column.
-const CYCLE_COLUMNS: Column<AutoflowCycleRow>[] = [
-  {
-    key: 'cycle',
-    header: 'Cycle',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.cycle_id,
-    render: (c) => <span className="text-sm font-medium text-ink font-mono">{shortId(c.cycle_id)}</span>,
-  },
-  {
-    key: 'mode',
-    header: 'Mode',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.mode,
-    render: (c) => <ModeChip mode={c.mode} />,
-  },
-  {
-    key: 'worker',
-    header: 'Worker',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.worker_name ?? null,
-    render: (c) =>
-      c.worker_name ? (
-        <span className="text-ink-dim">{c.worker_name}</span>
-      ) : (
-        <span className="text-ink-mute">—</span>
-      ),
-  },
-  {
-    key: 'started',
-    header: 'Started',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => (c.started_at ? Date.parse(c.started_at) : null),
-    render: (c) => <span className="text-ink-mute">{relativeTime(c.started_at)}</span>,
-  },
-  {
-    key: 'duration',
-    header: 'Duration',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => cycleDurationMs(c),
-    render: (c) => <span className="text-ink-dim">{durationBetween(c.started_at, c.finished_at)}</span>,
-  },
-  {
-    key: 'ran',
-    header: 'Ran',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.ran_cycles,
-    render: (c) => <span className="text-ink">{c.ran_cycles}</span>,
-  },
-  {
-    key: 'skipped',
-    header: 'Skipped',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.skipped_cycles,
-    render: (c) => <span className="text-ink-dim">{c.skipped_cycles}</span>,
-  },
-  {
-    key: 'failed',
-    header: 'Failed',
-    align: 'right',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.failed_cycles,
-    render: (c) => (
-      <span className={c.failed_cycles > 0 ? 'text-err font-medium' : 'text-ink-dim'}>
-        {c.failed_cycles}
-      </span>
-    ),
-  },
-  {
-    key: 'usage',
-    header: 'Usage',
-    align: 'right',
-    fit: true,
-    render: (c) => <UsageChip usage={c.usage} />,
-  },
-  {
-    key: 'host',
-    header: 'Host',
-    fit: true,
-    sortable: true,
-    sortValue: (c) => c.host_id ?? 'local',
-    render: (c) => (
-      <span className="text-note text-ink-mute font-mono">{c.host_id ?? 'local'}</span>
-    ),
-  },
-];
-
-// Expandable detail: the run ids spawned by this cycle, each linking to its
-// run graph (preserves the linkage the bespoke list rendered inline).
-// Appends ?host= when the cycle originated on a remote host.
-function CycleDetail(c: AutoflowCycleRow) {
-  if (c.run_ids.length === 0) {
-    return <span className="text-note text-ink-mute">No runs launched in this cycle.</span>;
-  }
-  const hostSuffix = c.host_id && c.host_id !== 'local'
-    ? `?host=${encodeURIComponent(c.host_id)}`
-    : '';
-  return (
-    <div className="flex items-center gap-1.5 flex-wrap">
-      <span className="text-meta text-ink-mute uppercase tracking-wide">runs:</span>
-      {c.run_ids.map((rid) => (
-        <Link
-          key={rid}
-          to={`/runs/${encodeURIComponent(rid)}${hostSuffix}`}
-          className="text-note font-mono text-brand-600 hover:underline"
-        >
-          {shortId(rid)}
-        </Link>
-      ))}
-    </div>
-  );
-}
-
-type Tab = 'runs' | 'cycles' | 'claims';
-
-const VIEW_OPTIONS: SegmentedOption[] = [
-  { value: 'runs', label: 'Runs' },
-  { value: 'cycles', label: 'Cycles' },
-  { value: 'claims', label: 'Claims' },
-];
+/** An attempt never ran: its usage, turns and duration are not zero, they
+ *  don't exist. Those cells show a dash instead of the server's zero fill. */
+const NO_USAGE_KEYS = new Set(['in', 'out', 'cached', 'cost', 'turns', 'duration']);
 
 export default function AutoflowRuns() {
-  const [tab, setTab] = useState<Tab>('runs');
-  // All hosts by default: local paints at once, each remote merges in as it
-  // answers (usePerHostPagedList). A picked host lists only that host.
-  const [hostFilter, setHostFilter] = useState<string>(ALL_HOSTS);
-  // Row-action (archive/delete) failures — kept separate from the
-  // list-fetch error each tab's own hook owns, but shown in the same banner.
+  const [q, setQ] = useListQuery('q');
+  const scoped = useScopedList(undefined, []);
+  const { customer } = scoped;
+  // Row-action (archive/restore/delete, claim) failures — kept separate from
+  // the list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
-  const [query, setQuery] = useState('');
+  const [busyClaim, setBusyClaim] = useState<string | null>(null);
+  const archive = asksArchived(q, AUTOFLOW_RUN_FIELDS);
+  // The hosts the query asks, for the problems strip too.
+  const pick = useMemo(() => hostPickOf(q, AUTOFLOW_RUN_FIELDS), [q]);
 
-  // The primary "Runs" (events) feed and the "Cycles" feed each get their own
-  // usePerHostPagedList instance (independent pagination + sentinel), matching
-  // the pre-migration two-list-machine shape. Both poll regardless of the
-  // active tab — unchanged from before (so switching tabs always shows fresh
-  // data, not a stale snapshot from before the tab was last visited): local
-  // every 5 s, remotes every 60 s while the tab is visible. Both feeds share
-  // one SSH `autoflow history` listing per host via the server's listing cache.
-  const scopeHost = hostFilter === ALL_HOSTS ? null : hostFilter;
-  const fetchEvents = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams) => api.getAutoflowEvents({ offset, limit, host, signal }),
-    [],
+  const fetchRows = useCallback(
+    (p: PerHostFetchParams & ListQueryOpts): Promise<AutoflowRunRow[]> =>
+      customer ? scoped.guard(api.getAutoflowRunList({ ...p, customer })) : api.getAutoflowRunList(p),
+    [customer, scoped.guard],
   );
-  const fetchCycles = useCallback(
-    ({ host, offset, limit, signal }: PerHostFetchParams) => api.getAutoflowRuns({ offset, limit, host, signal }),
-    [],
-  );
-  const events = usePerHostPagedList<AutoflowEventRow>({
-    host: scopeHost,
-    fetch: fetchEvents,
-    timeField: 'at',
-    idField: 'event_id',
-    deps: [],
-    poll: true,
-  });
-  const cycles = usePerHostPagedList<AutoflowCycleRow>({
-    host: scopeHost,
-    fetch: fetchCycles,
-    timeField: 'started_at',
-    idField: 'cycle_id',
-    deps: [],
-    poll: true,
-  });
 
-  // Claims tab: lazily fetched on selection, same as before — the endpoint
-  // has no offset/limit (a single full-list fetch), so any page beyond the
-  // first returns `[]` (mirrors the WorkflowRuns Archived-tab precedent) and
-  // the hook settles as `ended` after that one page. usePagedList never polls.
-  const claims = usePagedList<AutoflowClaim>({
-    fetch: ({ offset }) => {
-      if (tab !== 'claims') return Promise.resolve([]);
-      if (offset > 0) return Promise.resolve([]);
-      return api.getAutoflowClaims();
-    },
-    deps: [tab],
-  });
+  const { rows, slices, loading, error, hasMore, sentinelRef, refresh, refreshHost, removeRow, retryPaging, ended, facets, queryError, notes } =
+    usePerHostQueryList<AutoflowRunRow>({
+      q,
+      fields: AUTOFLOW_RUN_FIELDS,
+      scope: [customer],
+      fetch: fetchRows,
+      timeField: 'started_at',
+      idField: 'id',
+      poll: !archive,
+    });
 
-  // Row actions on the Runs tab (runs-section row-actions plan, Task 3) —
-  // ONLY for events carrying a `run_id` (`kind: "run_launched"`): those ARE
-  // genuine workflow runs, so Archive/Delete delegate to the EXISTING
-  // api.archiveRun/deleteRun (no new endpoint). Events without a `run_id`
-  // (awaiting_human / awaiting_external / cycle_failed) are pure scheduling
-  // signals with nothing on disk to address — `runActionColumn` below
-  // renders nothing for those rows rather than a dead/disabled button.
-  async function handleEventRunArchive(runId: string, host?: string) {
+  // Row-level archive / restore / delete — each drops the row and re-syncs
+  // just its host after success, on the host that owns the run.
+  async function handleRowArchive(id: string, host: string) {
     try {
-      await api.archiveRun(runId, host);
+      await api.archiveRun(id, host);
       setActionError(null);
-      // The event row stays in the history (only the launched run changed),
-      // so no removeRow — just re-sync the host that owns the run.
-      events.refreshHost(host ?? 'local');
+      removeRow(host, id);
+      refreshHost(host);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Archive failed');
     }
   }
 
-  async function handleEventRunDelete(runId: string, host?: string) {
-    if (
-      !window.confirm(
-        'Permanently delete this run and its transcripts? This cannot be undone. The autoflow event history entry stays, with its run reference now dangling.',
-      )
-    )
-      return;
+  async function handleRowRestore(id: string, host: string) {
     try {
-      await api.deleteRun(runId, host);
+      await api.restoreRun(id, host);
       setActionError(null);
-      // The event row stays in the history (only the launched run changed),
-      // so no removeRow — just re-sync the host that owns the run.
-      events.refreshHost(host ?? 'local');
+      removeRow(host, id);
+      refreshHost(host);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Restore failed');
+    }
+  }
+
+  async function handleRowDelete(id: string, host: string) {
+    if (!window.confirm('Permanently delete this run and its transcripts? This cannot be undone.')) return;
+    try {
+      await api.deleteRun(id, host);
+      setActionError(null);
+      removeRow(host, id);
+      refreshHost(host);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Delete failed');
     }
   }
 
-  // `interactive: true` (no header label) so SortableTable renders an
-  // unwrapped cell — see AgentRuns.tsx's `buildAgentRunActionColumn` doc
-  // comment for why every button still calls both `preventDefault()` and
-  // `stopPropagation()`.
-  const runActionColumn: Column<AutoflowEventRow> = {
-    key: 'action',
-    header: '',
-    fit: true,
-    align: 'right',
-    interactive: true,
-    render: (e) => {
-      if (!e.run_id) return null;
-      const runId = e.run_id;
+  // Claim actions on an expanded attempt row (local host only, as the claim
+  // endpoints are). The confirmation wording is the old Claims table's.
+  async function handleClaim(issueRef: string, action: 'requeue' | 'release') {
+    if (busyClaim) return;
+    if (!window.confirm(action === 'requeue' ? 'Requeue this autoflow?' : 'Release this claim?')) return;
+    setBusyClaim(issueRef);
+    try {
+      if (action === 'requeue') await api.requeueClaim(issueRef);
+      else await api.releaseClaim(issueRef);
+      setActionError(null);
+      refreshHost('local');
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : `Failed to ${action} claim`);
+    } finally {
+      setBusyClaim(null);
+    }
+  }
+
+  // The Workflows columns, unchanged in width: the Workflow cell (the row's
+  // link and the table's one flexible column) carries the issue — or an
+  // attempt's error — as a second line, and the "show only this workflow"
+  // filter and the PR link ride the actions column. Extra columns here would
+  // starve the Workflow column at ordinary widths (Workflows already leaves
+  // it ~180px at 1600px).
+  const workflowColumn: Column<AutoflowRunRow> = {
+    key: 'workflow',
+    header: 'Workflow',
+    subject: true,
+    sortable: true,
+    sortValue: (r) => r.workflow_name,
+    titleValue: (r) => {
+      const issue = r.autoflow?.issue_display_ref ?? r.autoflow?.issue_ref;
+      return issue ? `${r.workflow_name} · ${issue}` : r.workflow_name;
+    },
+    render: (r) => {
+      const issue = r.autoflow?.issue_display_ref ?? r.autoflow?.issue_ref;
       return (
-        <div className="flex items-center justify-end gap-1">
-          <Button
-            variant="ring"
-            onClick={(ev) => {
-              ev.preventDefault();
-              ev.stopPropagation();
-              void handleEventRunArchive(runId, e.host_id);
-            }}
-            aria-label={`Archive run ${runId}`}
-          >
-            Archive
-          </Button>
-          <Button
-            variant="ring-danger"
-            onClick={(ev) => {
-              ev.preventDefault();
-              ev.stopPropagation();
-              void handleEventRunDelete(runId, e.host_id);
-            }}
-            aria-label={`Delete run ${runId}`}
-          >
-            Delete
-          </Button>
-        </div>
+        <>
+          <span className="inline-flex items-center gap-2">
+            {r.codename && <CrewChip crew={parseCodename(r.codename).crew} derived={r.codename_derived} />}
+            <span className="text-sm font-medium text-ink">{r.workflow_name}</span>
+          </span>
+          {r.attempt?.detail ? (
+            <div className="text-note text-err truncate">{r.attempt.detail}</div>
+          ) : (
+            issue && <div className="text-note text-ink-mute font-mono truncate">{shortIssueRef(issue)}</div>
+          )}
+        </>
       );
     },
   };
-  const runColumns: Column<AutoflowEventRow>[] = [...EVENT_COLUMNS, runActionColumn];
 
-  // Claims columns close over claims.refresh for the row actions.
-  const claimColumns: Column<AutoflowClaim>[] = [
-    {
-      key: 'issue',
-      header: 'Issue Ref',
-      subject: true,
-      sortable: true,
-      sortValue: (c) => c.issue_display_ref ?? c.issue_ref,
-      titleValue: (c) => c.issue_display_ref ?? c.issue_ref,
-      render: (c) => {
-        const label = c.issue_display_ref ?? c.issue_ref;
-        return (
-          <div className="min-w-0">
-            {c.issue_url ? (
-              <a
-                href={c.issue_url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-sm font-medium text-brand-600 hover:underline truncate"
-              >
-                {label}
-              </a>
+  // Show only this workflow (a `workflow:` term in the query), the run's PR,
+  // and Archive / Restore / Delete (run rows only — an attempt is not a run
+  // record). Its own real buttons: independently focusable, not swallowed by
+  // the row link; the wrapper cancels the link's navigation (I7).
+  const actionColumn: Column<AutoflowRunRow> = {
+    key: 'actions',
+    header: '',
+    fit: true,
+    interactive: true,
+    render: (r) => (
+      <div
+        className="flex items-center justify-end gap-1"
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+      >
+        <button
+          type="button"
+          className="rounded p-1 text-ink-mute hover:bg-surface-hover hover:text-ink"
+          aria-label={`Show only ${r.workflow_name} runs`}
+          title={`Show only ${r.workflow_name} runs`}
+          onClick={() => setQ(withTerm(q, AUTOFLOW_RUN_FIELDS, 'workflow', [r.workflow_name]))}
+        >
+          <ListFilter size={12} />
+        </button>
+        {r.autoflow?.pr_url && (
+          <a
+            href={r.autoflow.pr_url}
+            target="_blank"
+            rel="noreferrer"
+            className="px-1 text-note text-brand-600 hover:underline"
+            onClick={(e) => e.stopPropagation()}
+          >
+            PR ↗
+          </a>
+        )}
+        {!r.attempt && (
+          <>
+            {r.archived ? (
+              <Button variant="ring" onClick={() => void handleRowRestore(r.id, hostOf(r))} aria-label={`Restore run ${r.id}`}>
+                Restore
+              </Button>
             ) : (
-              <span className="text-sm font-medium text-ink truncate">{label}</span>
+              <Button variant="ring" onClick={() => void handleRowArchive(r.id, hostOf(r))} aria-label={`Archive run ${r.id}`}>
+                Archive
+              </Button>
             )}
-            {c.issue_title && (
-              <div className="text-note text-ink-dim mt-0.5 truncate">{c.issue_title}</div>
-            )}
-            {c.last_error ? (
-              <div className="text-note text-err mt-0.5">{c.last_error}</div>
-            ) : (
-              c.last_summary && (
-                <div className="text-note text-ink-dim mt-0.5">{c.last_summary}</div>
-              )
-            )}
-            {c.pr_url && (
-              <a
-                href={c.pr_url}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-block text-note text-brand-600 hover:underline mt-1"
-              >
-                View PR
-              </a>
-            )}
-          </div>
-        );
-      },
-    },
-    {
-      key: 'status',
-      header: 'Status',
-      fit: true,
-      sortable: true,
-      sortValue: (c) => c.status,
-      render: (c) => <ClaimStatusBadge status={c.status} />,
-    },
-    {
-      key: 'workflow',
-      header: 'Workflow',
-      fit: true,
-      sortable: true,
-      sortValue: (c) => c.workflow,
-      render: (c) => (
-        <Badge tone="neutral" ring>
-          {c.workflow}
-        </Badge>
-      ),
-    },
-    {
-      key: 'repo',
-      header: 'Repo',
-      fit: true,
-      sortable: true,
-      sortValue: (c) => c.repo_ref,
-      render: (c) => <span className="text-note text-ink-dim">{c.repo_ref}</span>,
-    },
-    {
-      key: 'owner',
-      header: 'Owner',
-      fit: true,
-      sortable: true,
-      sortValue: (c) => c.claim_owner ?? null,
-      render: (c) =>
-        c.claim_owner ? (
-          <span className="text-note text-ink-dim">{c.claim_owner}</span>
-        ) : (
-          <span className="text-ink-mute">—</span>
-        ),
-    },
-    {
-      key: 'updated',
-      header: 'Updated',
-      align: 'right',
-      fit: true,
-      sortable: true,
-      sortValue: (c) => (c.updated_at ? Date.parse(c.updated_at) : null),
-      render: (c) => <span className="text-ink-mute">{relativeTime(c.updated_at)}</span>,
-    },
-    {
-      key: 'actions',
-      header: 'Actions',
-      align: 'right',
-      fit: true,
-      render: (c) => <ClaimActions claim={c} onChanged={() => claims.refresh()} />,
-    },
+            <Button variant="ring-danger" onClick={() => void handleRowDelete(r.id, hostOf(r))} aria-label={`Delete run ${r.id}`}>
+              Delete
+            </Button>
+          </>
+        )}
+      </div>
+    ),
+  };
+
+  const dashForAttempts = (c: Column<AutoflowRunRow>): Column<AutoflowRunRow> =>
+    NO_USAGE_KEYS.has(c.key)
+      ? {
+          ...c,
+          sortValue: (r) => (r.attempt ? null : c.sortValue?.(r) ?? null),
+          render: (r) => (r.attempt ? <span className="text-ink-mute">—</span> : c.render(r)),
+        }
+      : c;
+
+  // The Customer column resolves slugs (archived customers load on first need).
+  const customers = useRunCustomers(!customer ? rows.map((r) => r.customer) : []);
+  const baseColumns = (WORKFLOW_RUN_COLUMNS as Column<AutoflowRunRow>[]).flatMap((c) =>
+    c.key === 'workflow' ? [workflowColumn] : [dashForAttempts(c)],
+  );
+  const columns: Column<AutoflowRunRow>[] = [
+    ...withCustomerColumn(baseColumns, customers, rows, !customer),
+    actionColumn,
   ];
 
-  // A fresh action error (e.g. this click's Archive/Delete refusal) must win
-  // over a stale fetch error from an earlier load — never the other way
-  // around, or the operator sees the wrong banner for what just happened.
-  const bannerError =
-    actionError ?? (tab === 'runs' ? events.error : tab === 'cycles' ? cycles.error : claims.error);
-  const refreshing = events.loading || cycles.loading;
+  /** The in-place detail of an attempt that has no run to open. */
+  function renderDetail(r: AutoflowRunRow) {
+    if (!expandsInPlace(r) || !r.attempt) return null;
+    const a = r.attempt;
+    const issueRef = r.autoflow?.issue_ref;
+    const local = hostOf(r) === 'local';
+    return (
+      <div className="space-y-2">
+        {a.detail && <pre className="text-note font-mono whitespace-pre-wrap text-err">{a.detail}</pre>}
+        <dl className="flex flex-wrap gap-x-6 gap-y-1 text-note">
+          <div className="flex gap-1.5">
+            <dt className="text-ink-mute">cycle</dt>
+            <dd className="font-mono text-ink-dim" title={a.cycle_id}>
+              {shortId(a.cycle_id)}
+            </dd>
+          </div>
+          <div className="flex gap-1.5">
+            <dt className="text-ink-mute">worker</dt>
+            <dd className="font-mono text-ink-dim">{a.worker ?? '—'}</dd>
+          </div>
+          <div className="flex gap-1.5">
+            <dt className="text-ink-mute">claim</dt>
+            <dd className="font-mono text-ink-dim">{a.claim_status ?? '—'}</dd>
+          </div>
+          {issueRef && (
+            <div className="flex gap-1.5">
+              <dt className="text-ink-mute">issue</dt>
+              <dd className="font-mono">
+                {r.autoflow?.issue_url ? (
+                  <a href={r.autoflow.issue_url} target="_blank" rel="noreferrer" className="text-brand-600 hover:underline">
+                    {r.autoflow.issue_display_ref ?? issueRef}
+                  </a>
+                ) : (
+                  <span className="text-ink-dim">{r.autoflow?.issue_display_ref ?? issueRef}</span>
+                )}
+              </dd>
+            </div>
+          )}
+        </dl>
+        {issueRef && local ? (
+          <div className="flex items-center gap-1">
+            <Button variant="ring" disabled={busyClaim !== null} onClick={() => void handleClaim(issueRef, 'requeue')}>
+              Requeue claim
+            </Button>
+            <Button variant="ring-danger" disabled={busyClaim !== null} onClick={() => void handleClaim(issueRef, 'release')}>
+              Release claim
+            </Button>
+          </div>
+        ) : issueRef ? (
+          <p className="text-note text-ink-mute">Claim actions are available on the host that ran this autoflow.</p>
+        ) : null}
+      </div>
+    );
+  }
 
-  // Find — narrows whichever tab is active over ITS OWN searchable fields:
-  //   events (Runs tab): workflow/kind label (subject), run id, issue ref,
-  //     host id, worker name.
-  //   cycles: cycle id, host id, worker name (no single subject column — see
-  //     CYCLE_COLUMNS' comment).
-  //   claims: issue ref/display ref, workflow, repo ref, claim owner.
-  const q = query.trim().toLowerCase();
-  const visibleEvents = events.rows.filter((e) =>
-    matchesAutoflowQuery(q, [
-      e.workflow,
-      KIND_LABEL[e.kind] ?? e.kind,
-      e.run_id,
-      e.issue_display_ref,
-      e.host_id,
-      e.worker_name,
-    ]),
-  );
-  const visibleCycles = cycles.rows.filter((c) =>
-    matchesAutoflowQuery(q, [c.cycle_id, c.host_id, c.worker_name]),
-  );
-  const visibleClaims = claims.rows.filter((c) =>
-    matchesAutoflowQuery(q, [c.issue_display_ref, c.issue_ref, c.workflow, c.repo_ref, c.claim_owner]),
-  );
-
-  // Honest per-host states (spec §8), per feed: never claim "nothing" while a host is still
-  // loading, and keep the sentinel mounted whenever rows have loaded, even if Find hides all of
-  // them, so scrolling keeps loading (a later page may match).
-  const eventsWaiting = waitingLabel(events.slices);
-  const eventsMissing = notIncluded(events.slices);
-  // With every loaded row filtered out a feed shows "No matches yet · Waiting on X…" itself, so its
-  // footer (still mounted, to keep paging) does not repeat it.
-  const eventsFooter = perHostFooterText({ slices: events.slices, loading: events.loading, hasMore: events.hasMore, ended: events.ended, count: events.rows.length, waitingShown: visibleEvents.length === 0 });
-  const cyclesWaiting = waitingLabel(cycles.slices);
-  const cyclesMissing = notIncluded(cycles.slices);
-  const cyclesFooter = perHostFooterText({ slices: cycles.slices, loading: cycles.loading, hasMore: cycles.hasMore, ended: cycles.ended, count: cycles.rows.length, waitingShown: visibleCycles.length === 0 });
+  // A fresh action error must win over a stale fetch error from an earlier
+  // load, never the other way around.
+  const bannerError = actionError ?? error;
+  // Never claim "nothing" while a host is still loading.
+  const waiting = waitingLabel(slices);
 
   return (
     <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
+      <header className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold text-ink">Autoflows</h1>
-          <p className="mt-1 text-sm text-ink-dim">Runs launched by the autoflow worker across this control plane.</p>
+          <h1 className="text-2xl font-semibold text-ink">Autoflow Runs</h1>
+          <p className="mt-1 text-sm text-ink-dim">
+            Workflow runs launched by autoflows, and attempts that failed before a run started.
+          </p>
         </div>
-        <Button
-          variant="secondary"
-          onClick={() => {
-            events.refresh();
-            cycles.refresh();
-          }}
-          className="gap-1.5"
-        >
-          <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
+        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
           Refresh
         </Button>
       </header>
 
-      <div className="mb-5">
-        <FilterBar
-          view={
-            <Segmented
-              options={VIEW_OPTIONS}
-              value={tab}
-              onChange={(v) => setTab(v as Tab)}
-              ariaLabel="View"
-            />
-          }
-          search={
-            <SearchInput
-              aria-label="Find autoflows"
-              placeholder="Find autoflows…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Escape') setQuery('');
-              }}
-            />
-          }
-          scope={
-            // Host filter — shown for runs and cycles tabs; claims are always local.
-            tab !== 'claims' && (
-              <HostSelect allowAll ariaLabel="Host filter" value={hostFilter} onChange={setHostFilter} />
-            )
-          }
-        />
-      </div>
+      <ListQueryBar
+        value={q}
+        onChange={setQ}
+        fields={AUTOFLOW_RUN_FIELDS}
+        facets={facets}
+        label="Filter autoflow runs"
+        placeholder="Filter runs… e.g. status:failed since:7d · kind:attempt · issue:acme/api#7 · pr:any"
+        error={queryError}
+        alerts={hostAlerts(notes, 'runs', retryPaging)}
+      />
 
-      <UnscopedNote className="mb-4">
-        Autoflow runs can’t be filtered by customer — this list shows every customer’s runs,
-        cycles and claims.
-      </UnscopedNote>
-      {tab === 'runs' && <PerHostStrip slices={events.slices} />}
-      {tab === 'cycles' && <PerHostStrip slices={cycles.slices} />}
+      {customer && (
+        <p className="mb-4 text-note text-ink-mute">
+          Failed attempts aren’t listed while a customer is selected — they record no customer.
+        </p>
+      )}
+
+      <AutoflowProblems pick={pick} />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
-      {tab === 'runs' ? (
-        events.loading && events.rows.length === 0 ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label="Loading autoflow activity…" />
-          </div>
-        ) : events.rows.length === 0 && eventsWaiting ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label={eventsWaiting} />
-          </div>
-        ) : events.rows.length === 0 ? (
-          <EmptyState
-            title={
-              noHostAnswered(events.slices)
-                ? 'No hosts answered'
-                : eventsMissing
-                  ? 'No autoflow activity on the hosts that answered'
-                  : 'No autoflow activity yet'
-            }
-            hint={
-              eventsMissing
-                ? `Not included: ${eventsMissing}.`
-                : 'Runs launched by the autoflow worker will appear here, each linking to its run graph.'
-            }
-          />
-        ) : visibleEvents.length === 0 ? (
-          <>
-            {eventsWaiting ? (
-              <div className="py-16 flex items-center justify-center">
-                <Spinner label={`No matches yet · ${eventsWaiting}`} />
-              </div>
-            ) : (
-              <EmptyState title="No matches" hint={`No autoflow activity matches "${query}".`} />
-            )}
-            <PerHostFooter sentinelRef={events.sentinelRef} text={eventsFooter} slices={events.slices} onRetry={events.retryPaging} />
-          </>
-        ) : (
-          <section>
-            <SortableTable<AutoflowEventRow>
-              columns={runColumns}
-              rows={visibleEvents}
-              rowKey={(e) => `${e.host_id ?? 'local'}:${e.event_id}`}
-              rowHref={eventHref}
-              initialSort={{ key: 'started', dir: 'desc' }}
-              renderDetail={EventDetail}
-            />
-            <PerHostFooter
-              sentinelRef={events.sentinelRef}
-              text={q ? `${visibleEvents.length} matches of ${events.rows.length} loaded` : eventsFooter}
-              slices={events.slices}
-              onRetry={events.retryPaging}
-            />
-          </section>
-        )
-      ) : tab === 'cycles' ? (
-        cycles.loading && cycles.rows.length === 0 ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label="Loading autoflow cycles…" />
-          </div>
-        ) : cycles.rows.length === 0 && cyclesWaiting ? (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label={cyclesWaiting} />
-          </div>
-        ) : cycles.rows.length === 0 ? (
-          <EmptyState
-            title={
-              noHostAnswered(cycles.slices)
-                ? 'No hosts answered'
-                : cyclesMissing
-                  ? 'No autoflow cycles on the hosts that answered'
-                  : 'No autoflow cycles yet'
-            }
-            hint={
-              cyclesMissing
-                ? `Not included: ${cyclesMissing}.`
-                : 'Autoflow scheduling cycles will appear here once the autoflow worker runs.'
-            }
-          />
-        ) : visibleCycles.length === 0 ? (
-          <>
-            {cyclesWaiting ? (
-              <div className="py-16 flex items-center justify-center">
-                <Spinner label={`No matches yet · ${cyclesWaiting}`} />
-              </div>
-            ) : (
-              <EmptyState title="No matches" hint={`No autoflow cycles match "${query}".`} />
-            )}
-            <PerHostFooter sentinelRef={cycles.sentinelRef} text={cyclesFooter} slices={cycles.slices} onRetry={cycles.retryPaging} />
-          </>
-        ) : (
-          <section>
-            <SortableTable<AutoflowCycleRow>
-              columns={CYCLE_COLUMNS}
-              rows={visibleCycles}
-              rowKey={(c) => `${c.host_id ?? 'local'}:${c.cycle_id}`}
-              initialSort={{ key: 'started', dir: 'desc' }}
-              renderDetail={CycleDetail}
-            />
-            <PerHostFooter
-              sentinelRef={cycles.sentinelRef}
-              text={q ? `${visibleCycles.length} matches of ${cycles.rows.length} loaded` : cyclesFooter}
-              slices={cycles.slices}
-              onRetry={cycles.retryPaging}
-            />
-          </section>
-        )
-      ) : claims.loading && claims.rows.length === 0 ? (
+      {loading && rows.length === 0 ? (
         <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading autoflow claims…" />
+          <Spinner label="Loading runs…" />
         </div>
-      ) : claims.rows.length === 0 ? (
-        <EmptyState
-          title="No active claims"
-          hint="Issues the autoflow worker has leased will appear here, each with requeue and release controls."
-        />
-      ) : visibleClaims.length === 0 ? (
-        <EmptyState title="No matches" hint={`No autoflow claims match "${query}".`} />
-      ) : (
-        <section>
-          <SortableTable<AutoflowClaim>
-            columns={claimColumns}
-            rows={visibleClaims}
-            rowKey={(c) => c.issue_ref}
-            initialSort={{ key: 'updated', dir: 'desc' }}
+      ) : rows.length === 0 && waiting ? (
+        <div className="py-16 flex items-center justify-center">
+          <Spinner label={waiting} />
+        </div>
+      ) : rows.length === 0 && noHostAnswered(slices) ? (
+        <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
+      ) : rows.length === 0 ? (
+        q.trim() ? (
+          <NoMatches noun="autoflow runs" />
+        ) : (
+          <EmptyState
+            title="No autoflow runs yet"
+            hint={
+              customer === 'none'
+                ? 'No autoflow run without a customer yet. is:archived lists the archive.'
+                : customer
+                  ? 'No autoflow run is attributed to this customer yet. is:archived lists the archive.'
+                  : 'Runs appear here once an autoflow launches a workflow, or an attempt to launch one fails. is:archived lists the archive.'
+            }
           />
-          {q && (
-            <div className="py-2 text-center text-note text-ink-mute">
-              {visibleClaims.length} matches of {claims.rows.length} loaded
-            </div>
-          )}
-        </section>
-      )}
-    </div>
-  );
-}
-
-function ClaimActions({
-  claim,
-  onChanged,
-}: {
-  claim: AutoflowClaim;
-  onChanged: () => void;
-}) {
-  const [busy, setBusy] = useState<'requeue' | 'release' | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [requeued, setRequeued] = useState(false);
-
-  const onRequeue = async () => {
-    if (busy) return;
-    if (!window.confirm('Requeue this autoflow?')) return;
-    setBusy('requeue');
-    setActionError(null);
-    try {
-      await api.requeueClaim(claim.issue_ref);
-      setRequeued(true);
-      onChanged();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to requeue claim');
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const onRelease = async () => {
-    if (busy) return;
-    if (!window.confirm('Release this claim?')) return;
-    setBusy('release');
-    setActionError(null);
-    try {
-      await api.releaseClaim(claim.issue_ref);
-      onChanged();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Failed to release claim');
-      setBusy(null);
-    }
-  };
-
-  return (
-    <div className="flex flex-col items-end gap-1">
-      <div className="flex items-center gap-2 shrink-0">
-        {requeued && (
-          <span className="text-meta font-medium text-ok">requeued</span>
-        )}
-        <Button variant="secondary" size="sm" onClick={() => void onRequeue()} disabled={busy !== null}>
-          {busy === 'requeue' ? 'Requeuing…' : 'Requeue'}
-        </Button>
-        <Button
-          variant="danger-outline"
-          size="sm"
-          onClick={() => void onRelease()}
-          disabled={busy !== null}
-        >
-          {busy === 'release' ? 'Releasing…' : 'Release'}
-        </Button>
-      </div>
-      {actionError && (
-        <div role="alert" className="text-note text-err">
-          {actionError}
+        )
+      ) : (
+        <div className="space-y-6">
+          <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3 mb-4">
+            <UsageBarChart
+              bars={rows
+                .filter((r) => !r.attempt)
+                .map((r) => ({
+                  id: r.id,
+                  label: r.workflow_name,
+                  to: runHref(r),
+                  input_tokens: r.usage.input_tokens,
+                  output_tokens: r.usage.output_tokens,
+                  cached_tokens: r.usage.cached_tokens,
+                  cost_usd: r.usage.cost_usd,
+                }))}
+            />
+          </div>
+          <SortableTable<AutoflowRunRow>
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => `${hostOf(r)}:${r.id}`}
+            rowHref={(r) => (expandsInPlace(r) ? undefined : runHref(r))}
+            renderDetail={renderDetail}
+            initialSort={{ key: 'started', dir: 'desc' }}
+          />
+          <ListFooter sentinelRef={sentinelRef} loading={loading} hasMore={hasMore} ended={ended} count={rows.length} />
         </div>
       )}
     </div>
   );
 }
-
-// The three bespoke dashed-box empty states (Claims/Events/Cycles) are
-// superseded by the kit `EmptyState` component (same copy, inlined at each
-// call site above) per the One Control Language migration.

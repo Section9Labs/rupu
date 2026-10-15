@@ -8,7 +8,7 @@
 // Throwaway in-process mock-server client, not rupu's egress.
 #![allow(clippy::disallowed_methods)]
 
-use rupu_cp::query::{agent_runs, events, sessions, workflow_runs, Fields};
+use rupu_cp::query::{agent_runs, autoflow_runs, events, sessions, workflow_runs, Fields};
 use serde_json::Value;
 
 fn fixture_matches(list: &str, fields: Fields) {
@@ -40,6 +40,11 @@ fn fixture_matches(list: &str, fields: Fields) {
 #[test]
 fn workflow_runs_registry_matches_its_fixture() {
     fixture_matches("workflow_runs", workflow_runs::FIELDS);
+}
+
+#[test]
+fn autoflow_runs_registry_matches_its_fixture() {
+    fixture_matches("autoflow_runs", autoflow_runs::FIELDS);
 }
 
 #[test]
@@ -107,6 +112,7 @@ fn every_registry_pairs_kinds_with_their_match_modes() {
     use rupu_query::{FieldKind, MatchMode};
     for fields in [
         workflow_runs::FIELDS,
+        autoflow_runs::FIELDS,
         agent_runs::FIELDS,
         sessions::FIELDS,
         events::FIELDS,

@@ -2345,6 +2345,22 @@ impl RunStore {
         Ok(serde_json::from_slice(&body)?)
     }
 
+    /// [`Self::read_run_envelope`] through a process-wide [`FileCache`]: a
+    /// listing that asks every run for its envelope costs a `stat` per run
+    /// once the files have been read. `Ok(None)` when the run has none.
+    pub fn read_run_envelope_cached(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<std::sync::Arc<RunEnvelope>>, RunStoreError> {
+        match envelope_cache().read(&self.run_envelope(run_id), |body| {
+            serde_json::from_slice::<RunEnvelope>(body)
+        }) {
+            Ok(v) => Ok(v),
+            Err(FileCacheError::Io(e)) => Err(e.into()),
+            Err(FileCacheError::Parse(e)) => Err(e.into()),
+        }
+    }
+
     /// Cheap existence check across both scopes: true if `run_id` names a
     /// `run.json` under the active run dir OR the archived one. Two
     /// `is_file` stats, no directory scan and no JSON parse — the fast
@@ -4475,6 +4491,12 @@ fn record_cache() -> &'static FileCache<RunRecord> {
     CACHE.get_or_init(FileCache::default)
 }
 
+/// Every `run_envelope.json` parse, process-wide (run lists ask each run).
+fn envelope_cache() -> &'static FileCache<RunEnvelope> {
+    static CACHE: std::sync::OnceLock<FileCache<RunEnvelope>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(FileCache::default)
+}
+
 /// The run record at `path`: `Ok(None)` when there is no `run.json` there.
 /// Statted on every call; read and parsed only when it changed since the
 /// last read, so listing thousands of finished runs costs a `stat` each, not
@@ -4709,6 +4731,37 @@ mod tests {
             .unwrap();
         let loaded = store.read_run_envelope(&envelope.run_id).unwrap();
         assert_eq!(loaded, envelope);
+    }
+
+    #[test]
+    fn read_run_envelope_cached_none_when_missing_and_value_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let rec = sample_record("run_env_cached");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        assert!(store.read_run_envelope_cached(&rec.id).unwrap().is_none());
+
+        // An envelope is written before its run record exists.
+        let with_env = sample_record("run_env_cached_present");
+        let envelope = sample_envelope(&with_env.id);
+        store.write_run_envelope(&with_env.id, &envelope).unwrap();
+        store.create(with_env.clone(), SAMPLE_YAML).unwrap();
+        let got = store
+            .read_run_envelope_cached(&with_env.id)
+            .unwrap()
+            .expect("present");
+        assert_eq!(got.run_id, with_env.id);
+        assert_eq!(*got, envelope);
+    }
+
+    #[test]
+    fn read_run_envelope_cached_errors_on_garbage() {
+        let tmp = TempDir::new().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let rec = sample_record("run_env_garbage");
+        store.create(rec.clone(), SAMPLE_YAML).unwrap();
+        std::fs::write(store.run_envelope_path(&rec.id), b"{not json").unwrap();
+        assert!(store.read_run_envelope_cached(&rec.id).is_err());
     }
 
     #[test]

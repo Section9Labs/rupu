@@ -587,6 +587,17 @@ export function isKnownRunEvent(ev: RunEvent): ev is KnownRunEvent {
 // Slim run list row (returned by /api/runs and /api/runs/workflows)
 // ---------------------------------------------------------------------------
 
+/** What an autoflow recorded about the run it launched (`RunListRow.autoflow`,
+ *  spec 2026-10-14). `issue_ref` comes from the run's envelope; the rest from
+ *  the host's claim store, so a mirrored row may carry `issue_ref` only. */
+export interface RunAutoflow {
+  issue_ref?: string;
+  issue_display_ref?: string;
+  issue_url?: string;
+  /** The claim's PR, only when its last run is this run. */
+  pr_url?: string;
+}
+
 export interface RunListRow {
   codename: string;
   codename_derived: boolean;
@@ -610,6 +621,48 @@ export interface RunListRow {
   host_id?: string;
   /** True on a row from the archive (`is:archived`). */
   archived?: boolean;
+  /** Absent: the host can't tell. null: not an autoflow run. */
+  autoflow?: RunAutoflow | null;
+}
+
+/** A failed autoflow attempt that never became a run record (or whose run was
+ *  never recorded): a `cycle_failed` history event naming a workflow, or a
+ *  `run_launched` whose run doesn't exist. Rides `AutoflowRunRow.attempt`. */
+export interface AutoflowAttempt {
+  /** The failure text, when the event carried one. */
+  detail: string | null;
+  cycle_id: string;
+  worker: string | null;
+  /** The claim's status, mapped the way the run page maps it. */
+  claim_status: string | null;
+}
+
+/** One row of `GET /api/runs/autoflows/runs`: a run row (`RunListRow` with a
+ *  non-null `autoflow`) or an attempt row — the same shape, zero usage, with
+ *  `attempt` set and `id` the run id if the attempt had one, else the
+ *  history event id. */
+export type AutoflowRunRow = RunListRow & {
+  attempt?: AutoflowAttempt;
+  /** Attempt rows only. `false` when `id` is a run id with no run record (the
+   *  server sends it; a click opens `/runs/:id`, which renders an unpersisted
+   *  run from history). Absent when `id` is a history event id (that row
+   *  expands in place). Never `true`: an attempt whose run was recorded is
+   *  listed as the run row instead. */
+  run_recorded?: boolean;
+};
+
+/** One line of `GET /api/runs/autoflows/problems`: `cycle_failed` events that
+ *  name no workflow, seen within the last hour, grouped by host and subject —
+ *  the event's repo, else the cycle's worker. */
+export interface AutoflowProblem {
+  host_id: string;
+  subject_kind: 'repo' | 'worker';
+  subject: string;
+  /** The latest error. */
+  detail: string | null;
+  first_seen: string;
+  last_seen: string;
+  count: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -3190,6 +3243,27 @@ export const api = {
     if (params?.host) q.set('host', params.host);
     const qs = q.toString();
     return request<AutoflowEventRow[]>(`/api/runs/autoflows/events${qs ? `?${qs}` : ''}`, { signal: params?.signal });
+  },
+  /** Autoflow runs plus failed attempts, newest first (`GET /api/runs/autoflows/runs`):
+   *  `getWorkflowRuns`'s calling convention (`q`, facets, the left-out-host
+   *  headers) over the autoflow registry (`AUTOFLOW_RUN_FIELDS`). */
+  getAutoflowRunList(
+    params?: ListParams & Cancellable & ListQueryOpts & { host?: string; customer?: CustomerScope },
+  ): Promise<AutoflowRunRow[]> {
+    const q = new URLSearchParams();
+    if (params?.offset != null) q.set('offset', String(params.offset));
+    if (params?.limit != null) q.set('limit', String(params.limit));
+    if (params?.host) q.set('host', params.host);
+    setCustomer(q, params?.customer);
+    return requestList<AutoflowRunRow>('/api/runs/autoflows/runs', q, params ?? {});
+  },
+  /** Recent autoflow failures that name no workflow, grouped by host and
+   *  subject (`GET /api/runs/autoflows/problems`). */
+  getAutoflowProblems(params?: Cancellable & { host?: string }): Promise<AutoflowProblem[]> {
+    const q = new URLSearchParams();
+    if (params?.host) q.set('host', params.host);
+    const qs = q.toString();
+    return request<AutoflowProblem[]>(`/api/runs/autoflows/problems${qs ? `?${qs}` : ''}`, { signal: params?.signal });
   },
   /** Agentiflow runs (local only), newest first. */
   async getAgentiflows(opts?: Cancellable): Promise<AgentiflowRow[]> {

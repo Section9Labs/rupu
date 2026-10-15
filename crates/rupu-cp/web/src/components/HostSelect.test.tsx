@@ -1,13 +1,12 @@
 // @vitest-environment jsdom
-// HostSelect — the launcher variant lists hosts from api.getHosts() with their
-// status, the allowAll variant from api.getRegisteredHosts() (no probe). Emits
+// HostSelect — lists hosts from api.getHosts() with their status and emits
 // the chosen id via onChange. Falls back to a plain "Local" option on error.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { api, type HostView } from '../lib/api';
-import HostSelect, { ALL_HOSTS } from './HostSelect';
+import HostSelect from './HostSelect';
 
 const LOCAL: HostView = {
   id: 'local',
@@ -93,67 +92,5 @@ describe('HostSelect', () => {
     render(<HostSelect value="local" onChange={vi.fn()} disabled />);
 
     expect(screen.getByLabelText('Host')).toBeDisabled();
-  });
-});
-
-describe('HostSelect — allowAll (fan-out variant)', () => {
-  it('renders This host, All hosts, then the registered hosts, in that order', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
-
-    render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
-
-    await waitFor(() => expect(screen.getByText('staging')).toBeInTheDocument());
-
-    const options = screen.getAllByRole('option') as HTMLOptionElement[];
-    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts', 'staging']);
-    expect(options.map((o) => o.value)).toEqual(['local', ALL_HOSTS, 'h-abc']);
-  });
-
-  it('excludes the registered local host from the list (This host already covers it)', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
-
-    render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
-
-    await waitFor(() => expect(screen.getByText('staging')).toBeInTheDocument());
-    // "Local" (the registered host's name) never appears as its own option —
-    // only "This host" represents it.
-    expect(screen.queryByText('Local')).not.toBeInTheDocument();
-  });
-
-  it('emits ALL_HOSTS when "All hosts" is selected', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
-    const onChange = vi.fn();
-
-    render(<HostSelect value="local" onChange={onChange} allowAll />);
-
-    await waitFor(() => screen.getByText('staging'));
-
-    fireEvent.change(screen.getByLabelText('Host'), { target: { value: ALL_HOSTS } });
-    expect(onChange).toHaveBeenCalledWith(ALL_HOSTS);
-  });
-
-  it('shows only This host and All hosts while the hosts fetch is pending', () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockReturnValue(new Promise(() => {}));
-
-    render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
-
-    const options = screen.getAllByRole('option') as HTMLOptionElement[];
-    expect(options.map((o) => o.textContent)).toEqual(['This host', 'All hosts']);
-  });
-
-  it('honors a custom ariaLabel override', async () => {
-    vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
-
-    render(<HostSelect value="local" onChange={vi.fn()} allowAll ariaLabel="Host filter" />);
-
-    expect(screen.getByLabelText('Host filter')).toBeInTheDocument();
-  });
-
-  it('does not ask for host health (no probe) — only the registered list', async () => {
-    const reg = vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL, REMOTE]);
-    const health = vi.spyOn(api, 'getHosts');
-    render(<HostSelect value="local" onChange={vi.fn()} allowAll />);
-    await waitFor(() => expect(reg).toHaveBeenCalled());
-    expect(health).not.toHaveBeenCalled();
   });
 });

@@ -6,6 +6,7 @@
 //! registries are checked against too.
 
 pub mod agent_runs;
+pub mod autoflow_runs;
 pub mod events;
 pub mod sessions;
 pub mod workflow_runs;
@@ -84,11 +85,20 @@ impl ListQuery {
     }
 }
 
-/// What a list keeps before it pages: the `?customer=` filter AND the query.
+/// A list's own row predicate ([`RowFilter::only`]): `Err` names the field
+/// a row can't report.
+pub type RowPredicate = fn(&Value) -> Result<bool, Unreportable>;
+
+/// What a list keeps before it pages: the `?customer=` filter, the list's
+/// own predicate AND the query.
 #[derive(Clone, Default)]
 pub struct RowFilter {
     pub customer: Option<crate::customers::CustomerFilter>,
     pub query: Option<Arc<ListQuery>>,
+    /// The rows the list is of at all (the autoflow list: rows whose
+    /// `autoflow` is non-null). A row outside it is out of scope; one that
+    /// can't report it can't be filtered, like one without a `customer`.
+    pub only: Option<RowPredicate>,
 }
 
 impl RowFilter {
@@ -99,11 +109,18 @@ impl RowFilter {
         Self {
             customer,
             query: query.map(Arc::new),
+            only: None,
         }
     }
 
+    /// Keep only the rows `only` admits.
+    pub fn only(mut self, only: RowPredicate) -> Self {
+        self.only = Some(only);
+        self
+    }
+
     pub fn is_active(&self) -> bool {
-        self.customer.is_some() || self.query.is_some()
+        self.customer.is_some() || self.query.is_some() || self.only.is_some()
     }
 
     /// Whether the filter reads a row's customer — `?customer=` or a
@@ -114,15 +131,20 @@ impl RowFilter {
     }
 
     /// Whether `row` is in the list's scope: its `customer` key matches the
-    /// customer filter. A row without the key (or a key that is neither a
-    /// slug nor `null`) can't say.
+    /// customer filter (a row without the key, or with one that is neither
+    /// a slug nor `null`, can't say) and the list's own predicate admits it.
     pub fn in_scope(&self, row: &Value) -> Result<bool, Unreportable> {
-        let Some(f) = &self.customer else {
-            return Ok(true);
-        };
-        let customer =
-            crate::customers::row_customer(row).ok_or(Unreportable { field: "customer" })?;
-        Ok(f.matches(customer))
+        if let Some(f) = &self.customer {
+            let customer =
+                crate::customers::row_customer(row).ok_or(Unreportable { field: "customer" })?;
+            if !f.matches(customer) {
+                return Ok(false);
+            }
+        }
+        match self.only {
+            None => Ok(true),
+            Some(only) => only(row),
+        }
     }
 
     /// Whether an in-scope `row` matches the query.
@@ -459,6 +481,37 @@ mod tests {
         assert_eq!(ids(&scoped.unwrap()), ["a", "b"]);
         let no_key = vec![serde_json::json!({"id": "d", "status": "failed"})];
         assert_eq!(f.retain(no_key), Err(Unreportable { field: "customer" }));
+    }
+
+    #[test]
+    fn the_lists_own_predicate_scopes_rows_and_names_what_cannot_report_it() {
+        let f = RowFilter::new(
+            None,
+            ListQuery::parse(Some("status:failed"), autoflow_runs::FIELDS).unwrap(),
+        )
+        .only(autoflow_runs::is_autoflow_row);
+        assert!(f.is_active());
+        let af = serde_json::json!({"id": "a", "status": "failed", "autoflow": {"issue_ref": "x"}});
+        let manual = serde_json::json!({"id": "b", "status": "failed", "autoflow": null});
+        let old = serde_json::json!({"id": "c", "status": "failed"});
+        assert_eq!(f.in_scope(&af), Ok(true));
+        assert_eq!(f.in_scope(&manual), Ok(false));
+        assert_eq!(f.in_scope(&old), Err(Unreportable { field: "autoflow" }));
+        let (kept, scoped) = f.split(vec![af.clone(), manual.clone()], true).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(scoped.unwrap().len(), 1, "facets count autoflow rows only");
+        assert_eq!(
+            f.retain(vec![af, old.clone()]),
+            Err(Unreportable { field: "autoflow" })
+        );
+        let mut tagged = old;
+        tagged["host_id"] = serde_json::json!("old");
+        let merged = filter_merged(vec![tagged], &f, |_| true, false);
+        assert_eq!(merged.unfilterable, vec![("old".to_string(), "autoflow")]);
+        assert_eq!(
+            merged.headers().get(HOSTS_UNFILTERABLE_HEADER).unwrap(),
+            "old:autoflow"
+        );
     }
 
     #[test]

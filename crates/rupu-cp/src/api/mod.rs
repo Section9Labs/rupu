@@ -2,6 +2,7 @@ pub mod agentiflows;
 pub mod agents;
 pub mod assets;
 pub mod autoflow_claims;
+pub mod autoflow_runs;
 pub mod autoflows;
 pub mod children;
 pub mod code;

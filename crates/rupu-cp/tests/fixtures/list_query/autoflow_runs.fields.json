@@ -1,0 +1,16 @@
+[
+  {"aliases":[],"facet":true,"key":"status","kind":"enum","match":"exact","text":false,"values":["pending","running","awaiting_approval","paused","completed","failed","rejected","cancelled"]},
+  {"aliases":[],"facet":true,"key":"workflow","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":false,"key":"id","kind":"text","match":"prefix","text":true,"values":[]},
+  {"aliases":[],"facet":false,"key":"codename","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"trigger","kind":"enum","match":"exact","text":false,"values":["manual","cron","event"]},
+  {"aliases":[],"facet":true,"key":"host","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":true,"key":"customer","kind":"text","match":"exact","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"since","kind":"time","match":"since","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"until","kind":"time","match":"until","text":false,"values":[]},
+  {"aliases":[],"facet":false,"key":"is","kind":"enum","match":"exact","text":false,"values":["archived"]},
+  {"aliases":[],"facet":false,"key":"issue","kind":"text","match":"contains","text":true,"values":[]},
+  {"aliases":[],"facet":true,"key":"pr","kind":"enum","match":"exact","text":false,"values":["any","none"]},
+  {"aliases":[],"facet":true,"key":"kind","kind":"enum","match":"exact","text":false,"values":["run","attempt"]},
+  {"aliases":[],"facet":false,"key":"error","kind":"text","match":"contains","text":true,"values":[]}
+]

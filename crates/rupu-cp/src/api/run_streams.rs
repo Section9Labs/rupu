@@ -246,6 +246,12 @@ struct AutoflowEventRow {
     /// payload when absent so older clients see no shape change.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    /// The event's `repo_ref` — a `cycle_failed` that names the repo whose
+    /// config failed to load — so a coordinator can name the repo in a
+    /// remote host's autoflow problems (`GET /api/runs/autoflows/problems`).
+    /// Additive/optional: omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     host_id: Option<String>,
 }
@@ -1396,6 +1402,7 @@ async fn list_autoflow_events(
             turns: None,
             duration_ms: None,
             detail: rec.event.detail,
+            repo_ref: rec.event.repo_ref,
             host_id: None,
         })
         .collect();
@@ -2258,6 +2265,7 @@ mod tests {
             turns: None,
             duration_ms: None,
             detail: rec.event.detail.clone(),
+            repo_ref: rec.event.repo_ref.clone(),
             host_id: None,
         };
         let v = serde_json::to_value(&row).unwrap();
@@ -2269,6 +2277,11 @@ mod tests {
             v["issue_display_ref"],
             serde_json::json!("github:acme/widgets#7")
         );
+        assert!(v.get("repo_ref").is_none(), "no repo named: no key");
+        let mut named = row;
+        named.repo_ref = Some("github:acme/widgets".into());
+        let v = serde_json::to_value(&named).unwrap();
+        assert_eq!(v["repo_ref"], serde_json::json!("github:acme/widgets"));
     }
 
     #[test]
@@ -2298,6 +2311,7 @@ mod tests {
             turns: None,
             duration_ms: None,
             detail: rec.event.detail.clone(),
+            repo_ref: rec.event.repo_ref.clone(),
             host_id: None,
         };
         let s = serde_json::to_string(&row).unwrap();

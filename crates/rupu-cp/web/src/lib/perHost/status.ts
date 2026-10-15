@@ -1,5 +1,5 @@
 // Honest per-host state for list pages (spec §8): failure classification,
-// "waiting on …", "not included: …", and the freshness-strip mapping.
+// "waiting on …", and the freshness-strip mapping.
 
 import type { HostFreshnessEntry } from '../../components/dashboard/HostFreshnessStrip';
 import type { HostSlice } from './types';
@@ -13,13 +13,6 @@ export function waitingOn<T>(slices: readonly HostSlice<T>[]): string[] {
 export function waitingLabel<T>(slices: readonly HostSlice<T>[]): string | null {
   const names = waitingOn(slices);
   return names.length ? `Waiting on ${names.join(', ')}…` : null;
-}
-
-export function notIncluded<T>(slices: readonly HostSlice<T>[]): string | null {
-  const out = slices
-    .filter((s) => s.state === 'offline' || s.state === 'unavailable')
-    .map((s) => `${s.name} (${s.state})`);
-  return out.length ? out.join(', ') : null;
 }
 
 /** No host answered: every one is offline or unavailable. Empty states must not say "the hosts that answered". */

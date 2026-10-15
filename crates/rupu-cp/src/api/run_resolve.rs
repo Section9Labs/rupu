@@ -506,7 +506,7 @@ fn build_context(
 /// `"blocked"`, `"complete"`, `"released"`) onto the run-level [`RunStatus`]
 /// the CP already renders. Used only in the [`RunLocation::Unpersisted`] /
 /// [`AutoflowRunContext`] synthesis path — there's no live run to ask.
-fn map_claim_status_str(status: &str) -> RunStatus {
+pub(crate) fn map_claim_status_str(status: &str) -> RunStatus {
     match status {
         "complete" => RunStatus::Completed,
         "await_human" | "await_external" => RunStatus::AwaitingApproval,

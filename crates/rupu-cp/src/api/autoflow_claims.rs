@@ -7,6 +7,9 @@
 //!
 //! Issue refs embed `/` and `:` (e.g. `github:Section9Labs/rupu/issues/42`),
 //! so they travel in the JSON body rather than a path segment.
+//!
+//! [`ClaimIndex`] is the read side a run listing uses: the claims loaded once,
+//! filling each autoflow row's issue link and PR.
 
 use crate::{
     error::{ApiError, ApiResult},
@@ -38,6 +41,82 @@ fn claim_store(s: &AppState) -> AutoflowClaimStore {
 /// Build the wake store rooted at `<global>/autoflows/wakes`.
 fn wake_store(s: &AppState) -> WakeStore {
     WakeStore::new(s.global_dir.join("autoflows").join("wakes"))
+}
+
+/// The claim store's claims, keyed by issue ref, loaded once per listing to
+/// fill every autoflow row's claim-derived fields
+/// ([`crate::api::runs::RunAutoflow`]: `issue_display_ref`, `issue_url`, and
+/// `pr_url` on the claim's last run only).
+#[derive(Default)]
+pub struct ClaimIndex {
+    by_issue: std::collections::HashMap<String, AutoflowClaimRecord>,
+}
+
+impl ClaimIndex {
+    /// The claims under `<global>/autoflows/claims`; an unreadable store is
+    /// an empty index plus one warning (a listing never fails on claims).
+    pub fn load(global: &std::path::Path) -> Self {
+        let store = AutoflowClaimStore {
+            root: global.join("autoflows").join("claims"),
+        };
+        match store.list() {
+            Ok(claims) => Self {
+                by_issue: claims
+                    .into_iter()
+                    .map(|c| (c.issue_ref.clone(), c))
+                    .collect(),
+            },
+            Err(e) => {
+                tracing::warn!(
+                    root = %store.root.display(),
+                    error = %e,
+                    "autoflow claims unreadable; run rows carry no claim fields"
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The claim fields for the run `run_id` of issue `issue_ref`, applied
+    /// to `af`: the claim's display ref and URL, and its PR when this run is
+    /// the claim's last.
+    pub(crate) fn fill(&self, run_id: &str, af: &mut crate::api::runs::RunAutoflow) {
+        let Some(claim) = af.issue_ref.as_deref().and_then(|i| self.by_issue.get(i)) else {
+            return;
+        };
+        af.issue_display_ref = claim.issue_display_ref.clone();
+        af.issue_url = claim.issue_url.clone();
+        if claim.last_run_id.as_deref() == Some(run_id) {
+            af.pr_url = claim.pr_url.clone();
+        }
+    }
+
+    /// Fill `row.autoflow`'s issue_display_ref / issue_url from the claim
+    /// for its issue_ref, and pr_url when that claim's last_run_id is this row.
+    pub fn apply(&self, row: &mut crate::api::runs::RunListRow) {
+        if let Some(Some(af)) = row.autoflow.as_mut() {
+            self.fill(&row.id, af);
+        }
+    }
+
+    /// [`Self::apply`] on an already-serialized row (`id` + `autoflow`); a
+    /// row without the key, or with `null`, is left as it is.
+    pub fn apply_json(&self, row: &mut serde_json::Value) {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
+            return;
+        };
+        let Some(af_value) = row.get_mut("autoflow").filter(|v| !v.is_null()) else {
+            return;
+        };
+        let Ok(mut af) = serde_json::from_value::<crate::api::runs::RunAutoflow>(af_value.clone())
+        else {
+            return;
+        };
+        self.fill(&id, &mut af);
+        if let Ok(v) = serde_json::to_value(af) {
+            *af_value = v;
+        }
+    }
 }
 
 /// Slim wire DTO for an autoflow claim. `status` is the lowercase
@@ -181,11 +260,11 @@ async fn requeue_claim(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rupu_workspace::ClaimStatus;
 
-    fn seed_record(issue_ref: &str) -> AutoflowClaimRecord {
+    pub(crate) fn seed_record(issue_ref: &str) -> AutoflowClaimRecord {
         AutoflowClaimRecord {
             issue_ref: issue_ref.into(),
             repo_ref: "github:Section9Labs/rupu".into(),
@@ -212,6 +291,113 @@ mod tests {
             contenders: vec![],
             updated_at: "2026-05-08T20:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn claim_index_fills_display_url_and_pr_for_the_claims_last_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("autoflows").join("claims"),
+        };
+        let mut claim = seed_record("github:acme/api/issues/7");
+        claim.issue_display_ref = Some("acme/api#7".into());
+        claim.issue_url = Some("https://example.test/7".into());
+        claim.pr_url = Some("https://example.test/pr/9".into());
+        claim.last_run_id = Some("run_latest".into());
+        store.save(&claim).unwrap();
+        let idx = ClaimIndex::load(tmp.path());
+
+        let mut latest = serde_json::json!({
+            "id": "run_latest",
+            "autoflow": {"issue_ref": "github:acme/api/issues/7"}
+        });
+        idx.apply_json(&mut latest);
+        assert_eq!(latest["autoflow"]["issue_display_ref"], "acme/api#7");
+        assert_eq!(latest["autoflow"]["issue_url"], "https://example.test/7");
+        assert_eq!(latest["autoflow"]["pr_url"], "https://example.test/pr/9");
+
+        let mut older = serde_json::json!({
+            "id": "run_older",
+            "autoflow": {"issue_ref": "github:acme/api/issues/7"}
+        });
+        idx.apply_json(&mut older);
+        assert_eq!(older["autoflow"]["issue_display_ref"], "acme/api#7");
+        assert!(
+            older["autoflow"].get("pr_url").is_none(),
+            "a PR belongs to the claim's last run only"
+        );
+
+        let mut manual = serde_json::json!({"id": "run_m", "autoflow": null});
+        idx.apply_json(&mut manual);
+        assert_eq!(manual["autoflow"], serde_json::Value::Null);
+
+        let mut unknown = serde_json::json!({"id": "run_u"});
+        idx.apply_json(&mut unknown);
+        assert!(
+            unknown.get("autoflow").is_none(),
+            "a row without the key keeps none"
+        );
+
+        let mut unclaimed = serde_json::json!({
+            "id": "run_x",
+            "autoflow": {"issue_ref": "github:acme/api/issues/99"}
+        });
+        idx.apply_json(&mut unclaimed);
+        assert_eq!(
+            unclaimed["autoflow"],
+            serde_json::json!({"issue_ref": "github:acme/api/issues/99"}),
+            "an issue with no claim keeps only its ref"
+        );
+    }
+
+    #[test]
+    fn claim_index_applies_to_a_typed_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("autoflows").join("claims"),
+        };
+        let mut claim = seed_record("github:acme/api/issues/7");
+        claim.issue_display_ref = Some("acme/api#7".into());
+        claim.issue_url = Some("https://example.test/7".into());
+        claim.pr_url = Some("https://example.test/pr/9".into());
+        claim.last_run_id = Some("run_latest".into());
+        store.save(&claim).unwrap();
+        let idx = ClaimIndex::load(tmp.path());
+
+        let rec = crate::api::runs::tests::terminal_record("run_latest");
+        let mut row = crate::api::runs::RunListRow::from(&rec);
+        row.autoflow = Some(Some(crate::api::runs::RunAutoflow {
+            issue_ref: Some("github:acme/api/issues/7".into()),
+            ..Default::default()
+        }));
+        idx.apply(&mut row);
+        assert_eq!(
+            row.autoflow,
+            Some(Some(crate::api::runs::RunAutoflow {
+                issue_ref: Some("github:acme/api/issues/7".into()),
+                issue_display_ref: Some("acme/api#7".into()),
+                issue_url: Some("https://example.test/7".into()),
+                pr_url: Some("https://example.test/pr/9".into()),
+            }))
+        );
+    }
+
+    #[test]
+    fn claim_index_is_empty_when_the_store_is_unreadable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A file where the claims directory should be: the store can't list.
+        std::fs::create_dir_all(tmp.path().join("autoflows")).unwrap();
+        std::fs::write(tmp.path().join("autoflows").join("claims"), b"x").unwrap();
+        let idx = ClaimIndex::load(tmp.path());
+        let mut row = serde_json::json!({
+            "id": "run_1",
+            "autoflow": {"issue_ref": "github:acme/api/issues/7"}
+        });
+        idx.apply_json(&mut row);
+        assert_eq!(
+            row["autoflow"],
+            serde_json::json!({"issue_ref": "github:acme/api/issues/7"})
+        );
     }
 
     #[test]
