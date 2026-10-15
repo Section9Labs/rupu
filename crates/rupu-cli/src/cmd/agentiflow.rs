@@ -47,7 +47,7 @@ use rupu_runtime::argv::{AgentiflowRun, RunArgv};
 use rupu_runtime::provider_factory;
 use rupu_runtime::spawn::{SpawnSpec, SpawnStdio};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -927,6 +927,19 @@ struct StatusBudget {
     spent_usd: Option<f64>,
     /// Billable (input + output) tokens spent.
     spent_tokens: u64,
+    /// `(provider, model)` buckets in the run's ledger that spent billable
+    /// tokens but have no price, so their spend is `$0` against `budget.usd`.
+    /// Non-empty with a usd cap set means the cap silently under-counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unpriced: Vec<UnpricedLine>,
+}
+
+/// A `(provider, model)` bucket the current pricing config cannot price.
+#[derive(Debug, Serialize)]
+struct UnpricedLine {
+    provider: String,
+    model: String,
+    tokens: u64,
 }
 
 /// The tokens a run's ledgers hold, for a record that carries no spend: the
@@ -935,7 +948,11 @@ struct StatusBudget {
 /// ledger, the `usage.jsonl` of every unit under `units/<id>/` (its ledger is
 /// `<global>/runs/<id>/usage.jsonl`). Best-effort, like the fold itself: a
 /// ledger that is missing or unreadable adds nothing.
-fn ledger_tokens(global: &Path, run_dir: &Path) -> u64 {
+/// The usage ledgers this flow's spend is folded from: its own (the lead's
+/// rows and every launched unit's rollup copies), plus each unit's own ledger
+/// found through `units/<id>/` for runs that predate the rollup-row layout.
+/// `price_ledgers` dedups by row id, so a unit present in both counts once.
+fn ledger_paths(global: &Path, run_dir: &Path) -> Vec<PathBuf> {
     let mut unit_ids: Vec<String> = std::fs::read_dir(run_dir.join("units"))
         .into_iter()
         .flatten()
@@ -950,7 +967,19 @@ fn ledger_tokens(global: &Path, run_dir: &Path) -> u64 {
             .into_iter()
             .map(|id| global.join("runs").join(id).join("usage.jsonl")),
     );
-    rupu_agentiflow::fold_tokens(&ledgers).total.billable()
+    ledgers
+}
+
+/// The pricing config `rupu agentiflow status` prices a run's ledger with: the
+/// global `[pricing]` layer over the built-in vendor table. Global-only and
+/// best-effort (an unreadable config prices through the built-ins alone), the
+/// same contract `rupu models` uses.
+fn status_pricing(global: &Path) -> rupu_config::PricingConfig {
+    rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(
+        &global.join("config.toml"),
+    ))
+    .map(|c| c.pricing)
+    .unwrap_or_default()
 }
 
 /// `--format json` for `agentiflow status`.
@@ -1063,14 +1092,31 @@ fn load_status(global: &Path, fragment: &str) -> anyhow::Result<StatusReport> {
         .ok()
         .and_then(|raw| AgentiflowDef::parse_str(&raw).ok());
 
-    // Spend: the record's, kept current round by round. One without any (an
-    // older build wrote it, or no round has finished yet) is recovered from the
-    // ledgers; that gives tokens only, since pricing is not in the record.
+    // Price the run's ledger with the current config. This lets a record with
+    // no stamped spend (an older build, or no round finished yet) show real usd
+    // instead of "n/a" through a long first round, AND names every model the
+    // usd cap cannot price — the loud signal the budget meter otherwise only
+    // logs once, out of the operator's sight.
+    let pricing = status_pricing(global);
+    let priced = rupu_agentiflow::price_ledgers(&ledger_paths(global, &run_dir), &pricing);
     let (spent_usd, spent_tokens) = if record.spent_usd.is_some() || record.spent_tokens > 0 {
+        // The record's stamped spend is authoritative (metered with the pricing
+        // the run used); the ledger only fills in a record that has none.
         (record.spent_usd, record.spent_tokens)
+    } else if priced.tokens > 0 {
+        (Some(priced.usd), priced.tokens)
     } else {
-        (None, ledger_tokens(global, &run_dir))
+        (None, 0)
     };
+    let unpriced = priced
+        .unpriced
+        .into_iter()
+        .map(|m| UnpricedLine {
+            provider: m.provider,
+            model: m.model,
+            tokens: m.tokens,
+        })
+        .collect();
 
     let goals = record
         .goals
@@ -1111,6 +1157,7 @@ fn load_status(global: &Path, fragment: &str) -> anyhow::Result<StatusReport> {
             caps: def.as_ref().and_then(|d| d.budget.clone()),
             spent_usd,
             spent_tokens,
+            unpriced,
         },
         coverage_target: def.and_then(|d| d.coverage),
     })
@@ -1223,6 +1270,29 @@ fn render_status(r: &StatusReport) -> String {
             .map_or_else(|| "usd n/a".to_string(), |usd| format!("${usd:.4}")),
         r.budget.spent_tokens
     );
+    // Loud when a usd cap is declared but some of the run's spend cannot be
+    // priced: that spend counts as $0, so the cap under-counts (or, if nothing
+    // prices, cannot fire at all). Silence here is how a $100k cap looks live
+    // while most of the real spend goes uncounted.
+    if r.budget.caps.as_ref().and_then(|c| c.usd).is_some() && !r.budget.unpriced.is_empty() {
+        let cap = r.budget.caps.as_ref().and_then(|c| c.usd).unwrap();
+        let models: Vec<String> = r
+            .budget
+            .unpriced
+            .iter()
+            .map(|m| format!("{}/{} ({} tokens)", m.provider, m.model, m.tokens))
+            .collect();
+        let _ = writeln!(
+            out,
+            "  ⚠ budget.usd (${cap}) under-counts: no price for {}.",
+            models.join(", ")
+        );
+        let _ = writeln!(
+            out,
+            "    That spend counts as $0 against the cap. Add [pricing.<provider>.\"<model>\"] \
+             entries (budget.tokens/rounds/wall_clock still apply)."
+        );
+    }
 
     if let Some(c) = &r.coverage_target {
         let _ = writeln!(
@@ -2917,6 +2987,10 @@ pool:
     }
 
     fn ledger_line(id: &str, input: u64, output: u64) -> String {
+        ledger_line_for(id, "anthropic", "claude-sonnet-5-5", input, output)
+    }
+
+    fn ledger_line_for(id: &str, provider: &str, model: &str, input: u64, output: u64) -> String {
         let row = rupu_orchestrator::usage_ledger::LedgerRow {
             v: rupu_orchestrator::usage_ledger::LEDGER_VERSION,
             id: id.into(),
@@ -2929,8 +3003,8 @@ pool:
             parent_agent_run_id: None,
             transcript: std::path::PathBuf::from("/t/x.jsonl"),
             agent: "recon".into(),
-            provider: "anthropic".into(),
-            model: "claude-sonnet-5-5".into(),
+            provider: provider.into(),
+            model: model.into(),
             input_tokens: input,
             output_tokens: output,
             cached_tokens: 0,
@@ -2987,7 +3061,7 @@ pool:
     }
 
     #[test]
-    fn status_recovers_tokens_from_the_ledgers_when_the_record_has_no_spend() {
+    fn status_prices_the_ledger_when_the_record_has_no_stamped_spend() {
         let tmp = seeded_global();
         let g = tmp.path();
         let run_dir = agentiflow_dir(g).join("af_01NEWER");
@@ -3008,13 +3082,44 @@ pool:
         );
 
         let status = load_status(g, "af_01NEWER").unwrap();
-        assert_eq!(
-            status.budget.spent_usd, None,
-            "pricing is not in the ledger"
-        );
+        // `claude-sonnet-5-5` is priced by the built-in table, so a record with
+        // no stamped spend still shows a real usd figure through a long first
+        // round — never a bare "usd n/a" over real token spend.
+        let usd = status.budget.spent_usd.expect("priced from the ledger");
+        assert!(usd > 0.0, "{usd}");
         assert_eq!(status.budget.spent_tokens, 100 + 10 + 200 + 20);
         let human = render_status(&status);
-        assert!(human.contains("spent: usd n/a, 330 tokens"), "{human}");
+        assert!(!human.contains("usd n/a"), "{human}");
+        assert!(human.contains(&format!("${usd:.4}")), "{human}");
+    }
+
+    #[test]
+    fn status_warns_loudly_when_a_usd_cap_cannot_price_a_models_spend() {
+        let tmp = seeded_global();
+        let g = tmp.path();
+        let run_dir = agentiflow_dir(g).join("af_01NEWER");
+        // A declared usd cap (DEF_YAML sets `budget.usd: 50`)...
+        write(&run_dir.join("agentiflow.yaml"), DEF_YAML);
+        // ...and spend on a model nothing can price: the live-run shape, a unit
+        // on `openai-oracle/gpt-5.6-cyber` (the built-in table keys that model
+        // under `openai-codex`, so this account cannot price it).
+        write(
+            &run_dir.join("usage.jsonl"),
+            &ledger_line_for("01A", "openai-oracle", "gpt-5.6-cyber", 3_000_000, 1_000_000),
+        );
+
+        let status = load_status(g, "af_01NEWER").unwrap();
+        assert_eq!(status.budget.spent_tokens, 4_000_000);
+        assert_eq!(status.budget.spent_usd, Some(0.0), "nothing priced it");
+        assert_eq!(status.budget.unpriced.len(), 1);
+        assert_eq!(status.budget.unpriced[0].model, "gpt-5.6-cyber");
+
+        let human = render_status(&status);
+        // Loud, not a silent $0 under a live-looking cap.
+        assert!(human.contains("under-counts"), "{human}");
+        assert!(human.contains("openai-oracle/gpt-5.6-cyber (4000000 tokens)"), "{human}");
+        assert!(human.contains("[pricing."), "{human}");
+        assert!(!human.contains("usd n/a"), "{human}");
     }
 
     #[test]
