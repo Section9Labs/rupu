@@ -187,3 +187,159 @@ async fn protocol_errors_and_notifications() {
     drop(client);
     let _ = handle.await;
 }
+
+/// The next message, or a panic after 10 s.
+async fn next(client: &InProcessTransport) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(10), client.recv())
+        .await
+        .expect("a reply within 10 s")
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn ping_answers_an_empty_result() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), None, PermissionMode::Bypass);
+    let resp = request(&client, 3, "ping", Value::Null).await;
+    assert_eq!(resp, json!({ "jsonrpc": "2.0", "id": 3, "result": {} }));
+    drop(client);
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn a_malformed_line_is_answered_and_the_server_keeps_serving() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), Some(&["read_file"]), PermissionMode::Bypass);
+    client
+        .send_raw("{\"jsonrpc\": \"2.0\", \"id\": 1,")
+        .unwrap();
+    let resp = next(&client).await;
+    assert_eq!(resp["id"], Value::Null);
+    assert_eq!(resp["error"]["code"], -32700, "{resp}");
+    // Blank lines are skipped, not answered.
+    client.send_raw("").unwrap();
+    client.send_raw("   ").unwrap();
+    assert_eq!(names(&list(&client).await), ["read_file"]);
+    // JSON that is no JSON-RPC message is an invalid request.
+    client.send(json!(42)).await.unwrap();
+    assert_eq!(next(&client).await["error"]["code"], -32600);
+    client.send(json!([])).await.unwrap();
+    assert_eq!(next(&client).await["error"]["code"], -32600);
+    assert!(!handle.is_finished());
+    drop(client);
+    handle.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_batch_is_answered_with_one_array_in_order() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "alpha\n").unwrap();
+    let (client, handle, _) = server(tmp.path(), Some(&["read_file"]), PermissionMode::Bypass);
+    client
+        .send(json!([
+            { "jsonrpc": "2.0", "id": "c", "method": "tools/call",
+              "params": { "name": "read_file", "arguments": { "path": "a.txt" } } },
+            { "jsonrpc": "2.0", "method": "notifications/initialized" },
+            { "jsonrpc": "2.0", "id": "p", "method": "ping" },
+        ]))
+        .await
+        .unwrap();
+    let resp = next(&client).await;
+    let replies = resp.as_array().expect("an array reply");
+    assert_eq!(replies.len(), 2, "the notification gets no reply: {resp}");
+    assert_eq!(replies[0]["id"], "c");
+    assert!(
+        replies[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("alpha"),
+        "{resp}"
+    );
+    assert_eq!(
+        replies[1],
+        json!({ "jsonrpc": "2.0", "id": "p", "result": {} })
+    );
+    drop(client);
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn initialize_negotiates_the_protocol_version() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), None, PermissionMode::Bypass);
+    let latest = rupu_mcp::PROTOCOL_VERSIONS[0];
+    let cases: [(Value, &str); 6] = [
+        (json!({ "protocolVersion": "2024-11-05" }), "2024-11-05"),
+        (json!({ "protocolVersion": "2025-03-26" }), "2025-03-26"),
+        (json!({ "protocolVersion": "2025-06-18" }), "2025-06-18"),
+        (json!({ "protocolVersion": "2025-11-25" }), "2025-11-25"),
+        // One we don't speak (the stateless 2026-07-28 drops `initialize`),
+        // or none at all: our newest.
+        (json!({ "protocolVersion": "2026-07-28" }), latest),
+        (Value::Null, latest),
+    ];
+    for (i, (params, want)) in cases.into_iter().enumerate() {
+        let resp = request(&client, i as u64, "initialize", params.clone()).await;
+        assert_eq!(resp["result"]["protocolVersion"], want, "{params}");
+        assert_eq!(resp["result"]["capabilities"], json!({ "tools": {} }));
+    }
+    assert_eq!(latest, "2025-11-25");
+    drop(client);
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn calls_run_concurrently_and_a_cancel_aborts_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (client, handle, _) = server(tmp.path(), Some(&["bash"]), PermissionMode::Bypass);
+    let bash = |id: &str, command: &str| {
+        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": "bash", "arguments": { "command": command } } })
+    };
+    // A slow call does not hold up a ping or a second call. (`exec`, so the
+    // abort's kill reaches the sleep itself.)
+    client.send(bash("slow", "exec sleep 60")).await.unwrap();
+    client
+        .send(json!({ "jsonrpc": "2.0", "id": "p", "method": "ping" }))
+        .await
+        .unwrap();
+    assert_eq!(next(&client).await["id"], "p");
+    client.send(bash("fast", "echo quick")).await.unwrap();
+    let fast = next(&client).await;
+    assert_eq!(fast["id"], "fast");
+    assert!(
+        fast["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("quick"),
+        "{fast}"
+    );
+    // Cancelling the slow call aborts it: it is never answered, and the
+    // server goes on serving.
+    client
+        .send(
+            json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                      "params": { "requestId": "slow", "reason": "user" } }),
+        )
+        .await
+        .unwrap();
+    // A cancel for a request that isn't running is ignored.
+    client
+        .send(
+            json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+                      "params": { "requestId": "fast" } }),
+        )
+        .await
+        .unwrap();
+    client.send(bash("after", "echo next")).await.unwrap();
+    assert_eq!(next(&client).await["id"], "after");
+    drop(client);
+    // Nothing is left running to drain: the server ends right away rather
+    // than after the 60 s sleep.
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the cancelled call no longer runs")
+        .unwrap()
+        .unwrap();
+}

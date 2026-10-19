@@ -3,9 +3,10 @@
 //! run's [`PermissionPolicy`] over the tool's effect, exactly as the agent
 //! loop decides; what differs is only who asked.
 
-use crate::permission::{AllowAlways, Decision, DenyReason, PermissionPolicy};
+use crate::permission::{AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy};
 use crate::tool::{Tool, ToolContext, ToolError};
 use serde_json::Value;
+use std::sync::Mutex;
 
 /// What one call came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,28 +38,73 @@ pub async fn call(
     policy: &PermissionPolicy,
     always: &mut AllowAlways,
 ) -> CallOutcome {
+    match admit(tool, &input, policy, always) {
+        Ok(ceiling) => invoke(tool, input, ctx, ceiling).await,
+        Err(refused) => refused,
+    }
+}
+
+/// [`call`] for callers that run calls concurrently over one "allow always"
+/// set (`rupu mcp serve`): the set is locked only while the call is decided,
+/// so a decision (and any prompt behind it) is atomic with its update while
+/// the tool itself runs unlocked.
+pub async fn call_shared(
+    tool: &dyn Tool,
+    input: Value,
+    ctx: &ToolContext,
+    policy: &PermissionPolicy,
+    always: &Mutex<AllowAlways>,
+) -> CallOutcome {
+    let admitted = {
+        let mut always = always.lock().unwrap_or_else(|e| e.into_inner());
+        admit(tool, &input, policy, &mut always)
+    };
+    match admitted {
+        Ok(ceiling) => invoke(tool, input, ctx, ceiling).await,
+        Err(refused) => refused,
+    }
+}
+
+/// The permission half of a call: `Ok` with a `Spawn` call's ceiling to
+/// invoke, `Err` with the refusal.
+fn admit(
+    tool: &dyn Tool,
+    input: &Value,
+    policy: &PermissionPolicy,
+    always: &mut AllowAlways,
+) -> Result<Option<PermissionMode>, CallOutcome> {
     let d = tool.descriptor();
+    match policy.decide(d, input, always) {
+        Decision::Allow | Decision::AllowDegraded => Ok(None),
+        Decision::Spawn { ceiling } => Ok(Some(ceiling)),
+        Decision::Deny {
+            reason: DenyReason::Readonly,
+        } => Err(CallOutcome::Denied(format!(
+            "{} mode blocks {} tools",
+            policy.mode(),
+            d.effect.as_str()
+        ))),
+        Decision::Deny {
+            reason: DenyReason::OperatorDenied,
+        } => Err(CallOutcome::Denied("the operator denied the call".into())),
+        Decision::Stop => Err(CallOutcome::Denied("the operator stopped the run".into())),
+    }
+}
+
+async fn invoke(
+    tool: &dyn Tool,
+    input: Value,
+    ctx: &ToolContext,
+    ceiling: Option<PermissionMode>,
+) -> CallOutcome {
     let mut spawn_ctx;
-    let ctx = match policy.decide(d, &input, always) {
-        Decision::Allow | Decision::AllowDegraded => ctx,
-        Decision::Spawn { ceiling } => {
+    let ctx = match ceiling {
+        None => ctx,
+        Some(ceiling) => {
             spawn_ctx = ctx.clone();
             spawn_ctx.call.spawn_ceiling = Some(ceiling);
             &spawn_ctx
         }
-        Decision::Deny {
-            reason: DenyReason::Readonly,
-        } => {
-            return CallOutcome::Denied(format!(
-                "{} mode blocks {} tools",
-                policy.mode(),
-                d.effect.as_str()
-            ))
-        }
-        Decision::Deny {
-            reason: DenyReason::OperatorDenied,
-        } => return CallOutcome::Denied("the operator denied the call".into()),
-        Decision::Stop => return CallOutcome::Denied("the operator stopped the run".into()),
     };
     match tool.invoke(input, ctx).await {
         Ok(out) => match out.error {

@@ -15,5 +15,5 @@ pub mod server;
 pub mod transport;
 
 pub use error::{McpError, ServeError};
-pub use server::{CatalogServer, MCP_DEFAULT_GRANT};
-pub use transport::{InProcessTransport, StdioTransport, Transport};
+pub use server::{negotiate_protocol_version, CatalogServer, MCP_DEFAULT_GRANT, PROTOCOL_VERSIONS};
+pub use transport::{decode_line, InProcessTransport, StdioTransport, Transport};
