@@ -70,6 +70,8 @@ describe('Turn', () => {
 
     // The header is the first button.
     fireEvent.click(screen.getAllByRole('button')[0]);
+    // Tool rows are one-line until clicked.
+    fireEvent.click(screen.getByRole('button', { name: /read_file/ }));
 
     expect(screen.getByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeTruthy();
   });
@@ -114,6 +116,7 @@ describe('Turn', () => {
 
   it('defaultOpen=true renders the body immediately', () => {
     render(<Turn turn={makeTurn()} defaultOpen={true} />);
+    fireEvent.click(screen.getByRole('button', { name: /read_file/ }));
     expect(screen.getByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeTruthy();
   });
 

@@ -5,11 +5,13 @@
  *   2. Smoke renders via testing-library (optional, per spec)
  */
 
+import type { ReactElement } from 'react';
 import { it, expect, describe, afterEach, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { summarizeInput, parseAstGrepText, parseSubrunOutput } from './ToolCard';
 import { SubrunIdentityContext } from './subrunIdentity';
 import ToolCard from './ToolCard';
+import { TranscriptViewProvider } from './TranscriptViewContext';
 import type { ToolView, FindingView } from './transcriptView';
 import { buildTranscriptView } from './transcriptView';
 import { api } from '../../lib/api';
@@ -23,6 +25,14 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Render, then expand the tool row (bodies mount lazily on first open). */
+function renderOpen(ui: ReactElement) {
+  const r = render(ui);
+  const row = r.container.querySelector('button[aria-expanded]');
+  if (row) fireEvent.click(row);
+  return r;
+}
 
 function makeToolView(overrides: Partial<ToolView> & Pick<ToolView, 'tool' | 'kind'>): ToolView {
   return {
@@ -194,10 +204,10 @@ it('finding ToolView renders the finding summary (no extra outer header)', () =>
     input: {},
     finding: FINDING,
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText('Secret key in binary')).not.toBeNull();
-  // Finding uses its own chrome — no ⚙ prefix in the header
-  expect(screen.queryByText(/⚙ report_finding/)).toBeNull();
+  // Finding uses its own chrome — no row wrapper
+  expect(screen.queryByText('report_finding')).toBeNull();
 });
 
 it('full-profile {scope, report} report_finding call renders title + severity', () => {
@@ -219,10 +229,10 @@ it('full-profile {scope, report} report_finding call renders title + severity', 
       },
     },
   ]).turns.flatMap((t) => t.blocks).flatMap((b) => (b.kind === 'tool' ? [b.view] : []));
-  render(<ToolCard tool={tool} />);
+  renderOpen(<ToolCard tool={tool} />);
   expect(screen.getByText('Session cookie lacks the Secure flag')).not.toBeNull();
   expect(screen.getByText('HIGH')).not.toBeNull();
-  expect(screen.queryByText(/⚙ report_finding/)).toBeNull();
+  expect(screen.queryByText('report_finding')).toBeNull();
 });
 
 it('finding ToolView without a parsed finding (malformed / rejected) falls back to the generic card', () => {
@@ -232,8 +242,8 @@ it('finding ToolView without a parsed finding (malformed / rejected) falls back 
     input: { scope: 'repo', report: { tickets: 'TBD' } },
     error: 'finding report has 1 problem(s); fix all of them and call again',
   };
-  expect(() => render(<ToolCard tool={tv} />)).not.toThrow();
-  expect(screen.getByText(/⚙ report_finding/)).not.toBeNull();
+  expect(() => renderOpen(<ToolCard tool={tv} />)).not.toThrow();
+  expect(screen.getByText('report_finding')).not.toBeNull();
   expect(screen.getByText(/finding report has 1 problem/)).not.toBeNull();
 });
 
@@ -245,7 +255,7 @@ it('terminal ToolView renders the command inside TerminalBlock', () => {
     output: 'test result: ok',
     terminal: { command: 'cargo test', cwd: '/repo', exitCode: 0 },
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   // The command appears in both the header summary and TerminalBlock prompt —
   // use getAllByText and assert we get at least one match.
   expect(screen.getAllByText('cargo test').length).toBeGreaterThan(0);
@@ -259,7 +269,7 @@ it('generic ToolView with JSON output renders KV (not [object Object], not raw J
     input: {},
     output: JSON.stringify({ status: 'done', count: 3 }),
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   // StructuredView should render the keys
   expect(screen.getByText('status')).not.toBeNull();
   expect(screen.getByText('done')).not.toBeNull();
@@ -277,7 +287,7 @@ it('error ToolView shows red error block', () => {
     input: { path: 'missing.ts' },
     error: 'File not found: missing.ts',
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText('Error')).not.toBeNull();
   expect(screen.getByText('File not found: missing.ts')).not.toBeNull();
 });
@@ -306,8 +316,8 @@ it('subrun ToolView (dispatch_agent shape) renders ok + token chips and transcri
       sub_run_id: 'sub_abc',
     }),
   };
-  render(<ToolCard tool={tv} onOpenTranscript={(p) => { clicked = p; }} />);
-  // The card header has its own muted "ok" chip; the body's status badge is
+  renderOpen(<ToolCard tool={tv} onOpenTranscript={(p) => { clicked = p; }} />);
+  // The row has its own muted "ok" chip; the body's status badge is
   // the green-toned one.
   expect(screen.getAllByText('ok').some((el) => el.className.includes('bg-ok-bg'))).toBe(true);
   expect(screen.getByText('4,200 tokens')).not.toBeNull();
@@ -333,7 +343,7 @@ it('subrun ToolView with ok:false renders a failed chip', () => {
       sub_run_id: 'sub_x',
     }),
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText('failed')).not.toBeNull();
   expect(screen.getByText('0 tokens')).not.toBeNull();
 });
@@ -350,7 +360,7 @@ it('subrun ToolView without callback renders path as chip (no button)', () => {
       sub_run_id: 'sub_abc',
     }),
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   // No button
   expect(screen.queryByRole('button', { name: /View sub-run transcript/ })).toBeNull();
   // Path shown as chip text
@@ -385,7 +395,7 @@ it('subrun ToolView (dispatch_agents_parallel shape) renders per-request rows', 
       all_succeeded: false,
     }),
   };
-  render(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
+  renderOpen(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
   // Per-request ids shown
   expect(screen.getByText('reviewer')).not.toBeNull();
   expect(screen.getByText('scanner')).not.toBeNull();
@@ -408,8 +418,92 @@ it('subrun ToolView with unparseable output falls back to raw pre', () => {
     input: { agent: 'scanner' },
     output: 'not json at all',
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText('not json at all')).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// 3. One-line expandable row
+// ---------------------------------------------------------------------------
+
+describe('ToolCard row', () => {
+  const READ: ToolView = {
+    tool: 'read_file',
+    kind: 'read',
+    input: { path: 'src/lib/api.ts' },
+    output: 'OUTPUT-MARKER',
+    durationMs: 12,
+  };
+
+  it('renders verb + target and expands its body on click', () => {
+    render(<ToolCard tool={READ} />);
+    const row = screen.getByRole('button', { expanded: false });
+    expect(row.textContent).toContain('read_file');
+    expect(row.textContent).toContain('src/lib/api.ts');
+    expect(screen.queryByText('OUTPUT-MARKER')).toBeNull();
+    fireEvent.click(row);
+    expect(row.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('OUTPUT-MARKER')).not.toBeNull();
+    fireEvent.click(row);
+    expect(screen.queryByText('OUTPUT-MARKER')).toBeNull();
+  });
+
+  it('an errored tool shows an error chip, and the error text once expanded', () => {
+    const tv: ToolView = { tool: 'read_file', kind: 'read', input: { path: 'x' }, error: 'File not found: x' };
+    render(<ToolCard tool={tv} />);
+    expect(screen.getByText('error')).not.toBeNull();
+    expect(screen.queryByText('File not found: x')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText('File not found: x')).not.toBeNull();
+  });
+
+  it('a terminal tool shows $ command and an exit-code chip', () => {
+    const tv: ToolView = {
+      tool: 'bash',
+      kind: 'terminal',
+      input: { command: 'cargo test' },
+      output: 'test result: ok',
+      terminal: { command: 'cargo test', cwd: '/repo', exitCode: 2 },
+    };
+    render(<ToolCard tool={tv} />);
+    const row = screen.getByRole('button', { expanded: false });
+    expect(row.textContent).toContain('$ cargo test');
+    expect(screen.getByText('exit 2')).not.toBeNull();
+  });
+
+  it('a running tool (no output, error or duration) shows a neutral running chip', () => {
+    const tv: ToolView = { tool: 'bash', kind: 'generic', input: {} };
+    expect(() => render(<ToolCard tool={tv} />)).not.toThrow();
+    expect(screen.getByText('running')).not.toBeNull();
+    expect(screen.queryByText('ok')).toBeNull();
+    expect(screen.queryByText('error')).toBeNull();
+  });
+
+  it('a finding tool renders FindingCard with no row wrapper', () => {
+    const tv: ToolView = { tool: 'report_finding', kind: 'finding', input: {}, finding: FINDING };
+    const { container } = render(<ToolCard tool={tv} />);
+    expect(screen.getByText('Secret key in binary')).not.toBeNull();
+    expect(container.querySelector('button[aria-expanded]')).toBeNull();
+  });
+
+  it('carries data-call-id on the wrapper', () => {
+    const { container } = render(<ToolCard tool={{ ...READ, callId: 'c-7' }} />);
+    expect(container.querySelector('[data-call-id="c-7"]')).not.toBeNull();
+  });
+
+  it('follows the expand-all signal from the transcript view context', () => {
+    const view = (nonce: number, target: 'open' | 'closed' | null) => (
+      <TranscriptViewProvider value={{ filter: 'all', expandTarget: target, expandNonce: nonce }}>
+        <ToolCard tool={READ} />
+      </TranscriptViewProvider>
+    );
+    const { rerender } = render(view(0, null));
+    expect(screen.queryByText('OUTPUT-MARKER')).toBeNull();
+    rerender(view(1, 'open'));
+    expect(screen.getByText('OUTPUT-MARKER')).not.toBeNull();
+    rerender(view(2, 'closed'));
+    expect(screen.queryByText('OUTPUT-MARKER')).toBeNull();
+  });
 });
 
 describe('parseSubrunOutput', () => {
@@ -480,7 +574,7 @@ it('read ToolView renders output in a pre block with path in header', () => {
     input: { path: 'src/main.rs' },
     output: 'fn main() {\n  println!("hi");\n}',
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   // Header shows path
   expect(screen.getByText('src/main.rs')).not.toBeNull();
   // Output is in the pre block
@@ -494,7 +588,7 @@ it('grep ToolView renders match count and lines', () => {
     input: { pattern: 'ToolView', path: 'src/' },
     output: 'src/a.ts:10:export type ToolView\nsrc/b.ts:5:import type { ToolView }',
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText(/2 matches/)).not.toBeNull();
 });
 
@@ -571,7 +665,7 @@ describe('AstGrepBody (via ToolCard)', () => {
         ],
       },
     };
-    render(<ToolCard tool={tv} />);
+    renderOpen(<ToolCard tool={tv} />);
     expect(screen.getByText(/1 match in 1 file/)).not.toBeNull();
     expect(screen.getByText('src/a.rs')).not.toBeNull();
     // Highlighted metavar span carries the binding's bound text and a $NAME title.
@@ -595,7 +689,7 @@ describe('AstGrepBody (via ToolCard)', () => {
         ],
       },
     };
-    render(<ToolCard tool={tv} />);
+    renderOpen(<ToolCard tool={tv} />);
     expect(screen.getByText(/showing first 1 of 500/)).not.toBeNull();
   });
 
@@ -606,7 +700,7 @@ describe('AstGrepBody (via ToolCard)', () => {
       input: { pattern: 'fn $NAME() {}', lang: 'rust' },
       output: 'src/a.rs:10:3: fn foo() {}\nsrc/b.rs:1:1: fn bar() {}',
     };
-    render(<ToolCard tool={tv} />);
+    renderOpen(<ToolCard tool={tv} />);
     expect(screen.getByText(/2 matches in 2 files/)).not.toBeNull();
     expect(screen.getByText('src/a.rs')).not.toBeNull();
     expect(screen.getByText('src/b.rs')).not.toBeNull();
@@ -619,7 +713,7 @@ describe('AstGrepBody (via ToolCard)', () => {
       input: { pattern: 'fn $NAME() {}' },
       error: 'ast-grep binary not found',
     };
-    render(<ToolCard tool={tv} />);
+    renderOpen(<ToolCard tool={tv} />);
     expect(screen.getByText('Error')).not.toBeNull();
     expect(screen.queryByText(/match/)).toBeNull();
   });
@@ -662,7 +756,7 @@ describe('AstGrepBody (via ToolCard)', () => {
 
   it('clicking a structured match header mounts SourcePreview and calls api.readSource with file+line, when runId is provided', async () => {
     const spy = vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
-    const { container } = render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+    const { container } = renderOpen(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
 
     const header = screen.getByRole('button', { name: /src\/a\.rs:10:3/ });
     header.click();
@@ -678,7 +772,7 @@ describe('AstGrepBody (via ToolCard)', () => {
   });
 
   it('structured match header is non-clickable plain text when runId is absent', () => {
-    render(<ToolCard tool={STRUCTURED_TV} />);
+    renderOpen(<ToolCard tool={STRUCTURED_TV} />);
     expect(screen.queryByRole('button', { name: /src\/a\.rs:10:3/ })).toBeNull();
     expect(screen.getByText(/src\/a\.rs:10:3/)).not.toBeNull();
   });
@@ -691,7 +785,7 @@ describe('AstGrepBody (via ToolCard)', () => {
       input: { pattern: 'fn $NAME() {}' },
       output: 'src/a.rs:10:3: fn foo() {}',
     };
-    render(<ToolCard tool={tv} runId="run-1" />);
+    renderOpen(<ToolCard tool={tv} runId="run-1" />);
 
     const header = screen.getByRole('button', { name: /src\/a\.rs:10:3:/ });
     header.click();
@@ -723,7 +817,7 @@ describe('AstGrepBody (via ToolCard)', () => {
 
   it('clicking the tree button on a structured match mounts AstTree and calls api.readAst with file+line+col, when runId is provided', async () => {
     const spy = vi.spyOn(api, 'readAst').mockResolvedValue(AST_RESPONSE);
-    render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+    renderOpen(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
 
     const treeButton = screen.getByRole('button', { name: /^tree$/ });
     treeButton.click();
@@ -736,14 +830,14 @@ describe('AstGrepBody (via ToolCard)', () => {
   });
 
   it('no tree button on a structured match when runId is absent', () => {
-    render(<ToolCard tool={STRUCTURED_TV} />);
+    renderOpen(<ToolCard tool={STRUCTURED_TV} />);
     expect(screen.queryByRole('button', { name: /^tree$/ })).toBeNull();
   });
 
   it('source-preview and tree toggles are independent — both can be open at once', async () => {
     vi.spyOn(api, 'readSource').mockResolvedValue(SLICE);
     vi.spyOn(api, 'readAst').mockResolvedValue(AST_RESPONSE);
-    const { container } = render(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
+    const { container } = renderOpen(<ToolCard tool={STRUCTURED_TV} runId="run-1" />);
 
     screen.getByRole('button', { name: /src\/a\.rs:10:3/ }).click();
     screen.getByRole('button', { name: /^tree$/ }).click();
@@ -762,7 +856,7 @@ describe('AstGrepBody (via ToolCard)', () => {
       input: { pattern: 'fn $NAME() {}' },
       output: 'src/a.rs:10:3: fn foo() {}',
     };
-    render(<ToolCard tool={tv} runId="run-1" />);
+    renderOpen(<ToolCard tool={tv} runId="run-1" />);
 
     screen.getByRole('button', { name: /^tree$/ }).click();
 
@@ -778,7 +872,7 @@ describe('AstGrepBody (via ToolCard)', () => {
       input: { pattern: 'fn $NAME() {}' },
       output: 'src/a.rs:10:3: fn foo() {}',
     };
-    render(<ToolCard tool={tv} />);
+    renderOpen(<ToolCard tool={tv} />);
     expect(screen.queryByRole('button', { name: /^tree$/ })).toBeNull();
   });
 });
@@ -794,7 +888,7 @@ it('subrun ToolView with a codename renders the sub-agent name next to its agent
       codename: 'otter-3/lead>lynx#1',
     }),
   };
-  render(<ToolCard tool={tv} />);
+  renderOpen(<ToolCard tool={tv} />);
   expect(screen.getByText('lead>lynx#1 · scanner')).not.toBeNull();
 });
 
@@ -812,7 +906,7 @@ it('subrun card prefers the SubrunIdentityContext entry (provider/model) for its
   const ids = new Map([
     ['sub_X', { codename: 'otter-3/lead>lynx#1', agent: 'scanner', provider: 'anthropic', model: 'claude-opus-5-5' }],
   ]);
-  render(
+  renderOpen(
     <SubrunIdentityContext.Provider value={ids}>
       <ToolCard tool={tv} />
     </SubrunIdentityContext.Provider>,
@@ -834,7 +928,7 @@ describe('ToolCard call anchor', () => {
     );
     expect(f.container.querySelector('[data-call-id="f9"]')).not.toBeNull();
     cleanup();
-    const n = render(<ToolCard tool={makeToolView({ tool: 'bash', kind: 'generic' })} />);
+    const n = renderOpen(<ToolCard tool={makeToolView({ tool: 'bash', kind: 'generic' })} />);
     expect(n.container.querySelector('[data-call-id]')).toBeNull();
   });
 });
@@ -955,7 +1049,7 @@ it('a join card shows each child\'s state, and opens a finished child\'s transcr
       ],
     }),
   };
-  render(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
+  renderOpen(<ToolCard tool={tv} onOpenTranscript={(p) => { opened.push(p); }} />);
   expect(screen.getByText('ch_a')).not.toBeNull();
   expect(screen.getByText('ch_b')).not.toBeNull();
   expect(screen.getByText('1,500 tokens')).not.toBeNull();
