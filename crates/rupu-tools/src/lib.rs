@@ -49,6 +49,7 @@ pub mod skills;
 pub mod tool;
 
 mod path_scope;
+mod proc_tree;
 
 pub mod permission;
 // implemented in Task 19 (line-numbered output + workspace-scope check)
