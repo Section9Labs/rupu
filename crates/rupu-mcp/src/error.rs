@@ -4,6 +4,15 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum McpError {
+    /// An input line that is not JSON. The server answers it and keeps
+    /// serving.
+    #[error("parse error: {0}")]
+    Parse(String),
+
+    /// A JSON message that is not a JSON-RPC request or notification.
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
     /// A JSON-RPC method this server does not implement.
     #[error("unknown method: {0}")]
     UnknownMethod(String),
@@ -19,9 +28,11 @@ impl McpError {
     /// JSON-RPC 2.0 error code per MCP convention.
     pub fn code(&self) -> i32 {
         match self {
-            Self::UnknownMethod(_) => -32601, // method not found
-            Self::InvalidArgs(_) => -32602,   // invalid params
-            Self::Transport(_) => -32603,     // internal error
+            Self::Parse(_) => -32700,          // parse error
+            Self::InvalidRequest(_) => -32600, // invalid request
+            Self::UnknownMethod(_) => -32601,  // method not found
+            Self::InvalidArgs(_) => -32602,    // invalid params
+            Self::Transport(_) => -32603,      // internal error
         }
     }
 
