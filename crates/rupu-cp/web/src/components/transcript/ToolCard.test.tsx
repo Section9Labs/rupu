@@ -471,12 +471,23 @@ describe('ToolCard row', () => {
     expect(screen.getByText('exit 2')).not.toBeNull();
   });
 
-  it('a running tool (no output, error or duration) shows a neutral running chip', () => {
+  it('a running tool (no output, error or duration) shows a neutral running chip in a live run', () => {
     const tv: ToolView = { tool: 'bash', kind: 'generic', input: {} };
-    expect(() => render(<ToolCard tool={tv} />)).not.toThrow();
+    render(
+      <TranscriptViewProvider value={{ filter: 'all', expandTarget: null, expandNonce: 0, live: true }}>
+        <ToolCard tool={tv} />
+      </TranscriptViewProvider>,
+    );
     expect(screen.getByText('running')).not.toBeNull();
     expect(screen.queryByText('ok')).toBeNull();
     expect(screen.queryByText('error')).toBeNull();
+  });
+
+  it('a finished-but-empty call on a non-live transcript does not read running', () => {
+    const tv: ToolView = { tool: 'bash', kind: 'generic', input: {} };
+    render(<ToolCard tool={tv} />);
+    expect(screen.queryByText('running')).toBeNull();
+    expect(screen.getByText('ok')).not.toBeNull();
   });
 
   it('a finding tool renders FindingCard with no row wrapper', () => {
@@ -493,7 +504,7 @@ describe('ToolCard row', () => {
 
   it('follows the expand-all signal from the transcript view context', () => {
     const view = (nonce: number, target: 'open' | 'closed' | null) => (
-      <TranscriptViewProvider value={{ filter: 'all', expandTarget: target, expandNonce: nonce }}>
+      <TranscriptViewProvider value={{ filter: 'all', expandTarget: target, expandNonce: nonce, live: false }}>
         <ToolCard tool={READ} />
       </TranscriptViewProvider>
     );

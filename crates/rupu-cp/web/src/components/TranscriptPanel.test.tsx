@@ -116,6 +116,50 @@ describe('TranscriptPanel embedded mode', () => {
   });
 });
 
+describe('TranscriptPanel reader chrome', () => {
+  it('renders the metrics strip, controls and turn anchors on a completed run', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
+    const { container } = renderPanel(false);
+    await screen.findAllByText('Hello from the assistant body.');
+    const metrics = screen.getByTestId('transcript-metrics');
+    expect(metrics.textContent).toMatch(/1 turn/);
+    expect(metrics.textContent).toMatch(/0 tool calls/);
+    expect(metrics.textContent).toMatch(/42 tokens/);
+    expect(metrics.textContent).not.toMatch(/\$/);
+    expect(screen.getByTestId('transcript-controls')).toBeInTheDocument();
+    expect(container.querySelector('#turn-1')).not.toBeNull();
+  });
+
+  it('appends cost to the metrics strip only when costUsd is provided', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
+    render(
+      <MemoryRouter>
+        <TranscriptPanel path="/t/run-1.jsonl" live={false} costUsd={1.5} />
+      </MemoryRouter>,
+    );
+    await screen.findAllByText('Hello from the assistant body.');
+    expect(screen.getByTestId('transcript-metrics').textContent).toMatch(/\$1\.5/);
+  });
+
+  it('embedded hides header, metrics and controls but keeps the feed', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
+    renderPanel(true);
+    await screen.findAllByText('Hello from the assistant body.');
+    expect(screen.queryByTestId('transcript-metrics')).toBeNull();
+    expect(screen.queryByTestId('transcript-controls')).toBeNull();
+    expect(screen.queryByText('reviewer-agent')).toBeNull();
+  });
+
+  it('a headerless empty transcript shows the empty state and badges, no controls', async () => {
+    vi.spyOn(api, 'getTranscript').mockResolvedValue({ events: [], summary: null, partial: true });
+    renderPanel(false);
+    expect(await screen.findByText('No transcript events yet.')).toBeInTheDocument();
+    expect(screen.getByText(/incomplete/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('transcript-controls')).toBeNull();
+    expect(screen.queryByTestId('transcript-metrics')).toBeNull();
+  });
+});
+
 describe('TranscriptPanel load errors', () => {
   it("shows the server's error message, not the JSON body", async () => {
     const body = '{"error":"path is outside the allowed roots"}';
@@ -320,12 +364,12 @@ describe('TranscriptPanel live backlog', () => {
     const { emit, fail } = await mountLive([RUN_START, FIRST]);
     const SEQ = [RUN_START, FIRST, USAGE, SECOND];
     SEQ.forEach((e) => emit(e));
-    expect(screen.getAllByText('110 tok').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('110 tokens').length).toBeGreaterThan(0);
 
     // What is on screen: everything the stream delivered.
     const visible = () => ({
       second: screen.queryAllByText('second message body').length,
-      tokens: screen.queryAllByText('110 tok').length,
+      tokens: screen.queryAllByText('110 tokens').length,
     });
     const before = visible();
     expect(before.second).toBeGreaterThan(0);

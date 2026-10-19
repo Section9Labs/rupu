@@ -16,12 +16,15 @@ export interface TranscriptViewState {
   filter: FilterKind;
   expandTarget: 'open' | 'closed' | null;
   expandNonce: number;
+  /** The run is still being tailed: a call with no result yet is genuinely running. */
+  live: boolean;
 }
 
 const DEFAULT_STATE: TranscriptViewState = {
   filter: 'all',
   expandTarget: null,
   expandNonce: 0,
+  live: false,
 };
 
 const TranscriptViewContext = createContext<TranscriptViewState>(DEFAULT_STATE);

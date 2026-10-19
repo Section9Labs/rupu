@@ -51,7 +51,7 @@ describe('Turn', () => {
 
   it('thinking folds when collapse-all is active', () => {
     render(
-      <TranscriptViewProvider value={{ filter: 'all', expandTarget: 'closed', expandNonce: 1 }}>
+      <TranscriptViewProvider value={{ filter: 'all', expandTarget: 'closed', expandNonce: 1, live: false }}>
         <Turn turn={turnOf([{ kind: 'thinking', text: 'long reasoning body', provider: 'anthropic' }])} turnNumber={1} showMarker />
       </TranscriptViewProvider>,
     );
@@ -72,7 +72,7 @@ describe('Turn', () => {
 
   it('a Findings filter hides a turn with no findings entirely', () => {
     const { container } = render(
-      <TranscriptViewProvider value={{ filter: 'findings', expandTarget: null, expandNonce: 0 }}>
+      <TranscriptViewProvider value={{ filter: 'findings', expandTarget: null, expandNonce: 0, live: false }}>
         <Turn turn={basic} turnNumber={1} showMarker />
       </TranscriptViewProvider>,
     );

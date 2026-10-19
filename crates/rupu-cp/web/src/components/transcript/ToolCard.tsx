@@ -296,6 +296,7 @@ function isRunning(tool: ToolView): boolean {
 }
 
 function StatusBadge({ tool }: { tool: ToolView }) {
+  const { live } = useTranscriptView();
   if (tool.error) {
     return (
       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30">
@@ -317,7 +318,7 @@ function StatusBadge({ tool }: { tool: ToolView }) {
       </span>
     );
   }
-  if (isRunning(tool)) {
+  if (live && isRunning(tool)) {
     return (
       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute">
         running
