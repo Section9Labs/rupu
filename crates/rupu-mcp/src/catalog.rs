@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use rupu_tools::call::{call_shared, CallOutcome};
 use rupu_tools::{
     AliasScope, AllowAlways, Effect, GrantInputs, PermissionMode, PermissionPolicy, Service,
-    ToolCatalog, ToolContext, ToolDescriptor,
+    ToolCatalog, ToolContext, ToolDescriptor, Unavailable,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -41,6 +41,7 @@ pub struct CatalogSource {
     /// Served descriptors by canonical name.
     served: BTreeMap<&'static str, &'static ToolDescriptor>,
     defs: Vec<ToolDef>,
+    unavailable: Vec<Unavailable>,
     policy: PermissionPolicy,
     always: Mutex<AllowAlways>,
 }
@@ -57,8 +58,15 @@ fn hints_of(effect: Effect) -> ToolHints {
             ..ToolHints::default()
         },
         Effect::Record => ToolHints::default(),
-        Effect::Write => ToolHints::default(),
-        Effect::External | Effect::Spawn => ToolHints {
+        Effect::Write => ToolHints {
+            destructive: true,
+            ..ToolHints::default()
+        },
+        Effect::External => ToolHints {
+            open_world: true,
+            ..ToolHints::default()
+        },
+        Effect::Spawn => ToolHints {
             open_world: true,
             ..ToolHints::default()
         },
@@ -124,13 +132,31 @@ impl CatalogSource {
             });
             served.insert(d.name, *d);
         }
+        // Under grant `*` a tool whose service is missing is `skipped`;
+        // `unavailable` holds exact names. Report both, minus hidden tools.
+        let unavailable = grant
+            .unavailable
+            .iter()
+            .chain(grant.skipped.iter())
+            .filter(|u| !HIDDEN_BY_OPERATOR_TOOLS.contains(&u.tool))
+            .cloned()
+            .collect();
         Ok(Self {
             factory,
             served,
             defs,
+            unavailable,
             policy: PermissionPolicy::unattended(PermissionMode::Bypass),
             always: Mutex::new(AllowAlways::default()),
         })
+    }
+}
+
+impl CatalogSource {
+    /// Tools the base context can't serve (a missing service), not listed;
+    /// for the caller to report at startup.
+    pub fn unavailable(&self) -> &[Unavailable] {
+        &self.unavailable
     }
 }
 

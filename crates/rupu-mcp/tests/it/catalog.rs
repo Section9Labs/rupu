@@ -166,8 +166,36 @@ fn hints_follow_the_effect() {
     let tools = source(tmp.path()).tools();
     let read = tools.iter().find(|t| t.name == "read_file").unwrap();
     assert!(read.hints.read_only);
-    let bash = tools.iter().find(|t| t.name == "bash").unwrap();
-    assert!(!bash.hints.read_only && !bash.hints.destructive && !bash.hints.open_world);
-    let comment = tools.iter().find(|t| t.name == "issues.comment").unwrap();
-    assert!(comment.hints.open_world);
+    for name in ["bash", "write_file"] {
+        let t = tools.iter().find(|t| t.name == name).unwrap();
+        assert!(t.hints.destructive && !t.hints.read_only, "{name}");
+    }
+    let comment = tools.iter().find(|t| t.name == "scm.prs.comment").unwrap();
+    assert!(comment.hints.open_world && !comment.hints.destructive);
+}
+
+struct NoScm(TestFactory);
+
+impl ContextFactory for NoScm {
+    fn context(&self, ws: Option<&str>) -> Result<ToolContext, String> {
+        let mut ctx = self.0.context(ws)?;
+        ctx.services.scm = None;
+        Ok(ctx)
+    }
+}
+
+#[test]
+fn tools_missing_a_service_are_reported_not_dropped() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let s = CatalogSource::new(Arc::new(NoScm(TestFactory {
+        root: tmp.path().to_path_buf(),
+    })))
+    .unwrap();
+    assert!(s.unavailable().iter().any(|u| u.tool == "scm.prs.comment"));
+    assert!(!s.tools().iter().any(|t| t.name == "scm.prs.comment"));
+    // A fully served catalog reports no connector tool missing.
+    assert!(!source(tmp.path())
+        .unavailable()
+        .iter()
+        .any(|u| u.tool == "scm.prs.comment"));
 }
