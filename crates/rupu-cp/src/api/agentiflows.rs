@@ -56,7 +56,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows", get(list_agentiflows))
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
-        .route("/api/agentiflows/:id/children", get(get_agentiflow_children))
+        .route(
+            "/api/agentiflows/:id/children",
+            get(get_agentiflow_children),
+        )
         .route(
             "/api/agentiflows/:id/units/:unit_id/output",
             get(get_agentiflow_unit_output),
@@ -1053,7 +1056,10 @@ async fn get_agentiflow_unit_output(
         move || {
             // The unit must belong to this flow — the lookup is cheap now that
             // the list no longer reads transcripts.
-            if !read_units(&s, &run_dir).iter().any(|u| u.unit_id == unit_id) {
+            if !read_units(&s, &run_dir)
+                .iter()
+                .any(|u| u.unit_id == unit_id)
+            {
                 return Err(());
             }
             Ok(unit_output(&s, &run_dir, &unit_id))
@@ -1108,6 +1114,7 @@ fn steerable(id: &str, record: &AgentiflowRecord) -> ApiResult<()> {
 async fn steer_agentiflow(
     State(s): State<AppState>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SteerRequest>,
 ) -> ApiResult<Response> {
     if !valid_run_id(&id) {
@@ -1119,7 +1126,15 @@ async fn steer_agentiflow(
             body: req.message,
             urgent: req.now,
         };
-        return crate::api::messages::post(MessageRoute::Agentiflows, &s, &id, None, body).await;
+        return crate::api::messages::post(
+            MessageRoute::Agentiflows,
+            &s,
+            &id,
+            None,
+            &headers,
+            body,
+        )
+        .await;
     }
     if req.message.trim().is_empty() {
         return Err(ApiError::bad_request("steering message is empty"));

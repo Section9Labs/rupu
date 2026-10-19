@@ -529,6 +529,7 @@ fn legacy_messages(bus: &Bus) -> Result<Vec<MessageView>, BusError> {
             delivery: Default::default(),
             via: None,
             viewer: None,
+            client: None,
         },
         seen: Vec::new(),
     };
@@ -646,6 +647,7 @@ mod tests {
             urgent: false,
             via: OperatorVia::Cli,
             viewer: None,
+            client: None,
         }
     }
 

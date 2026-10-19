@@ -157,6 +157,7 @@ async fn operator_reaches_any_participant() {
                 urgent: false,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             },
             Default::default(),
             &pid_is_running,

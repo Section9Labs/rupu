@@ -388,7 +388,27 @@ fn operator(to: &str, body: &str, urgent: bool) -> OperatorMessage {
         urgent,
         via: OperatorVia::Cp,
         viewer: Some("matt".into()),
+        client: None,
     }
+}
+
+#[test]
+fn a_line_without_client_still_parses_and_round_trips_without_it() {
+    let old = serde_json::json!({
+        "id": "msg_1", "ts": "2026-01-01T00:00:00Z", "kind": "operator",
+        "from": "operator", "to": "lead", "body": "hi",
+        "delivery": {"resolved": ["lead"]}, "via": "cp"
+    });
+    let m: LogMessage = serde_json::from_value(old).unwrap();
+    assert_eq!(m.client, None);
+    let back = serde_json::to_value(&m).unwrap();
+    assert!(back.get("client").is_none(), "{back}");
+
+    let mut with = back.clone();
+    with["client"] = serde_json::json!("mcp");
+    let m: LogMessage = serde_json::from_value(with).unwrap();
+    assert_eq!(m.client.as_deref(), Some("mcp"));
+    assert_eq!(serde_json::to_value(&m).unwrap()["client"], "mcp");
 }
 
 #[test]
@@ -606,7 +626,9 @@ fn an_addressed_post_reaches_the_addressee_inbox_and_the_board() {
     let lynx = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
     let otter = joined(tmp.path(), "otter#1", member("triage", "r2", None, None));
     let to = Address::parse("lynx#1").unwrap();
-    let r = otter.post(PostKind::Question, Some(&to), "seen 10.0.0.5?").unwrap();
+    let r = otter
+        .post(PostKind::Question, Some(&to), "seen 10.0.0.5?")
+        .unwrap();
     assert_eq!(r.delivery().resolved, vec!["lynx#1".to_string()]);
     assert!(r.delivery().undelivered.is_empty());
 
@@ -630,7 +652,9 @@ fn a_channel_post_reaches_no_inbox() {
     let tmp = tempfile::tempdir().unwrap();
     let lynx = joined(tmp.path(), "lynx#1", member("recon", "r1", None, None));
     let otter = joined(tmp.path(), "otter#1", member("triage", "r2", None, None));
-    let r = otter.post(PostKind::Note, None, "status: scanning").unwrap();
+    let r = otter
+        .post(PostKind::Note, None, "status: scanning")
+        .unwrap();
     assert!(r.delivery().resolved.is_empty());
     assert!(lynx.mailbox.drain("lynx#1").unwrap().is_empty());
     assert_eq!(otter.board.read_posts().unwrap().len(), 1);
@@ -648,10 +672,16 @@ fn an_addressed_post_to_a_role_reaches_every_live_member_and_respects_inbox_caps
     let sender = Bus::open(tmp.path(), "otter#1").with_caps(caps);
     sender.join(member("triage", "r3", None, None)).unwrap();
     // Fill lynx#2's inbox first.
-    sender.send(&Address::parse("lynx#2").unwrap(), "busy").unwrap();
+    sender
+        .send(&Address::parse("lynx#2").unwrap(), "busy")
+        .unwrap();
 
     let r = sender
-        .post(PostKind::Observation, Some(&Address::parse("role:recon").unwrap()), "found it")
+        .post(
+            PostKind::Observation,
+            Some(&Address::parse("role:recon").unwrap()),
+            "found it",
+        )
         .unwrap();
     assert_eq!(r.delivery().resolved, vec!["lynx#1".to_string()]);
     assert_eq!(

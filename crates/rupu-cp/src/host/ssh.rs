@@ -11643,6 +11643,7 @@ mod tests {
                     body: body.into(),
                     urgent: true,
                     viewer: Some("matt".into()),
+                    client: None,
                 },
             )
             .await
@@ -11715,6 +11716,7 @@ mod tests {
             body: "x".into(),
             urgent: false,
             viewer: None,
+            client: None,
         };
         let cases = [
             (
@@ -11775,6 +11777,7 @@ mod tests {
             body: "x".into(),
             urgent: false,
             viewer: None,
+            client: None,
         };
         let (conn, _t, _b) = refusal("not_live");
         assert!(matches!(

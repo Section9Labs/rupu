@@ -488,6 +488,7 @@ mod tests {
                 urgent,
                 via: rupu_fleet::OperatorVia::Cli,
                 viewer: None,
+                client: None,
             })
             .unwrap()
         };
@@ -555,6 +556,7 @@ mod tests {
                 urgent: false,
                 via: rupu_fleet::OperatorVia::Cp,
                 viewer: None,
+                client: None,
             })
             .unwrap();
         lynx.send(&Address::parse("otter").unwrap(), body).unwrap();

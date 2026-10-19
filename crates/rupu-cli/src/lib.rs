@@ -985,6 +985,7 @@ mod arg_parse_tests {
                 body: body.into(),
                 urgent: true,
                 viewer: Some("matt".into()),
+                client: None,
             },
         );
         match parse(send) {

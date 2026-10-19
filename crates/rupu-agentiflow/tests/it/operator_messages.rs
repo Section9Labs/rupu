@@ -92,6 +92,7 @@ fn send(global: &Path, id: &str, body: &str, urgent: bool) {
                 urgent,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             },
             BusCaps::default(),
             &pid_is_running,

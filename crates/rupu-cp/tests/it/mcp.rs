@@ -614,3 +614,42 @@ async fn null_arguments_are_absent_and_an_empty_id_is_missing() {
         "{r}"
     );
 }
+
+fn log_lines(dir: &std::path::Path) -> Vec<Value> {
+    let path = dir
+        .join("sessions")
+        .join(OP_SESSION)
+        .join("messages/log.jsonl");
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn messages_sent_through_mcp_record_client_mcp_and_keep_via_cp() {
+    let (addr, tmp) = spawn_operator().await;
+    let r = call_tool(
+        addr,
+        "messages.send",
+        json!({"id": OP_SESSION, "body": "from mcp"}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/sessions/{OP_SESSION}/messages"))
+        .json(&json!({"body": "plain http"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let lines = log_lines(tmp.path());
+    let find = |body: &str| lines.iter().find(|l| l["body"] == body).cloned().unwrap();
+    let mcp = find("from mcp");
+    assert_eq!(mcp["via"], "cp", "{mcp}");
+    assert_eq!(mcp["client"], "mcp", "{mcp}");
+    let http = find("plain http");
+    assert_eq!(http["via"], "cp", "{http}");
+    assert!(http.get("client").is_none(), "{http}");
+}

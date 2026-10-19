@@ -61,8 +61,9 @@ pub fn routes() -> Router<AppState> {
                     move |State(s): State<AppState>,
                           Path(id): Path<String>,
                           Query(q): Query<HostQuery>,
+                          headers: HeaderMap,
                           Json(body): Json<PostBody>| async move {
-                        post(route, &s, &id, q.host.as_deref(), body).await
+                        post(route, &s, &id, q.host.as_deref(), &headers, body).await
                     },
                 ),
             )
@@ -183,17 +184,24 @@ pub(crate) async fn post(
     s: &AppState,
     id: &str,
     host: Option<&str>,
+    headers: &HeaderMap,
     body: PostBody,
 ) -> ApiResult<Response> {
     check_route(route, id)?;
     crate::api::config::require_writable_to(s, "messaging a run")?;
     // The CP authenticates a shared token, not a person: there is no viewer
     // to record.
+    // Only the in-process MCP operator source sends this header, and only a
+    // local write records it: a remote host keeps its own attribution.
+    let client = (remote(host).is_none()
+        && headers.get("x-rupu-client").and_then(|v| v.to_str().ok()) == Some("mcp"))
+    .then(|| "mcp".to_string());
     let msg = OperatorMessageRequest {
         to: body.to,
         body: body.body,
         urgent: body.urgent,
         viewer: None,
+        client,
     };
     let reply: OperatorSendReply = if let Some(host) = remote(host) {
         let conn = crate::api::runs::resolve_host(s, host)?;

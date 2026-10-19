@@ -82,6 +82,8 @@ pub struct OperatorMessage {
     pub via: OperatorVia,
     /// Who sent it, when the surface knows (the CP's viewer).
     pub viewer: Option<String>,
+    /// The client behind the surface (`mcp`), recorded beside `via`.
+    pub client: Option<String>,
 }
 
 /// One run's address in its message space.
@@ -351,6 +353,7 @@ impl Bus {
                 urgent: msg.urgent,
                 via: Some(msg.via),
                 viewer: msg.viewer.clone(),
+                client: msg.client.clone(),
             },
             |m| self.deliver(m, broadcast),
         )
@@ -532,6 +535,7 @@ impl Bus {
             delivery,
             via: draft.via,
             viewer: draft.viewer,
+            client: draft.client,
         };
         append(&log_path, &LogLine::Msg(message.clone()))?;
         #[cfg(test)]
@@ -636,6 +640,7 @@ struct Draft<'a> {
     urgent: bool,
     via: Option<OperatorVia>,
     viewer: Option<String>,
+    client: Option<String>,
 }
 
 impl Draft<'_> {
@@ -650,6 +655,7 @@ impl Draft<'_> {
             urgent: false,
             via: None,
             viewer: None,
+            client: None,
         }
     }
 }

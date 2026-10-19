@@ -368,6 +368,7 @@ async fn steer_alias_parity() {
                 urgent: true,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             },
             BusCaps::default(),
             &rupu_orchestrator::runs::pid_is_running,
