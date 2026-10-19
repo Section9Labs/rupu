@@ -1,13 +1,15 @@
 //! `findings_single_impl` (spec W4 §6.1): `findings.report` is one
 //! implementation. Called through the agent loop, through an `action:` step
-//! and through `rupu mcp serve`'s `CatalogServer` with the same input and
+//! and through the MCP `CatalogSource` with the same input and
 //! the same run identity, it writes byte-identical ledger lines (apart from
 //! the minted id and the timestamp). With a run stream, `findings.tag`
 //! mirrors to it in the agent path.
 
 use rupu_agent::runner::{MockProvider, ScriptedTurn};
 use rupu_agent::{run_agent, AgentRunOpts};
-use rupu_mcp::{CatalogServer, InProcessTransport, Transport};
+use rupu_mcp::{
+    CatalogSource, ContextFactory, InProcessTransport, McpServer, ToolFilter, Transport,
+};
 use rupu_orchestrator::runner::{call_action_tool, ActionServices};
 use rupu_providers::types::StopReason;
 use rupu_tools::{PermissionMode, PermissionPolicy, RunIdentity, Surface, ToolContext};
@@ -37,6 +39,17 @@ fn context(workspace: &Path, stream: Option<&Path>) -> ToolContext {
     ctx.services.scm = Some(Arc::new(rupu_scm::Registry::empty()));
     ctx.services.coverage_stream = stream.map(Path::to_path_buf);
     ctx
+}
+
+/// Hands every workspace name the same root and the shared context.
+struct Factory {
+    root: std::path::PathBuf,
+}
+
+impl ContextFactory for Factory {
+    fn context(&self, _workspace: Option<&str>) -> Result<ToolContext, String> {
+        Ok(context(&self.root, None))
+    }
 }
 
 fn input() -> Value {
@@ -139,21 +152,24 @@ async fn findings_report_writes_the_same_line_through_every_transport() {
     .unwrap();
     assert!(out.starts_with("finding_id: fnd_"), "{out}");
 
-    // `rupu mcp serve`.
+    // MCP: the catalog source behind `McpServer`, the workspace named per call.
     let mcp_ws = tempfile::TempDir::new().unwrap();
     let (client, server_t) = InProcessTransport::pair();
-    let (server, _) = CatalogServer::new(
-        server_t,
-        context(mcp_ws.path(), None),
-        PermissionMode::Bypass,
-        None,
+    let factory = Arc::new(Factory {
+        root: mcp_ws.path().to_path_buf(),
+    });
+    let server = McpServer::new(
+        vec![Arc::new(CatalogSource::new(factory).unwrap())],
+        &ToolFilter::all(),
     )
     .unwrap();
-    let handle = tokio::spawn(server.run());
+    let handle = tokio::spawn(Arc::new(server).run(server_t));
+    let mut args = input();
+    args["workspace"] = json!("p1");
     client
         .send(json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": { "name": "findings.report", "arguments": input() }
+            "params": { "name": "findings.report", "arguments": args }
         }))
         .await
         .unwrap();

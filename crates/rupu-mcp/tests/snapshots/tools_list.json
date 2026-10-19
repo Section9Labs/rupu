@@ -1,6 +1,173 @@
 [
   {
-    "description": "Record a security or quality finding in this project's ledger. Returns the generated finding id (use it in coverage.mark calls and in another finding's cross_references). Under the full profile send a complete `report`; a rejected call lists every problem to fix.",
+    "inputSchema": {
+      "properties": {
+        "command": {
+          "description": "The shell command to execute, e.g. `cargo test`, `git diff HEAD`, `ls -la src/`.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "bash"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "path": {
+          "description": "Path relative to the workspace root, e.g. `src/lib.rs` or `tests/foo.rs`.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "read_file"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "content": {
+          "description": "Full content of the file. Existing content is replaced.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to the workspace root.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "write_file"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "new_string": {
+          "description": "Replacement substring.",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "Exact substring to replace. Must match exactly once.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path relative to the workspace root.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "edit_file"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "path": {
+          "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Regex pattern to search for. Ripgrep's default regex syntax (similar to PCRE).",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "grep"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "pattern": {
+          "description": "Glob pattern, e.g. `src/**/*.rs` or `*.toml`.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "glob"
+  },
+  {
+    "inputSchema": {
+      "properties": {
+        "lang": {
+          "description": "Language grammar to parse with, e.g. `rust`, `python`, `typescript`, `go`, `javascript`, `java`, `c`, `cpp`. Required.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Optional sub-path within the workspace to restrict the search. Defaults to the whole workspace.",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "Structural pattern in ast-grep syntax. Metavariables: `$VAR` = one node, `$$$` = zero-or-more nodes. Example: `impl $T for $S`.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "lang",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "ast_grep"
+  },
+  {
     "inputSchema": {
       "properties": {
         "asset": {
@@ -845,18 +1012,22 @@
         "target_ref": {
           "description": "What this finding is about when it is not a file: a host or IP (host), a URL (endpoint), or a cloud resource id such as an OCID/ARN/URN (resource). Required for those three scopes.",
           "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
         }
       },
       "required": [
         "scope",
-        "report"
+        "report",
+        "workspace"
       ],
       "type": "object"
     },
     "name": "findings.report"
   },
   {
-    "description": "Record your verdict on a finding that ANOTHER run filed: confirmed (you reproduced or independently established it), disputed (you showed it is wrong), or inconclusive (you could not decide). Your run and agent are recorded automatically. A finding cannot be verified by the run that filed it, and a finding without a full report cannot be verified. A later verdict replaces an earlier one.",
     "inputSchema": {
       "properties": {
         "finding_id": {
@@ -875,81 +1046,22 @@
             "inconclusive"
           ],
           "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
         }
       },
       "required": [
         "finding_id",
-        "status"
+        "status",
+        "workspace"
       ],
       "type": "object"
     },
     "name": "findings.verify"
   },
   {
-    "description": "List findings recorded in this project with a one-line query in `q` (e.g. `severity>=high tag:needs-poc -has:poc`). Returns one page of slim rows (id, title, severity, location, tags), `next_cursor`, `total`, and `tags_in_use` — reuse an existing tag where it fits. `all: true` returns every match unpaged, however many: page with `cursor` instead unless you need the whole set.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "all": {
-          "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead.",
-          "type": "boolean"
-        },
-        "cursor": {
-          "description": "`next_cursor` from the previous page.",
-          "type": "string"
-        },
-        "limit": {
-          "description": "Rows per page (default 50).",
-          "maximum": 500,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "q": {
-          "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything.",
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "name": "findings.query"
-  },
-  {
-    "description": "Add or remove tags on findings in this project, one or many at once. Tags are free-form: lowercase a-z, 0-9 and . _ : / -, starting with a letter or digit (e.g. class:sqli, needs-poc, status:triaged). Prefer tags already in use (findings.query lists them). An unknown finding id rejects the whole call; adding a tag a finding already has changes nothing. Returns each finding's tags before and after.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "add": {
-          "description": "Tags to add.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "finding_ids": {
-          "description": "Finding ids (fnd_…) from findings.query or findings.report.",
-          "items": {
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "remove": {
-          "description": "Tags to remove.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "finding_ids"
-      ],
-      "type": "object"
-    },
-    "name": "findings.tag"
-  },
-  {
-    "description": "List repositories the authenticated user can access on the given platform. Omit `platform` to use [scm.default].",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -974,7 +1086,6 @@
     "name": "scm.repos.list"
   },
   {
-    "description": "Fetch a single repository (default branch, clone URLs, visibility, description).",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1008,7 +1119,6 @@
     "name": "scm.repos.get"
   },
   {
-    "description": "List branches on a repository. Returns name, sha, and protected flag for each.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1042,7 +1152,6 @@
     "name": "scm.branches.list"
   },
   {
-    "description": "Create a new branch from a given SHA. Returns the new branch.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1084,7 +1193,6 @@
     "name": "scm.branches.create"
   },
   {
-    "description": "Read a single file from a repository at an optional ref. Returns path, ref, content, and encoding.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1129,7 +1237,6 @@
     "name": "scm.files.read"
   },
   {
-    "description": "List pull/merge requests on a repository. Optional filters: state (open/closed/merged), author, limit.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1184,7 +1291,6 @@
     "name": "scm.prs.list"
   },
   {
-    "description": "Fetch a single pull/merge request by number. Returns title, body, state, head/base branches, author, timestamps.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1224,7 +1330,6 @@
     "name": "scm.prs.get"
   },
   {
-    "description": "Fetch the unified-diff patch for a pull/merge request. Returns patch text + per-file change counts.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1264,7 +1369,6 @@
     "name": "scm.prs.diff"
   },
   {
-    "description": "Post a top-level comment on a pull/merge request.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1308,7 +1412,6 @@
     "name": "scm.prs.comment"
   },
   {
-    "description": "Open a pull/merge request from `head` branch into `base`. Set draft=true to open as a draft.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1364,7 +1467,6 @@
     "name": "scm.prs.create"
   },
   {
-    "description": "List issues on a tracker. Filters: state (open/closed), labels, author, limit.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1423,7 +1525,6 @@
     "name": "issues.list"
   },
   {
-    "description": "Fetch a single issue by number. Returns title, body, state, labels, author, timestamps.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1459,7 +1560,6 @@
     "name": "issues.get"
   },
   {
-    "description": "Read an issue's comment thread. Returns id, author, body, created_at, author_association per comment, oldest-first. author_association is GitHub's role for the commenter on this repo (e.g. OWNER, COLLABORATOR, CONTRIBUTOR, NONE) — use it to tell an authorized operator's comment apart from an arbitrary commenter's; it is null on trackers that don't expose an equivalent (GitLab, Linear, Jira). A `limit` truncates the NEWEST comments off the end, not the oldest — omitting `limit` returns only the oldest 100; hard ceiling 5000.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1504,7 +1604,6 @@
     "name": "issues.comments"
   },
   {
-    "description": "Post a comment on an issue.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1544,7 +1643,6 @@
     "name": "issues.comment"
   },
   {
-    "description": "Open a new issue with title, body, and optional labels.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1591,7 +1689,6 @@
     "name": "issues.create"
   },
   {
-    "description": "Transition an issue's state to `open` or `closed`.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1632,7 +1729,6 @@
     "name": "issues.update_state"
   },
   {
-    "description": "Trigger a GitHub Actions workflow run via workflow_dispatch. Requires the workflow file to declare `on: workflow_dispatch:`.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -1673,7 +1769,6 @@
     "name": "github.workflows_dispatch"
   },
   {
-    "description": "Trigger a GitLab CI pipeline against a branch/tag with optional variables.",
     "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {

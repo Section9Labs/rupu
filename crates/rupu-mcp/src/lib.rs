@@ -12,12 +12,14 @@
 //! Transports: [`StdioTransport`] (`rupu mcp serve`, for Claude Desktop,
 //! Cursor, …) and [`InProcessTransport`] (tests).
 
+pub mod catalog;
 pub mod error;
 pub mod filter;
 pub mod server;
 pub mod source;
 pub mod transport;
 
+pub use catalog::{CatalogSource, ContextFactory, HIDDEN_BY_OPERATOR_TOOLS};
 pub use error::{McpError, ServeError};
 pub use filter::ToolFilter;
 pub use server::{
