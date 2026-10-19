@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard charts — refined</title>
+<style>
+  :root{
+    --bg:rgb(10 10 10); --panel:rgb(20 20 22); --surface:rgb(27 27 31);
+    --border:rgb(38 38 42); --border-strong:rgb(63 63 70);
+    --ink:rgb(245 245 245); --dim:rgb(161 161 170); --mute:rgb(113 113 122);
+    --grid:rgb(32 32 36);
+    --ok:rgb(74 222 128); --fail:rgb(248 113 113); --man:rgb(96 165 250); --cron:rgb(251 191 36); --evt:rgb(167 139 250);
+    --sans:-apple-system,"system-ui",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13px;-webkit-font-smoothing:antialiased;padding:30px 36px 80px;max-width:940px;margin:0 auto}
+  .doc-h{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:rgb(167 139 250);font-weight:700;margin-bottom:6px}
+  .doc-t{font-size:23px;font-weight:600;letter-spacing:-.01em;margin-bottom:8px}
+  .doc-s{color:var(--dim);font-size:13.5px;max-width:74ch;margin-bottom:26px}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px 20px 12px;margin-bottom:18px;position:relative}
+  .chead{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:6px}
+  .chead .t{font-size:13px;font-weight:600}
+  .chead .h{font-size:11.5px;color:var(--mute);margin-top:2px}
+  .chead .total{text-align:right}
+  .chead .total .v{font-size:22px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+  .chead .total .l{font-size:10.5px;color:var(--mute);margin-top:3px}
+  .legend{display:flex;gap:16px;margin:10px 0 4px}
+  .legend .i{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}
+  .legend .sw{width:9px;height:9px;border-radius:3px}
+
+  .plotwrap{position:relative}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .gridline{stroke:var(--grid);stroke-width:1}
+  .baseline{stroke:var(--border-strong);stroke-width:1}
+  .ytick{fill:var(--mute);font:10px var(--mono)}
+  .xtick{fill:var(--mute);font:10px var(--mono)}
+  .aline{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .peakdot{stroke:var(--panel);stroke-width:2}
+  .peaklbl{fill:var(--ink);font:600 11px var(--sans)}
+  .peaksub{fill:var(--mute);font:10px var(--mono)}
+  .peakstem{stroke:var(--border-strong);stroke-width:1;stroke-dasharray:2 2}
+
+  /* crosshair */
+  .cross{stroke:var(--border-strong);stroke-width:1;opacity:0;pointer-events:none}
+  .cdot{stroke:var(--panel);stroke-width:1.5;opacity:0;pointer-events:none}
+  .hit{fill:transparent;cursor:crosshair}
+  .tip{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-112%);background:rgb(27 27 31);border:1px solid var(--border-strong);border-radius:9px;padding:8px 10px;font-size:11.5px;white-space:nowrap;box-shadow:0 8px 24px rgb(0 0 0 /.5);transition:opacity .08s}
+  .tip .d{font-weight:600;margin-bottom:5px;font-size:11px}
+  .tip .r{display:flex;align-items:center;gap:7px;line-height:1.7}
+  .tip .r .sw{width:8px;height:8px;border-radius:2px}
+  .tip .r .n{color:var(--dim);flex:1}
+  .tip .r .v{font-variant-numeric:tabular-nums;font-weight:600}
+  .tip .tot{border-top:1px solid var(--border);margin-top:5px;padding-top:5px;display:flex;justify-content:space-between;gap:16px}
+  .tip .tot .n{color:var(--mute)} .tip .tot .v{font-variant-numeric:tabular-nums;font-weight:700}
+  .note{color:var(--dim);font-size:12px;margin-top:4px}
+  .note b{color:var(--ink)}
+</style>
+</head>
+<body>
+  <div class="doc-h">Charts — refined</div>
+  <div class="doc-t">The graphs, with attention to detail</div>
+  <div class="doc-s">The flat mystery-lines become <b style="color:var(--ink)">stacked thin areas that say something</b> — outcomes split into completed vs failed, throughput split by trigger. A real baseline and recessive grid, round ticks above the max, rounded data-ends, a direct-labelled peak, and a live crosshair + tooltip on hover. Colors are the CP's own status hues, validated colorblind-safe. <b style="color:var(--ink)">Move your cursor across either chart.</b></div>
+
+  <!-- CHART 1 -->
+  <div class="card">
+    <div class="chead">
+      <div><div class="t">Outcomes over time</div><div class="h">Runs per day · last 30 days</div></div>
+      <div class="total"><div class="v">100</div><div class="l">cycles · 92% ok</div></div>
+    </div>
+    <div class="legend">
+      <span class="i"><span class="sw" style="background:var(--ok)"></span>Completed</span>
+      <span class="i"><span class="sw" style="background:var(--fail)"></span>Failed</span>
+    </div>
+    <div class="plotwrap" id="w1">
+      <svg viewBox="0 0 470 162" id="svg1">
+        <line class="gridline" x1="46" y1="22" x2="458" y2="22"/>
+        <line class="gridline" x1="46" y1="61.3" x2="458" y2="61.3"/>
+        <line class="gridline" x1="46" y1="100.7" x2="458" y2="100.7"/>
+        <line class="baseline" x1="46" y1="140" x2="458" y2="140"/>
+        <text class="ytick" x="40" y="25" text-anchor="end">240</text>
+        <text class="ytick" x="40" y="64.3" text-anchor="end">160</text>
+        <text class="ytick" x="40" y="103.7" text-anchor="end">80</text>
+        <text class="ytick" x="40" y="143" text-anchor="end">0</text>
+        <!-- completed fill + line -->
+        <path d="M46.0 137.1 L90.7 135.6 L135.3 129.2 L180.0 105.6 L224.7 42.7 L269.3 134.1 L314.0 136.1 L358.7 92.8 L403.3 130.2 L448.0 135.6 L448.0 140.0 L403.3 140.0 L358.7 140.0 L314.0 140.0 L269.3 140.0 L224.7 140.0 L180.0 140.0 L135.3 140.0 L90.7 140.0 L46.0 140.0 Z" fill="var(--ok)" fill-opacity="0.15"/>
+        <polyline class="aline" stroke="var(--ok)" points="46.0,137.1 90.7,135.6 135.3,129.2 180.0,105.6 224.7,42.7 269.3,134.1 314.0,136.1 358.7,92.8 403.3,130.2 448.0,135.6"/>
+        <!-- failed fill + line (stacked) -->
+        <path d="M46.0 136.6 L90.7 135.1 L135.3 127.7 L180.0 101.7 L224.7 34.8 L269.3 133.1 L314.0 135.6 L358.7 87.9 L403.3 128.7 L448.0 134.6 L448.0 135.6 L403.3 130.2 L358.7 92.8 L314.0 136.1 L269.3 134.1 L224.7 42.7 L180.0 105.6 L135.3 129.2 L90.7 135.6 L46.0 137.1 Z" fill="var(--fail)" fill-opacity="0.22"/>
+        <polyline class="aline" stroke="var(--fail)" points="46.0,136.6 90.7,135.1 135.3,127.7 180.0,101.7 224.7,34.8 269.3,133.1 314.0,135.6 358.7,87.9 403.3,128.7 448.0,134.6"/>
+        <!-- peak annotation (Oct 4, total 214) -->
+        <line class="peakstem" x1="224.7" y1="34.8" x2="224.7" y2="22"/>
+        <circle class="peakdot" cx="224.7" cy="34.8" r="3.2" fill="var(--fail)"/>
+        <text class="peaklbl" x="224.7" y="17" text-anchor="middle">214</text>
+        <!-- x ticks -->
+        <text class="xtick" x="46" y="156">Sep 20</text>
+        <text class="xtick" x="135.3" y="156" text-anchor="middle">Sep 26</text>
+        <text class="xtick" x="224.7" y="156" text-anchor="middle">Oct 4</text>
+        <text class="xtick" x="358.7" y="156" text-anchor="middle">Oct 13</text>
+        <text class="xtick" x="458" y="156" text-anchor="end">Oct 18</text>
+        <!-- crosshair -->
+        <line class="cross" id="cr1" x1="0" y1="22" x2="0" y2="140"/>
+        <circle class="cdot" id="cd1a" r="3.5" fill="var(--ok)"/>
+        <circle class="cdot" id="cd1b" r="3.5" fill="var(--fail)"/>
+        <rect class="hit" x="46" y="22" width="412" height="118" id="hit1"/>
+      </svg>
+      <div class="tip" id="tip1"></div>
+    </div>
+    <div class="note">One failure spike on <b>Oct 4</b> (16 of 214) and a smaller one on <b>Oct 13</b> — visible at a glance because failed sits on its own red band, not buried in a single line.</div>
+  </div>
+
+  <!-- CHART 2 -->
+  <div class="card">
+    <div class="chead">
+      <div><div class="t">Throughput by trigger</div><div class="h">Runs per day · by what started them</div></div>
+      <div class="total"><div class="v">100</div><div class="l">cycles</div></div>
+    </div>
+    <div class="legend">
+      <span class="i"><span class="sw" style="background:var(--man)"></span>Manual</span>
+      <span class="i"><span class="sw" style="background:var(--cron)"></span>Cron</span>
+      <span class="i"><span class="sw" style="background:var(--evt)"></span>Event</span>
+    </div>
+    <div class="plotwrap" id="w2">
+      <svg viewBox="0 0 470 162" id="svg2">
+        <line class="gridline" x1="46" y1="22" x2="458" y2="22"/>
+        <line class="gridline" x1="46" y1="61.3" x2="458" y2="61.3"/>
+        <line class="gridline" x1="46" y1="100.7" x2="458" y2="100.7"/>
+        <line class="baseline" x1="46" y1="140" x2="458" y2="140"/>
+        <text class="ytick" x="40" y="25" text-anchor="end">240</text>
+        <text class="ytick" x="40" y="64.3" text-anchor="end">160</text>
+        <text class="ytick" x="40" y="103.7" text-anchor="end">80</text>
+        <text class="ytick" x="40" y="143" text-anchor="end">0</text>
+        <path d="M46.0 138.0 L90.7 137.5 L135.3 135.1 L180.0 125.2 L224.7 95.8 L269.3 137.1 L314.0 138.0 L358.7 120.3 L403.3 135.1 L448.0 137.5 L448.0 140.0 L403.3 140.0 L358.7 140.0 L314.0 140.0 L269.3 140.0 L224.7 140.0 L180.0 140.0 L135.3 140.0 L90.7 140.0 L46.0 140.0 Z" fill="var(--man)" fill-opacity="0.16"/>
+        <polyline class="aline" stroke="var(--man)" points="46.0,138.0 90.7,137.5 135.3,135.1 180.0,125.2 224.7,95.8 269.3,137.1 314.0,138.0 358.7,120.3 403.3,135.1 448.0,137.5"/>
+        <path d="M46.0 137.1 L90.7 136.1 L135.3 130.7 L180.0 111.5 L224.7 56.4 L269.3 134.6 L314.0 136.6 L358.7 101.7 L403.3 131.2 L448.0 135.6 L448.0 137.5 L403.3 135.1 L358.7 120.3 L314.0 138.0 L269.3 137.1 L224.7 95.8 L180.0 125.2 L135.3 135.1 L90.7 137.5 L46.0 138.0 Z" fill="var(--cron)" fill-opacity="0.16"/>
+        <polyline class="aline" stroke="var(--cron)" points="46.0,137.1 90.7,136.1 135.3,130.7 180.0,111.5 224.7,56.4 269.3,134.6 314.0,136.6 358.7,101.7 403.3,131.2 448.0,135.6"/>
+        <path d="M46.0 136.6 L90.7 135.1 L135.3 127.7 L180.0 101.7 L224.7 34.8 L269.3 133.1 L314.0 135.6 L358.7 87.9 L403.3 128.7 L448.0 134.6 L448.0 135.6 L403.3 131.2 L358.7 101.7 L314.0 136.6 L269.3 134.6 L224.7 56.4 L180.0 111.5 L135.3 130.7 L90.7 136.1 L46.0 137.1 Z" fill="var(--evt)" fill-opacity="0.18"/>
+        <polyline class="aline" stroke="var(--evt)" points="46.0,136.6 90.7,135.1 135.3,127.7 180.0,101.7 224.7,34.8 269.3,133.1 314.0,135.6 358.7,87.9 403.3,128.7 448.0,134.6"/>
+        <line class="peakstem" x1="224.7" y1="34.8" x2="224.7" y2="22"/>
+        <circle class="peakdot" cx="224.7" cy="34.8" r="3.2" fill="var(--evt)"/>
+        <text class="peaklbl" x="224.7" y="17" text-anchor="middle">214</text>
+        <text class="xtick" x="46" y="156">Sep 20</text>
+        <text class="xtick" x="135.3" y="156" text-anchor="middle">Sep 26</text>
+        <text class="xtick" x="224.7" y="156" text-anchor="middle">Oct 4</text>
+        <text class="xtick" x="358.7" y="156" text-anchor="middle">Oct 13</text>
+        <text class="xtick" x="458" y="156" text-anchor="end">Oct 18</text>
+        <line class="cross" id="cr2" x1="0" y1="22" x2="0" y2="140"/>
+        <circle class="cdot" id="cd2a" r="3.5" fill="var(--man)"/>
+        <circle class="cdot" id="cd2b" r="3.5" fill="var(--cron)"/>
+        <circle class="cdot" id="cd2c" r="3.5" fill="var(--evt)"/>
+        <rect class="hit" x="46" y="22" width="412" height="118" id="hit2"/>
+      </svg>
+      <div class="tip" id="tip2"></div>
+    </div>
+    <div class="note"><b>Oct 4</b> was almost all manual + cron; the <b>Oct 13</b> run was more event-driven — the kind of mix the old single blue line hid entirely.</div>
+  </div>
+
+<script>
+  const XS=[46,90.7,135.3,180,224.7,269.3,314,358.7,403.3,448];
+  const DATES=["Sep 20","Sep 23","Sep 26","Sep 30","Oct 4","Oct 7","Oct 10","Oct 13","Oct 16","Oct 18"];
+  const VMAX=240, Y0=140, YTOP=22;
+  const yv=v=>Y0-(v/VMAX)*(Y0-YTOP);
+  function near(px){let b=0,bd=1e9;for(let i=0;i<XS.length;i++){const d=Math.abs(XS[i]-px);if(d<bd){bd=d;b=i;}}return b;}
+
+  function wire(svgId,wrapId,tipId,crId,series,dots){
+    const svg=document.getElementById(svgId), wrap=document.getElementById(wrapId), tip=document.getElementById(tipId), cr=document.getElementById(crId);
+    const hit=svg.querySelector('.hit');
+    hit.addEventListener('mousemove',e=>{
+      const r=svg.getBoundingClientRect(), vb=svg.viewBox.baseVal;
+      const px=(e.clientX-r.left)/r.width*vb.width;
+      const i=near(px), x=XS[i];
+      cr.setAttribute('x1',x); cr.setAttribute('x2',x); cr.style.opacity=1;
+      let cum=0, rows='';
+      series.forEach((s,k)=>{ cum+=s.vals[i]; const dy=yv(cum);
+        dots[k].setAttribute('cx',x); dots[k].setAttribute('cy',dy); dots[k].style.opacity=1;
+        rows+=`<div class="r"><span class="sw" style="background:${s.color}"></span><span class="n">${s.name}</span><span class="v">${s.vals[i]}</span></div>`;
+      });
+      tip.innerHTML=`<div class="d">${DATES[i]}</div>${rows}<div class="tot"><span class="n">Total</span><span class="v">${cum}</span></div>`;
+      const relX=x/vb.width*wrap.clientWidth, topY=yv(cum)/vb.height*wrap.clientHeight;
+      tip.style.left=relX+'px'; tip.style.top=topY+'px'; tip.style.opacity=1;
+    });
+    hit.addEventListener('mouseleave',()=>{cr.style.opacity=0;tip.style.opacity=0;dots.forEach(d=>d.style.opacity=0);});
+  }
+  wire('svg1','w1','tip1','cr1',
+    [{name:'Completed',color:'rgb(74 222 128)',vals:[6,9,22,70,198,12,8,96,20,9]},{name:'Failed',color:'rgb(248 113 113)',vals:[1,1,3,8,16,2,1,10,3,2]}],
+    [document.getElementById('cd1a'),document.getElementById('cd1b')]);
+  wire('svg2','w2','tip2','cr2',
+    [{name:'Manual',color:'rgb(96 165 250)',vals:[4,5,10,30,90,6,4,40,10,5]},{name:'Cron',color:'rgb(251 191 36)',vals:[2,3,9,28,80,5,3,38,8,4]},{name:'Event',color:'rgb(167 139 250)',vals:[1,2,6,20,44,3,2,28,5,2]}],
+    [document.getElementById('cd2a'),document.getElementById('cd2b'),document.getElementById('cd2c')]);
+</script>
+</body>
+</html>

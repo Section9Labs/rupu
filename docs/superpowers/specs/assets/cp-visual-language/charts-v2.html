@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CP Dashboard Charts</title>
+<style>
+  :root{
+    --bg:rgb(10 10 10); --panel:rgb(20 20 22); --surface:rgb(27 27 31);
+    --border:rgb(38 38 42); --border-strong:rgb(63 63 70);
+    --ink:rgb(245 245 245); --dim:rgb(161 161 170); --mute:rgb(113 113 122);
+    --grid:rgb(32 32 36);
+    --brand:rgb(124 58 237); --brand-ink:rgb(167 139 250);
+    --ok:rgb(74 222 128); --fail:rgb(248 113 113);
+    --man:rgb(96 165 250); --cron:rgb(251 191 36); --evt:rgb(167 139 250);
+    --sans:-apple-system,"system-ui",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+    --ease-out:cubic-bezier(0.23,1,0.32,1);
+    --ease-in-out:cubic-bezier(0.77,0,0.175,1);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13px;
+    -webkit-font-smoothing:antialiased;padding:30px 24px 80px;max-width:980px;margin:0 auto}
+  .doc-h{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--brand-ink);font-weight:700;margin-bottom:6px}
+  .doc-t{font-size:23px;font-weight:600;letter-spacing:-.01em;margin-bottom:8px}
+  .doc-s{color:var(--dim);font-size:13.5px;max-width:78ch;margin-bottom:24px}
+  .doc-s b{color:var(--ink)}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+    padding:18px 20px 12px;margin-bottom:18px;position:relative}
+  .card.hero{padding:20px 22px 14px;
+    background:
+      radial-gradient(130% 90% at 88% -10%, rgb(124 58 237 / .07), transparent 60%),
+      var(--panel)}
+  .chead{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:4px;gap:16px}
+  .chead .t{font-size:13px;font-weight:600;display:flex;align-items:center;gap:9px}
+  .chead.hero .t{font-size:15px}
+  .chead .h{font-size:11.5px;color:var(--mute);margin-top:3px}
+  .chead .total{text-align:right;flex-shrink:0}
+  .chead .total .v{font-size:22px;font-weight:600;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1}
+  .chead.hero .total .v{font-size:30px}
+  .chead .total .l{font-size:10.5px;color:var(--mute);margin-top:3px}
+
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:10px;font-weight:600;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--ok);
+    background:rgb(74 222 128 / .1);border:1px solid rgb(74 222 128 / .22);
+    border-radius:999px;padding:3px 9px 3px 7px}
+  .live .blip{width:6px;height:6px;border-radius:50%;background:var(--ok);
+    box-shadow:0 0 0 0 rgb(74 222 128 / .6);animation:blip 2.2s var(--ease-out) infinite}
+  @keyframes blip{0%{box-shadow:0 0 0 0 rgb(74 222 128 / .55)}70%,100%{box-shadow:0 0 0 7px rgb(74 222 128 / 0)}}
+
+  .legend{display:flex;gap:16px;margin:8px 0 2px;flex-wrap:wrap}
+  .legend .i{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}
+  .legend .sw{width:9px;height:9px;border-radius:3px}
+
+  .plotwrap{position:relative}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .gridline{stroke:var(--grid);stroke-width:1}
+  .baseline{stroke:var(--border-strong);stroke-width:1}
+  .dayrule{stroke:rgb(255 255 255 / .04);stroke-width:1}
+  .ytick,.xtick{fill:var(--mute);font:10px var(--mono)}
+  .lanelbl{fill:var(--dim);font:700 10px var(--sans);letter-spacing:.09em}
+  .lanesub{fill:var(--mute);font:10px var(--mono)}
+
+  .area{stroke:none}
+  .a-ok{fill:var(--ok);fill-opacity:.15} .a-fail{fill:var(--fail);fill-opacity:.26}
+  .a-man{fill:var(--man);fill-opacity:.16} .a-cron{fill:var(--cron);fill-opacity:.16} .a-evt{fill:var(--evt);fill-opacity:.18}
+  .tfill{stroke:none} .f-man{fill:var(--man);fill-opacity:.08} .f-cron{fill:var(--cron);fill-opacity:.08} .f-evt{fill:var(--evt);fill-opacity:.09}
+  .aline,.tline{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+  .tline{stroke-width:1.75}
+  .l-ok{stroke:var(--ok)} .l-fail{stroke:var(--fail)}
+  .l-man{stroke:var(--man)} .l-cron{stroke:var(--cron)} .l-evt{stroke:var(--evt)}
+
+  .peakstem{stroke:var(--border-strong);stroke-width:1;stroke-dasharray:2 2}
+  .peaklbl{fill:var(--ink);font:600 11px var(--sans)} .peaklbl.big{font-size:15px}
+  .peaksub{fill:var(--mute);font:9px var(--mono)}
+
+  /* now pulse */
+  .nowring{fill:none;stroke-width:1.5;transform-box:fill-box;transform-origin:center}
+  .r-ok{stroke:var(--ok)} .r-fail{stroke:var(--fail)}
+  .nowdot{stroke:var(--panel);stroke-width:1.5}
+  .d-ok{fill:var(--ok)} .d-fail{fill:var(--fail)} .d-man{fill:var(--man)} .d-cron{fill:var(--cron)} .d-evt{fill:var(--evt)}
+  .nowring{animation:ring 2.4s var(--ease-out) infinite}
+  @keyframes ring{0%{transform:scale(.55);opacity:.9}70%,100%{transform:scale(2.6);opacity:0}}
+  .stylus{fill:var(--fail);filter:drop-shadow(0 0 5px rgb(248 113 113 / .9));opacity:0}
+
+  /* reveal states */
+  .riser{transform:scaleY(0);transform-box:fill-box;transform-origin:bottom}
+  .card.in .riser{transform:scaleY(1);transition:transform 1050ms var(--ease-out)}
+  .card.in .riser .area:nth-child(2){transition-delay:70ms}
+  .card.in .riser .area:nth-child(3){transition-delay:140ms}
+  #sweeprect{transform:scaleX(0);transform-box:view-box;transform-origin:left}
+  .card.hero.in #sweeprect{transform:scaleX(1);transition:transform 1400ms var(--ease-out)}
+  .nowring,.nowdot,.peakstem,.peaklbl,.peaksub,.tline,.tfill{opacity:0}
+  .card.in .nowring{opacity:1;transition:opacity 400ms ease 950ms}
+  .card.in .nowdot{opacity:1;transition:opacity 400ms ease 950ms}
+  .card.in .peakstem,.card.in .peaklbl,.card.in .peaksub{opacity:1;transition:opacity 500ms ease 700ms}
+  .card.hero.in .tline,.card.hero.in .tfill{opacity:1;transition:opacity 600ms ease 500ms}
+
+  /* crosshair (transform-translated, interruptible) */
+  .cross-g{opacity:0;transform:translateX(0)}
+  .cross-g.on{opacity:1;transition:transform 90ms var(--ease-out)}
+  .cross{stroke:var(--border-strong);stroke-width:1;pointer-events:none}
+  .cdot-g{transition:transform 90ms var(--ease-out)}
+  .cdot{stroke:var(--panel);stroke-width:1.5;fill:var(--ink)}
+  .hit{fill:transparent;cursor:crosshair}
+  .hovering .nowring{animation-play-state:paused}
+
+  .tip{position:absolute;pointer-events:none;opacity:0;transform:translate(-50%,-112%);
+    background:var(--surface);border:1px solid var(--border-strong);border-radius:9px;
+    padding:8px 10px;font-size:11.5px;white-space:nowrap;box-shadow:0 8px 24px rgb(0 0 0 /.5);
+    transition:opacity .09s ease}
+  .tip.on{opacity:1}
+  .tip .dt{font-weight:600;margin-bottom:5px;font-size:11px}
+  .tip .r{display:flex;align-items:center;gap:7px;line-height:1.75}
+  .tip .r .sw{width:8px;height:8px;border-radius:2px;flex-shrink:0}
+  .tip .r .n{color:var(--dim);flex:1;padding-right:12px}
+  .tip .r .v{font-variant-numeric:tabular-nums;font-weight:600;font-family:var(--mono)}
+  .tip .tot{border-top:1px solid var(--border);margin-top:5px;padding-top:5px;display:flex;justify-content:space-between;gap:16px}
+  .tip .tot .n{color:var(--mute)} .tip .tot .v{font-variant-numeric:tabular-nums;font-weight:700;font-family:var(--mono)}
+  .tip .lane{color:var(--mute);font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;margin:6px 0 1px}
+  .note{color:var(--dim);font-size:12px;margin-top:6px} .note b{color:var(--ink)}
+
+  @media (prefers-reduced-motion: reduce){
+    .riser{transform:none!important}
+    #sweeprect{transform:scaleX(1)!important}
+    .nowring{animation:none;opacity:1!important}
+    .nowdot,.peakstem,.peaklbl,.peaksub,.tline,.tfill{opacity:1!important}
+    .stylus{opacity:0!important}
+    .live .blip{animation:none}
+    .card.in .riser,.card.hero.in #sweeprect{transition:none}
+    .cross-g.on,.cdot-g{transition:none}
+  }
+</style>
+</head>
+<body>
+  <div class="doc-h">Control plane · Dashboard</div>
+  <div class="doc-t">Charts that feel alive</div>
+  <div class="doc-s">The flat mystery-lines become a living instrument. The hero <b>seismograph</b> reads both the outcomes mountain and the three trigger traces off one shared crosshair; the two dashboard tiles below are the production charts — thin stacked areas that <b>rise from the baseline</b> on load, a breathing <b>now</b> pulse on the latest day, and an interruptible hover crosshair. Status hues are the CP's own, validated colorblind-safe. <b>Move your cursor across any chart.</b></div>
+
+  <!-- HERO -->
+  <div class="card hero" id="card-hero">
+    <div class="chead hero">
+      <div><div class="t"><span class="dot"></span>Run seismograph <span class="live"><span class="blip"></span>live</span></div>
+        <div class="h">Outcomes &amp; throughput · last 30 days · one shared readout</div></div>
+      <div class="total"><div class="v">214</div><div class="l">peak day · Oct 4</div></div>
+    </div>
+    <div class="legend">
+      <span class="i"><span class="sw" style="background:var(--ok)"></span>Completed</span>
+      <span class="i"><span class="sw" style="background:var(--fail)"></span>Failed</span>
+      <span class="i" style="margin-left:6px;opacity:.5">·</span>
+      <span class="i"><span class="sw" style="background:var(--man)"></span>Manual</span>
+      <span class="i"><span class="sw" style="background:var(--cron)"></span>Cron</span>
+      <span class="i"><span class="sw" style="background:var(--evt)"></span>Event</span>
+    </div>
+    <div class="plotwrap" id="wh">
+      <svg viewBox="0 0 900 380" id="svgh"><clipPath id="sweepclip" clipPathUnits="userSpaceOnUse"><rect id="sweeprect" x="64" y="0" width="812" height="380"/></clipPath>
+<line class="baseline" x1="64" y1="196" x2="876" y2="196"/>
+<text class="ytick" x="56" y="199" text-anchor="end">0</text>
+<line class="gridline" x1="64" y1="148" x2="876" y2="148"/>
+<text class="ytick" x="56" y="151" text-anchor="end">80</text>
+<line class="gridline" x1="64" y1="100" x2="876" y2="100"/>
+<text class="ytick" x="56" y="103" text-anchor="end">160</text>
+<line class="gridline" x1="64" y1="52" x2="876" y2="52"/>
+<text class="ytick" x="56" y="55" text-anchor="end">240</text>
+<line class="baseline" x1="64" y1="344" x2="876" y2="344"/>
+<text class="ytick" x="56" y="347" text-anchor="end">0</text>
+<line class="gridline" x1="64" y1="288" x2="876" y2="288"/>
+<text class="ytick" x="56" y="291" text-anchor="end">50</text>
+<line class="gridline" x1="64" y1="232" x2="876" y2="232"/>
+<text class="ytick" x="56" y="235" text-anchor="end">100</text>
+<line class="dayrule" x1="64" y1="52" x2="64" y2="196"/>
+<line class="dayrule" x1="64" y1="232" x2="64" y2="344"/>
+<line class="dayrule" x1="154.22" y1="52" x2="154.22" y2="196"/>
+<line class="dayrule" x1="154.22" y1="232" x2="154.22" y2="344"/>
+<line class="dayrule" x1="244.44" y1="52" x2="244.44" y2="196"/>
+<line class="dayrule" x1="244.44" y1="232" x2="244.44" y2="344"/>
+<line class="dayrule" x1="334.67" y1="52" x2="334.67" y2="196"/>
+<line class="dayrule" x1="334.67" y1="232" x2="334.67" y2="344"/>
+<line class="dayrule" x1="424.89" y1="52" x2="424.89" y2="196"/>
+<line class="dayrule" x1="424.89" y1="232" x2="424.89" y2="344"/>
+<line class="dayrule" x1="515.11" y1="52" x2="515.11" y2="196"/>
+<line class="dayrule" x1="515.11" y1="232" x2="515.11" y2="344"/>
+<line class="dayrule" x1="605.33" y1="52" x2="605.33" y2="196"/>
+<line class="dayrule" x1="605.33" y1="232" x2="605.33" y2="344"/>
+<line class="dayrule" x1="695.56" y1="52" x2="695.56" y2="196"/>
+<line class="dayrule" x1="695.56" y1="232" x2="695.56" y2="344"/>
+<line class="dayrule" x1="785.78" y1="52" x2="785.78" y2="196"/>
+<line class="dayrule" x1="785.78" y1="232" x2="785.78" y2="344"/>
+<line class="dayrule" x1="876" y1="52" x2="876" y2="196"/>
+<line class="dayrule" x1="876" y1="232" x2="876" y2="344"/>
+<text class="lanelbl" x="64" y="38">OUTCOMES</text>
+<text class="lanesub" x="142" y="38">runs/day · completed + failed</text>
+<text class="lanelbl" x="64" y="220">THROUGHPUT</text>
+<text class="lanesub" x="156" y="220">traces by trigger</text>
+<g clip-path="url(#sweepclip)">
+<path class="area a-ok" d="M64 192.4 L154.22 190.6 L244.44 182.8 L334.67 154 L424.89 77.2 L515.11 188.8 L605.33 191.2 L695.56 138.4 L785.78 184 L876 190.6 L876 196 L64 196 Z"/>
+<path class="area a-fail" d="M64 191.8 L154.22 190 L244.44 181 L334.67 149.2 L424.89 67.6 L515.11 187.6 L605.33 190.6 L695.56 132.4 L785.78 182.2 L876 189.4 L876 188.6 L785.78 182 L695.56 136.4 L605.33 189.2 L515.11 186.8 L424.89 75.2 L334.67 152 L244.44 180.8 L154.22 188.6 L64 190.4 Z"/>
+<polyline class="aline l-ok" points="64,192.4 154.22,190.6 244.44,182.8 334.67,154 424.89,77.2 515.11,188.8 605.33,191.2 695.56,138.4 785.78,184 876,190.6"/>
+<polyline class="aline l-fail" points="64,191.8 154.22,190 244.44,181 334.67,149.2 424.89,67.6 515.11,187.6 605.33,190.6 695.56,132.4 785.78,182.2 876,189.4"/>
+<path class="tfill f-man" d="M64 339.52 L154.22 338.4 L244.44 332.8 L334.67 310.4 L424.89 243.2 L515.11 337.28 L605.33 339.52 L695.56 299.2 L785.78 332.8 L876 338.4 L876 344 L64 344 Z"/>
+<polyline class="tline l-man" points="64,339.52 154.22,338.4 244.44,332.8 334.67,310.4 424.89,243.2 515.11,337.28 605.33,339.52 695.56,299.2 785.78,332.8 876,338.4"/>
+<path class="tfill f-cron" d="M64 341.76 L154.22 340.64 L244.44 333.92 L334.67 312.64 L424.89 254.4 L515.11 338.4 L605.33 340.64 L695.56 301.44 L785.78 335.04 L876 339.52 L876 344 L64 344 Z"/>
+<polyline class="tline l-cron" points="64,341.76 154.22,340.64 244.44,333.92 334.67,312.64 424.89,254.4 515.11,338.4 605.33,340.64 695.56,301.44 785.78,335.04 876,339.52"/>
+<path class="tfill f-evt" d="M64 342.88 L154.22 341.76 L244.44 337.28 L334.67 321.6 L424.89 294.72 L515.11 340.64 L605.33 341.76 L695.56 312.64 L785.78 338.4 L876 341.76 L876 344 L64 344 Z"/>
+<polyline class="tline l-evt" points="64,342.88 154.22,341.76 244.44,337.28 334.67,321.6 424.89,294.72 515.11,340.64 605.33,341.76 695.56,312.64 785.78,338.4 876,341.76"/>
+</g>
+<line class="peakstem" x1="424.89" y1="67.6" x2="424.89" y2="50"/>
+<text class="peaklbl big" x="424.89" y="44" text-anchor="middle">214</text>
+<text class="peaksub" x="424.89" y="56" text-anchor="middle">16 failed · Oct 4</text>
+<circle class="nowring r-fail" cx="876" cy="189.4" r="5"/>
+<circle class="stylus" id="hero-stylus" cx="0" cy="0" r="4.5"/>
+<circle class="nowdot d-man" cx="876" cy="338.4" r="2.6"/>
+<circle class="nowdot d-cron" cx="876" cy="339.52" r="2.6"/>
+<circle class="nowdot d-evt" cx="876" cy="341.76" r="2.6"/>
+<text class="xtick" x="64" y="360" text-anchor="start">Sep 20</text>
+<text class="xtick" x="154.22" y="360" text-anchor="middle">Sep 23</text>
+<text class="xtick" x="244.44" y="360" text-anchor="middle">Sep 26</text>
+<text class="xtick" x="334.67" y="360" text-anchor="middle">Sep 30</text>
+<text class="xtick" x="424.89" y="360" text-anchor="middle">Oct 4</text>
+<text class="xtick" x="515.11" y="360" text-anchor="middle">Oct 7</text>
+<text class="xtick" x="605.33" y="360" text-anchor="middle">Oct 10</text>
+<text class="xtick" x="695.56" y="360" text-anchor="middle">Oct 13</text>
+<text class="xtick" x="785.78" y="360" text-anchor="middle">Oct 16</text>
+<text class="xtick" x="876" y="360" text-anchor="end">Oct 18</text>
+<g class="cross-g" id="hero-cross">
+<line class="cross" x1="0" y1="52" x2="0" y2="344"/>
+<g class="cdot-g" id="ho-comp"><circle class="cdot" r="3.6"/></g>
+<g class="cdot-g" id="ho-tot"><circle class="cdot" r="3.6"/></g>
+<g class="cdot-g" id="ho-man"><circle class="cdot" r="3.6"/></g>
+<g class="cdot-g" id="ho-cron"><circle class="cdot" r="3.6"/></g>
+<g class="cdot-g" id="ho-evt"><circle class="cdot" r="3.6"/></g>
+</g>
+<rect class="hit" x="64" y="52" width="812" height="292" id="hero-hit"/></svg>
+      <div class="tip" id="tiph"></div>
+    </div>
+    <div class="note">The stylus paints each day left-to-right, then parks at <b>now</b> and breathes. The <b>Oct 4</b> tremor (214 runs, 16 failed) and the <b>Oct 13</b> event-heavy burst read as spikes in the needle, not as a smooth hump.</div>
+  </div>
+
+  <!-- CHART 1 -->
+  <div class="card" id="card-c1">
+    <div class="chead">
+      <div><div class="t">Outcomes over time</div><div class="h">Runs per day · completed vs failed</div></div>
+      <div class="total"><div class="v">92%</div><div class="l">ok · 100 cycles</div></div>
+    </div>
+    <div class="legend">
+      <span class="i"><span class="sw" style="background:var(--ok)"></span>Completed</span>
+      <span class="i"><span class="sw" style="background:var(--fail)"></span>Failed</span>
+    </div>
+    <div class="plotwrap" id="w1"><svg viewBox="0 0 480 176" id="svg1"><line class="baseline" x1="48" y1="148" x2="466" y2="148"/>
+<text class="ytick" x="42" y="151" text-anchor="end">0</text>
+<line class="gridline" x1="48" y1="107.33" x2="466" y2="107.33"/>
+<text class="ytick" x="42" y="110.33" text-anchor="end">80</text>
+<line class="gridline" x1="48" y1="66.67" x2="466" y2="66.67"/>
+<text class="ytick" x="42" y="69.67" text-anchor="end">160</text>
+<line class="gridline" x1="48" y1="26" x2="466" y2="26"/>
+<text class="ytick" x="42" y="29" text-anchor="end">240</text>
+<g class="riser" id="c1-riser">
+<path class="area a-ok" d="M48 144.95 L94.44 143.43 L140.89 136.82 L187.33 112.42 L233.78 47.35 L280.22 141.9 L326.67 143.93 L373.11 99.2 L419.56 137.83 L466 143.43 L466 148 L419.56 148 L373.11 148 L326.67 148 L280.22 148 L233.78 148 L187.33 148 L140.89 148 L94.44 148 L48 148 Z" style="--d:0"/>
+<path class="area a-fail" d="M48 144.44 L94.44 142.92 L140.89 135.29 L187.33 108.35 L233.78 39.22 L280.22 140.88 L326.67 143.43 L373.11 94.12 L419.56 136.31 L466 142.41 L466 141.43 L419.56 135.83 L373.11 97.2 L326.67 141.93 L280.22 139.9 L233.78 45.35 L187.33 110.42 L140.89 134.82 L94.44 141.43 L48 142.95 Z" style="--d:1"/>
+<polyline class="aline l-ok" points="48,144.95 94.44,143.43 140.89,136.82 187.33,112.42 233.78,47.35 280.22,141.9 326.67,143.93 373.11,99.2 419.56,137.83 466,143.43" style="--d:0"/>
+<polyline class="aline l-fail" points="48,144.44 94.44,142.92 140.89,135.29 187.33,108.35 233.78,39.22 280.22,140.88 326.67,143.43 373.11,94.12 419.56,136.31 466,142.41" style="--d:1"/>
+</g>
+<line class="peakstem" x1="233.78" y1="39.22" x2="233.78" y2="24"/>
+<text class="peaklbl" x="233.78" y="20" text-anchor="middle">214</text>
+<text class="peaksub" x="233.78" y="31" text-anchor="middle">peak</text>
+<circle class="nowring r-fail" cx="466" cy="142.41" r="4"/>
+<circle class="nowdot d-fail" cx="466" cy="142.41" r="3"/>
+<text class="xtick" x="48" y="164" text-anchor="start">Sep 20</text>
+<text class="xtick" x="140.89" y="164" text-anchor="middle">Sep 26</text>
+<text class="xtick" x="233.78" y="164" text-anchor="middle">Oct 4</text>
+<text class="xtick" x="373.11" y="164" text-anchor="middle">Oct 13</text>
+<text class="xtick" x="466" y="164" text-anchor="end">Oct 18</text>
+<g class="cross-g" id="c1-cross"><line class="cross" x1="0" y1="26" x2="0" y2="148"/>
+<g class="cdot-g" id="c1-cdot-0"><circle class="cdot d-ok" r="3.4"/></g>
+<g class="cdot-g" id="c1-cdot-1"><circle class="cdot d-fail" r="3.4"/></g>
+</g>
+<rect class="hit" x="48" y="26" width="418" height="122" id="c1-hit"/></svg><div class="tip" id="tip1"></div></div>
+    <div class="note">Failed rides its own red band above completed with a 2px surface gap and direct labels — the <b>Oct 4</b> (16) and <b>Oct 13</b> (10) spikes stay legible instead of buried in one line.</div>
+  </div>
+
+  <!-- CHART 2 -->
+  <div class="card" id="card-c2">
+    <div class="chead">
+      <div><div class="t">Throughput by trigger</div><div class="h">Runs per day · by what started them</div></div>
+      <div class="total"><div class="v">100</div><div class="l">cycles</div></div>
+    </div>
+    <div class="legend">
+      <span class="i"><span class="sw" style="background:var(--man)"></span>Manual</span>
+      <span class="i"><span class="sw" style="background:var(--cron)"></span>Cron</span>
+      <span class="i"><span class="sw" style="background:var(--evt)"></span>Event</span>
+    </div>
+    <div class="plotwrap" id="w2"><svg viewBox="0 0 480 176" id="svg2"><line class="baseline" x1="48" y1="148" x2="466" y2="148"/>
+<text class="ytick" x="42" y="151" text-anchor="end">0</text>
+<line class="gridline" x1="48" y1="107.33" x2="466" y2="107.33"/>
+<text class="ytick" x="42" y="110.33" text-anchor="end">80</text>
+<line class="gridline" x1="48" y1="66.67" x2="466" y2="66.67"/>
+<text class="ytick" x="42" y="69.67" text-anchor="end">160</text>
+<line class="gridline" x1="48" y1="26" x2="466" y2="26"/>
+<text class="ytick" x="42" y="29" text-anchor="end">240</text>
+<g class="riser" id="c2-riser">
+<path class="area a-man" d="M48 145.97 L94.44 145.46 L140.89 142.92 L187.33 132.75 L233.78 102.25 L280.22 144.95 L326.67 145.97 L373.11 127.67 L419.56 142.92 L466 145.46 L466 148 L419.56 148 L373.11 148 L326.67 148 L280.22 148 L233.78 148 L187.33 148 L140.89 148 L94.44 148 L48 148 Z" style="--d:0"/>
+<path class="area a-cron" d="M48 144.95 L94.44 143.93 L140.89 138.34 L187.33 118.52 L233.78 61.58 L280.22 142.41 L326.67 144.44 L373.11 108.35 L419.56 138.85 L466 143.43 L466 143.96 L419.56 141.42 L373.11 126.17 L326.67 144.47 L280.22 143.45 L233.78 100.75 L187.33 131.25 L140.89 141.42 L94.44 143.96 L48 144.47 Z" style="--d:1"/>
+<path class="area a-evt" d="M48 144.44 L94.44 142.92 L140.89 135.29 L187.33 108.35 L233.78 39.22 L280.22 140.88 L326.67 143.43 L373.11 94.12 L419.56 136.31 L466 142.41 L466 141.93 L419.56 137.35 L373.11 106.85 L326.67 142.94 L280.22 140.91 L233.78 60.08 L187.33 117.02 L140.89 136.84 L94.44 142.43 L48 143.45 Z" style="--d:2"/>
+<polyline class="aline l-man" points="48,145.97 94.44,145.46 140.89,142.92 187.33,132.75 233.78,102.25 280.22,144.95 326.67,145.97 373.11,127.67 419.56,142.92 466,145.46" style="--d:0"/>
+<polyline class="aline l-cron" points="48,144.95 94.44,143.93 140.89,138.34 187.33,118.52 233.78,61.58 280.22,142.41 326.67,144.44 373.11,108.35 419.56,138.85 466,143.43" style="--d:1"/>
+<polyline class="aline l-evt" points="48,144.44 94.44,142.92 140.89,135.29 187.33,108.35 233.78,39.22 280.22,140.88 326.67,143.43 373.11,94.12 419.56,136.31 466,142.41" style="--d:2"/>
+</g>
+<line class="peakstem" x1="233.78" y1="39.22" x2="233.78" y2="24"/>
+<text class="peaklbl" x="233.78" y="20" text-anchor="middle">214</text>
+<text class="peaksub" x="233.78" y="31" text-anchor="middle">peak</text>
+<circle class="nowring r-evt" cx="466" cy="142.41" r="4"/>
+<circle class="nowdot d-evt" cx="466" cy="142.41" r="3"/>
+<text class="xtick" x="48" y="164" text-anchor="start">Sep 20</text>
+<text class="xtick" x="140.89" y="164" text-anchor="middle">Sep 26</text>
+<text class="xtick" x="233.78" y="164" text-anchor="middle">Oct 4</text>
+<text class="xtick" x="373.11" y="164" text-anchor="middle">Oct 13</text>
+<text class="xtick" x="466" y="164" text-anchor="end">Oct 18</text>
+<g class="cross-g" id="c2-cross"><line class="cross" x1="0" y1="26" x2="0" y2="148"/>
+<g class="cdot-g" id="c2-cdot-0"><circle class="cdot d-man" r="3.4"/></g>
+<g class="cdot-g" id="c2-cdot-1"><circle class="cdot d-cron" r="3.4"/></g>
+<g class="cdot-g" id="c2-cdot-2"><circle class="cdot d-evt" r="3.4"/></g>
+</g>
+<rect class="hit" x="48" y="26" width="418" height="122" id="c2-hit"/></svg><div class="tip" id="tip2"></div></div>
+    <div class="note"><b>Oct 4</b> was mostly manual + cron; the <b>Oct 13</b> run leaned event-driven — the mix the old single blue line hid entirely.</div>
+  </div>
+
+<script>
+const DATA={"dates": ["Sep 20", "Sep 23", "Sep 26", "Sep 30", "Oct 4", "Oct 7", "Oct 10", "Oct 13", "Oct 16", "Oct 18"], "c1": {"x0": 48, "x1": 466, "ytop": 26, "y0": 148, "vmax": 240, "xs": [48.0, 94.44444444444444, 140.88888888888889, 187.33333333333334, 233.77777777777777, 280.22222222222223, 326.6666666666667, 373.1111111111111, 419.55555555555554, 466.0], "series": [{"name": "Completed", "cv": "ok", "vals": [6, 9, 22, 70, 198, 12, 8, 96, 20, 9]}, {"name": "Failed", "cv": "fail", "vals": [1, 1, 3, 8, 16, 2, 1, 10, 3, 2]}]}, "c2": {"x0": 48, "x1": 466, "ytop": 26, "y0": 148, "vmax": 240, "xs": [48.0, 94.44444444444444, 140.88888888888889, 187.33333333333334, 233.77777777777777, 280.22222222222223, 326.6666666666667, 373.1111111111111, 419.55555555555554, 466.0], "series": [{"name": "Manual", "cv": "man", "vals": [4, 5, 10, 30, 90, 6, 4, 40, 10, 5]}, {"name": "Cron", "cv": "cron", "vals": [2, 3, 9, 28, 80, 5, 3, 38, 8, 4]}, {"name": "Event", "cv": "evt", "vals": [1, 2, 6, 20, 44, 3, 2, 28, 5, 2]}]}, "hero": {"xs": [64.0, 154.22222222222223, 244.44444444444446, 334.6666666666667, 424.8888888888889, 515.1111111111111, 605.3333333333334, 695.5555555555555, 785.7777777777778, 876.0], "hx0": 64, "hx1": 876, "ay_top": 52, "ay_0": 196, "vmaxA": 240, "by_top": 232, "by_0": 344, "vmaxB": 100, "completed": [6, 9, 22, 70, 198, 12, 8, 96, 20, 9], "failed": [1, 1, 3, 8, 16, 2, 1, 10, 3, 2], "manual": [4, 5, 10, 30, 90, 6, 4, 40, 10, 5], "cron": [2, 3, 9, 28, 80, 5, 3, 38, 8, 4], "event": [1, 2, 6, 20, 44, 3, 2, 28, 5, 2]}};
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function yvOf(v,ytop,y0,vmax){return y0-(v/vmax)*(y0-ytop);}
+function nearIdx(xs,px){let b=0,bd=1e9;for(let i=0;i<xs.length;i++){const d=Math.abs(xs[i]-px);if(d<bd){bd=d;b=i;}}return b;}
+
+/* ---- dashboard chart wiring (stacked) ---- */
+function wireDash(key){
+  const c=DATA[key], svg=document.getElementById('svg'+key.slice(1)),
+        wrap=svg.parentNode, tip=wrap.querySelector('.tip'),
+        cross=document.getElementById(key+'-cross'),
+        crossLine=cross.querySelector('.cross'),
+        hit=document.getElementById(key+'-hit'), card=svg.closest('.card');
+  const vb=svg.viewBox.baseVal;
+  const dots=c.series.map((s,bi)=>document.getElementById(key+'-cdot-'+bi));
+  hit.addEventListener('mousemove',e=>{
+    const r=svg.getBoundingClientRect();
+    const px=(e.clientX-r.left)/r.width*vb.width;
+    const i=nearIdx(c.xs,px), x=c.xs[i];
+    card.classList.add('hovering');
+    cross.classList.add('on');
+    cross.style.transform=`translateX(${x}px)`;
+    crossLine.setAttribute('x1',0);crossLine.setAttribute('x2',0);
+    let cum=0, rows='';
+    c.series.forEach((s,bi)=>{
+      cum+=s.vals[i];
+      const y=yvOf(cum,c.ytop,c.y0,c.vmax);
+      dots[bi].style.transform=`translateY(${y}px)`;   // x handled by cross-g
+      rows+=`<div class="r"><span class="sw" style="background:var(--${s.cv})"></span><span class="n">${s.name}</span><span class="v">${s.vals[i]}</span></div>`;
+    });
+    tip.innerHTML=`<div class="dt">${DATA.dates[i]}</div>${rows}<div class="tot"><span class="n">Total</span><span class="v">${cum}</span></div>`;
+    const topY=yvOf(cum,c.ytop,c.y0,c.vmax);
+    tip.style.left=(x/vb.width*wrap.clientWidth)+'px';
+    tip.style.top=(topY/vb.height*wrap.clientHeight)+'px';
+    tip.classList.add('on');
+  });
+  hit.addEventListener('mouseleave',()=>{
+    cross.classList.remove('on');tip.classList.remove('on');card.classList.remove('hovering');
+  });
+}
+
+/* ---- hero seismograph wiring (two lanes, one crosshair) ---- */
+function wireHero(){
+  const h=DATA.hero, svg=document.getElementById('svgh'),
+        wrap=document.getElementById('wh'), tip=document.getElementById('tiph'),
+        cross=document.getElementById('hero-cross'), crossLine=cross.querySelector('.cross'),
+        hit=document.getElementById('hero-hit'), card=document.getElementById('card-hero');
+  const vb=svg.viewBox.baseVal;
+  const yA=v=>yvOf(v,h.ay_top,h.ay_0,h.vmaxA), yB=v=>yvOf(v,h.by_top,h.by_0,h.vmaxB);
+  const map={'ho-comp':i=>yA(h.completed[i]),'ho-tot':i=>yA(h.completed[i]+h.failed[i]),
+             'ho-man':i=>yB(h.manual[i]),'ho-cron':i=>yB(h.cron[i]),'ho-evt':i=>yB(h.event[i])};
+  const dotEls=Object.fromEntries(Object.keys(map).map(k=>[k,document.getElementById(k)]));
+  hit.addEventListener('mousemove',e=>{
+    const r=svg.getBoundingClientRect();
+    const px=(e.clientX-r.left)/r.width*vb.width;
+    const i=nearIdx(h.xs,px), x=h.xs[i];
+    card.classList.add('hovering');
+    cross.classList.add('on'); cross.style.transform=`translateX(${x}px)`;
+    crossLine.setAttribute('x1',0);crossLine.setAttribute('x2',0);
+    for(const k in map){dotEls[k].style.transform=`translateY(${map[k](i)}px)`;}
+    const tot=h.completed[i]+h.failed[i];
+    tip.innerHTML=`<div class="dt">${DATA.dates[i]}</div>`
+      +`<div class="lane">Outcomes</div>`
+      +`<div class="r"><span class="sw" style="background:var(--ok)"></span><span class="n">Completed</span><span class="v">${h.completed[i]}</span></div>`
+      +`<div class="r"><span class="sw" style="background:var(--fail)"></span><span class="n">Failed</span><span class="v">${h.failed[i]}</span></div>`
+      +`<div class="lane">Throughput</div>`
+      +`<div class="r"><span class="sw" style="background:var(--man)"></span><span class="n">Manual</span><span class="v">${h.manual[i]}</span></div>`
+      +`<div class="r"><span class="sw" style="background:var(--cron)"></span><span class="n">Cron</span><span class="v">${h.cron[i]}</span></div>`
+      +`<div class="r"><span class="sw" style="background:var(--evt)"></span><span class="n">Event</span><span class="v">${h.event[i]}</span></div>`
+      +`<div class="tot"><span class="n">Total runs</span><span class="v">${tot}</span></div>`;
+    const topY=yA(tot);
+    tip.style.left=(x/vb.width*wrap.clientWidth)+'px';
+    tip.style.top=(topY/vb.height*wrap.clientHeight)+'px';
+    tip.classList.add('on');
+  });
+  hit.addEventListener('mouseleave',()=>{
+    cross.classList.remove('on');tip.classList.remove('on');card.classList.remove('hovering');
+  });
+}
+
+/* ---- reveal orchestration ---- */
+function reveal(){
+  ['card-hero','card-c1','card-c2'].forEach((id,k)=>{
+    const el=document.getElementById(id);
+    setTimeout(()=>el.classList.add('in'), reduce?0:k*160);
+  });
+  if(!reduce){
+    // stylus rides the outcomes top line, then parks at now and breathes
+    const stylus=document.getElementById('hero-stylus');
+    const path="M64 191.8 L154.22 190 L244.44 181 L334.67 149.2 L424.89 67.6 L515.11 187.6 L605.33 190.6 L695.56 132.4 L785.78 182.2 L876 189.4";
+    stylus.style.offsetPath=`path('${path}')`;
+    stylus.style.offsetRotate='0deg';
+    const anim=stylus.animate(
+      [{offsetDistance:'0%',opacity:1},{offsetDistance:'100%',opacity:1}],
+      {duration:1400,easing:'cubic-bezier(0.23,1,0.32,1)',fill:'forwards'});
+    anim.onfinish=()=>{stylus.style.offset='none';stylus.style.opacity='0';};
+  }
+}
+wireDash('c1');wireDash('c2');wireHero();
+if(document.readyState!=='loading')requestAnimationFrame(reveal);
+else addEventListener('DOMContentLoaded',()=>requestAnimationFrame(reveal));
+</script>
+</body>
+</html>

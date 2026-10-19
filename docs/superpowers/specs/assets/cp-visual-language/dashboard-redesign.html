@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard — before / after</title>
+<style>
+  :root{
+    --bg:rgb(10 10 10); --panel:rgb(20 20 22); --surface:rgb(27 27 31);
+    --surface-hover:rgb(35 35 39); --surface-active:rgb(46 46 51);
+    --border:rgb(38 38 42); --border-strong:rgb(63 63 70);
+    --ink:rgb(245 245 245); --dim:rgb(161 161 170); --mute:rgb(113 113 122);
+    --brand:rgb(124 58 237); --brand-ink:rgb(167 139 250);
+    --run:rgb(96 165 250); --ok:rgb(74 222 128); --okbg:rgb(18 40 27);
+    --fail:rgb(248 113 113); --failbg:rgb(43 22 22); --warn:rgb(251 191 36); --warnbg:rgb(48 36 12);
+    --sans:-apple-system,"system-ui",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased;padding:28px 36px 80px;max-width:1000px;margin:0 auto}
+  .num{font-variant-numeric:tabular-nums}
+
+  .banner{display:inline-flex;align-items:center;gap:8px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:4px 11px;border-radius:999px;margin-bottom:16px}
+  .banner.before{background:var(--failbg);color:var(--fail)}
+  .banner.after{background:var(--okbg);color:var(--ok)}
+  .note{color:var(--dim);font-size:12.5px;max-width:74ch;margin:-6px 0 18px}
+  .rule{height:1px;background:var(--border);margin:44px 0}
+
+  /* chips */
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;padding:3px 9px;border-radius:999px;line-height:1.4}
+  .chip .dot{width:6px;height:6px;border-radius:50%}
+  .chip.ok{background:var(--okbg);color:var(--ok)} .chip.ok .dot{background:var(--ok)}
+  .chip.run{background:rgb(96 165 250 /.14);color:var(--run)} .chip.run .dot{background:var(--run)}
+  .chip.fail{background:var(--failbg);color:var(--fail)} .chip.fail .dot{background:var(--fail)}
+  .chip.warn{background:var(--warnbg);color:var(--warn)} .chip.warn .dot{background:var(--warn)}
+  .chip.neutral{background:var(--surface);color:var(--dim)} .chip.neutral .dot{background:var(--mute)}
+
+  .btn{font:inherit;font-size:12.5px;font-weight:500;border-radius:8px;padding:6px 12px;cursor:pointer;border:1px solid transparent;display:inline-flex;align-items:center;gap:6px}
+  .btn-primary{background:var(--ink);color:var(--bg);font-weight:600}
+  .btn-secondary{background:transparent;border-color:var(--border-strong);color:var(--dim)}
+  .seg{display:inline-flex;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:2px}
+  .seg button{border:0;background:transparent;font:inherit;font-size:12px;color:var(--dim);padding:5px 11px;border-radius:7px;cursor:pointer}
+  .seg button.on{background:var(--panel);color:var(--ink);font-weight:500}
+
+  /* ============ BEFORE ============ */
+  .b-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .b-head h1{font-size:22px;font-weight:600}
+  .b-hosts{font-size:11.5px;color:var(--dim);margin-bottom:16px;display:flex;gap:4px;flex-wrap:wrap}
+  .b-hosts .h{display:inline-flex;align-items:center;gap:4px}
+  .b-hosts .h::after{content:"·";color:var(--mute);margin-left:4px}
+  .b-hosts .h:last-child::after{content:""}
+  .b-kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}
+  .b-kpi{border:1px solid var(--border);border-radius:14px;padding:14px;min-height:92px}
+  .b-kpi.sel{border-color:var(--border-strong);background:var(--surface)}
+  .b-kpi .l{font-size:11px;color:var(--dim);margin-bottom:10px}
+  .b-kpi .v{font-size:22px;font-weight:600}
+  .b-charts{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+  .b-chart{border:1px solid var(--border);border-radius:12px;padding:14px}
+  .b-chart .t{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);margin-bottom:10px}
+  .b-summary{font-size:12px;color:var(--dim);margin-top:4px}
+  .b-summary2{font-size:12px;color:var(--mute);margin-top:6px}
+
+  /* ============ AFTER ============ */
+  .a-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:6px}
+  .a-head h1{font-size:20px;font-weight:600;letter-spacing:-.01em}
+  .a-head .sub{font-size:12.5px;color:var(--mute);margin-top:2px}
+  .a-head .spacer{flex:1}
+  .a-section{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);font-weight:600;margin:24px 0 10px}
+
+  /* needs-you hero list */
+  .needs{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--panel)}
+  .needs .r{display:flex;align-items:center;gap:12px;padding:12px 16px;border-top:1px solid var(--border)}
+  .needs .r:first-child{border-top:0}
+  .needs .r:hover{background:var(--surface)}
+  .needs .code{font-family:var(--mono);font-size:12.5px}
+  .needs .meta{color:var(--mute);font-size:11.5px}
+  .needs .spacer{flex:1}
+  .needs .acts{display:flex;gap:7px}
+  .needs .mini{font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:7px;border:1px solid var(--border-strong);color:var(--dim);background:transparent;cursor:pointer}
+  .needs .mini.go{background:var(--ink);color:var(--bg);border-color:transparent}
+
+  /* kpi strip */
+  .kpis{display:grid;grid-template-columns:repeat(5,1fr);border-radius:12px;overflow:hidden;border:1px solid var(--border);background:var(--panel)}
+  .kpi{padding:15px 18px;border-right:1px solid var(--border)}
+  .kpi:last-child{border-right:0}
+  .kpi .l{font-size:11.5px;color:var(--dim);margin-bottom:7px}
+  .kpi .v{font-size:25px;font-weight:600;letter-spacing:-.02em}
+  .kpi .v.att{color:var(--fail)}
+  .kpi .m{font-size:11px;color:var(--mute);margin-top:4px}
+  .kpi .m .up{color:var(--ok)} .kpi .m .down{color:var(--fail)}
+
+  /* fleet host cards */
+  .fleet{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .host{border:1px solid var(--border);border-radius:10px;padding:12px 14px;background:var(--panel);display:flex;align-items:center;gap:10px}
+  .host .nm{font-family:var(--mono);font-size:12.5px;font-weight:600}
+  .host .st{font-size:11px;color:var(--mute);margin-top:1px}
+  .host .spacer{flex:1}
+
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .card{border:1px solid var(--border);border-radius:12px;padding:15px 18px;background:var(--panel)}
+  .card .ct{font-size:12px;color:var(--dim);font-weight:500;margin-bottom:12px}
+  svg .grid{stroke:var(--border);stroke-width:1}
+  svg .line{fill:none;stroke-width:2}
+  svg .axis{fill:var(--mute);font-size:9px;font-family:var(--mono)}
+
+  .strip{display:flex;flex-wrap:wrap;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:var(--panel);margin-top:14px}
+  .strip .kv{padding:10px 16px;border-right:1px solid var(--border);flex:1;min-width:110px}
+  .strip .kv:last-child{border-right:0}
+  .strip .kv .k{font-size:11px;color:var(--mute);margin-bottom:3px}
+  .strip .kv .v{font-size:15px;font-weight:600}
+  .strip .kv .v small{font-size:11px;color:var(--mute);font-weight:400}
+</style>
+</head>
+<body>
+
+  <!-- ================= BEFORE ================= -->
+  <span class="banner before">Before — today</span>
+  <p class="note">Faithful to the current Dashboard: a title with a range + "Spend →", a dotted host line, six KPI tiles (one selected, one with a sparkline), two gradient area charts, and two run-on summary lines.</p>
+
+  <div class="b-head">
+    <h1>Dashboard</h1>
+    <div style="display:flex;gap:8px;align-items:center"><div class="seg"><button>7d</button><button class="on">30d</button><button>all</button></div><span style="color:var(--dim);font-size:12px">Spend →</span></div>
+  </div>
+  <div class="b-hosts">
+    <span class="h"><span style="color:var(--ok)">●</span> local · 8s</span>
+    <span class="h"><span style="color:var(--ok)">●</span> mini · 8s</span>
+    <span class="h"><span style="color:var(--fail)">●</span> kali6 · offline</span>
+    <span class="h"><span style="color:var(--ok)">●</span> kali-b · 8s</span>
+    <span class="h"><span style="color:var(--run)">●</span> mini-8-66 · live</span>
+    <span class="h"><span style="color:var(--fail)">●</span> sutajio · offline</span>
+  </div>
+  <div class="b-kpis">
+    <div class="b-kpi"><div class="l">Awaiting you</div><div class="v">0</div></div>
+    <div class="b-kpi"><div class="l">Paused</div><div class="v">0</div></div>
+    <div class="b-kpi sel"><div class="l">Failed</div><div class="v">27</div><svg width="60" height="18" style="margin-top:4px"><polyline fill="none" stroke="rgb(248 113 113)" stroke-width="1.5" points="0,14 10,12 20,6 30,13 40,4 50,11 60,9"/></svg></div>
+    <div class="b-kpi"><div class="l">Success rate</div><div class="v">92%</div></div>
+    <div class="b-kpi"><div class="l">Active now</div><div class="v">0</div></div>
+    <div class="b-kpi"><div class="l">Open findings (partial)</div><div class="v">518+</div></div>
+  </div>
+  <div class="b-charts">
+    <div class="b-chart"><div class="t">Outcomes over time</div>
+      <svg viewBox="0 0 380 110" width="100%" height="90">
+        <defs><linearGradient id="g1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgb(74 222 128)" stop-opacity=".5"/><stop offset="1" stop-color="rgb(74 222 128)" stop-opacity="0"/></linearGradient></defs>
+        <path d="M10,95 L60,92 110,70 160,20 210,100 260,96 310,45 360,98 L360,105 L10,105 Z" fill="url(#g1)" stroke="rgb(74 222 128)" stroke-width="1.5"/>
+      </svg>
+    </div>
+    <div class="b-chart"><div class="t">Throughput by trigger</div>
+      <svg viewBox="0 0 380 110" width="100%" height="90">
+        <defs><linearGradient id="g2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgb(96 165 250)" stop-opacity=".5"/><stop offset="1" stop-color="rgb(96 165 250)" stop-opacity="0"/></linearGradient></defs>
+        <path d="M10,98 L60,95 110,92 160,25 210,100 260,98 310,60 360,99 L360,105 L10,105 Z" fill="url(#g2)" stroke="rgb(96 165 250)" stroke-width="1.5"/>
+      </svg>
+    </div>
+  </div>
+  <div class="b-summary num">100 cycles · — clean · — with failures (partial)</div>
+  <div class="b-summary2 num">620 repos · 2 providers · 0 autoflows (7 off) · 3 workers · 0 claimed · 0 pending (3109+ open) (partial)</div>
+
+  <div class="rule"></div>
+
+  <!-- ================= AFTER ================= -->
+  <span class="banner after">After — the common language</span>
+  <p class="note">Same data, reorganised around the dashboard's real job: <b style="color:var(--ink)">triage</b>. The biggest block answers "what needs me?"; fleet health, trends, and inventory follow. Type-first KPIs, flat charts, host cards, and a clean inventory strip — the shared language from the proposal.</p>
+
+  <div class="a-head">
+    <div>
+      <h1>Overview</h1>
+      <div class="sub">All customers · updated 8s ago</div>
+    </div>
+    <div class="spacer"></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <div class="seg"><button>7d</button><button class="on">30d</button><button>All</button></div>
+      <button class="btn btn-secondary">Usage →</button>
+    </div>
+  </div>
+
+  <div class="a-section">Needs you · 3</div>
+  <div class="needs">
+    <div class="r"><span class="chip warn"><span class="dot"></span>gate</span><span class="code">cobalt-harbor › heron#4</span><span class="meta">network-assessment · waiting 2h 14m</span><span class="spacer"></span><div class="acts"><button class="mini">Reject</button><button class="mini go">Approve</button></div></div>
+    <div class="r"><span class="chip fail"><span class="dot"></span>failed</span><span class="code">amber-forge</span><span class="meta">recon-sweep · provider error · 6m ago</span><span class="spacer"></span><div class="acts"><button class="mini">Transcript</button><button class="mini go">Resume</button></div></div>
+    <div class="r"><span class="chip fail"><span class="dot"></span>failed</span><span class="code">slate-vigil</span><span class="meta">service-analyst · exit 2 · 22m ago</span><span class="spacer"></span><div class="acts"><button class="mini">Transcript</button><button class="mini go">Resume</button></div></div>
+  </div>
+
+  <div class="a-section">Last 30 days</div>
+  <div class="kpis">
+    <div class="kpi"><div class="l">Failed</div><div class="v att num">27</div><div class="m"><span class="down">+4</span> vs prior 30d</div></div>
+    <div class="kpi"><div class="l">Success rate</div><div class="v num">92%</div><div class="m"><span class="up">+1.5pt</span></div></div>
+    <div class="kpi"><div class="l">Cycles</div><div class="v num">100</div><div class="m">partial window</div></div>
+    <div class="kpi"><div class="l">Active now</div><div class="v num">0</div><div class="m">3 workers idle</div></div>
+    <div class="kpi"><div class="l">Open findings</div><div class="v num">518</div><div class="m">partial · 9 hosts</div></div>
+  </div>
+
+  <div class="a-section">Fleet</div>
+  <div class="fleet">
+    <div class="host"><span class="chip run"><span class="dot"></span></span><div><div class="nm">mini-8-66</div><div class="st">live · 1 run</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">8s</span></div>
+    <div class="host"><span class="chip ok"><span class="dot"></span></span><div><div class="nm">local</div><div class="st">idle</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">8s</span></div>
+    <div class="host"><span class="chip ok"><span class="dot"></span></span><div><div class="nm">mini</div><div class="st">idle</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">8s</span></div>
+    <div class="host"><span class="chip ok"><span class="dot"></span></span><div><div class="nm">kali-b</div><div class="st">idle</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">8s</span></div>
+    <div class="host"><span class="chip fail"><span class="dot"></span></span><div><div class="nm">kali6</div><div class="st">offline</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">6m</span></div>
+    <div class="host"><span class="chip fail"><span class="dot"></span></span><div><div class="nm">sutajio</div><div class="st">offline</div></div><span class="spacer"></span><span class="meta" style="color:var(--mute);font-size:11px">1h</span></div>
+  </div>
+
+  <div class="a-section">Trends</div>
+  <div class="two">
+    <div class="card"><div class="ct">Outcomes over time</div>
+      <svg viewBox="0 0 420 140" width="100%" height="130">
+        <line class="grid" x1="30" y1="18" x2="420" y2="18"/><line class="grid" x1="30" y1="70" x2="420" y2="70"/><line class="grid" x1="30" y1="122" x2="420" y2="122"/>
+        <text class="axis" x="0" y="22">220</text><text class="axis" x="0" y="74">110</text><text class="axis" x="0" y="126">0</text>
+        <polyline class="line" stroke="rgb(74 222 128)" points="36,120 90,117 144,100 198,40 252,118 306,115 360,55 414,119"/>
+        <text class="axis" x="36" y="137">Sep 20</text><text class="axis" x="320" y="137">Oct 12</text>
+      </svg>
+    </div>
+    <div class="card"><div class="ct">Throughput by trigger</div>
+      <svg viewBox="0 0 420 140" width="100%" height="130">
+        <line class="grid" x1="30" y1="18" x2="420" y2="18"/><line class="grid" x1="30" y1="70" x2="420" y2="70"/><line class="grid" x1="30" y1="122" x2="420" y2="122"/>
+        <text class="axis" x="0" y="22">220</text><text class="axis" x="0" y="74">110</text><text class="axis" x="0" y="126">0</text>
+        <polyline class="line" stroke="rgb(96 165 250)" points="36,122 90,119 144,116 198,30 252,120 306,116 360,74 414,121"/>
+        <text class="axis" x="36" y="137">Sep 20</text><text class="axis" x="320" y="137">Oct 12</text>
+      </svg>
+    </div>
+  </div>
+
+  <div class="a-section">Inventory</div>
+  <div class="strip">
+    <div class="kv"><div class="k">Repos</div><div class="v num">620</div></div>
+    <div class="kv"><div class="k">Providers</div><div class="v num">2</div></div>
+    <div class="kv"><div class="k">Autoflows</div><div class="v num">0 <small>· 7 off</small></div></div>
+    <div class="kv"><div class="k">Workers</div><div class="v num">3</div></div>
+    <div class="kv"><div class="k">Claimed</div><div class="v num">0</div></div>
+    <div class="kv"><div class="k">Pending</div><div class="v num">0 <small>· 3,109+ open</small></div></div>
+  </div>
+
+</body>
+</html>
