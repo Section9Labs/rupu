@@ -223,6 +223,21 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
         "/api/fs/browse",
         "server-side filesystem browser for the web UI",
     ),
+    (
+        "GET",
+        "/api/runs/:id/messages/stream",
+        "SSE stream; wait replaces it",
+    ),
+    (
+        "GET",
+        "/api/sessions/:id/messages/stream",
+        "SSE stream; wait replaces it",
+    ),
+    (
+        "GET",
+        "/api/agentiflows/:id/messages/stream",
+        "SSE stream; wait replaces it",
+    ),
     ("POST", "/mcp", "the MCP endpoint itself"),
 ];
 
@@ -232,7 +247,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/agentiflows/:id"),
     ("GET", "/api/agentiflows/:id/children"),
     ("GET", "/api/agentiflows/:id/events"),
-    ("GET", "/api/agentiflows/:id/messages/stream"),
     ("GET", "/api/agentiflows/:id/netflow"),
     ("POST", "/api/agentiflows/:id/steer"),
     ("GET", "/api/agentiflows/:id/units/:unit_id/output"),
@@ -317,7 +331,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/runs/:id/autoflow"),
     ("GET", "/api/runs/:id/children"),
     ("GET", "/api/runs/:id/graph"),
-    ("GET", "/api/runs/:id/messages/stream"),
     ("GET", "/api/runs/:id/netflow"),
     ("POST", "/api/runs/:id/pause"),
     ("POST", "/api/runs/:id/restore"),
@@ -335,7 +348,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("DELETE", "/api/sessions/:id"),
     ("GET", "/api/sessions/:id"),
     ("POST", "/api/sessions/:id/archive"),
-    ("GET", "/api/sessions/:id/messages/stream"),
     ("POST", "/api/sessions/:id/restore"),
     ("GET", "/api/sessions/:id/runs"),
     ("GET", "/api/sessions/:id/usage-timeline"),

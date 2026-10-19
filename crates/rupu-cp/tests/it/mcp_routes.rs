@@ -154,7 +154,7 @@ fn every_route_is_a_tool_or_listed() {
         found.insert(("GET".into(), format!("{base}/stream")));
     }
     println!("scanned {} method+path pairs", found.len());
-    assert!(found.len() >= 150, "scanner found only {}", found.len());
+    assert!(found.len() >= 155, "scanner found only {}", found.len());
 
     let mut tools = BTreeSet::new();
     for op in ops() {
