@@ -121,13 +121,29 @@ fn grandchild_pid(dir: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
+/// Whether `pid` is alive. A zombie is dead: under a PID 1 that never
+/// reaps (the musl CI container, where it is `cargo`) a killed orphan stays a
+/// zombie, and `kill(pid, 0)` still succeeds on it.
+#[cfg(target_os = "linux")]
+fn is_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state is the first field after the parenthesised command name.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next());
+    !matches!(state, Some("Z" | "X"))
+}
+
+#[cfg(not(target_os = "linux"))]
 fn is_running(pid: u32) -> bool {
     let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
     rustix::process::test_kill_process(pid).is_ok()
 }
 
-/// Wait (at most 5 s) for `pid` to be gone; a killed orphan is reaped by
-/// init shortly after it dies.
+/// Wait (at most 5 s) for `pid` to be gone: dead, or a zombie no one has
+/// reaped yet.
 async fn assert_gone(pid: u32) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while is_running(pid) {
