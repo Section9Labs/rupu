@@ -10,13 +10,31 @@ use tower::ServiceExt as _;
 /// Largest API response a tool call reads.
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// An op with its schemas lifted once.
+struct Prepared {
+    op: &'static OpSpec,
+    schema: Value,
+    query_keys: Vec<String>,
+    has_body: bool,
+}
+
 pub struct OperatorSource {
     inner: axum::Router,
+    prepared: Vec<Prepared>,
 }
 
 impl OperatorSource {
     pub fn new(inner: axum::Router) -> Self {
-        Self { inner }
+        let prepared = ops()
+            .iter()
+            .map(|op| Prepared {
+                op,
+                schema: input_schema(op),
+                query_keys: lift((op.query)()).0.keys().cloned().collect(),
+                has_body: (op.body)().is_some(),
+            })
+            .collect();
+        Self { inner, prepared }
     }
 }
 
@@ -105,7 +123,7 @@ fn input_schema(op: &OpSpec) -> Value {
             required.push(r);
         }
     }
-    json!({"type": "object", "properties": props, "required": required})
+    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 
 /// Percent-encode one path segment (everything but unreserved bytes).
@@ -133,34 +151,43 @@ fn scalar(v: &Value) -> Option<String> {
 #[async_trait]
 impl ToolSource for OperatorSource {
     fn tools(&self) -> Vec<ToolDef> {
-        ops()
+        self.prepared
             .iter()
-            .map(|op| ToolDef {
-                name: op.name.to_string(),
-                description: op.description.to_string(),
-                input_schema: input_schema(op),
-                hints: op.hints,
+            .map(|p| ToolDef {
+                name: p.op.name.to_string(),
+                description: p.op.description.to_string(),
+                input_schema: p.schema.clone(),
+                hints: p.op.hints,
             })
             .collect()
     }
 
     async fn call(&self, name: &str, args: Value, _cx: &CallCx) -> Option<ToolResult> {
-        let op = ops().iter().find(|o| o.name == name)?;
-        Some(self.invoke(op, args).await)
+        let p = self.prepared.iter().find(|p| p.op.name == name)?;
+        Some(self.invoke(p, args).await)
     }
 }
 
 impl OperatorSource {
-    async fn invoke(&self, op: &OpSpec, args: Value) -> ToolResult {
+    async fn invoke(&self, p: &Prepared, args: Value) -> ToolResult {
         let mut args = match args {
             Value::Object(o) => o,
             Value::Null => Map::new(),
             _ => return ToolResult::Error("arguments must be an object".into()),
         };
-        let schema = input_schema(op);
-        if let Some(req) = schema["required"].as_array() {
+        let op = p.op;
+        // Agents send `null` for optional fields: treat it as absent.
+        args.retain(|_, v| !v.is_null());
+        let props = p.schema["properties"].as_object();
+        if let Some(key) = args
+            .keys()
+            .find(|k| !props.is_some_and(|m| m.contains_key(k.as_str())))
+        {
+            return ToolResult::Error(format!("unknown argument `{key}`"));
+        }
+        if let Some(req) = p.schema["required"].as_array() {
             for r in req.iter().filter_map(Value::as_str) {
-                if args.get(r).is_none_or(Value::is_null) {
+                if args.get(r).is_none_or(|v| v.as_str() == Some("")) {
                     return ToolResult::Error(format!("missing required argument `{r}`"));
                 }
             }
@@ -187,13 +214,19 @@ impl OperatorSource {
         }
 
         // Query: the query schema's properties, taken out of the arguments.
-        let (qprops, _) = lift((op.query)());
         let query = {
             let mut ser = url::form_urlencoded::Serializer::new(String::new());
-            for key in qprops.keys() {
+            for key in &p.query_keys {
                 if let Some(v) = args.remove(key) {
-                    if let Some(s) = scalar(&v) {
-                        ser.append_pair(key, &s);
+                    match scalar(&v) {
+                        Some(s) => {
+                            ser.append_pair(key, &s);
+                        }
+                        None => {
+                            return ToolResult::Error(format!(
+                                "argument `{key}` must be a string, number or boolean"
+                            ))
+                        }
                     }
                 }
             }
@@ -206,7 +239,7 @@ impl OperatorSource {
         };
 
         // Body: the rest, only for a route that has one.
-        let body = if (op.body)().is_some() {
+        let body = if p.has_body {
             axum::body::Body::from(Value::Object(args).to_string())
         } else {
             axum::body::Body::empty()
@@ -244,6 +277,36 @@ impl OperatorSource {
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(v) => ToolResult::Json(v),
             Err(_) => ToolResult::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_encoding_leaves_no_reserved_byte_raw() {
+        let e = encode_segment("a/b?c#d%e");
+        assert_eq!(e, "a%2Fb%3Fc%23d%25e");
+        assert!(!e.contains(['/', '?', '#']) && e.matches('%').count() == 4);
+    }
+
+    #[test]
+    fn no_op_has_overlapping_property_names() {
+        for op in ops() {
+            let path: Vec<String> = path_params(op.path).iter().map(|s| s.to_string()).collect();
+            let q: Vec<String> = lift((op.query)()).0.keys().cloned().collect();
+            let b: Vec<String> = lift((op.body)()).0.keys().cloned().collect();
+            for (an, a, bn, bb) in [
+                ("path", &path, "query", &q),
+                ("path", &path, "body", &b),
+                ("query", &q, "body", &b),
+            ] {
+                for k in a {
+                    assert!(!bb.contains(k), "{}: `{k}` in {an} and {bn}", op.name);
+                }
+            }
         }
     }
 }

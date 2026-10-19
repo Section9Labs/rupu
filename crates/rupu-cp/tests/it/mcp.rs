@@ -401,8 +401,9 @@ const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
 const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
 
 /// A writable CP with one run and one live session, serving `/mcp`.
-async fn spawn_operator() -> std::net::SocketAddr {
-    let dir = tempfile::tempdir().unwrap().keep();
+async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
     let store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
     store
         .create(
@@ -436,7 +437,7 @@ async fn spawn_operator() -> std::net::SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    addr
+    (addr, tmp)
 }
 
 async fn rpc(addr: std::net::SocketAddr, method: &str, params: Value) -> Value {
@@ -480,7 +481,7 @@ const OPERATOR_TOOLS: [&str; 13] = [
 
 #[tokio::test]
 async fn tools_list_has_the_13_operator_tools_with_schemas() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -500,7 +501,7 @@ async fn tools_list_has_the_13_operator_tools_with_schemas() {
 
 #[tokio::test]
 async fn runs_get_returns_the_run_detail_as_structured_content() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let r = call_tool(addr, "runs.get", json!({"id": OP_RUN})).await;
     assert_ne!(r["isError"], json!(true), "{r}");
     assert_eq!(r["structuredContent"]["run"]["id"], OP_RUN, "{r}");
@@ -508,7 +509,7 @@ async fn runs_get_returns_the_run_detail_as_structured_content() {
 
 #[tokio::test]
 async fn a_missing_required_argument_names_it() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let r = call_tool(addr, "runs.get", json!({})).await;
     assert_eq!(r["isError"], json!(true), "{r}");
     assert!(text_of(&r).contains("`id`"), "{r}");
@@ -516,7 +517,7 @@ async fn a_missing_required_argument_names_it() {
 
 #[tokio::test]
 async fn a_traversal_id_never_reaches_another_route() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let r = call_tool(addr, "runs.get", json!({"id": "../../config"})).await;
     assert_eq!(r["isError"], json!(true), "{r}");
     let t = text_of(&r);
@@ -526,7 +527,7 @@ async fn a_traversal_id_never_reaches_another_route() {
 
 #[tokio::test]
 async fn an_http_error_keeps_its_status_and_body() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let r = call_tool(addr, "runs.get", json!({"id": "run_nope"})).await;
     assert_eq!(r["isError"], json!(true), "{r}");
     assert!(text_of(&r).starts_with("HTTP 404"), "{r}");
@@ -534,7 +535,7 @@ async fn an_http_error_keeps_its_status_and_body() {
 
 #[tokio::test]
 async fn messages_send_picks_the_route_from_the_id_prefix() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let r = call_tool(
         addr,
         "messages.send",
@@ -553,7 +554,7 @@ async fn messages_send_picks_the_route_from_the_id_prefix() {
 
 #[tokio::test]
 async fn reject_and_cancel_are_marked_destructive() {
-    let addr = spawn_operator().await;
+    let (addr, _tmp) = spawn_operator().await;
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     for name in ["runs.reject", "runs.cancel"] {
@@ -562,4 +563,54 @@ async fn reject_and_cancel_are_marked_destructive() {
     }
     let get = tools.iter().find(|t| t["name"] == "runs.get").unwrap();
     assert_eq!(get["annotations"]["readOnlyHint"], json!(true), "{get}");
+}
+
+#[tokio::test]
+async fn an_unknown_argument_is_refused_naming_it() {
+    let (addr, _tmp) = spawn_operator().await;
+    let r = call_tool(
+        addr,
+        "runs.approve",
+        json!({"id": OP_RUN, "permission_mode": "readonly"}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(
+        text_of(&r).contains("unknown argument `permission_mode`"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_scalar_query_value_is_refused() {
+    let (addr, _tmp) = spawn_operator().await;
+    let r = call_tool(
+        addr,
+        "messages.list",
+        json!({"id": OP_SESSION, "kind": ["direct"]}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(
+        text_of(&r).contains("argument `kind` must be a string, number or boolean"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn null_arguments_are_absent_and_an_empty_id_is_missing() {
+    let (addr, _tmp) = spawn_operator().await;
+    let r = call_tool(
+        addr,
+        "messages.send",
+        json!({"id": OP_SESSION, "body": "hi", "to": null}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let r = call_tool(addr, "runs.get", json!({"id": ""})).await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(
+        text_of(&r).contains("missing required argument `id`"),
+        "{r}"
+    );
 }
