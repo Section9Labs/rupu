@@ -81,7 +81,7 @@ pub fn routes() -> Router<AppState> {
     router
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ListQuery {
     host: Option<String>,
     after: Option<String>,
@@ -90,13 +90,13 @@ pub(crate) struct ListQuery {
     kind: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct HostQuery {
     host: Option<String>,
 }
 
 /// The body of `POST …/messages`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PostBody {
     /// The recipient; the root's default (an agentiflow's lead, everyone
     /// elsewhere) when absent.

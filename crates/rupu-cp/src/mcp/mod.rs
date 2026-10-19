@@ -2,6 +2,8 @@
 //! tool sources [`build_server`] assembles.
 
 pub mod endpoint;
+pub mod operator_source;
+pub mod ops;
 
 use crate::state::AppState;
 use rupu_mcp::{McpServer, ServeError, ToolFilter, ToolSource};
@@ -19,10 +21,11 @@ pub struct McpOpts {
 /// The operator source + the wait source + `opts.catalog`, filtered by
 /// `opts.tools`.
 ///
-/// The operator source (Task 5) and the wait source (Task 8) join `sources`
-/// here; until then only the catalog is served.
-pub fn build_server(_state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>, ServeError> {
-    let mut sources: Vec<Arc<dyn ToolSource>> = Vec::new();
+/// The wait source (Task 8) joins `sources` here.
+pub fn build_server(state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>, ServeError> {
+    let mut sources: Vec<Arc<dyn ToolSource>> = vec![Arc::new(
+        operator_source::OperatorSource::new(inner_api(state)),
+    )];
     if let Some(catalog) = &opts.catalog {
         sources.push(Arc::clone(catalog));
     }
@@ -32,7 +35,6 @@ pub fn build_server(_state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>,
 
 /// `api_routes().with_state(state)` with the unsafe-segment guard applied
 /// (no token layer): what in-process calls go through.
-#[allow(dead_code)] // the operator source calls through it (Task 5)
 pub(crate) fn inner_api(state: &AppState) -> axum::Router {
     crate::server::api_routes()
         .with_state(state.clone())

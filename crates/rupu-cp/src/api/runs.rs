@@ -161,8 +161,8 @@ pub(crate) async fn blocking<T: Send + 'static>(
 /// today for a record with at most one parked gate, `ApprovalError::
 /// AmbiguousGate` for a genuine multi-gate record. Ignored by `cancel`/
 /// `pause` (neither operates on a specific gate).
-#[derive(serde::Deserialize, Default)]
-struct RunControlQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct RunControlQuery {
     #[serde(default)]
     host: Option<String>,
     #[serde(default)]
@@ -172,8 +172,8 @@ struct RunControlQuery {
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
 /// permission mode (`ask` / `bypass` / `readonly`) the resumed run runs
 /// under; an absent/empty body leaves it `None` (worker default).
-#[derive(serde::Deserialize, Default)]
-struct ApproveBody {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ApproveBody {
     #[serde(default)]
     mode: Option<String>,
 }
@@ -241,8 +241,8 @@ async fn approve_run(
     Ok(resp)
 }
 
-#[derive(serde::Deserialize)]
-struct RejectBody {
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct RejectBody {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -330,8 +330,8 @@ where
 }
 
 /// Optional body for `POST /api/runs/:id/cancel`.
-#[derive(serde::Deserialize, Default)]
-struct CancelBody {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct CancelBody {
     #[serde(default)]
     reason: Option<String>,
 }
@@ -1773,8 +1773,8 @@ async fn list_runs(
     Ok((listed.headers, Json(listed.rows)))
 }
 
-#[derive(serde::Deserialize, Default)]
-struct WorkflowRunsQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct WorkflowRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct
     // ("invalid type: string, expected usize"), so offset/limit are inlined.
@@ -1945,7 +1945,7 @@ async fn list_workflow_runs(
 /// Optional `?host=<id>` query param for `GET /api/runs/:id`,
 /// `GET /api/runs/:id/log`, `GET /api/runs/:id/graph`, and
 /// `GET /api/runs/:id/usage-timeline`.
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct RunDetailQuery {
     /// When present and not `"local"`, proxy the request to the named host.
     pub(crate) host: Option<String>,

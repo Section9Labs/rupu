@@ -382,3 +382,184 @@ async fn serve_on_refuses_nothing_to_serve() {
         "nothing to serve: --no-web and --no-mcp together"
     );
 }
+
+// ---- operator tools (in-process calls over the CP API) ----
+
+struct NoopLauncher;
+
+#[async_trait]
+impl rupu_cp::launcher::RunLauncher for NoopLauncher {
+    async fn launch(
+        &self,
+        _req: rupu_cp::launcher::LaunchRequest,
+    ) -> Result<String, rupu_cp::launcher::LaunchError> {
+        Ok("run_unused".into())
+    }
+}
+
+const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+
+/// A writable CP with one run and one live session, serving `/mcp`.
+async fn spawn_operator() -> std::net::SocketAddr {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
+    store
+        .create(
+            super::sse::seed_run(OP_RUN, rupu_orchestrator::runs::RunStatus::Completed),
+            "name: test\nsteps: []\n",
+        )
+        .unwrap();
+    let session = dir.join("sessions").join(OP_SESSION);
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("session.json"), r#"{"status":"active"}"#).unwrap();
+    let state = rupu_cp::state::AppState::new(dir.clone(), rupu_config::PricingConfig::default())
+        .with_launcher(Some(Arc::new(NoopLauncher)));
+    let server = rupu_cp::mcp::build_server(
+        &state,
+        &McpOpts {
+            catalog: None,
+            tools: vec![],
+        },
+    )
+    .unwrap();
+    let app = router_with(
+        state,
+        None,
+        RouterOpts {
+            web: true,
+            mcp: Some(server),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+async fn rpc(addr: std::net::SocketAddr, method: &str, params: Value) -> Value {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn call_tool(addr: std::net::SocketAddr, name: &str, args: Value) -> Value {
+    rpc(addr, "tools/call", json!({"name": name, "arguments": args})).await["result"].clone()
+}
+
+fn text_of(result: &Value) -> String {
+    result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+const OPERATOR_TOOLS: [&str; 13] = [
+    "runs.list",
+    "runs.get",
+    "runs.approve",
+    "runs.reject",
+    "runs.cancel",
+    "workflows.list",
+    "workflows.run",
+    "agents.list",
+    "agents.run",
+    "sessions.start",
+    "sessions.send",
+    "messages.list",
+    "messages.send",
+];
+
+#[tokio::test]
+async fn tools_list_has_the_13_operator_tools_with_schemas() {
+    let addr = spawn_operator().await;
+    let v = rpc(addr, "tools/list", json!({})).await;
+    let tools = v["result"]["tools"].as_array().unwrap();
+    let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    names.sort();
+    let mut want = OPERATOR_TOOLS.to_vec();
+    want.sort();
+    assert_eq!(names, want);
+    let approve = tools.iter().find(|t| t["name"] == "runs.approve").unwrap();
+    let required = approve["inputSchema"]["required"].as_array().unwrap();
+    assert!(required.contains(&json!("id")), "{approve}");
+    let props = approve["inputSchema"]["properties"].as_object().unwrap();
+    assert!(
+        props.contains_key("gate") && props.contains_key("mode"),
+        "{approve}"
+    );
+}
+
+#[tokio::test]
+async fn runs_get_returns_the_run_detail_as_structured_content() {
+    let addr = spawn_operator().await;
+    let r = call_tool(addr, "runs.get", json!({"id": OP_RUN})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["run"]["id"], OP_RUN, "{r}");
+}
+
+#[tokio::test]
+async fn a_missing_required_argument_names_it() {
+    let addr = spawn_operator().await;
+    let r = call_tool(addr, "runs.get", json!({})).await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains("`id`"), "{r}");
+}
+
+#[tokio::test]
+async fn a_traversal_id_never_reaches_another_route() {
+    let addr = spawn_operator().await;
+    let r = call_tool(addr, "runs.get", json!({"id": "../../config"})).await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let t = text_of(&r);
+    assert!(t.contains("HTTP 4"), "{t}");
+    assert!(!t.contains("\"providers\""), "{t}");
+}
+
+#[tokio::test]
+async fn an_http_error_keeps_its_status_and_body() {
+    let addr = spawn_operator().await;
+    let r = call_tool(addr, "runs.get", json!({"id": "run_nope"})).await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).starts_with("HTTP 404"), "{r}");
+}
+
+#[tokio::test]
+async fn messages_send_picks_the_route_from_the_id_prefix() {
+    let addr = spawn_operator().await;
+    let r = call_tool(
+        addr,
+        "messages.send",
+        json!({"id": OP_SESSION, "body": "hi"}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert!(
+        r["structuredContent"]["id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("msg_"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn reject_and_cancel_are_marked_destructive() {
+    let addr = spawn_operator().await;
+    let v = rpc(addr, "tools/list", json!({})).await;
+    let tools = v["result"]["tools"].as_array().unwrap();
+    for name in ["runs.reject", "runs.cancel"] {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap();
+        assert_eq!(t["annotations"]["destructiveHint"], json!(true), "{t}");
+    }
+    let get = tools.iter().find(|t| t["name"] == "runs.get").unwrap();
+    assert_eq!(get["annotations"]["readOnlyHint"], json!(true), "{get}");
+}

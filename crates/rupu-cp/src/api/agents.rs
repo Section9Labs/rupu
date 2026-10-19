@@ -951,8 +951,8 @@ async fn delete_agent(
 
 /// Request body for `POST /api/agents/:name/run`. All fields optional; a
 /// bodyless POST launches the agent with no prompt in its default mode.
-#[derive(Deserialize, Default)]
-struct AgentRunBody {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct AgentRunBody {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -1002,6 +1002,7 @@ struct AgentRunBody {
     /// The skills a coordinator shipped for a placed unit (`rupu run
     /// --skill-bundle`). Validated; a malformed manifest is a 400.
     #[serde(default)]
+    #[schemars(with = "Option<serde_json::Value>")]
     skill_bundle: Option<SkillBundleManifest>,
     /// Optional placed unit's workflow `messaging:` switch: `"off"` (the
     /// run and everything it launches gets no messaging tools, `rupu run
@@ -1011,6 +1012,7 @@ struct AgentRunBody {
     /// on the remote-proxy path a peer that does not advertise
     /// `agent.no_messaging` / `agent.messaging_tools` refuses the launch.
     #[serde(default)]
+    #[schemars(with = "serde_json::Value")]
     messaging: LaunchMessaging,
     /// Optional run id to execute under (`run_<…>`), minted by a
     /// coordinator that needs to know it before the run starts — honoured
@@ -1329,8 +1331,8 @@ async fn run_agent(
 
 /// Request body for `POST /api/agents/:name/session`. All fields optional; a
 /// bodyless POST starts the agent session with no prompt in its default mode.
-#[derive(Deserialize, Default)]
-struct SessionStartBody {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SessionStartBody {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
