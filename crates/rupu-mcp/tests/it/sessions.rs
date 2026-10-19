@@ -71,3 +71,100 @@ async fn json_results_carry_structured_content() {
         json!({"x": 1})
     );
 }
+
+fn call(id: u64, name: &str, args: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args } })
+}
+
+fn cancel(id: u64) -> Value {
+    json!({ "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": { "requestId": id } })
+}
+
+#[tokio::test]
+async fn a_finished_call_does_not_unregister_a_newer_call_with_the_same_id() {
+    let server = stub_server();
+    let older = tokio::spawn({
+        let s = server.clone();
+        async move {
+            s.handle(call(1, "stub.sleep", json!({"ms": 100})), Some("a"))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let newer = tokio::spawn({
+        let s = server.clone();
+        async move {
+            s.handle(call(1, "stub.sleep", json!({"ms": 5000})), Some("a"))
+                .await
+        }
+    });
+    // The older call finishes while the newer one still runs.
+    assert!(older.await.unwrap().is_some());
+    assert!(server.handle(cancel(1), Some("a")).await.is_none());
+    let newer = tokio::time::timeout(Duration::from_secs(2), newer)
+        .await
+        .expect("the cancel reached the newer call")
+        .unwrap();
+    assert!(newer.is_none());
+}
+
+#[tokio::test]
+async fn a_cancel_inside_a_batch_drops_only_that_reply() {
+    let server = stub_server();
+    let batch = tokio::spawn({
+        let s = server.clone();
+        async move {
+            s.handle(
+                json!([
+                    call(1, "stub.sleep", json!({"ms": 5000})),
+                    call(2, "stub.echo", json!({"x": 2})),
+                ]),
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(server.handle(cancel(1), None).await.is_none());
+    let reply = tokio::time::timeout(Duration::from_secs(2), batch)
+        .await
+        .expect("the batch finished")
+        .unwrap()
+        .unwrap();
+    let replies = reply.as_array().unwrap();
+    assert_eq!(replies.len(), 1, "{reply}");
+    assert_eq!(replies[0]["id"], 2);
+}
+
+#[tokio::test]
+async fn a_panicking_tool_gets_an_error_reply() {
+    let server = stub_server();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.handle(call(9, "stub.panic", json!({})), None),
+    )
+    .await
+    .expect("no hang")
+    .expect("a reply");
+    assert_eq!(reply["id"], 9);
+    assert_eq!(reply["result"]["isError"], true);
+    assert!(reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("panicked"));
+}
+
+#[tokio::test]
+async fn a_dropped_handle_future_does_not_stop_the_call() {
+    use crate::stub::TOUCHED;
+    use std::sync::atomic::Ordering;
+    let server = stub_server();
+    let before = TOUCHED.load(Ordering::SeqCst);
+    let fut = server.handle(call(1, "stub.touch", json!({"ms": 200})), None);
+    // Poll briefly, then drop (a client disconnect).
+    let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(TOUCHED.load(Ordering::SeqCst), before + 1);
+}

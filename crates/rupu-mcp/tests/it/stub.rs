@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
+/// Calls of `stub.touch` that ran to completion.
+pub static TOUCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// `stub.echo` returns its args; `stub.sleep` sleeps `args.ms`; `stub.ro` is
 /// a read-only no-op.
 pub struct StubSource;
@@ -25,6 +28,8 @@ impl ToolSource for StubSource {
         vec![
             def("stub.echo", ToolHints::default()),
             def("stub.sleep", ToolHints::default()),
+            def("stub.panic", ToolHints::default()),
+            def("stub.touch", ToolHints::default()),
             def(
                 "stub.ro",
                 ToolHints {
@@ -43,6 +48,13 @@ impl ToolSource for StubSource {
                 let ms = args["ms"].as_u64().unwrap_or(0);
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 Some(ToolResult::Text("slept".into()))
+            }
+            "stub.panic" => panic!("stub tool panics"),
+            "stub.touch" => {
+                let ms = args["ms"].as_u64().unwrap_or(0);
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                TOUCHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(ToolResult::Text("touched".into()))
             }
             "stub.ro" => Some(ToolResult::Text("ro".into())),
             _ => None,

@@ -7,6 +7,8 @@
 //! sent for a cancelled request).
 
 use crate::error::{McpError, ServeError};
+use crate::filter::ToolFilter;
+use crate::source::{CallCx, ToolDef, ToolResult, ToolSource};
 use crate::transport::Transport;
 use rupu_tools::call::{call_shared, CallOutcome};
 use rupu_tools::{
@@ -406,9 +408,6 @@ impl Inner {
 // McpServer: the protocol core over pluggable tool sources.
 // ---------------------------------------------------------------------------
 
-use crate::filter::ToolFilter;
-use crate::source::{CallCx, ToolDef, ToolResult, ToolSource};
-
 /// JSON-RPC 2.0 over any transport, serving the tools of its
 /// [`ToolSource`]s. `handle` takes one message (or batch) and returns the
 /// reply, so an HTTP transport can call it per request; `run` drives a
@@ -486,6 +485,11 @@ impl McpServer {
     /// One JSON-RPC message or batch → the reply (`None` for notifications,
     /// client responses, and a cancelled call). `session` keys in-flight
     /// calls, so a cancel only reaches its own session's call.
+    ///
+    /// A `tools/call` runs as its own task: if the caller drops this future
+    /// (a client disconnect), the call keeps running to completion. That is
+    /// deliberate, so a disconnect never aborts a write half-way; only
+    /// `notifications/cancelled` stops a call.
     pub async fn handle(&self, msg: Value, session: Option<&str>) -> Option<Value> {
         let session = session.map(str::to_string);
         match msg {
@@ -497,12 +501,25 @@ impl McpServer {
                 // in it), answered in order.
                 let tasks: Vec<_> = batch
                     .into_iter()
-                    .map(|m| tokio::spawn(self.core.clone().one(m, session.clone())))
+                    .map(|m| {
+                        let id = m.get("id").cloned();
+                        (id, tokio::spawn(self.core.clone().one(m, session.clone())))
+                    })
                     .collect();
                 let mut out = Vec::new();
-                for t in tasks {
-                    if let Ok(Some(v)) = t.await {
-                        out.push(v);
+                for (id, t) in tasks {
+                    match t.await {
+                        Ok(Some(v)) => out.push(v),
+                        Ok(None) => {}
+                        // A cancelled call is never answered.
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => {
+                            warn!(error = %e, "mcp request panicked");
+                            if let Some(id) = id {
+                                let e = McpError::Transport(anyhow::anyhow!("request panicked"));
+                                out.push(e.to_jsonrpc(id));
+                            }
+                        }
                     }
                 }
                 (!out.is_empty()).then_some(Value::Array(out))
@@ -619,6 +636,7 @@ impl Core {
     ) -> Option<Value> {
         let key = (session.clone().unwrap_or_default(), id.to_string());
         let core = self.clone();
+        let reply_id = id.clone();
         let task = {
             // Held across the spawn, so the task can't end (and deregister)
             // before it is registered.
@@ -646,7 +664,22 @@ impl Core {
             }
             task
         };
-        task.await.ok()
+        match task.await {
+            Ok(v) => Some(v),
+            // A cancel: no reply.
+            Err(e) if e.is_cancelled() => None,
+            Err(e) => {
+                warn!(error = %e, "tool call panicked");
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": reply_id,
+                    "result": {
+                        "isError": true,
+                        "content": [{"type": "text", "text": "tool call panicked"}],
+                    },
+                }))
+            }
+        }
     }
 
     async fn call(&self, name: &str, args: Value, cx: CallCx) -> Value {
