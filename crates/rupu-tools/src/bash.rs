@@ -7,10 +7,11 @@
 //! - **Environment is cleared** then repopulated with `PATH`, `HOME`,
 //!   `USER`, `TERM`, `LANG` (always allowed) plus `bash_env_allowlist`
 //!   names (per-workspace). Other inherited env vars are dropped.
-//! - **Timeout** sends SIGTERM (via tokio's `kill_on_drop` when the
-//!   child handle drops at the end of its scope) — effectively SIGKILL
-//!   on most Unix kernels for processes that ignore SIGTERM. The
-//!   `tool_result` carries `error: Some("timeout after Ns")`.
+//! - **A call that ends early** — its timeout fires, or its future is
+//!   dropped (an MCP `notifications/cancelled`, a run stopping) — kills the
+//!   shell and everything it started ([`crate::proc_tree::kill_tree`]), not
+//!   just the shell. A timeout's `tool_result` carries
+//!   `error: Some("timeout after Ns")`.
 //!
 //! Exit codes: a non-zero exit is NOT a tool error. The tool succeeds
 //! (Ok(ToolOutput { error: None, ... })) and the agent sees the exit
@@ -27,7 +28,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
 #[derive(Deserialize)]
@@ -58,6 +60,30 @@ impl Drop for CaptureGuard {
             c.finished();
         }
     }
+}
+
+/// Owns the call's shell. Dropped while the shell is still running (the
+/// call timed out, or the `invoke` future was dropped), it kills the shell's
+/// whole tree before the `Child` handle drops: `kill_on_drop` alone would
+/// SIGKILL only the shell and orphan what it started.
+struct ShellGuard(Child);
+
+impl Drop for ShellGuard {
+    fn drop(&mut self) {
+        // `try_wait` is `Some` once the shell has been reaped, when its pid
+        // may already name another process: never signal it then.
+        if let (Ok(None), Some(pid)) = (self.0.try_wait(), self.0.id()) {
+            crate::proc_tree::kill_tree(pid);
+        }
+    }
+}
+
+async fn read_all(pipe: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// Names, in a process a launched child spawned, the child's run: set on
@@ -232,20 +258,31 @@ impl Tool for BashTool {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let child = match cmd.spawn() {
-            Ok(child) => child,
+        let mut shell = match cmd.spawn() {
+            Ok(child) => ShellGuard(child),
             Err(e) => return Err(ToolError::Execution(e.to_string())),
         };
-        if let (Some(guard), Some(pid)) = (capture_call.as_mut(), child.id()) {
+        if let (Some(guard), Some(pid)) = (capture_call.as_mut(), shell.0.id()) {
             guard.spawned(pid);
         }
         let timeout_dur = Duration::from_secs(ctx.workspace.bash.timeout_secs);
 
-        // `capture_call` (if any) finishes when it drops: on every return
-        // path, and also if this future is dropped mid-await (a cancelled
-        // run).
-        match timeout(timeout_dur, child.wait_with_output()).await {
-            Ok(Ok(out)) => {
+        // `shell` kills the shell's tree and then `capture_call` (if any)
+        // finishes as they drop: on every return path, and also if this
+        // future is dropped mid-await (a cancelled run).
+        let stdout = shell.0.stdout.take();
+        let stderr = shell.0.stderr.take();
+        let waited = timeout(timeout_dur, async {
+            tokio::try_join!(shell.0.wait(), read_all(stdout), read_all(stderr))
+        })
+        .await;
+        match waited {
+            Ok(Ok((status, stdout, stderr))) => {
+                let out = std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
                 let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                 let exit_code = out.status.code().unwrap_or(-1);
@@ -301,8 +338,7 @@ impl Tool for BashTool {
                 structured: None,
             }),
             Err(_elapsed) => {
-                // Timeout. The kill_on_drop above will SIGKILL when
-                // the child handle is dropped at the end of this scope.
+                // Timeout. `shell` kills the shell's tree as it drops.
                 Ok(ToolOutput {
                     stdout: String::new(),
                     error: Some(format!(

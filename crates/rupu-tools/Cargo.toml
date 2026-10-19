@@ -25,10 +25,14 @@ thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
+rustix = { workspace = true }
 
 # Tool implementations (crate-local; not in workspace deps)
 which = "6"
 globwalk = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
