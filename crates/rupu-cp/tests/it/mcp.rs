@@ -159,8 +159,9 @@ async fn bearer_required_when_token_set() {
     assert_eq!(yes.status(), 200);
 }
 
-/// A tool that never finishes on its own, so a cancel is the only way out.
-struct Sleeper;
+/// A tool that signals when a call starts and then outlasts the test unless
+/// cancelled.
+struct Sleeper(Arc<tokio::sync::Semaphore>);
 
 #[async_trait]
 impl ToolSource for Sleeper {
@@ -176,18 +177,20 @@ impl ToolSource for Sleeper {
         if name != "sleep" {
             return None;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        self.0.add_permits(1);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         Some(ToolResult::Text("woke".into()))
     }
 }
 
 #[tokio::test]
 async fn cancel_is_scoped_to_the_session() {
+    let started = Arc::new(tokio::sync::Semaphore::new(0));
     let addr = spawn_with(
         None,
         true,
         Some(McpOpts {
-            catalog: Some(Arc::new(Sleeper)),
+            catalog: Some(Arc::new(Sleeper(Arc::clone(&started)))),
             tools: vec![],
         }),
     )
@@ -210,7 +213,8 @@ async fn cancel_is_scoped_to_the_session() {
     };
     let a = tokio::spawn(post("mcp_A", call.clone()));
     let b = tokio::spawn(post("mcp_B", call.clone()));
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Both calls are running before the cancel is sent.
+    started.acquire_many(2).await.unwrap().forget();
     // Session A cancels request id 1: only A's call is stopped.
     let cancel = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 1}});
@@ -266,4 +270,115 @@ async fn web_only_has_no_mcp() {
     assert_eq!(resp.status(), 404);
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["error"], "MCP is off (--no-mcp)");
+}
+
+async fn init_with_headers(
+    addr: std::net::SocketAddr,
+    host: Option<String>,
+    origin: Option<String>,
+) -> u16 {
+    let mut req = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .json(&init_body());
+    if let Some(h) = host {
+        req = req.header("Host", h);
+    }
+    if let Some(o) = origin {
+        req = req.header("Origin", o);
+    }
+    req.send().await.unwrap().status().as_u16()
+}
+
+#[tokio::test]
+async fn rebinding_host_is_refused_on_a_loopback_bind() {
+    let addr = spawn_with(None, true, plain_mcp()).await;
+    let host = format!("evil.example:{}", addr.port());
+    assert_eq!(init_with_headers(addr, Some(host.clone()), None).await, 403);
+    // Origin == Host is not enough on its own.
+    assert_eq!(
+        init_with_headers(addr, Some(host.clone()), Some(format!("http://{host}"))).await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn localhost_host_is_served_on_a_loopback_bind() {
+    let addr = spawn_with(None, true, plain_mcp()).await;
+    for host in ["localhost", "LOCALHOST:7878", "127.0.0.1:9", "[::1]:80"] {
+        assert_eq!(
+            init_with_headers(addr, Some(host.into()), None).await,
+            200,
+            "{host}"
+        );
+    }
+    // A different port than the CP's, Origin and Host agreeing: served.
+    assert_eq!(
+        init_with_headers(
+            addr,
+            Some("localhost:3000".into()),
+            Some("http://localhost:3000".into())
+        )
+        .await,
+        200
+    );
+    // Different port between Origin and Host: refused.
+    assert_eq!(
+        init_with_headers(
+            addr,
+            Some("localhost:3000".into()),
+            Some("http://localhost:3001".into())
+        )
+        .await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn null_origin_is_refused() {
+    let addr = spawn_with(None, true, plain_mcp()).await;
+    assert_eq!(
+        init_with_headers(addr, None, Some("null".into())).await,
+        403
+    );
+}
+
+#[tokio::test]
+async fn delete_on_mcp_is_405() {
+    let addr = spawn_with(None, true, plain_mcp()).await;
+    let resp = reqwest::Client::new()
+        .delete(format!("http://{addr}/mcp"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+}
+
+#[tokio::test]
+async fn no_web_keeps_the_json_404_for_api_paths() {
+    let addr = spawn_with(None, false, plain_mcp()).await;
+    let c = reqwest::Client::new();
+    let resp = c
+        .get(format!("http://{addr}/api/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["error"].as_str().unwrap().contains("/api/nope"), "{v}");
+    let plain = c.get(format!("http://{addr}/nope")).send().await.unwrap();
+    assert_eq!(plain.status(), 404);
+    assert!(plain.text().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn serve_on_refuses_nothing_to_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = serve_opts(dir.path());
+    opts.web = false;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let err = rupu_cp::serve_on(listener, opts).await.unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "nothing to serve: --no-web and --no-mcp together"
+    );
 }

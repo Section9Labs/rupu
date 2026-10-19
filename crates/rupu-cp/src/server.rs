@@ -95,10 +95,6 @@ async fn mcp_off() -> crate::error::ApiError {
     )
 }
 
-async fn plain_404() -> axum::http::StatusCode {
-    axum::http::StatusCode::NOT_FOUND
-}
-
 /// Build the control-plane router.
 ///
 /// `token`: when `Some`, every `/api/*` route and `/mcp` requires the token —
@@ -108,8 +104,12 @@ async fn plain_404() -> axum::http::StatusCode {
 /// and the static UI / SPA fallback stay open: the pages hold no data, every
 /// byte of it comes from `/api/*`.
 pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> Router {
+    let loopback = state
+        .bind
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_loopback());
     let mcp = match opts.mcp {
-        Some(server) => crate::mcp::endpoint::routes(server),
+        Some(server) => crate::mcp::endpoint::routes(server, loopback),
         // Mounted explicitly so the SPA fallback never answers `/mcp`.
         None => Router::new().route("/mcp", axum::routing::any(mcp_off)),
     };
@@ -141,7 +141,7 @@ pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> 
     let app = if opts.web {
         app.fallback(crate::embed::static_handler)
     } else {
-        app.fallback(plain_404)
+        app.fallback(crate::embed::no_web_handler)
     };
     let app = match token {
         Some(t) => app.layer(from_fn_with_state(t, crate::auth::bootstrap_cookie)),

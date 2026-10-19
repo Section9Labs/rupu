@@ -16,13 +16,21 @@ use std::sync::Arc;
 const SESSION_HEADER: &str = "mcp-session-id";
 
 #[derive(Clone)]
-struct McpState(Arc<McpServer>);
+struct McpState {
+    server: Arc<McpServer>,
+    loopback_bind: bool,
+}
 
 /// The `/mcp` route. GET and DELETE are 405 (no stream, no session delete).
-pub fn routes(server: Arc<McpServer>) -> Router<AppState> {
+/// `loopback_bind`: the CP is bound to a loopback address, so `Host` must
+/// be a loopback name too.
+pub fn routes(server: Arc<McpServer>, loopback_bind: bool) -> Router<AppState> {
     Router::new()
         .route("/mcp", post(handle).fallback(not_allowed))
-        .with_state(McpState(server))
+        .with_state(McpState {
+            server,
+            loopback_bind,
+        })
 }
 
 async fn not_allowed() -> Response {
@@ -34,22 +42,29 @@ async fn not_allowed() -> Response {
         .into_response()
 }
 
-/// True when `Origin` is absent, or names the authority the request was
-/// sent to.
-fn origin_ok(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN) else {
-        return true;
+/// A `Host` header naming this machine's loopback: `localhost`,
+/// `127.0.0.1` or `[::1]`, any port.
+fn loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().map(|h| format!("[{h}]")),
+        None => host.split(':').next().map(str::to_string),
     };
-    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    let authority = origin
-        .to_str()
-        .ok()
-        .and_then(|o| {
-            o.strip_prefix("http://")
-                .or_else(|| o.strip_prefix("https://"))
-        })
-        .map(|a| a.trim_end_matches('/'));
-    matches!((host, authority), (Some(h), Some(a)) if a.eq_ignore_ascii_case(h))
+    name.is_some_and(|n| n.eq_ignore_ascii_case("localhost") || n == "127.0.0.1" || n == "[::1]")
+}
+
+/// The request may be answered: `Origin`, if present, names the `Host` it
+/// was sent to, and on a loopback bind the `Host` is itself a loopback name
+/// (a DNS-rebinding page sends its own name in both).
+fn request_ok(headers: &HeaderMap, loopback_bind: bool) -> bool {
+    if loopback_bind
+        && !headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(loopback_host)
+    {
+        return false;
+    }
+    !headers.contains_key(header::ORIGIN) || crate::auth::same_origin(headers)
 }
 
 fn is_initialize(msg: &Value) -> bool {
@@ -60,11 +75,14 @@ fn is_initialize(msg: &Value) -> bool {
 }
 
 async fn handle(
-    State(McpState(server)): State<McpState>,
+    State(McpState {
+        server,
+        loopback_bind,
+    }): State<McpState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !origin_ok(&headers) {
+    if !request_ok(&headers, loopback_bind) {
         return (
             StatusCode::FORBIDDEN,
             Json(

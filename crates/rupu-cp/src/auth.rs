@@ -123,7 +123,7 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// True when the request's `Origin` names the host it was sent to.
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -133,7 +133,7 @@ fn same_origin(headers: &HeaderMap) -> bool {
     let authority = origin
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"));
-    authority.is_some_and(|a| a.eq_ignore_ascii_case(host))
+    authority.is_some_and(|a| a.trim_end_matches('/').eq_ignore_ascii_case(host))
 }
 
 fn unauthorized() -> Response {
