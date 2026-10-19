@@ -493,6 +493,8 @@ pub async fn handle(action: Action) -> ExitCode {
                     session_mutator,
                     transcript_mutator,
                     inventory: Some(inventory),
+                    web: true,
+                    mcp: None,
                 },
             )
             .await;

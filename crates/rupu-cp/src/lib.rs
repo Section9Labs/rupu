@@ -16,6 +16,7 @@ pub mod error;
 pub mod fleet_inventory;
 pub mod host;
 pub mod launcher;
+pub mod mcp;
 pub mod model_catalog;
 pub mod netflow_index;
 pub mod net;
@@ -89,6 +90,11 @@ pub struct ServeOpts {
     /// reports nothing for the provider- and SCM-backed counts rather than
     /// fabricating zeros.
     pub inventory: Option<std::sync::Arc<dyn crate::fleet_inventory::FleetInventory>>,
+    /// Serve the embedded web UI. `false` (`--no-web`): `/api/*`, `/healthz`
+    /// and `/mcp` only.
+    pub web: bool,
+    /// Serve `/mcp` over these options. `None` (`--no-mcp`): `/mcp` is a 404.
+    pub mcp: Option<mcp::McpOpts>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -237,11 +243,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     serve_on(listener, opts).await
 }
 
-/// Serve the control plane on an already-bound listener (see [`bind`]).
-/// `opts.bind` is informational here (`GET /api/config`'s `status.bind`);
-/// the listener's own address is what gets printed and served.
-pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> anyhow::Result<()> {
-    let open_browser = opts.open_browser;
+/// Everything `serve_on` wires before the prewarm: the `AppState` with its
+/// adapters and the fully-wired host registry.
+pub fn build_state(opts: &ServeOpts) -> state::AppState {
     let pricing = load_pricing(&opts.global_dir);
 
     // Build the AppState with the default (read-only) registry first so that
@@ -250,11 +254,11 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
     let app_state = state::AppState::new(opts.global_dir.clone(), pricing.clone())
         .with_launcher(opts.launcher.clone())
         .with_session_sender(opts.session_sender.clone())
-        .with_repos(opts.repos)
+        .with_repos(opts.repos.clone())
         .with_model_catalog(opts.model_catalog.clone())
         .with_agent_launcher(opts.agent_launcher.clone())
         .with_session_starter(opts.session_starter.clone())
-        .with_generator(opts.generator)
+        .with_generator(opts.generator.clone())
         .with_session_mutator(opts.session_mutator.clone())
         .with_transcript_mutator(opts.transcript_mutator.clone())
         .with_bind(opts.bind.to_string())
@@ -263,15 +267,15 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.
     let local = crate::host::local::LocalHostConnector::new(
-        opts.launcher,
-        opts.agent_launcher,
-        opts.session_starter,
-        opts.session_sender,
+        opts.launcher.clone(),
+        opts.agent_launcher.clone(),
+        opts.session_starter.clone(),
+        opts.session_sender.clone(),
         std::sync::Arc::clone(&app_state.run_store),
         app_state.global_dir.clone(),
     )
     .with_pricing(pricing)
-    .with_inventory(opts.inventory);
+    .with_inventory(opts.inventory.clone());
     let store = rupu_workspace::HostStore {
         root: app_state.global_dir.join("hosts"),
     };
@@ -282,8 +286,12 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             std::sync::Arc::clone(&app_state.run_store),
             std::sync::Arc::clone(&app_state.customer_pricing),
         );
-    let app_state = app_state.with_hosts(std::sync::Arc::new(registry));
+    app_state.with_hosts(std::sync::Arc::new(registry))
+}
 
+/// Fold spend and netflow ledgers into their indexes in the background, so
+/// the first page that shows them doesn't pay for reading every file.
+pub fn spawn_prewarm(app_state: &state::AppState) {
     // Fold spend into the usage index in the background, so the first page
     // that shows it doesn't pay for reading every transcript.
     {
@@ -324,9 +332,27 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             );
         });
     }
+}
+
+/// Serve the control plane on an already-bound listener (see [`bind`]).
+/// `opts.bind` is informational here (`GET /api/config`'s `status.bind`);
+/// the listener's own address is what gets printed and served.
+pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> anyhow::Result<()> {
+    if !opts.web && opts.mcp.is_none() {
+        anyhow::bail!("nothing to serve: --no-web and --no-mcp together");
+    }
+    let open_browser = opts.open_browser;
+    let app_state = build_state(&opts);
+    spawn_prewarm(&app_state);
 
     let token = opts.token.clone();
-    let app = server::router(app_state, opts.token);
+    let mcp = match &opts.mcp {
+        Some(m) => Some(mcp::build_server(&app_state, m).context("building the MCP server")?),
+        None => None,
+    };
+    let serves_mcp = mcp.is_some();
+    let web = opts.web;
+    let app = server::router_with(app_state, opts.token, server::RouterOpts { web, mcp });
 
     let addr = listener.local_addr()?;
     // With a token, the printed (and opened) link carries it once: the first
@@ -337,14 +363,32 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         None => click_url(addr),
     };
     // Always surface the URL prominently — independent of RUST_LOG / tracing.
-    println!("\n  ➜  rupu Control Plane  →  {url}\n");
+    if web {
+        println!("\n  ➜  rupu Control Plane  →  {url}");
+    } else {
+        println!(
+            "\n  ➜  rupu Control Plane (API only, --no-web)  →  {}",
+            click_url(addr)
+        );
+    }
+    if serves_mcp {
+        let mcp_url = format!("{}/mcp", click_url(addr));
+        println!("  ➜  rupu MCP  →  {mcp_url}");
+        match &token {
+            Some(t) => println!(
+                "     claude mcp add --transport http rupu {mcp_url} --header \"Authorization: Bearer {t}\""
+            ),
+            None => println!("     claude mcp add --transport http rupu {mcp_url}"),
+        }
+    }
+    println!();
     // The log gets the URL without the token: tracing sinks outlive the
     // terminal.
     info!("rupu cp serving on {}", click_url(addr));
 
     // Auto-open only when interactive (a real terminal), so headless / scripted
     // / supervised runs don't spawn a surprise browser. `--no-open` forces off.
-    if open_browser && std::io::stdout().is_terminal() {
+    if web && open_browser && std::io::stdout().is_terminal() {
         open_in_browser(&url);
     }
 

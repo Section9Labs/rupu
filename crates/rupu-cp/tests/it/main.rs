@@ -28,6 +28,7 @@ mod host_registry;
 mod host_run_netflow;
 mod hosts_api;
 mod launch_preview;
+mod mcp;
 mod legacy_codenames;
 mod list_query;
 mod messages;
