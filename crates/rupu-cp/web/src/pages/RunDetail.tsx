@@ -1381,6 +1381,7 @@ export default function RunDetail() {
                   live={isRunning}
                   runId={id}
                   host={host}
+                  costUsd={displayUsage?.cost_usd ?? undefined}
                 />
               ) : (
                 <div className="flex h-full min-h-[120px] items-center justify-center rounded-xl border border-border bg-panel text-sm text-ink-dim">
