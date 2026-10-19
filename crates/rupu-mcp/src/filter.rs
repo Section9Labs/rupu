@@ -46,7 +46,7 @@ impl ToolFilter {
         for entry in &self.entries {
             let mut matched = false;
             if entry == "*" {
-                matched = !names.is_empty();
+                matched = true;
                 kept.extend(names.iter().cloned());
             } else if entry == "core.*" {
                 for n in names {

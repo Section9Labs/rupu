@@ -48,3 +48,38 @@ fn unknown_entry_fails_naming_it() {
     assert!(err.contains("`nope.*`"), "{err}");
     assert!(err.contains("runs"), "{err}");
 }
+
+#[test]
+fn star_never_fails_even_with_no_tools() {
+    let f = ToolFilter::parse(&names(&["*"]));
+    assert_eq!(f.apply(&[]).unwrap(), BTreeSet::new());
+}
+
+#[test]
+fn exact_name_keeps_only_it() {
+    let all = names(&["runs.get", "runs.list"]);
+    let f = ToolFilter::parse(&names(&["runs.list"]));
+    assert_eq!(f.apply(&all).unwrap(), set(&["runs.list"]));
+}
+
+#[test]
+fn multiple_entries_union() {
+    let all = names(&["runs.get", "scm.prs.get", "bash", "issues.list"]);
+    let f = ToolFilter::parse(&names(&["runs.*", "bash", "issues.list"]));
+    assert_eq!(
+        f.apply(&all).unwrap(),
+        set(&["runs.get", "bash", "issues.list"])
+    );
+}
+
+#[test]
+fn server_new_reports_unknown_entry_across_sources() {
+    use crate::stub::StubSource;
+    use rupu_mcp::{McpServer, ServeError};
+    use std::sync::Arc;
+    let f = ToolFilter::parse(&names(&["nope.*"]));
+    let r = McpServer::new(vec![Arc::new(StubSource), Arc::new(StubSource)], &f);
+    assert!(
+        matches!(r, Err(ServeError::Filter(m)) if m.contains("`nope.*`") && m.contains("stub"))
+    );
+}
