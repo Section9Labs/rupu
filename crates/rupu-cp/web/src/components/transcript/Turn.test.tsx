@@ -1,212 +1,104 @@
 // @vitest-environment jsdom
-/**
- * Tests for Turn:
- *   - collapsed (defaultOpen=false): summary pills + snippet visible, but the
- *     full ToolCard body / markdown is NOT in the DOM.
- *   - clicking the header expands and reveals a ToolCard's content.
- *   - findingCount > 0 renders the findings pill.
- *   - result pill reflects summary.result.
- */
-
 import '@testing-library/jest-dom/vitest';
 import { it, expect, describe, afterEach } from 'vitest';
 import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import Turn from './Turn';
+import { TranscriptViewProvider } from './TranscriptViewContext';
 import type { TurnBlock, TurnView, ToolView } from './transcriptView';
 
 afterEach(cleanup);
 
-function readTool(overrides?: Partial<ToolView>): ToolView {
-  return {
-    tool: 'read_file',
-    kind: 'read',
-    input: { path: 'src/lib/api.ts' },
-    output: 'UNIQUE_TOOL_OUTPUT_MARKER',
-    durationMs: 12,
-    ...overrides,
-  };
+function readTool(): ToolView {
+  return { tool: 'read_file', kind: 'read', input: { path: 'src/lib/api.ts' }, output: 'OUT', durationMs: 12 };
 }
 
-// v2 blocks model: TurnView no longer carries `assistant`/`tools` fields
-// directly — build the equivalent `blocks` array instead. Mechanical
-// adaptation only (Task 3 owns the real Turn.tsx blocks rendering).
-function makeTurn(overrides?: { tools?: ToolView[]; summary?: TurnView['summary'] }): TurnView {
-  const tools = overrides?.tools ?? [readTool()];
-  const findingCount = tools.filter((t) => t.kind === 'finding').length;
-  const blocks: TurnBlock[] = [
-    { kind: 'assistant', content: 'Looking at the API surface now.' },
-    ...tools.map((view): TurnBlock => ({ kind: 'tool', view })),
-  ];
-  return {
-    blocks,
-    tokensIn: null,
-    tokensOut: null,
-    summary: overrides?.summary ?? {
-      toolCount: tools.length,
-      findingCount,
-      result: 'ok',
-    },
-  };
+function turnOf(blocks: TurnBlock[]): TurnView {
+  return { blocks, tokensIn: null, tokensOut: null, summary: { toolCount: 0, findingCount: 0, result: 'ok' } };
 }
+
+const basic = turnOf([
+  { kind: 'assistant', content: 'Looking at the API surface now.' },
+  { kind: 'tool', view: readTool() },
+]);
 
 describe('Turn', () => {
-  it('collapsed: shows snippet + pills but not the ToolCard body', () => {
-    render(<Turn turn={makeTurn()} defaultOpen={false} />);
-
-    // Snippet visible
-    expect(screen.getByText(/Looking at the API surface now\./)).toBeTruthy();
-    // Tool-count pill
-    expect(screen.getByText(/1 tool/)).toBeTruthy();
-    // Result pill
-    expect(screen.getByText('ok')).toBeTruthy();
-    // ToolCard body content is NOT rendered while collapsed
-    expect(screen.queryByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeNull();
+  it('renders assistant text, a tool row and the marker', () => {
+    render(<Turn turn={basic} turnNumber={1} showMarker />);
+    expect(screen.getByText(/Looking at the API surface now\./)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /read_file/ })).toBeInTheDocument();
+    expect(screen.getByText('Turn 1')).toBeInTheDocument();
+    expect(screen.getAllByText('1').length).toBeGreaterThan(0);
   });
 
-  it('expands on header click to reveal the ToolCard content', () => {
-    render(<Turn turn={makeTurn()} defaultOpen={false} />);
-
-    expect(screen.queryByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeNull();
-
-    // The header is the first button.
-    fireEvent.click(screen.getAllByRole('button')[0]);
-
-    expect(screen.getByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeTruthy();
+  it('showMarker=false renders no turn marker', () => {
+    render(<Turn turn={basic} turnNumber={3} showMarker={false} />);
+    expect(screen.queryByText('Turn 3')).toBeNull();
+    expect(screen.queryByText('3')).toBeNull();
+    expect(screen.getByText(/Looking at the API/)).toBeInTheDocument();
   });
 
-  it('renders the findings pill when findingCount > 0', () => {
-    const turn = makeTurn({
-      tools: [
-        {
-          tool: 'report_finding',
-          kind: 'finding',
-          input: { summary: 'a problem' },
-          finding: {
-            severity: 'medium',
-            summary: 'a problem',
-            scope: '',
-            rationale: 'because',
-            references: [],
-          },
-        },
-      ],
-      summary: { toolCount: 1, findingCount: 1, result: 'ok' },
-    });
-    render(<Turn turn={turn} defaultOpen={false} />);
-    expect(screen.getByText(/1 finding/)).toBeTruthy();
+  it('shows the token label', () => {
+    render(<Turn turn={basic} turnNumber={1} showMarker tokensLabel="11 in · 7 out" />);
+    expect(screen.getByText('11 in · 7 out')).toBeInTheDocument();
   });
 
-  it('result pill reflects summary.result (error)', () => {
-    const turn = makeTurn({
-      summary: { toolCount: 1, findingCount: 0, result: 'error' },
-    });
-    render(<Turn turn={turn} defaultOpen={false} />);
-    expect(screen.getByText('error')).toBeTruthy();
-  });
-
-  it('result pill reflects summary.result (running)', () => {
-    const turn = makeTurn({
-      summary: { toolCount: 1, findingCount: 0, result: 'running' },
-    });
-    render(<Turn turn={turn} defaultOpen={false} />);
-    expect(screen.getByText('running')).toBeTruthy();
-  });
-
-  it('defaultOpen=true renders the body immediately', () => {
-    render(<Turn turn={makeTurn()} defaultOpen={true} />);
-    expect(screen.getByText('UNIQUE_TOOL_OUTPUT_MARKER')).toBeTruthy();
-  });
-
-  it('renders blocks in order: thinking (collapsible, full text), assistant, gate', () => {
-    render(
-      <Turn
-        defaultOpen
-        turn={{
-          blocks: [
-            { kind: 'thinking', text: 'long reasoning body', provider: 'anthropic' },
-            { kind: 'assistant', content: 'the answer' },
-            { kind: 'gate', gateId: 'g1', prompt: 'ship it?', decision: null, decidedBy: null },
-          ],
-          tokensIn: 11,
-          tokensOut: 7,
-          summary: { toolCount: 0, findingCount: 0, result: 'ok' },
-        }}
-      />,
-    );
-    fireEvent.click(screen.getByText('thinking'));
+  it('thinking is shown in full and individually collapsible', () => {
+    render(<Turn turn={turnOf([{ kind: 'thinking', text: 'long reasoning body', provider: 'anthropic' }])} turnNumber={1} showMarker />);
     expect(screen.getByText('long reasoning body')).toBeInTheDocument();
-    // "the answer" legitimately appears twice with defaultOpen: once in the
-    // header snippet, once in the body's rendered assistant block.
-    expect(screen.getAllByText('the answer').length).toBeGreaterThan(0);
-    expect(screen.getByText('ship it?')).toBeInTheDocument();
-    expect(screen.getByText(/11.*→.*7|11 in.*7 out/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /thinking/ }));
+    expect(screen.queryByText('long reasoning body')).toBeNull();
   });
 
-  it('renders a redacted thinking block as a marker, and notice/seed/compaction/unknown rows', () => {
+  it('thinking folds when collapse-all is active', () => {
     render(
-      <Turn
-        defaultOpen
-        turn={{
-          blocks: [
-            { kind: 'seed', messageCount: 4, sourceTranscript: null },
-            { kind: 'user', content: 'do the task' },
-            { kind: 'thinking', text: null, provider: 'anthropic' },
-            { kind: 'notice', noticeKind: 'context_trim', message: 'trimmed to fit' },
-            { kind: 'meta', label: 'skills', text: 'loaded skill pdf (abababababab) via model' },
-            { kind: 'compaction', seq: 1, summarized: 9 },
-            { kind: 'unknown', type: 'hologram_projection' },
-          ],
-          tokensIn: null,
-          tokensOut: null,
-          summary: { toolCount: 0, findingCount: 0, result: 'running' },
-        }}
-      />,
+      <TranscriptViewProvider value={{ filter: 'all', expandTarget: 'closed', expandNonce: 1, live: false }}>
+        <Turn turn={turnOf([{ kind: 'thinking', text: 'long reasoning body', provider: 'anthropic' }])} turnNumber={1} showMarker />
+      </TranscriptViewProvider>,
     );
+    expect(screen.queryByText('long reasoning body')).toBeNull();
+  });
+
+  it('redacted thinking (text null) renders a muted marker, not an empty block', () => {
+    render(<Turn turn={turnOf([{ kind: 'thinking', text: null, provider: 'anthropic' }])} turnNumber={1} showMarker />);
     expect(screen.getByText(/redacted reasoning/)).toBeInTheDocument();
-    expect(screen.getByText(/4 prior messages/)).toBeInTheDocument();
-    expect(screen.getByText('do the task')).toBeInTheDocument();
-    expect(screen.getByText(/trimmed to fit/)).toBeInTheDocument();
-    expect(screen.getByText('skills')).toBeInTheDocument();
-    expect(screen.getByText(/loaded skill pdf \(abababababab\) via model/)).toBeInTheDocument();
-    expect(screen.getByText(/summarized 9/)).toBeInTheDocument();
-    expect(screen.getByText(/hologram_projection/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /thinking/ })).toBeNull();
   });
 
-  it('renders outcome blocks with title and detail, recovery as a muted line, and unknown data as JSON', () => {
+  it('unknown block renders the labelled fallback with raw data', () => {
+    render(<Turn turn={turnOf([{ kind: 'unknown', type: 'brand_new_event', data: { x: 1 } }])} turnNumber={1} showMarker />);
+    expect(screen.getByText(/unrecognized event: brand_new_event/)).toBeInTheDocument();
+    expect(screen.getByText(/"x": 1/)).toBeInTheDocument();
+  });
+
+  it('a Findings filter hides a turn with no findings entirely', () => {
+    const { container } = render(
+      <TranscriptViewProvider value={{ filter: 'findings', expandTarget: null, expandNonce: 0, live: false }}>
+        <Turn turn={basic} turnNumber={1} showMarker />
+      </TranscriptViewProvider>,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders every quiet block kind', () => {
     render(
       <Turn
-        defaultOpen
-        turn={{
-          blocks: [
-            {
-              kind: 'outcome',
-              severity: 'error',
-              title: 'refused · cyber',
-              detail: 'Declined for this example.',
-            },
-            { kind: 'outcome', severity: 'warning', title: 'cut off', detail: null },
-            { kind: 'recovery', text: '↺ rung 1 · retried' },
-            { kind: 'unknown', type: 'brand_new_event', data: { x: 1 } },
-            {
-              kind: 'assistant_block',
-              text: 'served by fallback · model-a → model-b',
-              abandoned: false,
-              raw: { type: 'fallback', from_model: 'model-a', to_model: 'model-b' },
-            },
-          ],
-          tokensIn: null,
-          tokensOut: null,
-          summary: { toolCount: 0, findingCount: 0, result: 'running' },
-        }}
+        turnNumber={1}
+        showMarker
+        turn={turnOf([
+          { kind: 'seed', messageCount: 4, sourceTranscript: null },
+          { kind: 'user', content: 'do the task' },
+          { kind: 'gate', gateId: 'g1', prompt: 'ship it?', decision: null, decidedBy: null },
+          { kind: 'notice', noticeKind: 'context_trim', message: 'trimmed to fit' },
+          { kind: 'meta', label: 'skills', text: 'loaded skill pdf' },
+          { kind: 'compaction', seq: 1, summarized: 9 },
+          { kind: 'outcome', severity: 'error', title: 'refused · cyber', detail: 'Declined.' },
+          { kind: 'recovery', text: '↺ rung 1 · retried' },
+          { kind: 'assistant_block', text: 'served by fallback', abandoned: false, raw: { to_model: 'model-b' } },
+        ])}
       />,
     );
-    expect(screen.getByText('refused · cyber')).toBeInTheDocument();
-    expect(screen.getByText('Declined for this example.')).toBeInTheDocument();
-    expect(screen.getByText('cut off')).toBeInTheDocument();
-    expect(screen.getByText('↺ rung 1 · retried')).toBeInTheDocument();
-    expect(screen.getByText(/brand_new_event/)).toBeInTheDocument();
-    expect(screen.getByText(/"x": 1/)).toBeInTheDocument();
-    expect(screen.getByText('served by fallback · model-a → model-b')).toBeInTheDocument();
-    expect(screen.getByText(/"to_model": "model-b"/)).toBeInTheDocument();
+    for (const re of [/4 prior messages/, /do the task/, /ship it\?/, /trimmed to fit/, /loaded skill pdf/, /summarized 9/, /refused · cyber/, /Declined\./, /rung 1/, /served by fallback/]) {
+      expect(screen.getByText(re)).toBeInTheDocument();
+    }
   });
 });

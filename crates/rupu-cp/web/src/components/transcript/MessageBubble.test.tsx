@@ -47,7 +47,7 @@ describe('Turn renders messages', () => {
   const view = buildTranscriptView(EVENTS);
 
   it('shows received and sent bubbles, a raw toggle and a collapsed chip', () => {
-    render(<Turn turn={view.turns[0]} defaultOpen self={view.self} />);
+    render(<Turn turn={view.turns[0]} turnNumber={1} showMarker self={view.self} />);
     const bubbles = screen.getAllByTestId('message-bubble');
     expect(bubbles.map((b) => b.dataset.direction)).toEqual(['received', 'sent', 'sent']);
     expect(within(bubbles[0]).getByText('→ you')).toBeInTheDocument();
@@ -70,7 +70,7 @@ describe('Turn renders messages', () => {
     const openParticipant = vi.fn();
     render(
       <MessageLinksContext.Provider value={{ openInFeed, openParticipant }}>
-        <Turn turn={view.turns[0]} defaultOpen self={view.self} />
+        <Turn turn={view.turns[0]} turnNumber={1} showMarker self={view.self} />
       </MessageLinksContext.Provider>,
     );
     const received = screen.getAllByTestId('message-bubble')[0];

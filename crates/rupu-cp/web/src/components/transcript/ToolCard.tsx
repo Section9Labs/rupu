@@ -2,22 +2,24 @@
  * ToolCard — dispatcher that renders one card per ToolView, switching on
  * `tool.kind` to the appropriate bespoke sub-component.
  *
- * Anatomy:
- *   • `finding`  → FindingCard (its own full chrome; no outer header)
- *   • `diff`     → header + DiffView
- *   • `terminal` → header + TerminalBlock
- *   • `read`     → header + monospace pre block
- *   • `grep`     → header + mono match list
- *   • `glob`     → header + mono path list
- *   • `subrun`   → header + sub-run callout
- *   • `coverage` → header + StructuredView of parsed output / input
- *   • `ast_grep` → header + AstGrepBody (group-by-file, metavar highlight +
+ * Anatomy: one clickable row (`<button aria-expanded>`: verb, target summary,
+ * result chip, duration) that expands its body inline, mounted lazily:
+ *   • `finding`  → FindingCard (its own full chrome; no row)
+ *   • `diff`     → DiffView
+ *   • `terminal` → TerminalBlock
+ *   • `read`     → monospace pre block
+ *   • `grep`     → mono match list
+ *   • `glob`     → mono path list
+ *   • `subrun`   → sub-run callout
+ *   • `coverage` → StructuredView of parsed output / input
+ *   • `ast_grep` → AstGrepBody (group-by-file, metavar highlight +
  *                  bindings table from `structured`, else a text-parse
  *                  fallback via `parseAstGrepText`)
- *   • `generic`  → header + StructuredView (JSON) or pre (plain) + input args
+ *   • `generic`  → StructuredView (JSON) or pre (plain) + input args
  *
- * Error state: when `tool.error` is set a red-tinted block is shown instead
- * of (or alongside) the body.
+ * Error state: when `tool.error` is set a red-tinted block is shown in the
+ * expanded body. A single scroll threshold (`BODY_MAX_H`) applies to the
+ * expanded body as a whole.
  *
  * Helper `summarizeInput` (exported) derives the short header summary string
  * from the tool input; unit-tested separately without DOM.
@@ -25,9 +27,10 @@
  * No `any`. Static Tailwind class strings only.
  */
 
-import { useContext, useState } from 'react';
+import { useContext, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
+import { useTranscriptView } from './TranscriptViewContext';
 import type { ToolView, ToolAuditView } from './transcriptView';
 import FindingCard from './FindingCard';
 import SourcePreview from './SourcePreview';
@@ -281,15 +284,19 @@ export function parseAstGrepText(
 // Card header
 // ---------------------------------------------------------------------------
 
-function DurationBadge({ ms }: { ms: number }) {
+/** True when the call has produced nothing yet (still running / orphaned). */
+function isRunning(tool: ToolView): boolean {
   return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono bg-surface text-ink-dim">
-      {formatDuration(ms)}
-    </span>
+    tool.output === undefined &&
+    tool.error === undefined &&
+    tool.durationMs === undefined &&
+    tool.diff === undefined &&
+    tool.terminal === undefined
   );
 }
 
 function StatusBadge({ tool }: { tool: ToolView }) {
+  const { live } = useTranscriptView();
   if (tool.error) {
     return (
       <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30">
@@ -297,8 +304,26 @@ function StatusBadge({ tool }: { tool: ToolView }) {
       </span>
     );
   }
-  if (tool.durationMs !== undefined) {
-    return <DurationBadge ms={tool.durationMs} />;
+  if (tool.kind === 'terminal' && tool.terminal) {
+    const ok = tool.terminal.exitCode === 0;
+    return (
+      <span
+        className={
+          ok
+            ? 'inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono bg-ok-bg text-ok'
+            : 'inline-flex items-center rounded px-1.5 py-0.5 text-meta font-mono font-semibold bg-err-bg text-err ring-1 ring-inset ring-err/30'
+        }
+      >
+        exit {tool.terminal.exitCode}
+      </span>
+    );
+  }
+  if (live && isRunning(tool)) {
+    return (
+      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute">
+        running
+      </span>
+    );
   }
   return (
     <span className="inline-flex items-center rounded px-1.5 py-0.5 text-meta bg-surface text-ink-mute">
@@ -356,27 +381,44 @@ export function blockedTitle(decision: string | undefined): string {
   }
 }
 
-function CardHeader({ tool, summary }: { tool: ToolView; summary: string }) {
+function ToolRow({
+  tool,
+  summary,
+  open,
+  onToggle,
+}: {
+  tool: ToolView;
+  summary: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const isTerminal = tool.kind === 'terminal';
   return (
-    <div className="flex items-center gap-2 min-w-0 px-3 py-1.5 bg-surface border-b border-border">
-      {/* Tool name */}
-      <span className="font-mono text-note font-semibold text-brand-700 shrink-0">
-        ⚙ {tool.tool}
-      </span>
-
-      {/* Input summary */}
+    <button
+      type="button"
+      aria-expanded={open}
+      onClick={onToggle}
+      className="flex w-full items-center gap-2 min-w-0 px-2 py-1 text-left hover:bg-surface"
+    >
+      {open ? (
+        <ChevronDown size={11} className="shrink-0 text-ink-mute" />
+      ) : (
+        <ChevronRight size={11} className="shrink-0 text-ink-mute" />
+      )}
+      <span className="font-mono text-note font-semibold text-brand-700 shrink-0">{tool.tool}</span>
       {summary && (
         <span className="font-mono text-[10.5px] text-ink-dim truncate flex-1 min-w-0">
-          {summary}
+          {isTerminal ? `$ ${summary}` : summary}
         </span>
       )}
-
-      {/* Right-side badges */}
       <span className="shrink-0 ml-auto flex items-center gap-1.5">
         {tool.audit && <AuditBadge audit={tool.audit} />}
         <StatusBadge tool={tool} />
+        {tool.durationMs !== undefined && (
+          <span className="font-mono text-meta text-ink-mute">{formatDuration(tool.durationMs)}</span>
+        )}
       </span>
-    </div>
+    </button>
   );
 }
 
@@ -399,13 +441,13 @@ function ErrorBlock({ error }: { error: string }) {
 // Kind-specific bodies
 // ---------------------------------------------------------------------------
 
-/** read — monospace pre, max-height scroll */
+/** read — monospace pre */
 function ReadBody({ tool }: { tool: ToolView }) {
   if (tool.error) return null; // error block handles it
   if (!tool.output) return null;
   return (
     <div className="px-3 py-2">
-      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-96 overflow-y-auto leading-snug">
+      <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug">
         {tool.output}
       </pre>
     </div>
@@ -422,7 +464,7 @@ function GrepBody({ tool }: { tool: ToolView }) {
       {lines.length > 0 && (
         <p className="text-meta text-ink-mute mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
       )}
-      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-72 overflow-y-auto leading-snug space-y-0">
+      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug space-y-0">
         {lines.map((line, i) => (
           <div key={i} className="whitespace-pre">{line}</div>
         ))}
@@ -438,7 +480,7 @@ function GlobBody({ tool }: { tool: ToolView }) {
   const paths = tool.output.split('\n').filter((l) => l.length > 0);
   return (
     <div className="px-3 py-2">
-      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto leading-snug space-y-0">
+      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug space-y-0">
         {paths.map((p, i) => (
           <div key={i} className="whitespace-pre">{p}</div>
         ))}
@@ -677,7 +719,7 @@ function SubrunBody({
   if (tool.output) {
     return (
       <div className="px-3 py-2">
-        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto">
+        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2">
           {tool.output}
         </pre>
       </div>
@@ -712,7 +754,7 @@ function GenericBody({ tool }: { tool: ToolView }) {
       {parsedOutput !== null ? (
         <StructuredView value={parsedOutput} />
       ) : tool.output ? (
-        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2 max-h-64 overflow-y-auto">
+        <pre className="whitespace-pre-wrap font-mono text-[10.5px] text-ink bg-surface rounded p-2">
           {tool.output}
         </pre>
       ) : null}
@@ -1056,6 +1098,7 @@ function AstGrepBody({ tool, runId, host }: { tool: ToolView; runId?: string; ho
 // Public component
 // ---------------------------------------------------------------------------
 
+
 function ToolCardBody({
   tool,
   onOpenTranscript,
@@ -1072,69 +1115,71 @@ function ToolCardBody({
    *  transcript fetch's `host` plumbing. */
   host?: string;
 }) {
-  // Findings get their own full chrome — no outer header wrapper. A
-  // `finding`-kind call whose input could not be parsed into a finding
-  // (malformed, or a shape this build does not know) falls through to the
-  // generic card below, which shows its args and any error, rather than
-  // handing FindingCard an undefined finding.
+  const [open, setOpen] = useState(false);
+  const { expandTarget, expandNonce } = useTranscriptView();
+
+  // Expand-all / collapse-all: each new nonce overrides the local state.
+  useEffect(() => {
+    if (expandNonce > 0 && expandTarget !== null) setOpen(expandTarget === 'open');
+  }, [expandNonce, expandTarget]);
+
+  // Findings get their own full chrome — no row wrapper. A `finding`-kind
+  // call whose input could not be parsed into a finding (malformed, or a
+  // shape this build does not know) falls through to the generic row below,
+  // which shows its args and any error, rather than handing FindingCard an
+  // undefined finding.
   if (tool.kind === 'finding' && tool.finding) {
     return <FindingCard finding={tool.finding} runId={runId} host={host} />;
   }
 
-  const summary = summarizeInput(tool);
-
-  // For terminal the TerminalBlock shows its own exit badge in the meta row —
-  // we also want the command in the header (from terminal.command if available,
-  // else from input).
-  const terminalSummary =
-    tool.kind === 'terminal' && tool.terminal
-      ? tool.terminal.command.length > 60
-        ? tool.terminal.command.slice(0, 57) + '…'
-        : tool.terminal.command
-      : summary;
-
-  const headerSummary = tool.kind === 'terminal' ? terminalSummary : summary;
+  const summary =
+    tool.kind === 'terminal' && tool.terminal ? tool.terminal.command : summarizeInput(tool);
+  const rowSummary = summary.length > 60 ? summary.slice(0, 57) + '…' : summary;
 
   return (
     <div className="border border-border rounded-md overflow-hidden my-1 text-[11.5px]">
-      <CardHeader tool={tool} summary={headerSummary} />
+      <ToolRow tool={tool} summary={rowSummary} open={open} onToggle={() => setOpen((v) => !v)} />
 
-      {/* Kind-specific body */}
-      {tool.kind === 'diff' && tool.diff && (
-        <DiffView
-          diff={tool.diff.diff}
-          path={tool.diff.path}
-          editKind={tool.diff.editKind}
-        />
+      {/* The one scroll threshold: an expanded body scrolls only past 32rem. */}
+      {open && (
+        <div className="border-t border-border overflow-y-auto max-h-[32rem]">
+          {tool.kind === 'diff' && tool.diff && (
+            <DiffView
+              diff={tool.diff.diff}
+              path={tool.diff.path}
+              editKind={tool.diff.editKind}
+            />
+          )}
+
+          {tool.kind === 'terminal' && tool.terminal && (
+            <TerminalBlock
+              command={tool.terminal.command}
+              output={tool.output}
+              exitCode={tool.terminal.exitCode}
+              cwd={tool.terminal.cwd}
+            />
+          )}
+
+          {tool.kind === 'read' && <ReadBody tool={tool} />}
+          {tool.kind === 'grep' && <GrepBody tool={tool} />}
+          {tool.kind === 'glob' && <GlobBody tool={tool} />}
+          {tool.kind === 'subrun' && (
+            <SubrunBody tool={tool} onOpenTranscript={onOpenTranscript} />
+          )}
+          {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
+          {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} runId={runId} host={host} />}
+          {(tool.kind === 'generic' || tool.kind === 'finding') && <GenericBody tool={tool} />}
+
+          {/* Error block — shown when tool.error is set */}
+          {tool.error && <ErrorBlock error={tool.error} />}
+        </div>
       )}
-
-      {tool.kind === 'terminal' && tool.terminal && (
-        <TerminalBlock
-          command={tool.terminal.command}
-          output={tool.output}
-          exitCode={tool.terminal.exitCode}
-          cwd={tool.terminal.cwd}
-        />
-      )}
-
-      {tool.kind === 'read' && <ReadBody tool={tool} />}
-      {tool.kind === 'grep' && <GrepBody tool={tool} />}
-      {tool.kind === 'glob' && <GlobBody tool={tool} />}
-      {tool.kind === 'subrun' && (
-        <SubrunBody tool={tool} onOpenTranscript={onOpenTranscript} />
-      )}
-      {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
-      {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} runId={runId} host={host} />}
-      {(tool.kind === 'generic' || tool.kind === 'finding') && <GenericBody tool={tool} />}
-
-      {/* Error block — shown when tool.error is set */}
-      {tool.error && <ErrorBlock error={tool.error} />}
     </div>
   );
 }
 
 /**
- * One tool call's card. The wrapper carries `data-call-id` (the RAW call id,
+ * One tool call's row. The wrapper carries `data-call-id` (the RAW call id,
  * never URL-encoded) so a `#call-<id>` link — the netflow table's "transcript"
  * link for a socket flow — can find the card; see `lib/toolCallAnchor.ts`.
  * A data attribute (not an `id`) so ids containing `/`, `:` etc. need no CSS

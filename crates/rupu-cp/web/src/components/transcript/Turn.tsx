@@ -1,71 +1,83 @@
 /**
- * Turn — one collapsible ordered-blocks group in the transcript.
+ * Turn — one turn of the transcript reader's feed.
  *
- * Collapsed (default for all but the last turn): a single summary header row —
- * an assistant-snippet (first ~100 chars, plain text, from the turn's first
- * assistant block) plus pills for tool count, finding count (only when > 0),
- * a per-turn tokens pill (when known), and a result pill (ok / error / running).
+ * A turn-head row (numbered spine marker, "Turn N", token label, a spine rule)
+ * followed by its blocks in order, each in an `.ev` row with a gutter glyph
+ * keyed by `blockEventKind`. Weights: assistant prose is loud, full thinking is
+ * quiet and individually collapsible, tools/commands/findings are `ToolCard`
+ * rows, messages are bubbles, everything else is a quiet one-line row. An
+ * unrecognized event still renders as a labelled fallback so nothing vanishes.
  *
- * Expanded: the same header (chevron down) then the body — every block in
- * `turn.blocks`, in order, dispatched by kind through `TurnBlockView`:
- * assistant/user markdown, a collapsible thinking block (or a redacted
- * marker), `ToolCard`s, message bubbles and injected-context chips,
- * gate/seed/notice/meta/compaction rows, and an `unknown`
- * fallback row so nothing silently vanishes.
+ * Honors the active filter from `useTranscriptView()`: non-matching blocks are
+ * skipped, and a turn with no matching block renders nothing at all.
  *
  * No `any`. Static Tailwind class strings only.
  */
 
 import { useEffect, useState } from 'react';
-import { ChevronRight, ChevronDown, Wrench, AlertTriangle } from 'lucide-react';
+import type { ReactNode } from 'react';
+import {
+  AlertTriangle,
+  Brain,
+  ChevronDown,
+  ChevronRight,
+  Info,
+  MessageSquare,
+  Terminal,
+  User,
+  Wrench,
+} from 'lucide-react';
 import Markdown from './Markdown';
 import ToolCard from './ToolCard';
 import MessageBubble, { InjectedChip } from './MessageBubble';
 import type { TurnBlock, TurnView } from './transcriptView';
+import { blockEventKind, blockMatchesFilter } from './eventKind';
+import type { EventKind } from './eventKind';
+import { useTranscriptView } from './TranscriptViewContext';
 import { cn } from '../../lib/cn';
 
-// ---------------------------------------------------------------------------
-// Static class maps (no interpolation)
-// ---------------------------------------------------------------------------
-
-const RESULT_PILL: Record<TurnView['summary']['result'], string> = {
-  ok: 'bg-ok-bg text-ok ring-ok/30',
-  error: 'bg-err-bg text-err ring-err/30',
-  running: 'bg-warn-bg text-warn ring-warn/30',
+const GLYPH_TONE: Record<EventKind, string> = {
+  said: 'text-brand-500',
+  thinking: 'text-ink-mute',
+  user: 'text-ink-dim',
+  message: 'text-info',
+  command: 'text-ink-dim',
+  finding: 'text-warn',
+  tool: 'text-ink-mute',
+  quiet: 'text-ink-mute',
 };
 
-const RESULT_LABEL: Record<TurnView['summary']['result'], string> = {
-  ok: 'ok',
-  error: 'error',
-  running: 'running',
-};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** A turn that said nothing itself but messaged: its first message. */
-function messageSnippet(turn: TurnView): string {
-  const first = turn.blocks.find((b): b is Extract<TurnBlock, { kind: 'message' }> => b.kind === 'message');
-  if (!first) return '';
-  const { direction, from, to, body } = first.message;
-  return snippet(direction === 'sent' ? `→ ${to ?? 'channel'}: ${body}` : `${from}: ${body}`);
+function Glyph({ kind, block }: { kind: EventKind; block: TurnBlock }) {
+  const cls = 'shrink-0';
+  switch (kind) {
+    case 'said':
+      return <MessageSquare size={13} className={cls} />;
+    case 'thinking':
+      return <Brain size={13} className={cls} />;
+    case 'user':
+      return <User size={13} className={cls} />;
+    case 'message':
+      return <MessageSquare size={13} className={cls} />;
+    case 'command':
+      return <Terminal size={13} className={cls} />;
+    case 'finding':
+      return <AlertTriangle size={13} className={cls} />;
+    case 'tool':
+      return <Wrench size={13} className={cls} />;
+    case 'quiet':
+      return block.kind === 'gate' || block.kind === 'outcome' ? (
+        <AlertTriangle size={13} className={cls} />
+      ) : (
+        <Info size={13} className={cls} />
+      );
+  }
 }
-
-/** First ~100 chars of the assistant content, whitespace-flattened. */
-function snippet(content: string | undefined): string {
-  if (!content) return '';
-  const flat = content.replace(/\s+/g, ' ').trim();
-  return flat.length > 100 ? `${flat.slice(0, 99)}…` : flat;
-}
-
-// ---------------------------------------------------------------------------
-// Public component
-// ---------------------------------------------------------------------------
 
 export default function Turn({
   turn,
-  defaultOpen,
+  turnNumber,
+  showMarker,
+  tokensLabel,
   onOpenTranscript,
   runId,
   host,
@@ -73,102 +85,65 @@ export default function Turn({
   highlightMsg,
 }: {
   turn: TurnView;
-  defaultOpen: boolean;
+  turnNumber: number;
+  showMarker: boolean;
+  tokensLabel?: string;
+  onOpenTranscript?: (path: string) => void;
+  runId?: string;
+  host?: string;
   /** The run's address in its message space (`TranscriptView.self`). */
   self?: string | null;
-  /** The `#msg-` anchor: the turn holding it opens, the bubble rings. */
+  /** The `#msg-` anchor: the bubble rings. */
   highlightMsg?: string | null;
-  onOpenTranscript?: (path: string) => void;
-  /** Run id threaded down to `ToolCard` for the source-preview affordance
-   *  (ast_grep match headers, finding location chips). */
-  runId?: string;
-  /** Remote host id, threaded alongside `runId`. */
-  host?: string;
 }) {
-  const [open, setOpen] = useState(defaultOpen);
-  const holdsAnchor = !!highlightMsg && turn.blocks.some((b) => b.kind === 'message' && b.message.id === highlightMsg);
-  useEffect(() => {
-    if (holdsAnchor) setOpen(true);
-  }, [holdsAnchor]);
-
-  const { toolCount, findingCount, result } = turn.summary;
-  const firstAssistant = turn.blocks.find(
-    (b): b is Extract<TurnBlock, { kind: 'assistant' }> => b.kind === 'assistant',
-  );
+  const { filter } = useTranscriptView();
+  const blocks = turn.blocks.filter((b) => blockMatchesFilter(b, filter));
+  if (blocks.length === 0) return null;
 
   return (
-    <div className="rounded-xl border border-border bg-panel">
-      {/* Summary header row — always rendered; toggles open */}
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left"
-      >
-        {open ? (
-          <ChevronDown size={13} className="shrink-0 text-ink-mute" />
-        ) : (
-          <ChevronRight size={13} className="shrink-0 text-ink-mute" />
-        )}
-
-        <span className="min-w-0 flex-1 truncate text-note text-ink-dim">
-          {snippet(firstAssistant?.content) || messageSnippet(turn) || (
-            <span className="italic text-ink-mute">no assistant message</span>
-          )}
-        </span>
-
-        {/* Pills */}
-        <span className="ml-auto flex shrink-0 items-center gap-1.5">
-          {toolCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium bg-surface text-ink">
-              <Wrench size={9} />
-              {toolCount} {toolCount === 1 ? 'tool' : 'tools'}
-            </span>
-          )}
-          {findingCount > 0 && (
-            <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium ring-1 ring-inset bg-warn-bg text-sev-medium ring-warn/30">
-              <AlertTriangle size={9} />
-              {findingCount} {findingCount === 1 ? 'finding' : 'findings'}
-            </span>
-          )}
-          {turn.tokensIn !== null && turn.tokensOut !== null && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-medium bg-surface text-ink-mute">
-              {turn.tokensIn} in · {turn.tokensOut} out
-            </span>
-          )}
+    <section className="relative" data-testid="turn">
+      <div className="flex items-center gap-2 py-1.5">
+        {showMarker && (
           <span
-            className={cn(
-              'inline-flex items-center rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ring-1 ring-inset',
-              RESULT_PILL[result],
-            )}
+            aria-hidden
+            className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-border bg-panel text-[10px] font-semibold text-ink-dim"
           >
-            {RESULT_LABEL[result]}
+            {turnNumber}
           </span>
-        </span>
-      </button>
-
-      {/* Body — only when expanded */}
-      {open && (
-        <div className="flex flex-col gap-1.5 border-t border-border px-3 pb-3 pt-2">
-          {turn.blocks.map((block, i) => (
-            <TurnBlockView
-              key={i}
-              block={block}
-              onOpenTranscript={onOpenTranscript}
-              runId={runId}
-              host={host}
-              self={self}
-              highlightMsg={highlightMsg}
-            />
-          ))}
-        </div>
-      )}
-    </div>
+        )}
+        {showMarker && <span className="text-note font-medium text-ink-dim">Turn {turnNumber}</span>}
+        {tokensLabel && <span className="text-meta text-ink-mute">{tokensLabel}</span>}
+        <span className="h-px flex-1 bg-border" />
+      </div>
+      <div className={cn('flex flex-col gap-1.5', showMarker && 'border-l border-border pl-3')}>
+        {blocks.map((block, i) => {
+          const kind = blockEventKind(block);
+          return (
+            <div key={i} className="ev flex items-start gap-2">
+              <span className={cn('mt-0.5 flex w-4 justify-center', GLYPH_TONE[kind])}>
+                <Glyph kind={kind} block={block} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <TurnBlockView
+                  block={block}
+                  onOpenTranscript={onOpenTranscript}
+                  runId={runId}
+                  host={host}
+                  self={self}
+                  highlightMsg={highlightMsg}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Per-block rendering
-// ---------------------------------------------------------------------------
+function Quiet({ children }: { children: ReactNode }) {
+  return <div className="text-meta text-ink-mute">{children}</div>;
+}
 
 function TurnBlockView({
   block,
@@ -192,17 +167,20 @@ function TurnBlockView({
           message={block.message}
           self={self}
           highlight={highlightMsg === block.message.id}
-          raw={block.message.raw ? <ToolCard tool={block.message.raw} onOpenTranscript={onOpenTranscript} runId={runId} host={host} /> : undefined}
+          raw={
+            block.message.raw ? (
+              <ToolCard tool={block.message.raw} onOpenTranscript={onOpenTranscript} runId={runId} host={host} />
+            ) : undefined
+          }
         />
       );
     case 'injected':
-      return <InjectedChip source={block.source} kind={block.injectedKind} cadence={block.cadence} content={block.content} />;
+      return (
+        <InjectedChip source={block.source} kind={block.injectedKind} cadence={block.cadence} content={block.content} />
+      );
     case 'assistant':
       return (
-        <div>
-          <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-brand-500">
-            assistant
-          </div>
+        <div className="text-ink">
           <Markdown text={block.content} />
         </div>
       );
@@ -211,25 +189,21 @@ function TurnBlockView({
     case 'user':
       return (
         <div>
-          <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-ink-mute">
-            prompt
-          </div>
+          <div className="mb-1 text-[9px] font-bold uppercase tracking-wide text-ink-mute">prompt</div>
           <Markdown text={block.content} />
         </div>
       );
     case 'tool':
-      return (
-        <ToolCard tool={block.view} onOpenTranscript={onOpenTranscript} runId={runId} host={host} />
-      );
+      return <ToolCard tool={block.view} onOpenTranscript={onOpenTranscript} runId={runId} host={host} />;
     case 'gate':
       return (
-        <div className="rounded-lg border-l-2 border-warn bg-warn-bg/40 px-2.5 py-2">
-          <div className="flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-wide text-warn">
-            gate <span className="font-normal normal-case text-ink-mute">#{block.gateId}</span>
+        <div className="border-l-2 border-warn pl-2">
+          <div className="text-meta text-warn">
+            gate <span className="text-ink-mute">#{block.gateId}</span>
           </div>
-          <div className="text-note text-ink">{block.prompt}</div>
+          <div className="text-note text-ink-dim">{block.prompt}</div>
           {block.decision && (
-            <div className="text-meta text-ink-dim">
+            <div className="text-meta text-ink-mute">
               {block.decidedBy ? `${block.decision} by ${block.decidedBy}` : block.decision}
             </div>
           )}
@@ -237,7 +211,7 @@ function TurnBlockView({
       );
     case 'seed':
       return (
-        <div className="text-meta text-ink-mute">
+        <Quiet>
           {block.messageCount} prior messages seed this run (stored once at the source)
           {block.sourceTranscript && onOpenTranscript && (
             <button
@@ -248,42 +222,38 @@ function TurnBlockView({
               view source transcript
             </button>
           )}
-        </div>
+        </Quiet>
       );
     case 'notice':
       return (
-        <div className="text-meta text-ink-mute">
+        <Quiet>
           <span className="font-medium">{block.noticeKind}</span> · {block.message}
-        </div>
+        </Quiet>
       );
     case 'meta':
       return (
-        <div className="text-meta text-ink-mute">
+        <Quiet>
           <span className="font-medium">{block.label}</span> · {block.text}
-        </div>
+        </Quiet>
       );
     case 'compaction':
       return (
-        <div className="text-meta text-ink-mute">
+        <Quiet>
           context compacted · seq {block.seq} · summarized {block.summarized} messages
-        </div>
+        </Quiet>
       );
     case 'outcome': {
       const tone =
-        block.severity === 'error'
-          ? 'border-err bg-err-bg/40'
-          : block.severity === 'warning'
-            ? 'border-warn bg-warn-bg/40'
-            : 'border-info';
+        block.severity === 'error' ? 'border-err' : block.severity === 'warning' ? 'border-warn' : 'border-info';
       return (
-        <div className={`rounded-lg border-l-2 px-2.5 py-2 ${tone}`}>
-          <div className="text-note font-medium text-ink">{block.title}</div>
-          {block.detail && <div className="text-meta text-ink-dim">{block.detail}</div>}
+        <div className={`border-l-2 pl-2 ${tone}`}>
+          <div className="text-note font-medium text-ink-dim">{block.title}</div>
+          {block.detail && <div className="text-meta text-ink-mute">{block.detail}</div>}
         </div>
       );
     }
     case 'recovery':
-      return <div className="text-meta text-ink-mute">{block.text}</div>;
+      return <Quiet>{block.text}</Quiet>;
     case 'assistant_block':
       return (
         <details className="text-meta text-ink-mute">
@@ -307,8 +277,15 @@ function TurnBlockView({
   }
 }
 
+/** Full thinking text, quiet; open by default, folds on collapse-all. */
 function ThinkingBlock({ text, provider }: { text: string | null; provider: string }) {
-  const [show, setShow] = useState(false);
+  const { expandTarget, expandNonce } = useTranscriptView();
+  const [show, setShow] = useState(expandTarget !== 'closed');
+  useEffect(() => {
+    if (expandTarget === 'closed') setShow(false);
+    else if (expandTarget === 'open') setShow(true);
+  }, [expandTarget, expandNonce]);
+
   if (text === null || text === '') {
     return (
       <div className="text-meta italic text-ink-mute">
@@ -320,6 +297,7 @@ function ThinkingBlock({ text, provider }: { text: string | null; provider: stri
     <div>
       <button
         type="button"
+        aria-expanded={show}
         onClick={() => setShow((v) => !v)}
         className="flex items-center gap-1 text-meta font-medium text-ink-mute"
       >
@@ -327,7 +305,7 @@ function ThinkingBlock({ text, provider }: { text: string | null; provider: stri
         thinking
       </button>
       {show && (
-        <div className="mt-1 border-l-2 border-border pl-2 text-ink-mute opacity-80">
+        <div className="mt-1 border-l-2 border-border pl-2 text-ink-dim">
           <Markdown text={text} />
         </div>
       )}

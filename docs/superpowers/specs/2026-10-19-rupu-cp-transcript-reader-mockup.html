@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcript reader — redesign</title>
+<style>
+  :root{
+    --c-bg:250 250 250; --c-panel:255 255 255; --c-surface:241 245 249;
+    --c-surface-hover:226 232 240; --c-border:229 231 235; --c-border-strong:203 213 225;
+    --c-ink:15 23 42; --c-ink-dim:100 116 139; --c-ink-mute:148 163 184;
+    --c-brand-500:124 58 237; --c-brand-600:109 40 217; --c-brand-700:91 33 182;
+    --c-sev-high:220 38 38; --c-sev-high-bg:254 242 242;
+    --c-sev-medium:234 88 12; --c-sev-medium-bg:255 247 237;
+    --c-status-running:59 130 246; --c-ok:22 163 74; --c-ok-bg:240 253 244;
+    --c-err:220 38 38; --c-err-bg:254 242 242; --c-warn:217 119 6; --c-warn-bg:255 251 235;
+    --bg:rgb(var(--c-bg)); --panel:rgb(var(--c-panel)); --surface:rgb(var(--c-surface));
+    --border:rgb(var(--c-border)); --borderS:rgb(var(--c-border-strong));
+    --ink:rgb(var(--c-ink)); --dim:rgb(var(--c-ink-dim)); --mute:rgb(var(--c-ink-mute));
+    --brand:rgb(var(--c-brand-600)); --brand7:rgb(var(--c-brand-700));
+    --run:rgb(var(--c-status-running)); --ok:rgb(var(--c-ok)); --err:rgb(var(--c-err));
+    --warn:rgb(var(--c-warn)); --hi:rgb(var(--c-sev-high)); --med:rgb(var(--c-sev-medium));
+    --sans:-apple-system,"system-ui",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .app{display:flex;height:100vh;overflow:hidden}
+
+  /* ---- sidebar (real CP chrome, trimmed) ---- */
+  aside{width:224px;flex:0 0 224px;border-right:1px solid var(--border);background:var(--panel);display:flex;flex-direction:column}
+  .brand{display:flex;align-items:center;gap:8px;padding:18px 20px;border-bottom:1px solid var(--border)}
+  .logo{width:28px;height:28px;border-radius:7px;background:var(--brand);color:#fff;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:300}
+  .brand b{font-size:13px;font-weight:600;display:block}
+  .brand span{font-size:11px;color:var(--mute);display:block}
+  nav{flex:1;padding:12px 8px;overflow:auto}
+  .navgrp{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute);font-weight:600;padding:12px 12px 4px}
+  .navi{display:flex;align-items:center;gap:10px;padding:7px 12px;border-radius:6px;color:var(--ink);text-decoration:none;font-size:13px}
+  .navi:hover{background:rgb(var(--c-surface-hover))}
+  .navi.active{background:var(--surface);font-weight:500}
+  .navi svg{width:16px;height:16px;stroke:var(--dim);stroke-width:2;fill:none}
+  .dot{width:7px;height:7px;border-radius:50%}
+
+  /* ---- canvas ---- */
+  main{flex:1;overflow:auto;background:var(--bg)}
+  .wrap{max-width:860px;margin:0 auto;padding:28px 32px 120px}
+
+  /* run header */
+  .back{display:inline-flex;align-items:center;gap:6px;color:var(--dim);font-size:12px;font-weight:500;text-decoration:none;margin-bottom:18px}
+  .rhead{display:flex;align-items:flex-start;gap:16px;margin-bottom:6px}
+  .rtitle{font-size:22px;font-weight:600;letter-spacing:-.01em;line-height:1.15}
+  .rsub{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;color:var(--dim);font-size:12.5px;margin-top:8px}
+  .rsub .k{color:var(--ink);font-weight:500}
+  .crew{font-family:var(--mono);font-size:12px;color:var(--brand7);background:rgb(var(--c-brand-500)/.08);padding:2px 7px;border-radius:5px}
+  .live{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:var(--ok)}
+  .live .dot{background:var(--ok)}
+  .metrics{display:flex;gap:28px;margin:18px 0 6px;padding:16px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}
+  .metric .mv{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .metric .ml{font-size:11.5px;color:var(--dim);margin-top:2px}
+  .metric .mv .u{font-size:12px;color:var(--mute);font-weight:400}
+
+  /* filter / reading controls */
+  .controls{position:sticky;top:0;z-index:5;background:linear-gradient(var(--bg) 70%,rgb(var(--c-bg)/0));padding:14px 0 12px;margin-top:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .seg{display:inline-flex;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:2px}
+  .seg button{border:0;background:transparent;font:inherit;font-size:12px;color:var(--dim);padding:4px 10px;border-radius:6px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .seg button.on{background:var(--panel);color:var(--ink);font-weight:500;box-shadow:0 1px 2px rgb(15 23 42/.06)}
+  .seg button .c{font-variant-numeric:tabular-nums;color:var(--mute);font-size:11px}
+  .spacer{flex:1}
+  .ghost{border:1px solid var(--border);background:var(--panel);border-radius:7px;font:inherit;font-size:12px;color:var(--dim);padding:5px 10px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+
+  /* ---- the reading column ---- */
+  .feed{position:relative;padding-left:40px}
+  /* the spine */
+  .feed::before{content:"";position:absolute;left:13px;top:6px;bottom:0;width:2px;background:var(--border)}
+
+  .turn{position:relative;margin-top:30px}
+  .turn:first-child{margin-top:6px}
+  .turnmark{position:absolute;left:-40px;top:0;width:28px;height:28px;border-radius:50%;background:var(--panel);border:1px solid var(--borderS);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:var(--dim);font-variant-numeric:tabular-nums;z-index:2}
+  .turnhead{display:flex;align-items:center;gap:10px;color:var(--mute);font-size:11px;margin-bottom:10px}
+  .turnhead .tl{height:1px;flex:1;background:var(--border)}
+  .turnhead b{color:var(--dim);font-weight:600}
+
+  /* event row: a glyph in the gutter + content */
+  .ev{position:relative;margin:2px 0}
+  .ev .g{position:absolute;left:-33px;top:1px;width:16px;height:16px;border-radius:50%;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:2}
+  .ev .g svg{width:11px;height:11px;stroke-width:2.2;fill:none}
+
+  /* thinking */
+  .think{color:var(--dim);font-size:12.5px;line-height:1.55;padding:5px 0 5px 12px;border-left:2px solid var(--border);margin:4px 0}
+  .think .lbl{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);font-weight:600;display:block;margin-bottom:3px}
+  .think.collapsed p{display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+  .think .g svg{stroke:var(--mute)}
+
+  /* assistant prose — the loud text */
+  .say{font-size:14px;line-height:1.6;color:var(--ink);padding:3px 0 6px;max-width:68ch}
+  .say .g svg{stroke:var(--brand)}
+
+  /* operator / lead message */
+  .msg{background:rgb(var(--c-brand-500)/.05);border:1px solid rgb(var(--c-brand-500)/.18);border-radius:10px;padding:10px 12px;margin:6px 0}
+  .msg .mh{font-size:11px;color:var(--brand7);font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:6px}
+  .msg .mb{font-size:12.5px;color:var(--ink);line-height:1.5}
+  .msg .g svg{stroke:var(--brand)}
+
+  /* tool call — one scannable log line, expandable */
+  .tool{border:1px solid var(--border);border-radius:9px;background:var(--panel);margin:5px 0;overflow:hidden}
+  .tool .g svg{stroke:var(--dim)}
+  .trow{display:flex;align-items:center;gap:9px;padding:8px 11px;cursor:pointer;user-select:none}
+  .trow:hover{background:var(--surface)}
+  .tverb{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--ink);flex:0 0 auto}
+  .ttarget{font-family:var(--mono);font-size:12px;color:var(--dim);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chip{font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:999px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .chip.ok{background:var(--ok-bg,rgb(var(--c-ok-bg)));color:var(--ok)}
+  .chip.err{background:rgb(var(--c-err-bg));color:var(--err)}
+  .chip.n{background:var(--surface);color:var(--dim)}
+  .dur{font-size:11px;color:var(--mute);font-variant-numeric:tabular-nums}
+  .chev{color:var(--mute);width:14px;height:14px;stroke-width:2;fill:none;transition:transform .15s}
+  .tool.open .chev{transform:rotate(90deg)}
+  .tbody{display:none;border-top:1px solid var(--border)}
+  .tool.open .tbody{display:block}
+  pre.out{font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--ink);background:var(--surface);padding:10px 12px;max-height:280px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+  .tin{padding:6px 11px;font-family:var(--mono);font-size:11px;color:var(--dim);background:rgb(var(--c-surface)/.5);border-bottom:1px solid var(--border)}
+
+  /* command — terminal row */
+  .cmd .g svg{stroke:var(--ink)}
+  .cmd .trow{background:rgb(var(--c-ink)/.015)}
+  .cmd .tverb{color:var(--ink)}
+  .cmd .tverb::before{content:"$ ";color:var(--mute)}
+
+  /* finding — the signal, severity color only here */
+  .finding{border:1px solid rgb(var(--c-sev-high)/.3);background:rgb(var(--c-sev-high-bg));border-radius:10px;padding:11px 13px;margin:6px 0}
+  .finding.med{border-color:rgb(var(--c-sev-medium)/.3);background:rgb(var(--c-sev-medium-bg))}
+  .finding .g svg{stroke:var(--hi)}
+  .finding.med .g svg{stroke:var(--med)}
+  .fh{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .sev{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:2px 7px;border-radius:5px;color:#fff;background:var(--hi)}
+  .finding.med .sev{background:var(--med)}
+  .ftitle{font-size:13px;font-weight:600;color:var(--ink)}
+  .fbody{font-size:12.5px;color:var(--dim);line-height:1.5}
+  .ftarget{font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:4px}
+
+  .skill{font-size:11.5px;color:var(--mute);padding:3px 0}
+  .skill .g svg{stroke:var(--mute)}
+  .skill code{font-family:var(--mono);color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- SIDEBAR -->
+  <aside>
+    <div class="brand"><div class="logo">∞</div><div><b>rupu</b><span>Control Plane</span></div></div>
+    <nav>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg>Dashboard</a>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><path d="M9 20H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v5"/><circle cx="13" cy="12" r="2"/></svg>Projects</a>
+      <div class="navgrp">Runs</div>
+      <a class="navi active" href="#"><svg viewBox="0 0 24 24"><path d="M9.9 15.5A2 2 0 0 0 8.5 14l-6.1-1.6a.5.5 0 0 1 0-1L8.5 9.9A2 2 0 0 0 9.9 8.5l1.6-6.1a.5.5 0 0 1 1 0L14 8.5A2 2 0 0 0 15.5 9.9l6.1 1.6a.5.5 0 0 1 0 1L15.5 14a2 2 0 0 0-1.4 1.4l-1.6 6.1a.5.5 0 0 1-1 0z"/></svg>Agents</a>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><rect width="8" height="8" x="3" y="3" rx="2"/><path d="M7 11v4a2 2 0 0 0 2 2h4"/><rect width="8" height="8" x="13" y="13" rx="2"/></svg>Workflows</a>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><path d="M10.4 21.9a10 10 0 0 0 9.9-15.4"/><path d="M13.5 2.1a10 10 0 0 0-9.8 15.4"/></svg>Agentiflows</a>
+      <div class="navgrp">Security</div>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.7 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.5 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>Findings</a>
+      <a class="navi" href="#"><svg viewBox="0 0 24 24"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg>Network</a>
+    </nav>
+  </aside>
+
+  <!-- CANVAS -->
+  <main>
+  <div class="wrap">
+    <a class="back" href="#"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>Agent runs</a>
+
+    <div class="rhead">
+      <div style="flex:1">
+        <div class="rtitle">cellgw-assessor</div>
+        <div class="rsub">
+          <span class="crew">buzzard&gt;guppy#3</span>
+          <span><span class="k">anthropic</span> · claude-mythos-5</span>
+          <span>·</span>
+          <span class="live"><span class="dot"></span>completed</span>
+          <span>· Oct 15, 21:17 · 37m 53s</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="mv">51</div><div class="ml">turns</div></div>
+      <div class="metric"><div class="mv">104</div><div class="ml">tool calls</div></div>
+      <div class="metric"><div class="mv">39</div><div class="ml">commands</div></div>
+      <div class="metric"><div class="mv">1 <span class="u">finding</span></div><div class="ml">27 assets marked</div></div>
+      <div class="metric"><div class="mv">7.3<span class="u">M</span></div><div class="ml">tokens · $39.33</div></div>
+    </div>
+
+    <!-- reading controls -->
+    <div class="controls">
+      <div class="seg">
+        <button class="on">All</button>
+        <button>Said <span class="c">36</span></button>
+        <button>Thinking <span class="c">43</span></button>
+        <button>Commands <span class="c">39</span></button>
+        <button>Findings <span class="c">1</span></button>
+      </div>
+      <div class="spacer"></div>
+      <button class="ghost"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 7 5 5-5 5"/><path d="M21 12H8"/></svg>Expand all</button>
+      <button class="ghost">Jump to…</button>
+    </div>
+
+    <!-- FEED -->
+    <div class="feed">
+
+      <!-- turn 0 -->
+      <div class="turn">
+        <div class="turnmark">1</div>
+        <div class="turnhead"><b>Turn 1</b><span>· 64.8k in · 135 out</span><span class="tl"></span></div>
+
+        <div class="ev msg">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
+          <div class="mh"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5z"/></svg>Directive from lead</div>
+          <div class="mb">DECONFLICT v2: 218.144.248.0/27 (incl. .12 foothold, .16 LG ACS5, .17 console server) is now <b>exclusive</b> to the pivot operators. All other operators stay off this block.</div>
+        </div>
+
+        <div class="ev think collapsed">
+          <span class="g"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+          <span class="lbl">Thinking</span>
+          <p>I should start by reading the worklist and checking the board for context, including any existing finding ids.</p>
+        </div>
+
+        <div class="ev tool">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg></span>
+          <div class="trow">
+            <span class="tverb">read_file</span>
+            <span class="ttarget">reports/worklists/wave3.md</span>
+            <span class="chip ok">ok</span><span class="dur">1ms</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody"><pre class="out">1  # Wave-3 worklist — residual credential paths + untouched exposure surface
+2  ## OFF LIMITS: 218.144.248.0/27 (pivot ops exclusive)
+3  ## Tier 1 — credential campaigns (authorized; slow and paced)
+4  - 39.124.191.61 tcp/161 SNMPv3: VALID USM user "admin" confirmed
+     (Cisco, engine ent.9 MAC 10:F9:20:45:9E:C0). Run a patient…</pre></div>
+        </div>
+
+        <div class="ev tool">
+          <span class="g"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="16" width="18" height="4" rx="1"/></svg></span>
+          <div class="trow">
+            <span class="tverb">board.read</span>
+            <span class="ttarget">limit: 80</span>
+            <span class="chip ok">ok</span><span class="dur">2ms</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody"><pre class="out">pipit#2 [note]: buzzard&gt;pipit#2 claimed batch:batch_ab. Found prior
+discovery output in reports/recon_ab (166 live hosts, tcp_top1000 in
+flight) — adopting it rather than re-scanning.</pre></div>
+        </div>
+      </div>
+
+      <!-- turn 2 -->
+      <div class="turn">
+        <div class="turnmark">2</div>
+        <div class="turnhead"><b>Turn 2</b><span>· 74.1k in · 778 out</span><span class="tl"></span></div>
+
+        <div class="ev think">
+          <span class="g"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+          <span class="lbl">Thinking</span>
+          <p>As guppy#3 on wave-3, I'm laying out my targets: a paced SNMPv3 USM campaign against the admin user on one host, an extended telnet spray against another, SNMPv3 user enumeration then password attempts on a third, and a fourth host still to plan. Then a CHAP oracle attempt against the SonicWALL host with strict rate limits, plus tier-2 retests on BGP RST, Opengear enumeration, and NTP mode-6.</p>
+        </div>
+
+        <div class="ev tool">
+          <span class="g"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="16" width="18" height="4" rx="1"/></svg></span>
+          <div class="trow">
+            <span class="tverb">board.claim</span>
+            <span class="ttarget">×6 — host:39.124.191.61, 103.124.225.241, 84.232.96.77 …</span>
+            <span class="chip ok">6 granted</span><span class="dur">0ms</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody"><pre class="out">granted: host:39.124.191.61
+granted: host:103.124.225.241
+granted: host:84.232.96.77
+granted: host:203.197.67.130
+granted: host:84.232.96.70
+granted: host:103.225.73.177</pre></div>
+        </div>
+
+        <div class="ev tool cmd">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
+          <div class="trow">
+            <span class="tverb">which snmpwalk snmpget hydra medusa …</span>
+            <span class="ttarget"></span>
+            <span class="chip ok">exit 0</span><span class="dur">1.8 KB</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody">
+            <div class="tin">cwd /Users/matt/Security/CellGW</div>
+            <pre class="out">/usr/bin/snmpwalk
+/usr/bin/snmpget
+/opt/homebrew/bin/hydra
+/run/current-system/sw/bin/python3
+/run/current-system/sw/bin/nmap
+ModuleNotFoundError: No module named 'pysnmp'</pre></div>
+        </div>
+      </div>
+
+      <!-- turn 4 -->
+      <div class="turn">
+        <div class="turnmark">4</div>
+        <div class="turnhead"><b>Turn 4</b><span>· 77.8k in · 2.2k out</span><span class="tl"></span></div>
+
+        <div class="ev say">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="M9.9 15.5A2 2 0 0 0 8.5 14l-6.1-1.6a.5.5 0 0 1 0-1L8.5 9.9A2 2 0 0 0 9.9 8.5l1.6-6.1a.5.5 0 0 1 1 0L14 8.5A2 2 0 0 0 15.5 9.9l6.1 1.6a.5.5 0 0 1 0 1L15.5 14a2 2 0 0 0-1.4 1.4l-1.6 6.1a.5.5 0 0 1-1 0z"/></svg></span>
+          Directive noted — I hold no claims in that block and will not touch it. Now reviewing prior attempt logs so the campaigns don't repeat tried credentials, and the existing PoC scripts.
+        </div>
+
+        <div class="ev tool cmd">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
+          <div class="trow">
+            <span class="tverb">cat reports/wave2/sw_login2.py</span>
+            <span class="ttarget"></span>
+            <span class="chip ok">exit 0</span><span class="dur">1.6 KB</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody"><pre class="out">#!/usr/bin/env python3
+"""SonicWALL login + post-auth verification in one session (serialized)."""
+import sys, re, ssl, time, hashlib, urllib.request, http.cookiejar
+host, user, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+ctx = ssl.create_default_context(); ctx.check_hostname=False
+cj = http.cookiejar.CookieJar()…</pre></div>
+        </div>
+      </div>
+
+      <!-- turn with finding -->
+      <div class="turn">
+        <div class="turnmark">8</div>
+        <div class="turnhead"><b>Turn 8</b><span>· 90.4k in · 1.3k out</span><span class="tl"></span></div>
+
+        <div class="ev think collapsed">
+          <span class="g"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+          <span class="lbl">Thinking</span>
+          <p>The POST response looks identical for valid and invalid attempts, so the real oracle is the SessId cookie / auth.html state. Let me confirm the detector before launching the paced campaigns.</p>
+        </div>
+
+        <div class="ev say">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="M9.9 15.5A2 2 0 0 0 8.5 14l-6.1-1.6a.5.5 0 0 1 0-1L8.5 9.9A2 2 0 0 0 9.9 8.5l1.6-6.1a.5.5 0 0 1 1 0L14 8.5A2 2 0 0 0 15.5 9.9l6.1 1.6a.5.5 0 0 1 0 1L15.5 14a2 2 0 0 0-1.4 1.4l-1.6 6.1a.5.5 0 0 1-1 0z"/></svg></span>
+          The POST response is identical for right/wrong — the real oracle is the SessId cookie. Confirmed detector works; launching the four paced campaigns in the background now.
+        </div>
+
+        <div class="ev finding">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.7 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.2-2.7a1.2 1.2 0 0 1 1.5 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg></span>
+          <div class="fh"><span class="sev">High</span><span class="ftitle">SonicWALL login response-timing credential oracle</span></div>
+          <div class="fbody">Auth endpoint returns an identical body for valid and invalid credentials, but a valid login sets a <code>SessId</code> cookie — a blind oracle that enables unthrottled offline-style credential confirmation.</div>
+          <div class="ftarget">84.232.96.77 · tcp/443 · /auth.cgi</div>
+        </div>
+      </div>
+
+      <!-- a quiet / running tail -->
+      <div class="turn">
+        <div class="turnmark" style="background:rgb(var(--c-status-running)/.12);border-color:rgb(var(--c-status-running)/.5);color:var(--run)">9</div>
+        <div class="turnhead"><b>Turn 9</b><span>· running</span><span class="tl"></span></div>
+        <div class="ev tool cmd">
+          <span class="g"><svg viewBox="0 0 24 24"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></span>
+          <div class="trow">
+            <span class="tverb">nohup python3 snmp_campaign.py 39.124.191.61 admin &</span>
+            <span class="ttarget"></span>
+            <span class="chip n">running</span><span class="dur">—</span>
+            <svg class="chev" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="tbody"><pre class="out">[*] campaign started · pid 48213 · 1 conn / 45-60s · log snmp61_campaign.log</pre></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+  </main>
+</div>
+
+<script>
+  document.querySelectorAll('.trow').forEach(r=>{
+    r.addEventListener('click',()=>r.closest('.tool').classList.toggle('open'));
+  });
+  document.querySelectorAll('.think').forEach(t=>{
+    t.addEventListener('click',()=>t.classList.toggle('collapsed'));
+  });
+</script>
+</body>
+</html>

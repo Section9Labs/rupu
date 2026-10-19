@@ -17,6 +17,11 @@ import { Spinner } from './ui/Spinner';
 import { buildTranscriptView } from './transcript/transcriptView';
 import { parseMsgHash } from '../lib/messages';
 import Turn from './transcript/Turn';
+import TranscriptControls from './transcript/TranscriptControls';
+import TranscriptOutline from './transcript/TranscriptOutline';
+import { TranscriptViewProvider } from './transcript/TranscriptViewContext';
+import { filterCounts } from './transcript/eventKind';
+import type { FilterKind } from './transcript/eventKind';
 import { AgentName } from './codename/AgentName';
 
 type LoadState = 'loading' | 'ready' | 'error';
@@ -98,6 +103,15 @@ export default function TranscriptPanel({
   const [partial, setPartial] = useState(false);
   const navigate = useNavigate();
   const location = useLocation();
+  // Reader view state: the event-kind filter and the expand-all/collapse-all
+  // signal (a new nonce re-applies the target even when it repeats).
+  const [filter, setFilter] = useState<FilterKind>('all');
+  const [expandTarget, setExpandTarget] = useState<'open' | 'closed' | null>(null);
+  const [expandNonce, setExpandNonce] = useState(0);
+  const expandAll = (target: 'open' | 'closed') => {
+    setExpandTarget(target);
+    setExpandNonce((n) => n + 1);
+  };
 
   // Open a sub-run transcript in the same transcript route (reuses the existing
   // `/transcript?path=…` page — no new global state). Sub-runs are completed
@@ -233,6 +247,11 @@ export default function TranscriptPanel({
   // `#msg-<id>`: the turn holding the bubble opens and the bubble scrolls
   // itself into view (Turn, MessageBubble).
   const highlightMsg = parseMsgHash(location.hash);
+  // An anchored message must not be filtered out: reset to `all` whenever a
+  // `#msg-<id>` anchor appears.
+  useEffect(() => {
+    if (highlightMsg) setFilter('all');
+  }, [highlightMsg]);
 
   // ---- non-ready states ----------------------------------------------------
 
@@ -260,12 +279,54 @@ export default function TranscriptPanel({
 
   // ---- ready ---------------------------------------------------------------
 
+  const counts = filterCounts(view.turns);
+  const toolCalls = view.turns.reduce((n, t) => n + t.summary.toolCount, 0);
+  const totalTokens = view.footer?.totalTokens;
+  const hasChrome =
+    view.header != null || (typeof unparsed === 'number' && unparsed > 0) || partial;
+
+  // The feed: every turn mounted up front (the outline observes `#turn-<n>`).
+  const feed = (
+    <div className="flex min-w-0 flex-1 flex-col">
+      {isEmpty && (
+        <div className="p-6 text-center text-sm text-ink-mute">No transcript events yet.</div>
+      )}
+      {view.turns.map((turn, ti) => (
+        <div key={ti} id={`turn-${ti + 1}`}>
+          <Turn
+            turn={turn}
+            turnNumber={ti + 1}
+            showMarker={!embedded}
+            tokensLabel={
+              turn.tokensIn != null || turn.tokensOut != null
+                ? `${(turn.tokensIn ?? 0).toLocaleString()} in · ${(turn.tokensOut ?? 0).toLocaleString()} out`
+                : undefined
+            }
+            onOpenTranscript={openTranscript}
+            runId={runId}
+            host={host}
+            self={view.self}
+            highlightMsg={highlightMsg}
+          />
+        </div>
+      ))}
+    </div>
+  );
+
+  if (embedded) {
+    return (
+      <TranscriptViewProvider value={{ filter, expandTarget, expandNonce, live }}>
+        <div className="flex flex-col text-note">{feed}</div>
+      </TranscriptViewProvider>
+    );
+  }
+
   return (
     <div className="flex flex-col rounded-xl border border-border bg-bg p-3 text-note">
-      {/* Header: agent · provider · model · live · status / tokens. Renders
-          even without a `run_start` header (headerless snapshots) when the
-          unparsed/partial data-quality badges have something to show. */}
-      {!embedded && (view.header || (typeof unparsed === 'number' && unparsed > 0) || partial) && (
+      {/* Run header: agent · provider · model · live · data-quality badges.
+          Renders even without a `run_start` header (headerless snapshots) when
+          the unparsed/partial badges have something to show. */}
+      {hasChrome && (
         <div className="mb-2 flex flex-wrap items-center gap-2 border-b border-border pb-1.5 text-note text-ink-dim">
           {view.header &&
             (view.header.codename ? (
@@ -314,47 +375,45 @@ export default function TranscriptPanel({
               incomplete
             </span>
           )}
-          {view.footer?.totalTokens != null && (
-            <span className="ml-auto tabular-nums">
-              {view.footer.totalTokens.toLocaleString()} tok
+          {view.footer?.status && (
+            <span className="ml-auto">
+              {statusGlyph(view.footer.status)} {view.footer.status}
             </span>
           )}
         </div>
       )}
 
-      {isEmpty && (
-        <div className="p-6 text-center text-sm text-ink-mute">No transcript events yet.</div>
-      )}
-
-      {/* Turns — last turn expanded by default, earlier turns collapsed. */}
-      <div className="flex flex-col gap-1.5">
-        {view.turns.map((turn, ti) => (
-          <Turn
-            key={ti}
-            turn={turn}
-            defaultOpen={ti === view.turns.length - 1}
-            onOpenTranscript={openTranscript}
-            runId={runId}
-            host={host}
-            self={view.self}
-            highlightMsg={highlightMsg}
-          />
-        ))}
-      </div>
-
-      {/* Footer: status · total tokens · duration */}
-      {!embedded && view.footer && (
-        <div className="mt-2 flex flex-wrap gap-3 border-t border-border pt-1.5 text-meta text-ink-dim">
-          {view.footer.status && <span>{statusGlyph(view.footer.status)} {view.footer.status}</span>}
-          {view.footer.totalTokens != null && (
-            <span className="tabular-nums">{view.footer.totalTokens.toLocaleString()} tokens</span>
-          )}
-          {view.footer.durationMs != null && (
-            <span className="tabular-nums">{formatDuration(view.footer.durationMs)}</span>
-          )}
-          {view.footer.error && <span className="text-err">{view.footer.error}</span>}
+      {/* Metrics strip: the run at a glance. */}
+      {!isEmpty && (
+        <div
+          className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-meta tabular-nums text-ink-dim"
+          data-testid="transcript-metrics"
+        >
+          <span>{view.turns.length} {view.turns.length === 1 ? 'turn' : 'turns'}</span>
+          <span>{toolCalls} tool {toolCalls === 1 ? 'call' : 'calls'}</span>
+          <span>{counts.commands} {counts.commands === 1 ? 'command' : 'commands'}</span>
+          <span>{counts.findings} {counts.findings === 1 ? 'finding' : 'findings'}</span>
+          {totalTokens != null && <span>{totalTokens.toLocaleString()} tokens</span>}
+          {view.footer?.durationMs != null && <span>{formatDuration(view.footer.durationMs)}</span>}
+          {view.footer?.error && <span className="text-err">{view.footer.error}</span>}
         </div>
       )}
+
+      <TranscriptViewProvider value={{ filter, expandTarget, expandNonce, live }}>
+        {!isEmpty && (
+          <TranscriptControls
+            counts={counts}
+            filter={filter}
+            onFilter={setFilter}
+            onExpandAll={() => expandAll('open')}
+            onCollapseAll={() => expandAll('closed')}
+          />
+        )}
+        <div className="flex gap-3">
+          {feed}
+          {!isEmpty && <TranscriptOutline turns={view.turns} filter={filter} />}
+        </div>
+      </TranscriptViewProvider>
     </div>
   );
 }
