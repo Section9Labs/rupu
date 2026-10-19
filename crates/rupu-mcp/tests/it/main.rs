@@ -4,5 +4,8 @@
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
 
+mod protocol;
 mod schema_snapshot;
 mod serve;
+mod sessions;
+mod stub;

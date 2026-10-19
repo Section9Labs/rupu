@@ -7,13 +7,21 @@
 //! same permission policy and tool bodies the agent loop and `action:`
 //! workflow steps use (`rupu_tools::call`). It owns no tools.
 //!
+//! [`McpServer`] is the protocol core over pluggable [`ToolSource`]s.
+//!
 //! Transports: [`StdioTransport`] (`rupu mcp serve`, for Claude Desktop,
 //! Cursor, …) and [`InProcessTransport`] (tests).
 
 pub mod error;
+pub mod filter;
 pub mod server;
+pub mod source;
 pub mod transport;
 
 pub use error::{McpError, ServeError};
-pub use server::{negotiate_protocol_version, CatalogServer, MCP_DEFAULT_GRANT, PROTOCOL_VERSIONS};
+pub use filter::ToolFilter;
+pub use server::{
+    negotiate_protocol_version, CatalogServer, McpServer, MCP_DEFAULT_GRANT, PROTOCOL_VERSIONS,
+};
+pub use source::{CallCx, ToolDef, ToolHints, ToolResult, ToolSource};
 pub use transport::{decode_line, InProcessTransport, StdioTransport, Transport};

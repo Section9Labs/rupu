@@ -401,3 +401,303 @@ impl Inner {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// McpServer: the protocol core over pluggable tool sources.
+// ---------------------------------------------------------------------------
+
+use crate::filter::ToolFilter;
+use crate::source::{CallCx, ToolDef, ToolResult, ToolSource};
+
+/// JSON-RPC 2.0 over any transport, serving the tools of its
+/// [`ToolSource`]s. `handle` takes one message (or batch) and returns the
+/// reply, so an HTTP transport can call it per request; `run` drives a
+/// [`Transport`] (tests).
+pub struct McpServer {
+    core: Arc<Core>,
+}
+
+struct Core {
+    /// Listed tools, in source order.
+    defs: Vec<ToolDef>,
+    /// Tool name → the source index that serves it.
+    owner: HashMap<String, usize>,
+    sources: Vec<Arc<dyn ToolSource>>,
+    in_flight: Mutex<SessionFlight>,
+}
+
+/// In-flight `tools/call`s keyed by (session, request id).
+#[derive(Default)]
+struct SessionFlight {
+    next: u64,
+    calls: HashMap<(String, String), (u64, AbortHandle)>,
+}
+
+struct Deregister {
+    core: Arc<Core>,
+    key: (String, String),
+    generation: u64,
+}
+
+impl Drop for Deregister {
+    fn drop(&mut self) {
+        let mut f = self
+            .core
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if f.calls.get(&self.key).map(|(g, _)| *g) == Some(self.generation) {
+            f.calls.remove(&self.key);
+        }
+    }
+}
+
+impl McpServer {
+    /// Lists every tool of `sources` that `filter` keeps. A name served by
+    /// two sources is `ServeError::Duplicate(name)`.
+    pub fn new(sources: Vec<Arc<dyn ToolSource>>, filter: &ToolFilter) -> Result<Self, ServeError> {
+        let mut defs = Vec::new();
+        let mut owner: HashMap<String, usize> = HashMap::new();
+        for (i, source) in sources.iter().enumerate() {
+            for def in source.tools() {
+                if !filter.apply(&def.name) {
+                    continue;
+                }
+                if owner.insert(def.name.clone(), i).is_some() {
+                    return Err(ServeError::Duplicate(def.name));
+                }
+                defs.push(def);
+            }
+        }
+        Ok(Self {
+            core: Arc::new(Core {
+                defs,
+                owner,
+                sources,
+                in_flight: Mutex::new(SessionFlight::default()),
+            }),
+        })
+    }
+
+    pub fn tool_names(&self) -> Vec<String> {
+        self.core.defs.iter().map(|d| d.name.clone()).collect()
+    }
+
+    /// One JSON-RPC message or batch → the reply (`None` for notifications,
+    /// client responses, and a cancelled call). `session` keys in-flight
+    /// calls, so a cancel only reaches its own session's call.
+    pub async fn handle(&self, msg: Value, session: Option<&str>) -> Option<Value> {
+        let session = session.map(str::to_string);
+        match msg {
+            Value::Array(batch) if batch.is_empty() => {
+                Some(McpError::InvalidRequest("empty batch".into()).to_jsonrpc(Value::Null))
+            }
+            Value::Array(batch) => {
+                // Started together (a cancel in a batch can reach a call
+                // in it), answered in order.
+                let tasks: Vec<_> = batch
+                    .into_iter()
+                    .map(|m| tokio::spawn(self.core.clone().one(m, session.clone())))
+                    .collect();
+                let mut out = Vec::new();
+                for t in tasks {
+                    if let Ok(Some(v)) = t.await {
+                        out.push(v);
+                    }
+                }
+                (!out.is_empty()).then_some(Value::Array(out))
+            }
+            msg => self.core.clone().one(msg, session).await,
+        }
+    }
+
+    /// Serve a transport until it closes (tests; `InProcessTransport`).
+    /// What is running when it closes finishes and is answered; a transport
+    /// error aborts it.
+    pub async fn run<T: Transport + 'static>(
+        self: Arc<Self>,
+        transport: T,
+    ) -> Result<(), McpError> {
+        let transport = Arc::new(transport);
+        let mut replies = JoinSet::new();
+        let result = loop {
+            while replies.try_join_next().is_some() {}
+            match transport.recv().await {
+                Ok(Some(msg)) => {
+                    let this = self.clone();
+                    let t = transport.clone();
+                    replies.spawn(async move {
+                        if let Some(v) = this.handle(msg, None).await {
+                            send_logged(&*t, v).await;
+                        }
+                    });
+                }
+                Ok(None) => break Ok(()),
+                Err(e @ McpError::Parse(_)) => {
+                    warn!(error = %e, "malformed JSON-RPC line");
+                    if let Err(e) = transport.send(e.to_jsonrpc(Value::Null)).await {
+                        break Err(e);
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        if result.is_err() {
+            self.core.abort_all();
+        }
+        while replies.join_next().await.is_some() {}
+        result
+    }
+}
+
+impl Core {
+    /// One non-batch message.
+    async fn one(self: Arc<Self>, msg: Value, session: Option<String>) -> Option<Value> {
+        let Value::Object(msg) = msg else {
+            let e = McpError::InvalidRequest("not a JSON-RPC object".into());
+            return Some(e.to_jsonrpc(Value::Null));
+        };
+        let id = msg.get("id").cloned();
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let Some(method) = msg.get("method").and_then(Value::as_str) else {
+            // A response to a request of ours (we send none) needs no answer.
+            if msg.contains_key("result") || msg.contains_key("error") {
+                return None;
+            }
+            let e = McpError::InvalidRequest("no method".into());
+            return Some(e.to_jsonrpc(id.unwrap_or(Value::Null)));
+        };
+        let Some(id) = id else {
+            match method {
+                "notifications/cancelled" => {
+                    if let Some(request_id) = params.get("requestId") {
+                        self.cancel(session.as_deref(), request_id);
+                    }
+                }
+                _ => debug!(method, "notification"),
+            }
+            return None;
+        };
+        let ok = |result: Value| Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        match method {
+            "initialize" => {
+                let requested = params.get("protocolVersion").and_then(Value::as_str);
+                ok(json!({
+                    "protocolVersion": negotiate_protocol_version(requested),
+                    "serverInfo": { "name": "rupu", "version": env!("CARGO_PKG_VERSION") },
+                    "capabilities": { "tools": {} },
+                }))
+            }
+            "ping" => ok(json!({})),
+            "tools/list" => ok(json!({ "tools": self.list() })),
+            "tools/call" => self.tools_call(id, params, session).await,
+            other => Some(McpError::UnknownMethod(other.to_string()).to_jsonrpc(id)),
+        }
+    }
+
+    fn list(&self) -> Vec<Value> {
+        self.defs
+            .iter()
+            .map(|d| {
+                json!({
+                    "name": d.name,
+                    "description": d.description,
+                    "inputSchema": d.input_schema,
+                    "annotations": d.hints.to_annotations(),
+                })
+            })
+            .collect()
+    }
+
+    /// Run the call as its own task, registered under (session, id) until
+    /// it ends; a cancel aborts it and then no reply is sent.
+    async fn tools_call(
+        self: &Arc<Self>,
+        id: Value,
+        params: Value,
+        session: Option<String>,
+    ) -> Option<Value> {
+        let key = (session.clone().unwrap_or_default(), id.to_string());
+        let core = self.clone();
+        let task = {
+            // Held across the spawn, so the task can't end (and deregister)
+            // before it is registered.
+            let mut flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let generation = flight.next;
+            flight.next += 1;
+            let guard = Deregister {
+                core: core.clone(),
+                key: key.clone(),
+                generation,
+            };
+            let task = tokio::spawn(async move {
+                let _guard = guard;
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = params.get("arguments").cloned().unwrap_or(json!({}));
+                let result = core.call(name, args, CallCx { session }).await;
+                json!({ "jsonrpc": "2.0", "id": id, "result": result })
+            });
+            if flight
+                .calls
+                .insert(key, (generation, task.abort_handle()))
+                .is_some()
+            {
+                warn!("a tools/call reused the id of a call still running");
+            }
+            task
+        };
+        task.await.ok()
+    }
+
+    async fn call(&self, name: &str, args: Value, cx: CallCx) -> Value {
+        let result = match self.owner.get(name) {
+            Some(&i) => self.sources[i].call(name, args, &cx).await,
+            None => None,
+        };
+        match result {
+            Some(ToolResult::Json(v)) => json!({
+                "content": [{"type": "text", "text": v.to_string()}],
+                "structuredContent": v,
+            }),
+            Some(ToolResult::Text(t)) => json!({ "content": [{"type": "text", "text": t}] }),
+            Some(ToolResult::Error(t)) => {
+                warn!(tool = %name, error = %t, "tool call failed");
+                json!({ "isError": true, "content": [{"type": "text", "text": t}] })
+            }
+            None => json!({
+                "isError": true,
+                "content": [{"type": "text", "text": format!("unknown tool: {name}")}],
+            }),
+        }
+    }
+
+    fn cancel(&self, session: Option<&str>, request_id: &Value) {
+        let key = (session.unwrap_or("").to_string(), request_id.to_string());
+        let call = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .calls
+            .remove(&key);
+        match call {
+            Some((_, task)) => {
+                debug!(request_id = %key.1, "tools/call cancelled");
+                task.abort();
+            }
+            None => debug!(request_id = %key.1, "cancel for no running call"),
+        }
+    }
+
+    fn abort_all(&self) {
+        let calls = std::mem::take(
+            &mut self
+                .in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .calls,
+        );
+        for (_, task) in calls.into_values() {
+            task.abort();
+        }
+    }
+}
