@@ -30,6 +30,7 @@ mod hosts_api;
 mod launch_preview;
 mod mcp;
 mod mcp_routes;
+mod mcp_wait;
 mod legacy_codenames;
 mod list_query;
 mod messages;

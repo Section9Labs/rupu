@@ -440,7 +440,7 @@ async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
     (addr, tmp)
 }
 
-async fn rpc(addr: std::net::SocketAddr, method: &str, params: Value) -> Value {
+pub(super) async fn rpc(addr: std::net::SocketAddr, method: &str, params: Value) -> Value {
     reqwest::Client::new()
         .post(format!("http://{addr}/mcp"))
         .json(&json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
@@ -452,11 +452,11 @@ async fn rpc(addr: std::net::SocketAddr, method: &str, params: Value) -> Value {
         .unwrap()
 }
 
-async fn call_tool(addr: std::net::SocketAddr, name: &str, args: Value) -> Value {
+pub(super) async fn call_tool(addr: std::net::SocketAddr, name: &str, args: Value) -> Value {
     rpc(addr, "tools/call", json!({"name": name, "arguments": args})).await["result"].clone()
 }
 
-fn text_of(result: &Value) -> String {
+pub(super) fn text_of(result: &Value) -> String {
     result["content"][0]["text"]
         .as_str()
         .unwrap_or("")
@@ -486,7 +486,9 @@ async fn tools_list_has_the_13_operator_tools_with_schemas() {
     let tools = v["result"]["tools"].as_array().unwrap();
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     names.sort();
+    // The operator tools plus `wait` (its own source).
     let mut want = OPERATOR_TOOLS.to_vec();
+    want.push("wait");
     want.sort();
     assert_eq!(names, want);
     let approve = tools.iter().find(|t| t["name"] == "runs.approve").unwrap();

@@ -65,7 +65,7 @@ pub fn last_event_id(headers: &axum::http::HeaderMap) -> u64 {
 /// is alive — nothing will append to its `events.jsonl` again (blocking
 /// read, off the runtime). An unreadable record is "not settled": the stream
 /// stays open, as it always did.
-async fn run_is_settled(store: Arc<RunStore>, run_id: String) -> bool {
+pub(crate) async fn run_is_settled(store: Arc<RunStore>, run_id: String) -> bool {
     tokio::task::spawn_blocking(move || {
         store.load(&run_id).is_ok_and(|r| {
             r.status.is_terminal()

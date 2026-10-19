@@ -1,0 +1,367 @@
+//! The `wait` MCP tool: a run settling, a gate parking, new run events and
+//! new messages, resumed from a cursor of the SSE streams' line ids.
+
+#![allow(clippy::disallowed_methods)]
+
+use super::mcp::{call_tool, text_of};
+use chrono::Utc;
+use rupu_cp::mcp::McpOpts;
+use rupu_cp::server::{router_with, RouterOpts};
+use rupu_fleet::{Address, OperatorMessage, OperatorVia};
+use rupu_orchestrator::executor::Event;
+use rupu_orchestrator::runs::{AwaitingGate, RunStatus, RunStore, StepKind};
+use serde_json::{json, Value};
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+const RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1WAT";
+
+/// A CP over `global` serving `/mcp` (no catalog).
+async fn spawn(global: &Path) -> SocketAddr {
+    let state =
+        rupu_cp::state::AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+    let server = rupu_cp::mcp::build_server(
+        &state,
+        &McpOpts {
+            catalog: None,
+            tools: vec![],
+        },
+    )
+    .unwrap();
+    let app = router_with(
+        state,
+        None,
+        RouterOpts {
+            web: true,
+            mcp: Some(server),
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+fn store(global: &Path) -> RunStore {
+    RunStore::new(global.join("runs"))
+}
+
+fn seed(global: &Path, status: RunStatus) -> rupu_orchestrator::runs::RunRecord {
+    let rec = super::sse::seed_run(RUN, status);
+    store(global)
+        .create(rec.clone(), "name: test\nsteps: []\n")
+        .unwrap();
+    rec
+}
+
+fn append_step(global: &Path, step_id: &str) {
+    let ev = Event::StepStarted {
+        run_id: RUN.into(),
+        step_id: step_id.into(),
+        kind: StepKind::Linear,
+        agent: None,
+        host: None,
+        codename: None,
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store(global).events_path(RUN))
+        .unwrap();
+    writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();
+}
+
+async fn wait(addr: SocketAddr, args: Value) -> Value {
+    call_tool(addr, "wait", args).await
+}
+
+fn ids(r: &Value) -> Vec<u64> {
+    r["structuredContent"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no events: {r}"))
+        .iter()
+        .map(|e| e["id"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_settled_run_fires_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Completed);
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN}]}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(s["fired"][0]["index"], 0, "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+}
+
+#[tokio::test]
+async fn a_parked_gate_fires_at_once_with_its_gates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut rec = super::sse::seed_run(RUN, RunStatus::AwaitingApproval);
+    rec.awaiting = vec![AwaitingGate {
+        step_id: "review".into(),
+        prompt: Some("ship it?".into()),
+        since: Utc::now(),
+        expires_at: None,
+    }];
+    store(tmp.path())
+        .create(rec, "name: test\nsteps: []\n")
+        .unwrap();
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(addr, json!({"watch": [{"kind": "run_gate", "run": RUN}]})).await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    let fired = &r["structuredContent"]["fired"][0];
+    assert_eq!(fired["kind"], "run_gate", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["prompt"], "ship it?", "{r}");
+}
+
+#[tokio::test]
+async fn new_events_are_returned_with_their_line_ids_and_the_cursor_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    append_step(tmp.path(), "one");
+    append_step(tmp.path(), "two");
+    let addr = spawn(tmp.path()).await;
+    let watch = json!([{"kind": "run_events", "run": RUN}]);
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 5000})).await;
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    let source = format!("run:{RUN}");
+    assert_eq!(s["events"][0]["source"], source.as_str(), "{r}");
+    assert_eq!(s["events"][1]["event"]["type"], "step_started", "{r}");
+    assert_eq!(s["events"][1]["event"]["step_id"], "two", "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 2 }), "{r}");
+    assert_eq!(s["fired"][0]["kind"], "run_events", "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+
+    append_step(tmp.path(), "three");
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": s["cursor"], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ &source: 3 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_types_filter_skips_other_events_but_moves_the_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    append_step(tmp.path(), "one");
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "types": ["run_completed"]}],
+               "timeout_ms": 600}),
+    )
+    .await;
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert_eq!(ids(&r), Vec::<u64>::new(), "{r}");
+    assert_eq!(s["cursor"], json!({ format!("run:{RUN}"): 1 }), "{r}");
+}
+
+#[tokio::test]
+async fn messages_wait_returns_new_operator_lines_and_skips_seen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let g = tmp.path();
+    let bus = super::messages::workflow_run(g, RUN, RunStatus::Running);
+    // Line 1: a broadcast; line 2: an operator message; line 3: its receipt.
+    bus.send(&Address::Broadcast, "status").unwrap();
+    let op = bus
+        .operator_send(OperatorMessage {
+            to: Address::Broadcast,
+            body: "focus".into(),
+            urgent: false,
+            via: OperatorVia::Cli,
+            viewer: None,
+            client: None,
+        })
+        .unwrap();
+    bus.mark_seen(&[op.id().to_string()], "lynx#1", 1).unwrap();
+    let addr = spawn(g).await;
+    let source = format!("messages:{RUN}");
+
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "messages", "root": RUN, "kinds": ["operator"]}],
+               "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["events"][0]["source"], source.as_str(), "{r}");
+    assert_eq!(s["events"][0]["event"]["id"], op.id(), "{r}");
+    assert_eq!(s["events"][0]["event"]["body"], "focus", "{r}");
+    assert_eq!(s["fired"][0]["kind"], "messages", "{r}");
+
+    // After the operator line only its receipt follows: nothing to return.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "messages", "root": RUN}],
+               "cursor": { &source: 2 }, "timeout_ms": 600}),
+    )
+    .await;
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert_eq!(ids(&r), Vec::<u64>::new(), "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 3 }), "{r}");
+}
+
+#[tokio::test]
+async fn times_out_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN},
+                         {"kind": "run_events", "run": RUN}],
+               "timeout_ms": 300}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert_eq!(s["fired"], json!([]), "{r}");
+    assert_eq!(s["events"], json!([]), "{r}");
+}
+
+#[tokio::test]
+async fn an_unknown_run_is_an_error_not_a_hang() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    for watch in [
+        json!({"kind": "run_settled", "run": "run_nope"}),
+        json!({"kind": "run_events", "run": "run_nope"}),
+        json!({"kind": "messages", "root": "run_nope"}),
+    ] {
+        let t = Instant::now();
+        let r = wait(addr, json!({"watch": [watch], "timeout_ms": 5000})).await;
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert!(text_of(&r).contains("run_nope"), "{r}");
+    }
+}
+
+#[tokio::test]
+async fn bad_arguments_are_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let cases = [
+        (
+            json!({"watch": [{"kind": "run_settled", "run": RUN, "host": "mini"}]}),
+            "wait on a remote host is not built yet (Plan 2)",
+        ),
+        (
+            json!({"watch": [{"kind": "run_settled", "run": RUN}], "follow": true}),
+            "unknown argument `follow`",
+        ),
+        (
+            json!({"watch": [{"kind": "run_settled", "run": RUN, "types": ["x"]}]}),
+            "`types`",
+        ),
+        (json!({"watch": []}), "`watch`"),
+        (
+            json!({"watch": [{"kind": "messages", "root": RUN, "kinds": ["shout"]}]}),
+            "shout",
+        ),
+        (
+            json!({"watch": [{"kind": "run_settled", "run": "../config"}]}),
+            "../config",
+        ),
+    ];
+    for (args, want) in cases {
+        let r = wait(addr, args.clone()).await;
+        assert_eq!(r["isError"], json!(true), "{args} -> {r}");
+        assert!(text_of(&r).contains(want), "{args} -> {r}");
+    }
+    // `host: local` is this host.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN, "host": "local"}],
+               "timeout_ms": 0}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+}
+
+#[test]
+fn timeout_is_capped_at_55s() {
+    use rupu_cp::mcp::wait::clamp_timeout;
+    assert_eq!(clamp_timeout(None), Duration::from_millis(30_000));
+    assert_eq!(clamp_timeout(Some(1_000)), Duration::from_millis(1_000));
+    assert_eq!(clamp_timeout(Some(55_000)), Duration::from_millis(55_000));
+    assert_eq!(clamp_timeout(Some(600_000)), Duration::from_millis(55_000));
+}
+
+/// Cancelling an in-flight `wait` stops it: no reply (202), long before its
+/// timeout. The cancel is re-sent until the call ends, since it can arrive
+/// before the call is registered.
+#[tokio::test]
+async fn cancelling_a_wait_stops_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let c = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp");
+    let call = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": "wait", "arguments": {
+            "watch": [{"kind": "run_settled", "run": RUN}], "timeout_ms": 20_000}}});
+    let t = Instant::now();
+    let pending = {
+        let (c, url) = (c.clone(), url.clone());
+        tokio::spawn(async move {
+            c.post(&url)
+                .header("Mcp-Session-Id", "mcp_W")
+                .json(&call)
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    let cancel = json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 7}});
+    while !pending.is_finished() {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "the wait was never cancelled"
+        );
+        let r = c
+            .post(&url)
+            .header("Mcp-Session-Id", "mcp_W")
+            .json(&cancel)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 202);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let resp = pending.await.unwrap();
+    assert_eq!(resp.status(), 202);
+    assert!(resp.text().await.unwrap().is_empty());
+    assert!(t.elapsed() < Duration::from_secs(10));
+}

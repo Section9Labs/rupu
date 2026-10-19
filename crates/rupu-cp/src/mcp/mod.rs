@@ -4,6 +4,7 @@
 pub mod endpoint;
 pub mod operator_source;
 pub mod ops;
+pub mod wait;
 
 use crate::state::AppState;
 use rupu_mcp::{McpServer, ServeError, ToolFilter, ToolSource};
@@ -20,12 +21,11 @@ pub struct McpOpts {
 
 /// The operator source + the wait source + `opts.catalog`, filtered by
 /// `opts.tools`.
-///
-/// The wait source (Task 8) joins `sources` here.
 pub fn build_server(state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>, ServeError> {
-    let mut sources: Vec<Arc<dyn ToolSource>> = vec![Arc::new(
-        operator_source::OperatorSource::new(inner_api(state)),
-    )];
+    let mut sources: Vec<Arc<dyn ToolSource>> = vec![
+        Arc::new(operator_source::OperatorSource::new(inner_api(state))),
+        Arc::new(wait::WaitSource::new(state.clone())),
+    ];
     if let Some(catalog) = &opts.catalog {
         sources.push(Arc::clone(catalog));
     }
