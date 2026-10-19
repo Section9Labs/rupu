@@ -61,4 +61,7 @@ pub enum ServeError {
     /// Two sources serve the same tool name.
     #[error("tool `{0}` is served by more than one source")]
     Duplicate(String),
+    /// A `--tools` entry matches no tool (the message names it).
+    #[error("{0}")]
+    Filter(String),
 }

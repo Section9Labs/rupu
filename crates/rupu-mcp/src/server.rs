@@ -457,9 +457,12 @@ impl McpServer {
     pub fn new(sources: Vec<Arc<dyn ToolSource>>, filter: &ToolFilter) -> Result<Self, ServeError> {
         let mut defs = Vec::new();
         let mut owner: HashMap<String, usize> = HashMap::new();
-        for (i, source) in sources.iter().enumerate() {
-            for def in source.tools() {
-                if !filter.apply(&def.name) {
+        let all: Vec<_> = sources.iter().map(|s| s.tools()).collect();
+        let names: Vec<String> = all.iter().flatten().map(|d| d.name.clone()).collect();
+        let kept = filter.apply(&names)?;
+        for (i, tools) in all.into_iter().enumerate() {
+            for def in tools {
+                if !kept.contains(&def.name) {
                     continue;
                 }
                 if owner.insert(def.name.clone(), i).is_some() {
