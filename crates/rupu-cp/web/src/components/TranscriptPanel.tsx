@@ -13,7 +13,6 @@ import { api, apiErrorMessage } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
-import { formatCost } from '../lib/usage';
 import { Spinner } from './ui/Spinner';
 import { buildTranscriptView } from './transcript/transcriptView';
 import { parseMsgHash } from '../lib/messages';
@@ -58,7 +57,6 @@ export default function TranscriptPanel({
   runId,
   embedded = false,
   onComplete,
-  costUsd,
 }: {
   path: string;
   live: boolean;
@@ -85,9 +83,6 @@ export default function TranscriptPanel({
   /** Called once when the live SSE stream receives a run_complete or run_failed
    *  event. Allows the parent to trigger a reload on turn completion. */
   onComplete?: () => void;
-  /** The run's cost in USD, when the host page already has it. Shown in the
-   *  metrics strip only when provided — the feed never fetches or invents it. */
-  costUsd?: number;
 }) {
   // The REST snapshot and the live SSE stream are kept apart: both start at
   // byte 0 of the same file, so each is a prefix of the other (see
@@ -388,7 +383,7 @@ export default function TranscriptPanel({
         </div>
       )}
 
-      {/* Metrics strip: the run at a glance. Cost only where the host page has it. */}
+      {/* Metrics strip: the run at a glance. */}
       {!isEmpty && (
         <div
           className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-meta tabular-nums text-ink-dim"
@@ -399,7 +394,6 @@ export default function TranscriptPanel({
           <span>{counts.commands} {counts.commands === 1 ? 'command' : 'commands'}</span>
           <span>{counts.findings} {counts.findings === 1 ? 'finding' : 'findings'}</span>
           {totalTokens != null && <span>{totalTokens.toLocaleString()} tokens</span>}
-          {costUsd !== undefined && <span>{formatCost(costUsd)}</span>}
           {view.footer?.durationMs != null && <span>{formatDuration(view.footer.durationMs)}</span>}
           {view.footer?.error && <span className="text-err">{view.footer.error}</span>}
         </div>

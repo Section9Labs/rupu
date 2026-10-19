@@ -130,17 +130,6 @@ describe('TranscriptPanel reader chrome', () => {
     expect(container.querySelector('#turn-1')).not.toBeNull();
   });
 
-  it('appends cost to the metrics strip only when costUsd is provided', async () => {
-    vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
-    render(
-      <MemoryRouter>
-        <TranscriptPanel path="/t/run-1.jsonl" live={false} costUsd={1.5} />
-      </MemoryRouter>,
-    );
-    await screen.findAllByText('Hello from the assistant body.');
-    expect(screen.getByTestId('transcript-metrics').textContent).toMatch(/\$1\.5/);
-  });
-
   it('embedded hides header, metrics and controls but keeps the feed', async () => {
     vi.spyOn(api, 'getTranscript').mockResolvedValue(TRANSCRIPT);
     renderPanel(true);
