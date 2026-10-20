@@ -8,6 +8,7 @@
 pub mod accounts;
 pub mod build_info;
 pub mod cmd;
+pub mod cp_admin_ops;
 pub mod cp_agent_launcher;
 pub mod cp_agentiflow_launcher;
 pub mod cp_definition_generator;

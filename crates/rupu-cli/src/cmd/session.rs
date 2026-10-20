@@ -7125,6 +7125,30 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
     report::emit_collection(global_format, &output)
 }
 
+/// `rupu session prune`'s JSON report, for the control plane's
+/// `POST /api/maintenance/prune {kind: sessions}`.
+pub(crate) fn prune_json(
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let mut pruned = prune_archived_sessions(older_than, dry_run)?;
+    pruned.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(serde_json::to_value(SessionPruneReport {
+        kind: "session_prune",
+        version: 1,
+        rows: pruned
+            .into_iter()
+            .map(|row| SessionPruneRow {
+                session_id: row.session_id,
+                scope: row.scope,
+                status: row.status,
+                updated_at: row.updated_at,
+                action: row.action,
+            })
+            .collect(),
+    })?)
+}
+
 pub(crate) fn prune_archived_sessions(
     older_than: Option<&str>,
     dry_run: bool,
@@ -9616,7 +9640,9 @@ fn session_prune_cutoff(
             .archived_session_retention
             .unwrap_or_else(|| "30d".to_string())
     };
-    Ok(Utc::now() - parse_retention_duration(&retention)?)
+    let retention = parse_retention_duration(&retention)
+        .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?;
+    Ok(Utc::now() - retention)
 }
 
 // Process liveness/termination live in `rupu_orchestrator::runs`: one

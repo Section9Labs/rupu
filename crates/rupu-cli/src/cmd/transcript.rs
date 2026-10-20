@@ -2314,6 +2314,30 @@ async fn prune(
     report::emit_collection(global_format, &output)
 }
 
+/// `rupu transcript prune`'s JSON report, for the control plane's
+/// `POST /api/maintenance/prune {kind: transcripts}`.
+pub(crate) fn prune_json(
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let mut pruned = prune_archived_transcripts(older_than, dry_run)?;
+    pruned.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    Ok(serde_json::to_value(TranscriptPruneReport {
+        kind: "transcript_prune",
+        version: 1,
+        rows: pruned
+            .into_iter()
+            .map(|row| TranscriptPruneRow {
+                run_id: row.run_id,
+                scope: row.scope,
+                location: row.location,
+                archived_at: row.archived_at,
+                action: row.action,
+            })
+            .collect(),
+    })?)
+}
+
 /// `transcript prune` has no `--no-color` flag of its own (unlike
 /// `list`/`show`) — resolve UI prefs the same way `autoflow_ui_prefs`
 /// does for its own flagless commands: config + env only, `no_color`
@@ -2774,7 +2798,9 @@ fn prune_cutoff(
             .archived_transcript_retention
             .unwrap_or_else(|| "30d".to_string())
     };
-    Ok(chrono::Utc::now() - parse_retention_duration(&retention)?)
+    let retention = parse_retention_duration(&retention)
+        .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?;
+    Ok(chrono::Utc::now() - retention)
 }
 
 fn move_if_exists(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {

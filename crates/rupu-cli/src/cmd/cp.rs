@@ -482,6 +482,12 @@ pub async fn handle(action: Action) -> ExitCode {
                 Duration::from_secs(cp_runtime_cfg.cron_tick_interval_secs.max(1)),
                 shutdown_tx.subscribe(),
                 || async {
+                    // Single-flight with `POST /api/cron/tick`: a tick the
+                    // API started is still running, so this one is skipped.
+                    let Some(_tick) = crate::cmd::cron::try_begin_tick() else {
+                        tracing::info!("cp serve: cron tick skipped: a tick is already running");
+                        return;
+                    };
                     if let Err(e) = crate::cmd::cron::tick(false, false, false).await {
                         tracing::warn!(error = %e, "cp serve: cron tick failed");
                     }
@@ -690,6 +696,16 @@ pub async fn handle(action: Action) -> ExitCode {
                 crate::cp_transcript_mutator::SubprocessTranscriptMutator { exe: exe.clone() },
             ));
 
+            // Adapter for rupu-cp's AdminOps port: the autoflow, cron and
+            // prune endpoints run the CLI's own functions in process
+            // (`rupu autoflow run` detached), single-flighting the cron tick
+            // with the loop above.
+            let admin_ops: Arc<dyn rupu_cp::admin_ops::AdminOps> =
+                Arc::new(crate::cp_admin_ops::CliAdminOps {
+                    exe: exe.clone(),
+                    global: global_dir.clone(),
+                });
+
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
@@ -788,6 +804,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     web: !no_web,
                     mcp,
                     agentiflow_launcher,
+                    admin_ops: Some(admin_ops),
                 },
             )
             .await;

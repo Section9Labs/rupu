@@ -4,6 +4,8 @@
 //! - `GET  /api/autoflows/claims`         — list tracked autoflow claims.
 //! - `POST /api/autoflows/claims/release` — delete a claim (release the issue).
 //! - `POST /api/autoflows/claims/requeue` — enqueue a manual wake for an issue.
+//! - `POST /api/autoflows/claims/repair`  — `rupu autoflow repair` (through the
+//!   `AdminOps` port).
 //!
 //! Issue refs embed `/` and `:` (e.g. `github:Section9Labs/rupu/issues/42`),
 //! so they travel in the JSON body rather than a path segment.
@@ -15,7 +17,11 @@ use crate::{
     error::{ApiError, ApiResult},
     state::AppState,
 };
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::post,
+    Json, Router,
+};
 use chrono::{DateTime, Utc};
 use rupu_runtime::{
     WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeSource, WakeStore,
@@ -29,6 +35,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/autoflows/claims", axum::routing::get(list_claims))
         .route("/api/autoflows/claims/release", post(release_claim))
         .route("/api/autoflows/claims/requeue", post(requeue_claim))
+        .route("/api/autoflows/claims/repair", post(repair_claim))
 }
 
 /// Build the claim store rooted at `<global>/autoflows/claims`.
@@ -257,6 +264,55 @@ async fn requeue_claim(
         .enqueue(req)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({ "wake_id": rec.wake_id })))
+}
+
+/// `POST /api/autoflows/claims/repair` body.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct RepairBody {
+    /// The claimed issue, e.g. `github:owner/repo/issues/42`.
+    issue_ref: String,
+    /// Release the claim after repairing (at most one of `release` and
+    /// `requeue`).
+    #[serde(default)]
+    release: bool,
+    /// Queue a follow-up repair wake after repairing.
+    #[serde(default)]
+    requeue: bool,
+    /// Report the repairs without applying them. Defaults to `true`: pass
+    /// `false` to repair.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `POST /api/autoflows/claims/repair` — `rupu autoflow repair <ref>`: drop
+/// invalid queued wakes, rebuild a claim's missing worktree, then release
+/// the claim or queue a repair wake when asked. `dry_run` (the default)
+/// lists the repairs without applying them. Answers `{issue_ref, dry_run,
+/// repairs}`; 404 when no claim is tracked, 400 for `release` with
+/// `requeue`.
+async fn repair_claim(
+    State(s): State<AppState>,
+    Query(q): Query<crate::admin_ops::HostQuery>,
+    Json(body): Json<RepairBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::admin_ops::local_only(q.host.as_deref(), "repairing an autoflow claim")?;
+    if !body.dry_run {
+        crate::api::config::require_writable_to(&s, "repairing an autoflow claim")?;
+    }
+    let ops = crate::admin_ops::ops(&s, "repairing an autoflow claim")?;
+    Ok(Json(
+        ops.autoflow_repair(crate::admin_ops::RepairRequest {
+            issue_ref: body.issue_ref,
+            release: body.release,
+            requeue: body.requeue,
+            dry_run: body.dry_run,
+        })
+        .await?,
+    ))
 }
 
 #[cfg(test)]

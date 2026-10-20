@@ -384,11 +384,69 @@ async fn prune(
     absolute: bool,
     all_columns: bool,
 ) -> anyhow::Result<()> {
-    let retention = args.older_than.as_deref().unwrap_or(DEFAULT_RETENTION);
-    let older_than = parse_retention_duration(retention)?;
-    reject_non_positive_retention(retention, older_than)?;
-
     let global = paths::global_dir()?;
+    let (report, problems) = prune_report(&global, args.older_than.as_deref(), args.dry_run)?;
+    let csv_rows = report
+        .rows
+        .iter()
+        .map(|row| NetflowPruneCsvRow {
+            run_id: row.run_id.clone(),
+            scope: row.scope.clone(),
+            bytes: row.bytes,
+            modified_at: row.modified_at.clone(),
+            status: row.status.clone(),
+        })
+        .collect();
+
+    let prefs = prune_ui_prefs()?.with_table_flags(absolute, all_columns);
+    let output = NetflowPruneOutput {
+        prefs,
+        report,
+        csv_rows,
+    };
+    report::emit_collection(global_format, &output)?;
+
+    // Partial failure must not be silent: the report above already
+    // named every file that could not be removed (STATUS
+    // `failed: <reason>`) AND every root that could not even be
+    // scanned, but a non-zero exit is what actually tells a script —
+    // or an operator glancing at `$?` — that this run did NOT fully
+    // succeed. Every candidate that COULD be removed already was; this
+    // only affects the exit code, never a rollback. The report is
+    // ALWAYS printed above before this returns, in whatever `--format`
+    // was requested — never only on the success path.
+    if !problems.is_empty() {
+        anyhow::bail!(problems.join("; "));
+    }
+    Ok(())
+}
+
+/// `rupu netflow prune`'s JSON report and the partial failures it met, for
+/// the control plane's `POST /api/maintenance/prune {kind: netflow}`.
+pub(crate) fn prune_json(
+    global: &Path,
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<(serde_json::Value, Vec<String>)> {
+    let (report, problems) = prune_report(global, older_than, dry_run)?;
+    Ok((serde_json::to_value(report)?, problems))
+}
+
+/// Sweep both netflow roots for ledgers older than `older_than` (default
+/// [`DEFAULT_RETENTION`]). Returns the report and, non-silently, a line per
+/// kind of partial failure (files that could not be removed, roots that
+/// could not be scanned); every candidate that could be removed already
+/// was. A bad or non-positive duration is [`AdminOpError::Invalid`].
+fn prune_report(
+    global: &Path,
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<(NetflowPruneReport, Vec<String>)> {
+    let retention = older_than.unwrap_or(DEFAULT_RETENTION);
+    let older_than = parse_retention_duration(retention)
+        .and_then(|d| reject_non_positive_retention(retention, d).map(|()| d))
+        .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?;
+    let global = global.to_path_buf();
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
 
@@ -458,7 +516,7 @@ async fn prune(
         // from disk. Record the failure and keep going; every
         // already-known outcome still reaches the report and the exit
         // code still goes non-zero (see below).
-        let entries = match prune_ledgers(&dir, older_than, args.dry_run, &live) {
+        let entries = match prune_ledgers(&dir, older_than, dry_run, &live) {
             Ok(entries) => entries,
             Err(e) => {
                 scan_failures.push(format!("{} ({e})", dir.display()));
@@ -472,7 +530,7 @@ async fn prune(
                     format!("failed: {err}")
                 }
                 None if entry.skipped_live => "skipped_live".to_string(),
-                None if args.dry_run => "would_delete".to_string(),
+                None if dry_run => "would_delete".to_string(),
                 None => "deleted".to_string(),
             };
             rows.push(NetflowPruneRow {
@@ -489,58 +547,30 @@ async fn prune(
     }
     rows.sort_by(|a, b| a.run_id.cmp(&b.run_id));
 
-    let csv_rows = rows
-        .iter()
-        .map(|row| NetflowPruneCsvRow {
-            run_id: row.run_id.clone(),
-            scope: row.scope.clone(),
-            bytes: row.bytes,
-            modified_at: row.modified_at.clone(),
-            status: row.status.clone(),
-        })
-        .collect();
-
-    let prefs = prune_ui_prefs()?.with_table_flags(absolute, all_columns);
-    let output = NetflowPruneOutput {
-        prefs,
-        report: NetflowPruneReport {
+    let mut problems = Vec::new();
+    if !failures.is_empty() {
+        problems.push(format!(
+            "failed to remove {} ledger(s): {}",
+            failures.len(),
+            failures.join(", ")
+        ));
+    }
+    if !scan_failures.is_empty() {
+        problems.push(format!(
+            "failed to scan {} netflow director{}: {}",
+            scan_failures.len(),
+            if scan_failures.len() == 1 { "y" } else { "ies" },
+            scan_failures.join(", ")
+        ));
+    }
+    Ok((
+        NetflowPruneReport {
             kind: "netflow_prune",
             version: 1,
             rows,
         },
-        csv_rows,
-    };
-    report::emit_collection(global_format, &output)?;
-
-    // Partial failure must not be silent: the report above already
-    // named every file that could not be removed (STATUS
-    // `failed: <reason>`) AND every root that could not even be
-    // scanned, but a non-zero exit is what actually tells a script —
-    // or an operator glancing at `$?` — that this run did NOT fully
-    // succeed. Every candidate that COULD be removed already was; this
-    // only affects the exit code, never a rollback. The report is
-    // ALWAYS printed above before this returns, in whatever `--format`
-    // was requested — never only on the success path.
-    if !failures.is_empty() || !scan_failures.is_empty() {
-        let mut detail = Vec::new();
-        if !failures.is_empty() {
-            detail.push(format!(
-                "failed to remove {} ledger(s): {}",
-                failures.len(),
-                failures.join(", ")
-            ));
-        }
-        if !scan_failures.is_empty() {
-            detail.push(format!(
-                "failed to scan {} netflow director{}: {}",
-                scan_failures.len(),
-                if scan_failures.len() == 1 { "y" } else { "ies" },
-                scan_failures.join(", ")
-            ));
-        }
-        anyhow::bail!(detail.join("; "));
-    }
-    Ok(())
+        problems,
+    ))
 }
 
 fn run_id_from_ledger_path(path: &Path) -> String {

@@ -5,6 +5,7 @@
 //! enforces this.
 
 mod agentiflow_api;
+mod admin_api;
 mod agentiflows;
 mod ast;
 mod auth;
@@ -31,6 +32,7 @@ mod hosts_api;
 mod launch_api;
 mod launch_preview;
 mod mcp;
+mod mcp_ops_admin;
 mod mcp_ops_agentiflows;
 mod mcp_ops_definitions;
 mod mcp_ops_findings;

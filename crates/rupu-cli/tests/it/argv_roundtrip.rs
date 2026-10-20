@@ -12,8 +12,8 @@ use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
-    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace, RunArgv,
-    SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
+    AgentRun, AgentiflowRun, AutoflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace,
+    RunArgv, SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -347,6 +347,27 @@ fn agentiflows() -> Vec<RunArgv> {
         .collect()
 }
 
+fn autoflow_runs() -> Vec<RunArgv> {
+    let mut out = Vec::new();
+    for name in ["fix-issues", "-x"] {
+        for repo in [None, Some("github:acme/widgets".to_string())] {
+            for mode in [
+                None,
+                Some(PermissionMode::Bypass),
+                Some(PermissionMode::Readonly),
+            ] {
+                out.push(RunArgv::AutoflowRun(AutoflowRun {
+                    name: name.into(),
+                    target: "github:acme/widgets/issues/42".into(),
+                    repo: repo.clone(),
+                    mode,
+                }));
+            }
+        }
+    }
+    out
+}
+
 fn mode(word: Option<String>) -> Option<PermissionMode> {
     word.map(|w| PermissionMode::parse(&w).expect("a mode word clap accepted"))
 }
@@ -507,6 +528,20 @@ fn back(cli: Cli) -> RunArgv {
                 run_id: run_id.expect("the detached child carries its id"),
             })
         }
+        Cmd::Autoflow {
+            action:
+                cmd::autoflow::Action::Run {
+                    name,
+                    target,
+                    repo,
+                    mode: m,
+                },
+        } => RunArgv::AutoflowRun(AutoflowRun {
+            name,
+            target,
+            repo,
+            mode: mode(m),
+        }),
         other => panic!("not a rendered command: {other:?}"),
     }
 }
@@ -519,6 +554,7 @@ fn argv_roundtrip() {
         controls(),
         sessions(),
         agentiflows(),
+        autoflow_runs(),
     ]
     .concat();
     assert!(all.len() > 300, "the generated set shrank: {}", all.len());

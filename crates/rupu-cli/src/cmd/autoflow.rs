@@ -34,6 +34,7 @@ use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
 use rupu_auth::CredentialResolver;
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
+use rupu_cp::admin_ops::AdminOpError;
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
     author_allowed, pr_event_context, AutoflowWorkspaceStrategy, ContractFormat, RunStatus,
@@ -1640,6 +1641,20 @@ fn build_autoflow_show_output(
         render_autoflow_show_summary(entry, autoflow),
         rendered_yaml
     );
+    Ok(AutoflowShowOutput {
+        prefs,
+        report: build_autoflow_show_report(entry, body)?,
+        rendered,
+    })
+}
+
+/// The `autoflow_show` report `rupu autoflow show --format json` prints and
+/// `GET /api/autoflows/:name` serves.
+fn build_autoflow_show_report(
+    entry: &VisibleAutoflowWorkflow,
+    body: String,
+) -> anyhow::Result<AutoflowShowReport> {
+    let autoflow = entry.autoflow()?;
     let selector_states = autoflow
         .selector
         .states
@@ -1699,14 +1714,10 @@ fn build_autoflow_show_output(
         selector_limit: autoflow.selector.limit,
         body,
     };
-    Ok(AutoflowShowOutput {
-        prefs,
-        report: AutoflowShowReport {
-            kind: "autoflow_show",
-            version: 1,
-            item,
-        },
-        rendered,
+    Ok(AutoflowShowReport {
+        kind: "autoflow_show",
+        version: 1,
+        item,
     })
 }
 
@@ -1715,12 +1726,34 @@ async fn show(
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
+    let entry = show_entry(name, repo)?;
+    let body = std::fs::read_to_string(&entry.workflow_path)?;
+    let output = build_autoflow_show_output(&entry, body)?;
+    output_report::emit_detail(global_format, &output)
+}
+
+/// `rupu autoflow show`'s JSON report, for the control plane's
+/// `GET /api/autoflows/:name`.
+pub(crate) fn show_json(name: &str, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    let entry = show_entry(name, repo)?;
+    let body = std::fs::read_to_string(&entry.workflow_path)?;
+    Ok(serde_json::to_value(build_autoflow_show_report(
+        &entry, body,
+    )?)?)
+}
+
+/// The one visible autoflow named `name`: none is [`AdminOpError::NotFound`],
+/// several (pass `--repo`) [`AdminOpError::Conflict`].
+fn show_entry(name: &str, repo: Option<&str>) -> anyhow::Result<VisibleAutoflowWorkflow> {
     let matches = visible_autoflow_matches(name, repo)?;
     let entry = match matches.as_slice() {
-        [] => match repo {
-            Some(repo) => bail!("no autoflow named `{name}` is visible for repo `{repo}`"),
-            None => bail!("no autoflow named `{name}` is visible"),
-        },
+        [] => {
+            return Err(AdminOpError::NotFound(match repo {
+                Some(repo) => format!("no autoflow named `{name}` is visible for repo `{repo}`"),
+                None => format!("no autoflow named `{name}` is visible"),
+            })
+            .into())
+        }
         [entry] => entry,
         many => {
             let mut options = many
@@ -1735,15 +1768,39 @@ async fn show(
                 })
                 .collect::<Vec<_>>();
             options.sort();
-            bail!(
+            return Err(AdminOpError::Conflict(format!(
                 "multiple autoflows named `{name}` are visible:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
                 options.join("\n")
-            );
+            ))
+            .into());
         }
     };
-    let body = std::fs::read_to_string(&entry.workflow_path)?;
-    let output = build_autoflow_show_output(entry, body)?;
-    output_report::emit_detail(global_format, &output)
+    Ok(entry.clone())
+}
+
+/// What `rupu autoflow run` checks before it fetches the issue, for the
+/// control plane to answer before it starts the cycle detached: the target
+/// is an issue ([`AdminOpError::Invalid`]), the autoflow resolves for it
+/// ([`AdminOpError::NotFound`] / [`AdminOpError::Conflict`] when ambiguous),
+/// the mode is one autoflows take, and no other cycle holds the issue's
+/// claim ([`AdminOpError::Conflict`]).
+pub(crate) fn run_precheck(
+    global: &Path,
+    name: &str,
+    target: &str,
+    repo: Option<&str>,
+    mode: Option<&str>,
+) -> anyhow::Result<()> {
+    let issue_ref =
+        parse_full_issue_target(target).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
+    let resolved = resolve_autoflow_workflow_for_issue(global, name, &issue_ref, repo)?;
+    resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())
+        .map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
+    let claim_store = AutoflowClaimStore {
+        root: paths::autoflow_claims_dir(global),
+    };
+    let fetch_ref = issue_ref_for_autoflow(&issue_ref, &resolved)?;
+    ensure_manual_run_can_take_claim(&claim_store, &format_issue_ref(&fetch_ref))
 }
 
 async fn run(
@@ -1800,23 +1857,26 @@ fn ensure_manual_run_can_take_claim(
         return Ok(());
     }
     if claim.status == ClaimStatus::Blocked {
-        bail!(
+        return Err(AdminOpError::Conflict(format!(
             "issue `{issue_ref_text}` has a blocked autoflow claim for workflow `{}`; release it first with `rupu autoflow release {issue_ref_text}`",
             claim.workflow
-        );
+        ))
+        .into());
     }
     if claim_store.read_active_lock(issue_ref_text)?.is_some() {
-        bail!(
+        return Err(AdminOpError::Conflict(format!(
             "issue `{issue_ref_text}` already has an active autoflow cycle for workflow `{}`",
             claim.workflow
-        );
+        ))
+        .into());
     }
     if !claim_lease_expired(&claim)? {
-        bail!(
+        return Err(AdminOpError::Conflict(format!(
             "issue `{issue_ref_text}` already has an owned autoflow claim for workflow `{}` with status `{}`; wait for it, run `rupu autoflow tick`, or release it first",
             claim.workflow,
             status_name(claim.status)
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -4710,8 +4770,31 @@ async fn wakes(
     all_columns: bool,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
+    let report = wakes_report(&global, repo)?;
+    if report.rows.is_empty()
+        && matches!(
+            global_format.unwrap_or(crate::output::formats::OutputFormat::Table),
+            crate::output::formats::OutputFormat::Table
+        )
+    {
+        println!("(no autoflow wakes)");
+        return Ok(());
+    }
+    let prefs = autoflow_ui_prefs()?.with_table_flags(absolute, all_columns);
+    let output = AutoflowWakesOutput { prefs, report };
+    output_report::emit_collection(global_format, &output)
+}
+
+/// The `autoflow_wakes` report: queued wakes, then the ten most recently
+/// processed. `rupu autoflow wakes` and `GET /api/autoflows/wakes` both
+/// serve it.
+pub(crate) fn wakes_json(global: &Path, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(wakes_report(global, repo)?)?)
+}
+
+fn wakes_report(global: &Path, repo: Option<&str>) -> anyhow::Result<AutoflowWakesReport> {
     let repo_filter = normalize_repo_filter(repo)?;
-    let store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let store = WakeStore::new(paths::autoflow_wakes_dir(global));
     let queued = filter_wakes_by_repo(store.list_queued()?, repo_filter.as_deref());
     let mut processed = filter_wakes_by_repo(store.list_processed()?, repo_filter.as_deref());
     processed.sort_by(|left, right| {
@@ -4721,17 +4804,6 @@ async fn wakes(
             .then_with(|| right.wake_id.cmp(&left.wake_id))
     });
     let recent_processed = processed.into_iter().take(10).collect::<Vec<_>>();
-
-    if queued.is_empty()
-        && recent_processed.is_empty()
-        && matches!(
-            global_format.unwrap_or(crate::output::formats::OutputFormat::Table),
-            crate::output::formats::OutputFormat::Table
-        )
-    {
-        println!("(no autoflow wakes)");
-        return Ok(());
-    }
     let mut rows = queued
         .into_iter()
         .map(|wake| AutoflowWakeRow {
@@ -4753,16 +4825,11 @@ async fn wakes(
         not_before: wake.not_before,
         repo: wake.repo_ref,
     }));
-    let prefs = autoflow_ui_prefs()?.with_table_flags(absolute, all_columns);
-    let output = AutoflowWakesOutput {
-        prefs,
-        report: AutoflowWakesReport {
-            kind: "autoflow_wakes",
-            version: 1,
-            rows,
-        },
-    };
-    output_report::emit_collection(global_format, &output)
+    Ok(AutoflowWakesReport {
+        kind: "autoflow_wakes",
+        version: 1,
+        rows,
+    })
 }
 
 async fn monitor(
@@ -8388,7 +8455,21 @@ async fn explain(
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
-    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
+    let report = explain_report(r#ref, repo)?;
+    let rendered = render_autoflow_explain_report(&report);
+    output_report::emit_detail(global_format, &AutoflowExplainOutput { report, rendered })
+}
+
+/// `rupu autoflow explain`'s JSON report, for the control plane's
+/// `GET /api/autoflows/explain`. A ref that isn't an issue ref is
+/// [`AdminOpError::Invalid`].
+pub(crate) fn explain_json(r#ref: &str, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(explain_report(r#ref, repo)?)?)
+}
+
+fn explain_report(r#ref: &str, repo: Option<&str>) -> anyhow::Result<AutoflowExplainReport> {
+    let issue_ref =
+        canonical_autoflow_issue_ref(r#ref).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
     let global = paths::global_dir()?;
     let pricing = autoflow_pricing_config();
     let claim_store = AutoflowClaimStore {
@@ -8579,8 +8660,7 @@ async fn explain(
             recent_cycle_events: recent_history,
         },
     };
-    let rendered = render_autoflow_explain_report(&report);
-    output_report::emit_detail(global_format, &AutoflowExplainOutput { report, rendered })
+    Ok(report)
 }
 
 async fn doctor(
@@ -8588,6 +8668,20 @@ async fn doctor(
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
+    let output = AutoflowDoctorOutput {
+        report: doctor_report(&global, repo)?,
+    };
+    output_report::emit_collection(global_format, &output)
+}
+
+/// `rupu autoflow doctor`'s JSON report, for the control plane's
+/// `GET /api/autoflows/doctor`.
+pub(crate) fn doctor_json(global: &Path, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(doctor_report(global, repo)?)?)
+}
+
+fn doctor_report(global: &Path, repo: Option<&str>) -> anyhow::Result<AutoflowDoctorReport> {
+    let global = global.to_path_buf();
     let repo_filter = normalize_repo_filter(repo)?;
     let repo_store = RepoRegistryStore {
         root: paths::repos_dir(&global),
@@ -8733,33 +8827,74 @@ async fn doctor(
         })
         .collect::<Vec<_>>();
 
-    let output = AutoflowDoctorOutput {
-        report: AutoflowDoctorReport {
-            kind: "autoflow_doctor",
-            version: 1,
-            ok: rows.is_empty(),
-            rows,
-        },
-    };
-    output_report::emit_collection(global_format, &output)
+    Ok(AutoflowDoctorReport {
+        kind: "autoflow_doctor",
+        version: 1,
+        ok: rows.is_empty(),
+        rows,
+    })
 }
 
 async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let outcome = repair_claim(&global, r#ref, release, requeue_requested, false)?;
+    if outcome.repairs.is_empty() {
+        println!("no repairs applied for {}", outcome.issue_ref);
+    } else {
+        println!("repaired {}:", outcome.issue_ref);
+        for repair in outcome.repairs {
+            println!("- {repair}");
+        }
+    }
+    Ok(())
+}
+
+/// What [`repair_claim`] did, or with `dry_run` would do: one line per
+/// repair.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct RepairOutcome {
+    pub(crate) issue_ref: String,
+    pub(crate) dry_run: bool,
+    pub(crate) repairs: Vec<String>,
+}
+
+/// `rupu autoflow repair <ref> [--release | --requeue]`: delete the claim's
+/// invalid queued wakes, rebuild its missing worktree (unless releasing),
+/// then release the claim or queue a repair wake. `dry_run` checks the same
+/// things and reports each repair as `would …`, changing nothing — the
+/// control plane's `POST /api/autoflows/claims/repair` defaults to it.
+pub(crate) fn repair_claim(
+    global: &Path,
+    r#ref: &str,
+    release: bool,
+    requeue_requested: bool,
+    dry_run: bool,
+) -> anyhow::Result<RepairOutcome> {
     if release && requeue_requested {
-        bail!("repair accepts at most one of `--release` or `--requeue`");
+        return Err(AdminOpError::Invalid(
+            "repair accepts at most one of `--release` or `--requeue`".into(),
+        )
+        .into());
     }
 
-    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
-    let global = paths::global_dir()?;
+    let issue_ref =
+        canonical_autoflow_issue_ref(r#ref).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
     let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
+        root: paths::repos_dir(global),
     };
     let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(&global),
+        root: paths::autoflow_claims_dir(global),
     };
-    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
+    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(global));
     let Some(mut claim) = claim_store.load(&issue_ref)? else {
-        bail!("no autoflow claim for `{issue_ref}`");
+        return Err(AdminOpError::NotFound(format!("no autoflow claim for `{issue_ref}`")).into());
+    };
+    let would = |text: String| {
+        if dry_run {
+            format!("would {text}")
+        } else {
+            text
+        }
     };
 
     let mut repairs = Vec::new();
@@ -8769,8 +8904,14 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
     );
     for wake in queued {
         if invalid_wake_payload_detail(&wake_store, &wake).is_some() {
-            wake_store.delete(&wake.wake_id)?;
-            repairs.push(format!("deleted invalid queued wake {}", wake.wake_id));
+            if !dry_run {
+                wake_store.delete(&wake.wake_id)?;
+            }
+            repairs.push(would(format!(
+                "{} invalid queued wake {}",
+                if dry_run { "delete" } else { "deleted" },
+                wake.wake_id
+            )));
         }
     }
 
@@ -8788,49 +8929,61 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
             .branch
             .clone()
             .unwrap_or_else(|| format!("rupu/{}", issue_dir_name(&claim.issue_ref)));
-        let worktree = ensure_issue_worktree(
-            Path::new(&tracked.preferred_path),
-            &paths::autoflow_worktrees_dir(&global),
-            &claim.repo_ref,
-            &claim.issue_ref,
-            &branch,
-            Some("HEAD"),
-        )?;
-        claim.worktree_path = Some(worktree.path.display().to_string());
-        claim.branch = Some(branch);
-        claim.updated_at = chrono::Utc::now().to_rfc3339();
-        claim_store.save(&claim)?;
-        repairs.push(format!(
-            "rebuilt worktree {}",
-            claim.worktree_path.as_deref().unwrap_or("-")
-        ));
+        if dry_run {
+            repairs.push(would(format!(
+                "rebuild worktree {} on branch {branch}",
+                claim.worktree_path.as_deref().unwrap_or("-")
+            )));
+        } else {
+            let worktree = ensure_issue_worktree(
+                Path::new(&tracked.preferred_path),
+                &paths::autoflow_worktrees_dir(global),
+                &claim.repo_ref,
+                &claim.issue_ref,
+                &branch,
+                Some("HEAD"),
+            )?;
+            claim.worktree_path = Some(worktree.path.display().to_string());
+            claim.branch = Some(branch);
+            claim.updated_at = chrono::Utc::now().to_rfc3339();
+            claim_store.save(&claim)?;
+            repairs.push(format!(
+                "rebuilt worktree {}",
+                claim.worktree_path.as_deref().unwrap_or("-")
+            ));
+        }
     }
 
     if release {
-        cleanup_claim_artifacts(&repo_store, &claim)?;
-        claim_store.delete(&issue_ref)?;
-        repairs.push(format!("released claim {issue_ref}"));
+        if !dry_run {
+            cleanup_claim_artifacts(&repo_store, &claim)?;
+            claim_store.delete(&issue_ref)?;
+        }
+        repairs.push(would(format!(
+            "{} claim {issue_ref}",
+            if dry_run { "release" } else { "released" }
+        )));
     } else if requeue_requested {
-        let wake = enqueue_issue_wake(
-            &wake_store,
-            WakeSource::Repair,
-            &claim.repo_ref,
-            &issue_ref,
-            "autoflow.repair.requeue",
-            chrono::Utc::now(),
-        )?;
-        repairs.push(format!("queued repair wake {}", wake.wake_id));
-    }
-
-    if repairs.is_empty() {
-        println!("no repairs applied for {issue_ref}");
-    } else {
-        println!("repaired {issue_ref}:");
-        for repair in repairs {
-            println!("- {repair}");
+        if dry_run {
+            repairs.push(would("queue a repair wake".to_string()));
+        } else {
+            let wake = enqueue_issue_wake(
+                &wake_store,
+                WakeSource::Repair,
+                &claim.repo_ref,
+                &issue_ref,
+                "autoflow.repair.requeue",
+                chrono::Utc::now(),
+            )?;
+            repairs.push(format!("queued repair wake {}", wake.wake_id));
         }
     }
-    Ok(())
+
+    Ok(RepairOutcome {
+        issue_ref,
+        dry_run,
+        repairs,
+    })
 }
 
 async fn requeue(r#ref: &str, event: Option<&str>, not_before: Option<&str>) -> anyhow::Result<()> {
@@ -9294,7 +9447,7 @@ fn normalize_repo_filter(repo: Option<&str>) -> anyhow::Result<Option<String>> {
         return Ok(None);
     };
     let parsed = crate::run_target::parse_run_target(repo)
-        .map_err(|err| anyhow!("invalid repo filter `{repo}`: {err}"))?;
+        .map_err(|err| AdminOpError::Invalid(format!("invalid repo filter `{repo}`: {err}")))?;
     match parsed {
         crate::run_target::RunTarget::Repo {
             platform,
@@ -11901,12 +12054,13 @@ fn resolve_autoflow_workflow_for_issue(
     let entry = match matches.as_slice() {
         [] => {
             let issue_ref_text = format_issue_ref(issue_ref);
-            match repo {
-                Some(repo) => bail!(
+            return Err(AdminOpError::NotFound(match repo {
+                Some(repo) => format!(
                     "no autoflow named `{name}` is visible for issue `{issue_ref_text}` and repo `{repo}`"
                 ),
-                None => bail!("no autoflow named `{name}` is visible for issue `{issue_ref_text}`"),
-            }
+                None => format!("no autoflow named `{name}` is visible for issue `{issue_ref_text}`"),
+            })
+            .into());
         }
         [entry] => entry.clone(),
         many => {
@@ -11922,11 +12076,12 @@ fn resolve_autoflow_workflow_for_issue(
                 })
                 .collect::<Vec<_>>();
             options.sort();
-            bail!(
+            return Err(AdminOpError::Conflict(format!(
                 "multiple autoflows named `{name}` are visible for issue `{}`:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
                 format_issue_ref(issue_ref),
                 options.join("\n")
-            );
+            ))
+            .into());
         }
     };
     resolve_visible_autoflow_workflow(global, &entry)
@@ -18661,5 +18816,127 @@ steps:
                 "no repo connector to verify collaborator status must fail closed"
             );
         }
+    }
+
+    fn owned_claim(issue_ref: &str, status: ClaimStatus) -> AutoflowClaimRecord {
+        AutoflowClaimRecord {
+            issue_ref: issue_ref.into(),
+            repo_ref: "github:Section9Labs/rupu".into(),
+            source_ref: None,
+            issue_display_ref: None,
+            issue_title: None,
+            issue_url: None,
+            issue_state_name: None,
+            issue_tracker: None,
+            workflow: "controller".into(),
+            status,
+            worktree_path: None,
+            branch: None,
+            last_run_id: None,
+            last_error: None,
+            last_summary: None,
+            pr_url: None,
+            artifacts: None,
+            artifact_manifest_path: None,
+            next_retry_at: None,
+            claim_owner: None,
+            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+            pending_dispatch: None,
+            contenders: vec![],
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn a_claim_another_cycle_owns_is_a_typed_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoflowClaimStore {
+            root: tmp.path().join("claims"),
+        };
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        store
+            .save(&owned_claim(issue_ref, ClaimStatus::AwaitExternal))
+            .unwrap();
+        let err = ensure_manual_run_can_take_claim(&store, issue_ref).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<AdminOpError>(),
+                Some(AdminOpError::Conflict(_))
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_repair_reports_the_release_and_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let store = AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(global),
+        };
+        store
+            .save(&owned_claim(issue_ref, ClaimStatus::Blocked))
+            .unwrap();
+
+        let dry = repair_claim(global, issue_ref, true, false, true).unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(
+            dry.repairs,
+            vec![format!("would release claim {issue_ref}")]
+        );
+        assert!(
+            store.load(issue_ref).unwrap().is_some(),
+            "a dry run kept the claim"
+        );
+
+        let done = repair_claim(global, issue_ref, true, false, false).unwrap();
+        assert_eq!(done.repairs, vec![format!("released claim {issue_ref}")]);
+        assert!(
+            store.load(issue_ref).unwrap().is_none(),
+            "the real run released it"
+        );
+    }
+
+    #[test]
+    fn repair_refusals_are_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        let both = repair_claim(tmp.path(), issue_ref, true, true, true).unwrap_err();
+        assert!(matches!(
+            both.downcast_ref::<AdminOpError>(),
+            Some(AdminOpError::Invalid(_))
+        ));
+        let missing = repair_claim(tmp.path(), issue_ref, false, false, true).unwrap_err();
+        assert!(matches!(
+            missing.downcast_ref::<AdminOpError>(),
+            Some(AdminOpError::NotFound(_))
+        ));
+        let bad = repair_claim(tmp.path(), "not an issue", false, false, true).unwrap_err();
+        assert!(matches!(
+            bad.downcast_ref::<AdminOpError>(),
+            Some(AdminOpError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn doctor_reports_a_claim_on_an_untracked_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path();
+        let issue_ref = "github:Section9Labs/rupu/issues/42";
+        AutoflowClaimStore {
+            root: paths::autoflow_claims_dir(global),
+        }
+        .save(&owned_claim(issue_ref, ClaimStatus::AwaitExternal))
+        .unwrap();
+        let report = doctor_json(global, None).unwrap();
+        assert_eq!(report["kind"], "autoflow_doctor");
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["rows"][0]["scope"], issue_ref);
+        assert_eq!(report["rows"][0]["problem"], "missing_repo_binding");
+        assert_eq!(
+            wakes_json(global, None).unwrap(),
+            serde_json::json!({"kind": "autoflow_wakes", "version": 1, "rows": []})
+        );
     }
 }

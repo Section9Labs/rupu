@@ -89,7 +89,11 @@ pub async fn handle(
             dry_run,
             skip_events,
             only_events,
-        } => tick(dry_run, skip_events, only_events).await,
+        } => tick(dry_run, skip_events, only_events).await.map(|report| {
+            for fire in &report.would_fire {
+                println!("{}", fire.line);
+            }
+        }),
         Action::Events { no_color } => events(no_color, global_format).await,
     };
     match result {
@@ -329,8 +333,23 @@ async fn list(
         );
         return Ok(());
     }
-    let now = Utc::now();
     let prefs = ui_prefs(no_color, absolute, all_columns)?;
+    let output = CronListOutput {
+        prefs,
+        report: list_report(&workflows, Utc::now()),
+    };
+    report::emit_collection(global_format, &output)
+}
+
+/// `rupu cron list`'s JSON report, for the control plane's `GET /api/cron`.
+pub(crate) fn list_json() -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(list_report(
+        &collect_cron_workflows()?,
+        Utc::now(),
+    ))?)
+}
+
+fn list_report(workflows: &[CronWorkflow], now: DateTime<Utc>) -> CronListReport {
     let rows = workflows
         .iter()
         .map(|workflow| {
@@ -345,15 +364,11 @@ async fn list(
             }
         })
         .collect();
-    let output = CronListOutput {
-        prefs,
-        report: CronListReport {
-            kind: "cron_list",
-            version: 1,
-            rows,
-        },
-    };
-    report::emit_collection(global_format, &output)
+    CronListReport {
+        kind: "cron_list",
+        version: 1,
+        rows,
+    }
 }
 
 fn ui_prefs(
@@ -372,27 +387,95 @@ fn ui_prefs(
     )
 }
 
+/// One workflow a dry-run tick would fire.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WouldFire {
+    /// `cron` (a due schedule) or `event` (a polled event matched).
+    tier: &'static str,
+    workflow: String,
+    /// When it last fired (cron tier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_fired: Option<String>,
+    /// The matched event id and its delivery (event tier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<String>,
+    /// The run id the event's run would get (event tier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    /// The line `rupu cron tick --dry-run` prints for it.
+    #[serde(skip)]
+    pub(crate) line: String,
+}
+
+/// What a tick did. A real tick records nothing here (its runs are on the
+/// run store); a dry run lists what it would fire.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CronTickReport {
+    kind: &'static str,
+    version: u8,
+    dry_run: bool,
+    pub(crate) would_fire: Vec<WouldFire>,
+}
+
+/// Held while a tick runs in this process: `cp serve`'s cron loop and
+/// `POST /api/cron/tick` both take it, so they never tick at once.
+pub(crate) struct TickGuard(());
+
+static TICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Drop for TickGuard {
+    fn drop(&mut self) {
+        TICKING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// The tick guard, or `None` while another tick in this process holds it.
+pub(crate) fn try_begin_tick() -> Option<TickGuard> {
+    TICKING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::Acquire,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .ok()
+        .map(|_| TickGuard(()))
+}
+
 /// The `rupu cron tick` core: fires due cron-scheduled workflows, then
 /// polls event-triggered workflows. `pub(crate)` so `rupu cp serve`'s
-/// cron-tick background loop (`crate::cmd::cp`) can call the exact same
-/// entrypoint on a timer instead of reimplementing the tick logic.
+/// cron-tick background loop (`crate::cmd::cp`) and its `POST
+/// /api/cron/tick` call the exact same entrypoint instead of reimplementing
+/// the tick logic; they hold [`try_begin_tick`]'s guard around it.
 pub(crate) async fn tick(
     dry_run: bool,
     skip_events: bool,
     only_events: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<CronTickReport> {
     let global = paths::global_dir()?;
 
+    let mut would_fire = Vec::new();
     if !only_events {
-        tick_cron(&global, dry_run).await?;
+        tick_cron(&global, dry_run, &mut would_fire).await?;
     }
     if !skip_events {
-        tick_polled_events(&global, dry_run).await?;
+        tick_polled_events(&global, dry_run, &mut would_fire).await?;
     }
-    Ok(())
+    Ok(CronTickReport {
+        kind: "cron_tick",
+        version: 1,
+        dry_run,
+        would_fire,
+    })
 }
 
-async fn tick_cron(global: &Path, dry_run: bool) -> anyhow::Result<()> {
+async fn tick_cron(
+    global: &Path,
+    dry_run: bool,
+    would_fire: &mut Vec<WouldFire>,
+) -> anyhow::Result<()> {
     let workflows = collect_cron_workflows()?;
     if workflows.is_empty() {
         info!("no cron-triggered workflows found");
@@ -422,10 +505,18 @@ async fn tick_cron(global: &Path, dry_run: bool) -> anyhow::Result<()> {
         }
 
         if dry_run {
-            println!(
-                "would fire: {} (last_fired={:?}, now={})",
-                w.name, last_fired, now
-            );
+            would_fire.push(WouldFire {
+                tier: "cron",
+                workflow: w.name.clone(),
+                last_fired: last_fired.map(|t| t.to_rfc3339()),
+                event: None,
+                delivery: None,
+                run_id: None,
+                line: format!(
+                    "would fire: {} (last_fired={:?}, now={})",
+                    w.name, last_fired, now
+                ),
+            });
             continue;
         }
 
@@ -474,7 +565,11 @@ async fn tick_cron(global: &Path, dry_run: bool) -> anyhow::Result<()> {
 /// we don't re-process events on a crash mid-run.
 ///
 /// Spec: design §4.1, §6.2, §10. Plan 1 task 6 + task 8.
-async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> {
+async fn tick_polled_events(
+    global: &Path,
+    dry_run: bool,
+    would_fire: &mut Vec<WouldFire>,
+) -> anyhow::Result<()> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
     let cfg_paths = paths::config_paths(global, project_root.as_deref(), &pwd)?;
@@ -630,10 +725,18 @@ async fn tick_polled_events(global: &Path, dry_run: bool) -> anyhow::Result<()> 
                 );
 
                 if dry_run {
-                    println!(
-                        "would fire: {} (event={}, delivery={}, run_id={})",
-                        wf.name, event.id, event.delivery, run_id
-                    );
+                    would_fire.push(WouldFire {
+                        tier: "event",
+                        workflow: wf.name.clone(),
+                        last_fired: None,
+                        event: Some(event.id.clone()),
+                        delivery: Some(event.delivery.clone()),
+                        run_id: Some(run_id.clone()),
+                        line: format!(
+                            "would fire: {} (event={}, delivery={}, run_id={})",
+                            wf.name, event.id, event.delivery, run_id
+                        ),
+                    });
                     continue;
                 }
 
@@ -734,6 +837,34 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
     }
 
     let prefs = crate::cmd::ui::UiPrefs::resolve(&cfg.ui, no_color, None, None, None);
+    let output = CronEventsOutput {
+        prefs,
+        report: events_report(&cfg, &workflows, &cursors_root),
+    };
+    report::emit_collection(global_format, &output)
+}
+
+/// `rupu cron events`' JSON report, for the control plane's
+/// `GET /api/cron/events`.
+pub(crate) fn events_json() -> anyhow::Result<serde_json::Value> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
+    let workflows = collect_event_workflows()?;
+    let cursors_root = global.join("cron-state").join("event-cursors");
+    Ok(serde_json::to_value(events_report(
+        &cfg,
+        &workflows,
+        &cursors_root,
+    ))?)
+}
+
+fn events_report(
+    cfg: &rupu_config::Config,
+    workflows: &[EventWorkflow],
+    cursors_root: &Path,
+) -> CronEventsReport {
     let poll_sources: Vec<String> = cfg
         .triggers
         .poll_sources
@@ -749,7 +880,7 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
                 .iter()
                 .filter_map(|s| s.source().parse::<EventSourceRef>().ok())
                 .find_map(|source| {
-                    let path = cursor_path(&cursors_root, &source);
+                    let path = cursor_path(cursors_root, &source);
                     read_cursor(&path).ok()
                 });
             CronEventsRow {
@@ -760,16 +891,12 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
             }
         })
         .collect();
-    let output = CronEventsOutput {
-        prefs,
-        report: CronEventsReport {
-            kind: "cron_events",
-            version: 1,
-            summary: CronEventsSummary { poll_sources },
-            rows,
-        },
-    };
-    report::emit_collection(global_format, &output)
+    CronEventsReport {
+        kind: "cron_events",
+        version: 1,
+        summary: CronEventsSummary { poll_sources },
+        rows,
+    }
 }
 
 struct EventWorkflow {
