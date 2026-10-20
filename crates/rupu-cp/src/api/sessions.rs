@@ -23,6 +23,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sessions/:id/send", post(send_session))
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/restore", post(restore_session))
+        .route("/api/sessions/:id/stop", post(stop_session))
+        .route("/api/sessions/:id/compact", post(compact_session))
 }
 
 /// Minimal projection of the on-disk `session.json`. All fields are
@@ -1328,6 +1330,93 @@ async fn delete_session(
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
 
+// ---------------------------------------------------------------------------
+// Session stop / compact — /api/sessions/:id/{stop,compact} (local only: no
+// host transport carries them)
+// ---------------------------------------------------------------------------
+
+/// The local session `id` a stop or compact acts on, read from its active
+/// directory: 404 when there is none, 409 when it is archived (the CLI
+/// refuses both commands on an archived session).
+fn active_session(s: &AppState, id: &str, command: &str) -> ApiResult<SessionDto> {
+    let active = s.global_dir.join("sessions").join(id);
+    if let Some(dto) = load_session_file(&active)? {
+        return Ok(dto);
+    }
+    let archived = s.global_dir.join("sessions-archive").join(id);
+    if load_session_file(&archived)?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "session {id} is archived; restore it before `{command}`"
+        )));
+    }
+    Err(ApiError::not_found(format!("session {id} not found")))
+}
+
+/// `POST /api/sessions/:id/stop`: `rupu session stop <id>` — ends the
+/// session's worker and its running turn, and marks the session stopped.
+/// Answers `{ok, id}` once the session record says stopped.
+async fn stop_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
+    crate::api::fleet::require_local(q.host.as_deref(), "stopping a session")?;
+    crate::api::config::require_writable_to(&s, "stopping a session")?;
+    active_session(&s, &id, "session stop")?;
+    mutate_session(&s, &id, crate::session_mutator::SessionAction::Stop).await
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct CompactBody {
+    /// Context-window size (tokens) to size the compaction against, in place
+    /// of the session's stored one; required for a session whose model's
+    /// input limit is unknown.
+    #[serde(default)]
+    window: Option<u32>,
+}
+
+/// `POST /api/sessions/:id/compact {window?}`: `rupu session compact`,
+/// started detached (it summarizes older turns with a model call). 202
+/// `{ok, id, log}` once it has started — the compacted history lands in the
+/// session record when it ends, and a failure is in `log`. 409 while a turn
+/// is running.
+async fn compact_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
+    crate::api::runs::OptionalJson(body): crate::api::runs::OptionalJson<CompactBody>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    crate::api::runs::validate_id(&id)?;
+    crate::api::fleet::require_local(q.host.as_deref(), "compacting a session")?;
+    crate::api::config::require_writable_to(&s, "compacting a session")?;
+    let window = body.and_then(|b| b.window);
+    let dto = active_session(&s, &id, "session compact")?;
+    if dto.status.as_str() == Some("running") {
+        return Err(ApiError::conflict(format!(
+            "session {id} is running a turn; stop it or wait for the turn to end"
+        )));
+    }
+    let m = s
+        .session_mutator
+        .clone()
+        .ok_or_else(|| ApiError::not_available("compacting a session requires `rupu cp serve`"))?;
+    let log = s.global_dir.join("sessions").join(&id).join("compact.log");
+    m.compact(&id, window, &log).await.map_err(|e| match e {
+        crate::session_mutator::SessionMutateError::NotFound(_) => {
+            ApiError::not_found(format!("session {id} not found"))
+        }
+        crate::session_mutator::SessionMutateError::Invalid(msg) => ApiError::conflict(msg),
+        crate::session_mutator::SessionMutateError::Failed { message, .. } => {
+            ApiError::internal(message)
+        }
+    })?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true, "id": id, "log": log })),
+    ))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1868,6 +1957,14 @@ pub(crate) mod tests {
             if action == SessionAction::Archive && id == "active-running" {
                 return Err(SessionMutateError::Invalid("session is running".into()));
             }
+            Ok(())
+        }
+        async fn compact(
+            &self,
+            _id: &str,
+            _window: Option<u32>,
+            _log: &std::path::Path,
+        ) -> Result<(), SessionMutateError> {
             Ok(())
         }
     }

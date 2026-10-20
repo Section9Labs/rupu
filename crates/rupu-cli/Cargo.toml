@@ -72,6 +72,7 @@ rupu-launch = { workspace = true }
 rupu-fleet = { workspace = true }
 rupu-codename = { workspace = true }
 rupu-skills = { workspace = true, features = ["git"] }
+rupu-templates = { workspace = true }
 rupu-update = { path = "../rupu-update" }
 comfy-table.workspace = true
 indicatif.workspace = true

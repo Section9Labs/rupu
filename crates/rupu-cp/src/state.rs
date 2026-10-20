@@ -105,6 +105,10 @@ pub struct AppState {
     /// the shell from every page) answers without waiting on SSH — see
     /// [`crate::host::probe_cache`].
     pub host_probes: Arc<crate::host::probe_cache::HostProbeCache<crate::api::hosts::RemoteProbe>>,
+    /// Optional skill-installer port (the git fetch behind
+    /// `/api/skills/install|update`). Defaults to `None`; rupu-cli's `cp
+    /// serve` installs `GitFetcher` via [`AppState::with_skill_installer`].
+    pub skill_installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
 }
 
 impl AppState {
@@ -177,6 +181,7 @@ impl AppState {
                 crate::netflow_index::DEFAULT_BUDGET_MB * 1024 * 1024,
             )),
             host_probes: Arc::default(),
+            skill_installer: None,
         }
     }
 
@@ -255,6 +260,15 @@ impl AppState {
         m: Option<Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
     ) -> Self {
         self.transcript_mutator = m;
+        self
+    }
+
+    /// Install a skill-installer adapter (or clear it with `None`).
+    pub fn with_skill_installer(
+        mut self,
+        installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
+    ) -> Self {
+        self.skill_installer = installer;
         self
     }
 

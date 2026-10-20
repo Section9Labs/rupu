@@ -566,6 +566,14 @@ impl rupu_cp::session_mutator::SessionMutator for StubSessionMutator {
     ) -> Result<(), rupu_cp::session_mutator::SessionMutateError> {
         Ok(())
     }
+    async fn compact(
+        &self,
+        _id: &str,
+        _window: Option<u32>,
+        _log: &std::path::Path,
+    ) -> Result<(), rupu_cp::session_mutator::SessionMutateError> {
+        Ok(())
+    }
 }
 
 async fn spawn_with_remote_and_session_mutator(

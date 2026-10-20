@@ -1,6 +1,7 @@
-//! Port: archive / restore / delete sessions. rupu-cp defines it; rupu-cli's
-//! `cp serve` provides the subprocess adapter that shells `rupu session
-//! archive|restore|delete <id>`. `None` → the endpoints return 501.
+//! Port: archive / restore / delete / stop / compact sessions. rupu-cp
+//! defines it; rupu-cli's `cp serve` provides the subprocess adapter that
+//! shells `rupu session archive|restore|delete|stop <id>` and starts a
+//! detached `rupu session compact <id>`. `None` → the endpoints return 501.
 
 use async_trait::async_trait;
 
@@ -9,6 +10,8 @@ pub enum SessionAction {
     Archive,
     Restore,
     Delete,
+    /// `rupu session stop`: end the session's worker and its running turn.
+    Stop,
 }
 
 impl SessionAction {
@@ -17,6 +20,7 @@ impl SessionAction {
             SessionAction::Archive => "archive",
             SessionAction::Restore => "restore",
             SessionAction::Delete => "delete",
+            SessionAction::Stop => "stop",
         }
     }
 }
@@ -37,6 +41,16 @@ pub enum SessionMutateError {
 #[async_trait]
 pub trait SessionMutator: Send + Sync {
     async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError>;
+
+    /// Start `rupu session compact <id> [--window <window>]` detached, its
+    /// stderr to `log`, and return once it has started: the compaction
+    /// itself is a model call and lands in the session record when it ends.
+    async fn compact(
+        &self,
+        id: &str,
+        window: Option<u32>,
+        log: &std::path::Path,
+    ) -> Result<(), SessionMutateError>;
 }
 
 #[cfg(test)]
@@ -51,6 +65,14 @@ mod tests {
             if action == SessionAction::Restore {
                 return Err(SessionMutateError::NotFound("x".into()));
             }
+            Ok(())
+        }
+        async fn compact(
+            &self,
+            _id: &str,
+            _window: Option<u32>,
+            _log: &std::path::Path,
+        ) -> Result<(), SessionMutateError> {
             Ok(())
         }
     }

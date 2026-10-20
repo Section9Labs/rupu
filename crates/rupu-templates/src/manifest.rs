@@ -3,10 +3,10 @@
 //! The manifest is the single source-of-truth for what ships in
 //! `--with-samples`. Adding a template is two steps:
 //!
-//!   1. Drop the file under `crates/rupu-cli/templates/<dir>/<name>`.
+//!   1. Drop the file under `crates/rupu-templates/templates/<dir>/<name>`.
 //!   2. Add a line to `MANIFEST` below.
 //!
-//! `init_manifest_in_sync.rs` enforces both directions: every file
+//! `rupu-cli`'s `init_manifest_in_sync.rs` enforces both directions: every file
 //! under templates/ appears in MANIFEST, and every MANIFEST entry
 //! exists on disk.
 
@@ -159,7 +159,7 @@ pub const MANIFEST: &[Template] = &[
 /// (`agents/<name>.md`, `workflows/<id>.yaml`), NOT `.rupu/`-prefixed, so
 /// it lands exactly where `rupu_agent::load_agents` /
 /// `rupu_orchestrator::list_workflow_summaries` read it. The on-disk
-/// source lives under `crates/rupu-cli/templates/fleet/<target_relpath>`.
+/// source lives under `crates/rupu-templates/templates/fleet/<target_relpath>`.
 ///
 /// Adding a fleet member is the same two steps as [`MANIFEST`]: drop the
 /// file under `templates/fleet/<dir>/<name>` and add a line here.
@@ -283,7 +283,7 @@ pub const CONFIG_SKELETON: &str = r#"# rupu project config — see https://githu
 /// filename and no longer exists) records every host, IP, path and
 /// timing rupu contacted on the user's behalf. Without this entry,
 /// `git add .` in a freshly-`init`'d project commits that record
-/// straight into the user's repo. `cmd::init::ensure_netflow_dir` also
+/// straight into the user's repo. `crate::init` also
 /// creates this directory itself (with its own self-ignoring
 /// `.gitignore`, belt-and-suspenders with this entry) — see that
 /// function's doc comment for why that's a deliberate, explicit opt-in

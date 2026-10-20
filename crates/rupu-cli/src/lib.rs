@@ -29,7 +29,8 @@ pub mod paths;
 pub mod resume;
 pub mod run_target;
 pub mod standalone_run_metadata;
-pub mod templates;
+/// The embedded `rupu init` samples and the stock fleet (`rupu-templates`).
+pub use rupu_templates as templates;
 pub mod update_notice;
 
 #[cfg(test)]

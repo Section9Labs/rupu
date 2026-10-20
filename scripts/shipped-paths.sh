@@ -21,7 +21,7 @@
 #   scripts/**              — release and dev helper scripts.
 #   crates/<crate>/tests/** — integration tests, never linked into a binary.
 #
-# A `.md` suffix alone is NOT documentation: crates/rupu-cli/templates/**/*.md
+# A `.md` suffix alone is NOT documentation: crates/rupu-templates/templates/**/*.md
 # are compiled into the binary with include_str!. Nor is every `tests/`
 # directory a test: one under src/ is compiled into its crate.
 set -euo pipefail

@@ -6,6 +6,13 @@
 //! does; a layer that can't be read is skipped and named in the response's
 //! `warnings`. `GET /api/skills/:layer/:name` shows one skill, as `rupu
 //! skill show` does.
+//!
+//! The writes are what `rupu skill install|update|validate` run, through the
+//! same `rupu_skills` functions (an install's unpack, validation and swap
+//! are `install_from`'s, never reimplemented here): `POST
+//! /api/skills/install`, `/update` and `/validate`. They are local only;
+//! install and update fetch git sources through the
+//! [`crate::skill_installer`] port.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -26,6 +33,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/skills", get(list_skills))
         .route("/api/skills/:layer/:name", get(get_skill))
+        .route("/api/skills/install", post(install_skills))
+        .route("/api/skills/update", post(update_skills))
+        .route("/api/skills/validate", post(validate_skills))
         // Shipped skill content (placed units). The static `bundle` segment
         // wins over `:layer`, so the routes above keep serving.
         .route("/api/skills/bundle/missing", post(bundle_missing))
@@ -289,6 +299,370 @@ async fn get_skill(
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+// ---------------------------------------------------------------------------
+// Install / update / validate — `rupu skill install|update|validate`
+// ---------------------------------------------------------------------------
+
+/// The skills directory of `layer`: the global root's, or the project
+/// `ws_id`'s (which must have a `.rupu/`, as `rupu skill … --project`
+/// requires one).
+fn target_skills_dir(
+    s: &AppState,
+    project: Option<&str>,
+) -> ApiResult<(Layer, std::path::PathBuf)> {
+    match project {
+        None => Ok((Layer::Global, s.global_dir.join("skills"))),
+        Some(id) => Ok((
+            Layer::Project,
+            crate::api::fleet::project_rupu_dir(s, id)?.join("skills"),
+        )),
+    }
+}
+
+fn require_installer(
+    s: &AppState,
+    what: &str,
+    host: Option<&str>,
+) -> ApiResult<std::sync::Arc<crate::skill_installer::SkillInstaller>> {
+    crate::api::fleet::require_local(host, what)?;
+    crate::api::config::require_writable_to(s, what)?;
+    s.skill_installer
+        .clone()
+        .ok_or_else(|| ApiError::not_available(format!("{what} requires `rupu cp serve`")))
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SkillsWriteQuery {
+    /// Must be this host: skill installs are local-only.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct InstallBody {
+    /// An absolute directory, `owner/repo`, a GitHub tree URL, or an https
+    /// git URL (`#path` narrows to a folder in the repository).
+    source: String,
+    /// Branch, tag or commit to install from (`--ref`).
+    #[serde(default, rename = "ref")]
+    git_ref: Option<String>,
+    /// Install these skills from a source that holds several (`--skill`).
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Install every valid skill in the source (`--all`).
+    #[serde(default)]
+    all: bool,
+    /// A project id: install into that project's `.rupu/skills` instead of
+    /// the global one (`--project`).
+    #[serde(default)]
+    project: Option<String>,
+    /// Replace installed skills of the same name (`--force`).
+    #[serde(default)]
+    force: bool,
+}
+
+/// What an install failure is to the caller: the request's fault (400),
+/// a name that's taken (409), a fetch that failed (502), or the disk (500).
+fn install_err(e: rupu_skills::install::InstallError) -> ApiError {
+    use rupu_skills::install::InstallError as E;
+    use rupu_skills::source::SourceError;
+    match e {
+        E::Exists(_) => ApiError::conflict(e.to_string()),
+        E::Io { .. } => ApiError::internal(e.to_string()),
+        E::Source(SourceError::Clone(_)) => ApiError::bad_gateway(e.to_string()),
+        E::Partial { report, error } => {
+            let landed: Vec<String> = report
+                .installed
+                .iter()
+                .map(|i| i.name.to_string())
+                .collect();
+            let ApiError(status, msg) = install_err(*error);
+            ApiError(
+                status,
+                format!(
+                    "{msg} (installed before the failure: {})",
+                    landed.join(", ")
+                ),
+            )
+        }
+        other => ApiError::bad_request(other.to_string()),
+    }
+}
+
+fn install_report(report: &rupu_skills::install::InstallReport, layer: Layer) -> serde_json::Value {
+    use rupu_skills::install::InstallOutcome;
+    let installed: Vec<serde_json::Value> = report
+        .installed
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "name": i.name.to_string(),
+                "layer": layer.as_str(),
+                "path": i.path,
+                "outcome": match i.outcome {
+                    InstallOutcome::Created => "created",
+                    InstallOutcome::Replaced => "replaced",
+                },
+                "content_hash": i.content_hash.short(),
+                "tracked": !report.untracked.contains(&i.name),
+            })
+        })
+        .collect();
+    let skipped: Vec<serde_json::Value> = report
+        .skipped
+        .iter()
+        .map(|(name, reason)| serde_json::json!({ "name": name, "reason": reason }))
+        .collect();
+    serde_json::json!({ "installed": installed, "skipped": skipped })
+}
+
+/// `POST /api/skills/install {source, ref?, skills?, all?, project?, force?}`:
+/// `rupu skill install`. Answers `{installed, skipped}` once the skills are
+/// in place; `installed[].tracked` is false for a project install from a
+/// directory outside the project (`update` can't follow it).
+async fn install_skills(
+    State(s): State<AppState>,
+    Query(q): Query<SkillsWriteQuery>,
+    Json(body): Json<InstallBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use rupu_skills::install::{install_from, InstallSpec, Selection};
+    let fetcher = require_installer(&s, "installing skills", q.host.as_deref())?;
+    if body.all && !body.skills.is_empty() {
+        return Err(ApiError::bad_request("give `skills` or `all`, not both"));
+    }
+    let local = std::path::Path::new(&body.source);
+    if local.is_relative() && local.exists() {
+        return Err(ApiError::bad_request(format!(
+            "a local source must be an absolute path: {}",
+            body.source
+        )));
+    }
+    let (layer, skills_dir) = target_skills_dir(&s, body.project.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let source = rupu_skills::parse_source(&body.source, body.git_ref.as_deref(), None)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        let selection = if body.all {
+            Selection::All
+        } else if !body.skills.is_empty() {
+            Selection::Named(body.skills)
+        } else {
+            Selection::Default
+        };
+        let report = install_from(
+            &InstallSpec {
+                source: &source,
+                input: &body.source,
+                selection,
+                skills_dir: &skills_dir,
+                layer,
+                force: body.force,
+            },
+            fetcher.as_ref(),
+        )
+        .map_err(install_err)?;
+        Ok(Json(install_report(&report, layer)))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct UpdateBody {
+    /// The skills to update; empty or absent updates every installed skill
+    /// with a source record (`--all`).
+    #[serde(default)]
+    names: Vec<String>,
+    /// A project id: update that project's skills instead of the global ones.
+    #[serde(default)]
+    project: Option<String>,
+    /// Replace skills whose installed copy was edited (`--force`).
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /api/skills/update {names?, project?, force?}`: `rupu skill
+/// update`. Answers `{results: [{name, outcome, from?, to?, error?}]}`,
+/// `outcome` one of `updated`, `up_to_date`, `no_record`,
+/// `locally_modified`, `not_installed`, `failed` — per skill, so a failed
+/// skill is a row, not an error status.
+async fn update_skills(
+    State(s): State<AppState>,
+    Query(q): Query<SkillsWriteQuery>,
+    crate::api::runs::OptionalJson(body): crate::api::runs::OptionalJson<UpdateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    use rupu_skills::update::UpdateOutcome;
+    let fetcher = require_installer(&s, "updating skills", q.host.as_deref())?;
+    let body = body.unwrap_or_default();
+    let (layer, skills_dir) = target_skills_dir(&s, body.project.as_deref())?;
+    tokio::task::spawn_blocking(move || {
+        let results =
+            rupu_skills::update::update_skills(&skills_dir, layer, &body.names, body.force, fetcher.as_ref());
+        let rows: Vec<serde_json::Value> = results
+            .into_iter()
+            .map(|(name, outcome)| match outcome {
+                UpdateOutcome::Updated { from, to } => {
+                    serde_json::json!({ "name": name, "outcome": "updated", "from": from, "to": to })
+                }
+                UpdateOutcome::UpToDate => serde_json::json!({ "name": name, "outcome": "up_to_date" }),
+                UpdateOutcome::NoRecord => serde_json::json!({ "name": name, "outcome": "no_record" }),
+                UpdateOutcome::LocallyModified => {
+                    serde_json::json!({ "name": name, "outcome": "locally_modified" })
+                }
+                UpdateOutcome::NotInstalled => {
+                    serde_json::json!({ "name": name, "outcome": "not_installed" })
+                }
+                UpdateOutcome::Failed(e) => {
+                    serde_json::json!({ "name": name, "outcome": "failed", "error": e })
+                }
+            })
+            .collect();
+        Ok(Json(serde_json::json!({ "layer": layer.as_str(), "results": rows })))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ValidateBody {
+    /// An absolute directory: validate every skill found under it, installed
+    /// or not (what an install from it would check).
+    #[serde(default)]
+    path: Option<String>,
+    /// An installed skill's name; with no `layer`, both layers' skills of
+    /// that name.
+    #[serde(default)]
+    name: Option<String>,
+    /// `global` or `project` (needs `ws_id`).
+    #[serde(default)]
+    layer: Option<String>,
+    /// The project whose layer is read.
+    #[serde(default)]
+    ws_id: Option<String>,
+}
+
+/// `POST /api/skills/validate {path}` or `{name, layer?, ws_id?}`: `rupu
+/// skill validate`, against the Agent Skills format. Answers `{ok, skills:
+/// [{name, layer?, path, status, error?, warnings}]}`; `ok` is false when
+/// any skill is invalid. 404 when `name` matches no installed skill.
+async fn validate_skills(
+    State(s): State<AppState>,
+    Query(q): Query<SkillsWriteQuery>,
+    Json(body): Json<ValidateBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::fleet::require_local(q.host.as_deref(), "validating skills")?;
+    let rows = match (body.path, body.name) {
+        (Some(path), None) => {
+            let root = std::path::PathBuf::from(&path);
+            if !root.is_absolute() || !root.is_dir() {
+                return Err(ApiError::bad_request(format!(
+                    "path must be an absolute, existing directory: {path}"
+                )));
+            }
+            tokio::task::spawn_blocking(move || validate_dir(&root))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))??
+        }
+        (None, Some(name)) => {
+            let layer = match body.layer.as_deref() {
+                None => None,
+                Some(l) => Some(Layer::parse(l).ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "unknown layer {l:?}; expected global or project"
+                    ))
+                })?),
+            };
+            if layer == Some(Layer::Project) && body.ws_id.is_none() {
+                return Err(ApiError::bad_request(
+                    "a project skill needs `ws_id` naming its project",
+                ));
+            }
+            let dirs = layers(&s, body.ws_id.as_deref())?;
+            tokio::task::spawn_blocking(move || validate_installed(&dirs, layer, &name))
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))??
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "give `path`, or `name` (with an optional `layer`)",
+            ))
+        }
+    };
+    let ok = rows.iter().all(|r| r["status"] == "ok");
+    Ok(Json(serde_json::json!({ "ok": ok, "skills": rows })))
+}
+
+fn validate_dir(root: &std::path::Path) -> ApiResult<Vec<serde_json::Value>> {
+    use rupu_skills::install::InstallError;
+    let found = rupu_skills::install::find_skills(root).map_err(|e| match e {
+        InstallError::Io { .. } => ApiError::internal(e.to_string()),
+        other => ApiError::bad_request(other.to_string()),
+    })?;
+    if found.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "no SKILL.md found in {}",
+            root.display()
+        )));
+    }
+    Ok(found
+        .into_iter()
+        .map(|f| {
+            let warnings: Vec<String> = match &f.error {
+                Some(_) => Vec::new(),
+                None => rupu_skills::load_skill(&f.path, Layer::Global)
+                    .map(|sk| sk.frontmatter.warnings)
+                    .unwrap_or_default(),
+            };
+            serde_json::json!({
+                "name": f.name,
+                "path": f.path,
+                "status": if f.error.is_some() { "invalid" } else { "ok" },
+                "error": f.error,
+                "warnings": warnings,
+            })
+        })
+        .collect())
+}
+
+fn validate_installed(
+    dirs: &LayerDirs,
+    layer: Option<Layer>,
+    name: &str,
+) -> ApiResult<Vec<serde_json::Value>> {
+    let (cat, failed) = discover(dirs);
+    if let Some((_, w)) = failed
+        .into_iter()
+        .find(|(l, _)| layer.is_none_or(|want| want == *l))
+    {
+        return Err(ApiError::internal(w));
+    }
+    let entries: Vec<&CatalogEntry> = match layer {
+        Some(l) => cat.get(l, name).into_iter().collect(),
+        None => cat.named(name).collect(),
+    };
+    if entries.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "no installed skill named {name:?}"
+        )));
+    }
+    Ok(entries
+        .into_iter()
+        .map(|e| {
+            let (status, error, warnings) = match e.skill() {
+                Ok(sk) => ("ok", None, sk.frontmatter.warnings.clone()),
+                Err(err) => ("invalid", Some(err.to_string()), Vec::new()),
+            };
+            serde_json::json!({
+                "name": e.dir_name,
+                "layer": e.layer.as_str(),
+                "path": e.path,
+                "status": status,
+                "error": error,
+                "warnings": warnings,
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]

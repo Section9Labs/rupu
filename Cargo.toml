@@ -4,6 +4,7 @@ members = [
     "crates/rupu-ast",
     "crates/rupu-codename",
     "crates/rupu-skills",
+    "crates/rupu-templates",
     "crates/rupu-app-canvas",
     "crates/rupu-coverage",
     "crates/rupu-query",
@@ -199,6 +200,8 @@ http-body-util = "0.1"
 # Human codenames for runs/agents
 rupu-codename = { path = "crates/rupu-codename" }
 rupu-skills = { path = "crates/rupu-skills" }
+# The embedded `rupu init` samples and the stock fleet, and their installers.
+rupu-templates = { path = "crates/rupu-templates" }
 
 # Network egress observability (netflow)
 rupu-netflow = { path = "crates/rupu-netflow", default-features = false }
