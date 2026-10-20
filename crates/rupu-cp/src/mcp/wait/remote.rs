@@ -351,8 +351,17 @@ impl Remote {
     /// source still waits for its first answer is asked until `first_by`, the
     /// others until `deadline`.
     pub(super) fn schedule(&mut self, watch: &[Condition], got: &Got, deadline: Instant) {
+        self.start_due(watch, got, deadline, false);
+    }
+
+    /// [`Self::schedule`], for every host or, with `first_only`, only for the
+    /// hosts with a source still waiting for its first answer.
+    fn start_due(&mut self, watch: &[Condition], got: &Got, deadline: Instant, first_only: bool) {
         let now = Instant::now();
         for h in 0..self.hosts.len() {
+            if first_only && !self.host_first_pending(h) {
+                continue;
+            }
             // A hung host can keep the loop running to its first-round cut,
             // past the deadline: a round started then would only be cut off
             // and warn, unless it brings a first answer.
@@ -415,6 +424,15 @@ impl Remote {
         let asks = self.asks_for(h, watch, got, kind);
         if asks.is_empty() {
             return false;
+        }
+        // A held-back ask going out now is no longer held: if it doesn't
+        // answer in time, it is named as any unanswered ask is.
+        for ask in &asks {
+            match ask {
+                Ask::Gate { src, .. } => self.gates[*src].first.held = None,
+                Ask::Msgs { src, .. } => self.msgs[*src].first.held = None,
+                Ask::Open { .. } | Ask::Status { .. } => {}
+            }
         }
         let memo = self.hosts[h]
             .spaced
@@ -621,7 +639,10 @@ impl Remote {
                     if Instant::now() >= cut {
                         break;
                     }
-                    self.schedule(watch, got, deadline);
+                    // Only the rounds that can bring a first answer: one for
+                    // another host would land past the loop, unread (a
+                    // status it carries lost to this call).
+                    self.start_due(watch, got, deadline, true);
                     // A turn that started no round would only wake this
                     // again at once.
                     if self.inflight.is_empty() {
@@ -1090,6 +1111,79 @@ mod tests {
         assert!(r.next_poll_at(past).is_none());
         r.schedule(&[], &Got::default(), past);
         assert!(!r.hosts[0].busy);
+    }
+
+    /// A host with the stub connector, its next poll due.
+    fn idle_host(id: &str) -> Host {
+        use crate::host::connector::testing::StubConnector;
+        Host {
+            id: id.into(),
+            conn: Arc::new(StubConnector::default()),
+            busy: false,
+            poll: REMOTE_POLL,
+            spaced: false,
+            next_poll: Instant::now() - Duration::from_secs(1),
+        }
+    }
+
+    /// While waiting for first answers, only the hosts that can bring one
+    /// are asked: a status another host owes isn't started there, where its
+    /// round would land unread.
+    #[tokio::test]
+    async fn waiting_for_first_answers_asks_only_their_hosts() {
+        let req = super::super::parse::parse(json!({"watch": [
+            {"kind": "run_gate", "run": "run_g", "host": "a"},
+            {"kind": "run_settled", "run": "run_r", "host": "b"}]}))
+        .unwrap();
+        let mut r = Remote {
+            hosts: vec![idle_host("a"), idle_host("b")],
+            runs: vec![RunSrc {
+                host: 1,
+                run: "run_r".into(),
+                source: req.watch[1].source.clone(),
+                collects: false,
+                stream: None,
+                ended: true,
+                needs_status: true,
+                answered: true,
+            }],
+            gates: vec![GateSrc {
+                host: 0,
+                run: "run_g".into(),
+                source: req.watch[0].source.clone(),
+                first: First {
+                    answered: false,
+                    held: Some((Instant::now(), Instant::now())),
+                },
+            }],
+            msgs: Vec::new(),
+            turn: 0,
+            inflight: FuturesUnordered::new(),
+            throttle: Arc::default(),
+            first_by: Instant::now() + FIRST_ROUND_BUDGET,
+        };
+        let far = Instant::now() + Duration::from_secs(60);
+        r.start_due(&req.watch, &Got::default(), far, true);
+        assert!(r.hosts[0].busy, "the held gate's host is asked");
+        // Its ask is out: no longer held, so an unanswered one reads as any.
+        assert!(r.gates[0].first.held.is_none());
+        assert!(!r.hosts[1].busy, "the status host is left for the loop");
+        r.start_due(&req.watch, &Got::default(), far, false);
+        assert!(r.hosts[1].busy);
+
+        // The gate's ask went out at its turn and hasn't answered by the
+        // cut: named as an unanswered first ask, not as the other call's.
+        r.inflight = FuturesUnordered::new();
+        r.hosts[0].busy = false;
+        let mut got = Got::default();
+        let now = Instant::now();
+        r.settle_first(now, far, &req.watch, &mut got)
+            .await
+            .unwrap();
+        assert_eq!(
+            got.warnings[&req.watch[0].source],
+            "no first answer within 5 s"
+        );
     }
 
     #[tokio::test]
