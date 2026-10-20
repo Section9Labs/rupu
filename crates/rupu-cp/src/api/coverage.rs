@@ -541,6 +541,11 @@ async fn rerun(
         skill_bundle: None,
         messaging: Default::default(),
         codename: None,
+        // As `rupu coverage rerun`: the agent's own model and provider, a
+        // fresh run.
+        model: None,
+        provider: None,
+        continue_from: None,
     };
     let run_id = launcher.launch(req).await.map_err(|e| match e {
         crate::agent_launcher::AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
