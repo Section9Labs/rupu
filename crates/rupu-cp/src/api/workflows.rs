@@ -680,31 +680,7 @@ pub(crate) fn resolve_launch_scope(
         resolve_workflow_scoped_explicit(s, name, kind, scope_id).ok_or_else(|| {
             ApiError::not_found(format!("workflow {name} not found in the requested scope"))
         })?;
-    match resolved_kind {
-        // dir == <workspace root>/.rupu/workflows; strip both segments to
-        // reach the workspace root the picker's Project row targets.
-        ScopeKind::Project => Ok(dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(std::path::PathBuf::from)),
-        // dir == <global_dir>/workflows; dir.parent() == global_dir itself.
-        ScopeKind::Global => {
-            let global_dir = dir
-                .parent()
-                .ok_or_else(|| ApiError::internal("resolved global workflows dir has no parent"))?;
-            if global_dir.file_name() != Some(std::ffi::OsStr::new(".rupu")) {
-                return Err(ApiError::bad_request(
-                    "global-scope launch pinning isn't available: RUPU_HOME is set to a \
-                     directory not named \".rupu\", so the cwd-based trick that forces \
-                     global-only resolution can't be applied here",
-                ));
-            }
-            let global_parent = global_dir
-                .parent()
-                .ok_or_else(|| ApiError::internal("global dir has no parent"))?;
-            Ok(Some(global_parent.to_path_buf()))
-        }
-    }
+    crate::api::repo_scope::launch_dir_for(&dir, resolved_kind)
 }
 
 /// Start a fresh run of `:name` via the configured [`RunLauncher`] (local) or

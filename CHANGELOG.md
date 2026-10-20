@@ -5,6 +5,7 @@
 ### Added
 - **Operator MCP over `rupu cp serve`.** The control plane serves MCP (streamable HTTP) at `/mcp` behind the `/api` bearer token, with an Origin/Host guard. 138 operator tools, one per CP route (runs, sessions, agentiflows, definitions, findings and coverage, usage and netflow, hosts, config, customers, projects), call the CP's own endpoints in process; `x-rupu-*` response headers come back as notes and file results (finding exports, artifacts) as embedded resources. A `wait` tool long-polls run settled / gate parked / run events / messages (also on remote hosts), agentiflow lines, agent run ends, session turns and new findings, with a cursor, `warnings` and progress notifications and the tool catalog (files, shell, SCM, issues, findings; fs/shell and findings tools take a `workspace`). rupu adds no permission layer: the client's harness decides. Operator messages and finding tags sent over MCP record `client: "mcp"`. See `docs/mcp.md`.
 - **`rupu cp serve --no-web`, `--no-mcp`, `--tools <grant>`.**
+- **Agentiflows from the control plane.** `POST /api/agentiflows` launches one detached, `POST /api/agentiflows/:id/stop {now}` stops it (gracefully or hard), and `/api/agentiflow-defs` lists, reads, creates, saves, deletes and validates definitions; each is an operator MCP tool (`agentiflows.run`, `agentiflows.stop`, `agentiflow_defs.*`).
 
 ### Changed
 - **`rupu mcp serve` is deprecated.** It prints a notice and runs `rupu cp serve --no-web` on 127.0.0.1:7878; the stdio transport is gone (`--transport` and `--mode` are ignored).

@@ -105,6 +105,10 @@ pub struct AppState {
     /// the shell from every page) answers without waiting on SSH — see
     /// [`crate::host::probe_cache`].
     pub host_probes: Arc<crate::host::probe_cache::HostProbeCache<crate::api::hosts::RemoteProbe>>,
+    /// Optional agentiflow-launcher port (`POST /api/agentiflows`). Defaults
+    /// to `None`; rupu-cli's `cp serve` installs its detached-start adapter
+    /// via [`AppState::with_agentiflow_launcher`].
+    pub agentiflow_launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
 }
 
 impl AppState {
@@ -177,6 +181,7 @@ impl AppState {
                 crate::netflow_index::DEFAULT_BUDGET_MB * 1024 * 1024,
             )),
             host_probes: Arc::default(),
+            agentiflow_launcher: None,
         }
     }
 
@@ -255,6 +260,15 @@ impl AppState {
         m: Option<Arc<dyn crate::transcript_mutator::TranscriptMutator>>,
     ) -> Self {
         self.transcript_mutator = m;
+        self
+    }
+
+    /// Install an agentiflow-launcher adapter (or clear it with `None`).
+    pub fn with_agentiflow_launcher(
+        mut self,
+        launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    ) -> Self {
+        self.agentiflow_launcher = launcher;
         self
     }
 
