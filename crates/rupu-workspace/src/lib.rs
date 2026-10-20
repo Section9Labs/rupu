@@ -49,7 +49,7 @@ pub use host_store::{
 };
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
-pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
+pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError, TrackCheckoutError};
 pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 pub use store::{find_by_path, register, upsert, StoreError, WorkspaceStore};
 pub use worker_store::{WorkerStore, WorkerStoreError};

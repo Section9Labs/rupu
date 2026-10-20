@@ -18,6 +18,13 @@ pub enum ConfigWriteError {
     Io(String),
     #[error("config busy: {0}")]
     Locked(String),
+    /// A write refused before anything was written (an existing file that
+    /// isn't TOML, a request that names no rule); the message stands alone.
+    #[error("{0}")]
+    Refused(String),
+    /// The existing file could not be read.
+    #[error("{0}")]
+    Read(String),
 }
 
 /// Parse `candidate` into the typed `rupu_config::Config` (deny_unknown_fields
@@ -35,6 +42,14 @@ pub fn validate_toml(candidate: &str) -> Result<(), ConfigWriteError> {
 /// `<file>.lock` sidecar serializes concurrent writers.
 pub fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigWriteError> {
     validate_toml(contents)?;
+    let lock = lock_config(path)?;
+    let written = replace_locked(path, contents);
+    let _ = fs2::FileExt::unlock(&lock);
+    written
+}
+
+/// Take the `<file>.lock` advisory lock [`write_atomic`] writes under.
+fn lock_config(path: &Path) -> Result<std::fs::File, ConfigWriteError> {
     let parent = path
         .parent()
         .ok_or_else(|| ConfigWriteError::Io("config path has no parent".into()))?;
@@ -50,7 +65,11 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigWriteError>
         .map_err(|e| ConfigWriteError::Io(e.to_string()))?;
     fs2::FileExt::lock_exclusive(&lock_file)
         .map_err(|e| ConfigWriteError::Locked(e.to_string()))?;
+    Ok(lock_file)
+}
 
+/// Back up `path` and rename `contents` over it; the caller holds the lock.
+fn replace_locked(path: &Path, contents: &str) -> Result<(), ConfigWriteError> {
     // Backup existing.
     if path.exists() {
         let bak = path.with_extension("toml.bak");
@@ -60,9 +79,105 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigWriteError>
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, contents).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
     std::fs::rename(&tmp, path).map_err(|e| ConfigWriteError::Io(e.to_string()))?;
-
-    let _ = fs2::FileExt::unlock(&lock_file);
     Ok(())
+}
+
+/// `rupu scm bind`: append one `[[scm.rules]]` entry selecting `account`
+/// for repos under the owner glob `owner`, or checkouts under the path
+/// glob `path` (exactly one of the two), to the config file at `cfg_path`.
+///
+/// Comments and layout survive (`toml_edit`), and the whole result is
+/// validated before it lands, like any [`write_atomic`]. The file is read
+/// and replaced under its lock, so two binds at once both land. An
+/// existing file that is not valid TOML is refused untouched: replacing it
+/// would discard whatever it holds. Every value is written as a TOML
+/// value, never parsed as a key, so an account name with dots
+/// (`gh.work`) stays one name.
+pub fn append_scm_rule(
+    cfg_path: &Path,
+    owner: Option<&str>,
+    path: Option<&str>,
+    account: &str,
+) -> Result<rupu_config::ScmRule, ConfigWriteError> {
+    let rule = match (owner, path) {
+        (Some(o), None) => rupu_config::ScmRule {
+            owner: Some(o.to_string()),
+            path: None,
+            account: account.to_string(),
+        },
+        (None, Some(p)) => rupu_config::ScmRule {
+            owner: None,
+            path: Some(p.to_string()),
+            account: account.to_string(),
+        },
+        _ => {
+            return Err(ConfigWriteError::Refused(
+                "a rule takes exactly one of `owner` or `path`".into(),
+            ))
+        }
+    };
+    if account.trim().is_empty() {
+        return Err(ConfigWriteError::Refused("`account` is empty".into()));
+    }
+    let lock = lock_config(cfg_path)?;
+    let written = append_scm_rule_locked(cfg_path, &rule);
+    let _ = fs2::FileExt::unlock(&lock);
+    written.map(|()| rule)
+}
+
+fn append_scm_rule_locked(
+    cfg_path: &Path,
+    rule: &rupu_config::ScmRule,
+) -> Result<(), ConfigWriteError> {
+    let text = match std::fs::read_to_string(cfg_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(ConfigWriteError::Read(e.to_string())),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
+        ConfigWriteError::Refused(format!(
+            "refusing to write: {} is not valid TOML ({e}). \
+             Fix or move the file first — writing would discard its contents.",
+            cfg_path.display()
+        ))
+    })?;
+
+    let root = doc.as_table_mut();
+    if root.get("scm").is_none() {
+        root.insert("scm", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let scm = root
+        .get_mut("scm")
+        .and_then(|item| item.as_table_mut())
+        .ok_or_else(|| ConfigWriteError::Refused("`scm` is already a value, not a table".into()))?;
+    if scm.get("rules").is_none() {
+        scm.insert(
+            "rules",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    let rules = scm
+        .get_mut("rules")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .ok_or_else(|| {
+            ConfigWriteError::Refused(
+                "`scm.rules` is already declared as something other than an array of tables".into(),
+            )
+        })?;
+
+    let mut entry = toml_edit::Table::new();
+    if let Some(o) = &rule.owner {
+        entry["owner"] = toml_edit::value(o.as_str());
+    }
+    if let Some(p) = &rule.path {
+        entry["path"] = toml_edit::value(p.as_str());
+    }
+    entry["account"] = toml_edit::value(rule.account.as_str());
+    rules.push(entry);
+
+    let contents = doc.to_string();
+    validate_toml(&contents)?;
+    replace_locked(cfg_path, &contents)
 }
 
 /// Backup + atomic write for files `write_atomic`'s `validate_toml` gate does
@@ -490,5 +605,139 @@ mod tests {
             effective_max_workspace_bytes(&cp_def),
             crate::host::connector::MAX_WORKSPACE_BYTES
         );
+    }
+
+    #[test]
+    fn append_scm_rule_writes_owner_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        append_scm_rule(&path, Some("acme/*"), None, "gh-work").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        let rules = v["scm"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["owner"].as_str(), Some("acme/*"));
+        assert_eq!(rules[0]["account"].as_str(), Some("gh-work"));
+        assert!(rules[0].get("path").is_none());
+    }
+
+    #[test]
+    fn append_scm_rule_writes_path_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        append_scm_rule(&path, None, Some("~/Code/work/*"), "gh-work").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        let rules = v["scm"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["path"].as_str(), Some("~/Code/work/*"));
+        assert_eq!(rules[0]["account"].as_str(), Some("gh-work"));
+    }
+
+    /// Binds are additive: three binds, three entries, in order.
+    #[test]
+    fn append_scm_rule_appends_rather_than_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        append_scm_rule(&path, Some("acme/*"), None, "gh-work").unwrap();
+        append_scm_rule(&path, Some("MrBrutti/*"), None, "gh-personal").unwrap();
+        append_scm_rule(&path, None, Some("~/Code/work/*"), "gh-work").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        let rules = v["scm"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 3);
+        assert_eq!(rules[0]["account"].as_str(), Some("gh-work"));
+        assert_eq!(rules[1]["account"].as_str(), Some("gh-personal"));
+        assert_eq!(rules[2]["path"].as_str(), Some("~/Code/work/*"));
+    }
+
+    /// Concurrent binds each read and replace the file under its lock, so
+    /// none is lost.
+    #[test]
+    fn concurrent_appends_all_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let path = &path;
+                s.spawn(move || {
+                    append_scm_rule(path, Some(&format!("o{i}/*")), None, "gh-work").unwrap();
+                });
+            }
+        });
+        let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["scm"]["rules"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn append_scm_rule_preserves_a_comment_and_a_dotted_account_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# do not remove this note\ndefault_provider = \"anthropic\"\n\n[scm.\"gh.work\"]\nkind = \"github\"\n",
+        )
+        .unwrap();
+
+        append_scm_rule(&path, Some("acme/*"), None, "gh.work").unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# do not remove this note"),
+            "comment was dropped by the config write:\n{text}"
+        );
+        let cfg: rupu_config::Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.scm.platforms["gh.work"].kind.as_deref(), Some("github"));
+        assert_eq!(cfg.scm.rules[0].account, "gh.work");
+        assert_eq!(cfg.scm.rules[0].owner.as_deref(), Some("acme/*"));
+    }
+
+    #[test]
+    fn append_scm_rule_refuses_to_clobber_invalid_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is not = = toml").unwrap();
+
+        let err = append_scm_rule(&path, Some("acme/*"), None, "gh-work").unwrap_err();
+        // `rupu scm bind` prints this as it is: no "invalid config: " prefix.
+        assert!(
+            err.to_string().starts_with(&format!(
+                "refusing to write: {} is not valid TOML (",
+                path.display()
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "this is not = = toml"
+        );
+    }
+
+    /// The whole document is re-validated: an existing rule with both
+    /// `owner` and `path` fails `Config::validate`, so the append is refused.
+    #[test]
+    fn append_scm_rule_rejects_a_result_that_would_fail_config_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[scm.rules]]\nowner = \"a/*\"\npath = \"~/x\"\naccount = \"gh-work\"\n",
+        )
+        .unwrap();
+
+        assert!(append_scm_rule(&path, Some("acme/*"), None, "gh-personal").is_err());
+    }
+
+    #[test]
+    fn append_scm_rule_takes_exactly_one_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(append_scm_rule(&path, None, None, "gh").is_err());
+        assert!(append_scm_rule(&path, Some("a"), Some("b"), "gh").is_err());
+        assert!(append_scm_rule(&path, Some("a"), None, " ").is_err());
+        assert!(!path.exists());
     }
 }

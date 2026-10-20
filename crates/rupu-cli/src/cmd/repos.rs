@@ -315,48 +315,42 @@ async fn list_inner(args: ListArgs, global_format: Option<OutputFormat>) -> anyh
 }
 
 async fn attach_inner(args: TrackArgs) -> anyhow::Result<()> {
-    let global = paths::global_dir()?;
-    paths::ensure_dir(&global)?;
-    let store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
-    };
-    let repo = resolve_repo_or_autodetect(Some(&args.repo), None)?;
-    let repo_ref = canonical_repo_ref(&repo);
-    let path = checkout_path(args.path.as_deref())?;
-    validate_checkout_matches_repo(&path, &repo_ref)?;
-    let origin_url = detect_origin_url(&path)?;
-    let default_branch = detect_origin_default_branch(&path);
-    let rec = store.upsert(
-        &repo_ref,
-        &path,
-        origin_url.as_deref(),
-        default_branch.as_deref(),
-    )?;
+    let rec = track_inner(&args, false)?;
     println!("tracked {} -> {}", rec.repo_ref, rec.preferred_path);
     Ok(())
 }
 
 async fn prefer_inner(args: TrackArgs) -> anyhow::Result<()> {
+    let rec = track_inner(&args, true)?;
+    println!("preferred {} -> {}", rec.repo_ref, rec.preferred_path);
+    Ok(())
+}
+
+fn track_inner(args: &TrackArgs, prefer: bool) -> anyhow::Result<rupu_workspace::TrackedRepo> {
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     let store = RepoRegistryStore {
         root: paths::repos_dir(&global),
     };
     let repo = resolve_repo_or_autodetect(Some(&args.repo), None)?;
-    let repo_ref = canonical_repo_ref(&repo);
-    let path = checkout_path(args.path.as_deref())?;
-    validate_checkout_matches_repo(&path, &repo_ref)?;
-    let origin_url = detect_origin_url(&path)?;
-    let default_branch = detect_origin_default_branch(&path);
-    store.upsert(
-        &repo_ref,
-        &path,
-        origin_url.as_deref(),
-        default_branch.as_deref(),
-    )?;
-    let rec = store.set_preferred_path(&repo_ref, &path)?;
-    println!("preferred {} -> {}", rec.repo_ref, rec.preferred_path);
-    Ok(())
+    let path = match args.path.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    store
+        .track_checkout(&repo, &path, prefer)
+        .map_err(track_error)
+}
+
+/// A failed attach/prefer as `rupu repos` has always printed it: an io
+/// failure (canonicalizing the path, running git) bare, the rest as they
+/// read.
+fn track_error(e: rupu_workspace::TrackCheckoutError) -> anyhow::Error {
+    match e {
+        rupu_workspace::TrackCheckoutError::Path { source, .. }
+        | rupu_workspace::TrackCheckoutError::Git { source, .. } => source.into(),
+        other => other.into(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -501,83 +495,6 @@ async fn forget_inner(args: ForgetArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn checkout_path(path: Option<&str>) -> anyhow::Result<PathBuf> {
-    let path = match path {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_dir()?,
-    };
-    Ok(path.canonicalize()?)
-}
-
-fn validate_checkout_matches_repo(path: &Path, expected_repo_ref: &str) -> anyhow::Result<()> {
-    let detected = autodetect_repo_from_path(path)?;
-    let detected_ref = canonical_repo_ref(&detected);
-    if detected_ref != expected_repo_ref {
-        anyhow::bail!(
-            "checkout {} points at {}, not {}",
-            path.display(),
-            detected_ref,
-            expected_repo_ref
-        );
-    }
-    Ok(())
-}
-
-fn detect_origin_url(path: &Path) -> anyhow::Result<Option<String>> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["remote", "get-url", "origin"])
-        .output()?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if value.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(value))
-    }
-}
-
-fn detect_origin_default_branch(path: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args([
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if let Some(branch) = value.strip_prefix("origin/") {
-            if !branch.is_empty() {
-                return Some(branch.to_string());
-            }
-        }
-    }
-
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
 pub(crate) fn auto_track_checkout(global: &Path, path: &Path) -> anyhow::Result<bool> {
     let repo = match autodetect_repo_from_path(path) {
         Ok(repo) => repo,
@@ -587,8 +504,8 @@ pub(crate) fn auto_track_checkout(global: &Path, path: &Path) -> anyhow::Result<
         }
     };
     let repo_ref = canonical_repo_ref(&repo);
-    let origin_url = detect_origin_url(path)?;
-    let default_branch = detect_origin_default_branch(path);
+    let origin_url = rupu_scm::checkout::origin_url(path)?;
+    let default_branch = rupu_scm::checkout::origin_default_branch(path);
     let store = RepoRegistryStore {
         root: paths::repos_dir(global),
     };
@@ -654,4 +571,30 @@ fn emit_private_repo_diag(prefs: &crate::cmd::ui::UiPrefs, scopes: &[String]) {
         ),
         "rupu auth logout --provider github && rupu auth login --provider github --mode sso",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_io_failure_prints_bare() {
+        let e = rupu_workspace::TrackCheckoutError::Path {
+            path: "/nope".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert_eq!(
+            track_error(e).to_string(),
+            std::io::Error::from(std::io::ErrorKind::NotFound).to_string()
+        );
+        let e = rupu_workspace::TrackCheckoutError::Mismatch {
+            path: "/c".into(),
+            detected: "github:a/b".into(),
+            expected: "github:a/c".into(),
+        };
+        assert_eq!(
+            track_error(e).to_string(),
+            "checkout /c points at github:a/b, not github:a/c"
+        );
+    }
 }
