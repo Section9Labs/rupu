@@ -13,7 +13,8 @@ use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
     AgentRun, AgentiflowRun, AutoflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace,
-    RunArgv, SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
+    RunArgv, SessionCompact, SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef,
+    WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -332,6 +333,16 @@ fn sessions() -> Vec<RunArgv> {
     out.push(RunArgv::SessionWorker(SessionWorker {
         session_id: "ses_01X".into(),
     }));
+    for (session_id, window, compaction_id) in [
+        ("ses_01X", None, None),
+        ("-ses", Some(1_000_000), Some("cmp_01X")),
+    ] {
+        out.push(RunArgv::SessionCompact(SessionCompact {
+            session_id: session_id.into(),
+            window,
+            compaction_id: compaction_id.map(str::to_string),
+        }));
+    }
     out
 }
 
@@ -511,6 +522,15 @@ fn back(cli: Cli) -> RunArgv {
             }),
             cmd::session::Action::RunWorker(w) => RunArgv::SessionWorker(SessionWorker {
                 session_id: w.session_id,
+            }),
+            cmd::session::Action::Compact {
+                session_id,
+                window,
+                compaction_id,
+            } => RunArgv::SessionCompact(SessionCompact {
+                session_id,
+                window,
+                compaction_id,
             }),
             other => panic!("not a rendered session command: {other:?}"),
         },

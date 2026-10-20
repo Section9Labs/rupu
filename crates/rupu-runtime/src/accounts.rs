@@ -1,7 +1,7 @@
 //! Account-aware credential resolver construction.
 //!
 //! `rupu-auth` cannot read config (hexagonal rule 1) and `rupu-config`
-//! knows nothing about credentials, so `rupu-cli` — which depends on
+//! knows nothing about credentials, so `rupu-runtime` — which depends on
 //! both — is the correct seam for turning `[providers.*]` into the
 //! `AccountSpec` list the resolver needs.
 
@@ -33,7 +33,7 @@ use rupu_auth::{AccountSpec, KeychainResolver};
 /// already resolves with no `AccountSpec` needed.
 pub fn account_specs(cfg: &rupu_config::Config) -> Vec<AccountSpec> {
     let providers = cfg.providers.keys().filter_map(|name| {
-        rupu_runtime::provider_factory::resolve_kind(name, &cfg.providers)
+        crate::provider_factory::resolve_kind(name, &cfg.providers)
             .map(|kind| AccountSpec::new(name.clone(), kind))
     });
     let scm = cfg.scm.platforms.iter().filter_map(|(name, platform_cfg)| {

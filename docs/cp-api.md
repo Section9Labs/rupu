@@ -297,13 +297,15 @@ none, and a body that isn't the expected JSON is a 400.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/sessions` | Sessions, most recently updated first. | `offset`, `limit`, `scope` (`active` / `archived`), `host`, `since`, `until`, `customer`, `q`, `facets`. |
-| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. |
+| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. A local session also carries `compacting` (a compaction is running), `compaction` (its marker `{id, pid, pid_start, started_at}`, else null) and `last_compaction` (see `compact`). |
 | GET | `/api/sessions/:id/runs` | The session's turns for the chat view (`SessionRunRow`). | `host`. |
 | GET | `/api/sessions/:id/usage-timeline` | Tokens per model call. | `host`. |
 | POST | `/api/sessions/:id/send` | Send a prompt as the next turn, or invoke skills in it. | `host`. Body `{prompt?, skills?}` → `{run_id, host_id}`; watch the turn with `/api/transcript/stream`. `skills` (skill entries) become `rupu session send --skill`; the prompt may be empty when a skill is given. 400 with neither, a malformed or wildcard entry, or a skill the session can't take (unknown, ambiguous, held from the other layer; the body is the CLI's message); 404 unknown session; 409 session stopped; 501 without `cp serve`. A remote host that does not advertise `session.skills` refuses a send with skills: 501, "upgrade rupu there", and nothing reaches it. |
 | POST | `/api/sessions/:id/archive` | Archive a session. | `host`. |
 | POST | `/api/sessions/:id/restore` | Restore an archived session. | `host`. |
 | DELETE | `/api/sessions/:id` | Delete a session. | `host`. |
+| POST | `/api/sessions/:id/stop` | Stop a session (`rupu session stop`): end its worker and running turn, mark it stopped. | Local only (`host` other than `local` is 501). → `{ok, id}` once the record says stopped. 404 unknown session; 409 archived; 501 without `cp serve`. A later send reactivates it. |
+| POST | `/api/sessions/:id/compact` | Compact the stored conversation now (`rupu session compact`). | Local only. Body `{window?}` (tokens to size against, in place of the session's own). Recorded first: a marker (`<session dir>/compaction.json`, under `session.lock`) names the CP, then the child it starts, and while that process lives `send`, `stop`, `archive`, `DELETE` and another `compact` answer 409 (a marker whose process is gone is stale and cleared). Started detached: 202 `{ok, id, compaction_id, log}`. The child writes the compacted history only if the session record is unchanged since it read it (else it discards the summary); how it ended is `last_compaction` `{id, outcome: compacted\|nothing_to_compact\|discarded\|failed, detail, finished_at}` on the session detail, and errors are in `log` (`<session dir>/compact.log`). `rupu session compact` in a terminal takes the same marker. 404 unknown; 409 a turn or a compaction is running, or the session is archived; 501 without `cp serve`. |
 
 Start a session with `POST /api/agents/:name/session`.
 
@@ -403,15 +405,26 @@ curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: applicati
 
 ## Skills
 
-Installed [Agent Skills](skills.md), read-only: installing and updating stay
-`rupu skill` operations. Both routes read the global layer and, with `ws_id`,
-that project's layer (`.rupu/skills` in the workspace; none when the project's
-`.rupu` is the global dir). An unknown `ws_id` is a 404.
+Installed [Agent Skills](skills.md). The reads take the global layer and, with
+`ws_id`, that project's layer (`.rupu/skills` in the workspace; none when the
+project's `.rupu` is the global dir). An unknown `ws_id` is a 404.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/skills` | Every installed skill, as `rupu skill list` (`SkillsResponse`). | `ws_id`. Rows sorted by name, then layer. Each row loads its skill to show its status. |
 | GET | `/api/skills/:layer/:name` | One skill, as `rupu skill show` (`SkillDetail`). | `ws_id`, required for `project`. 400 for a layer other than `global` / `project`, or `project` without `ws_id`; 404 `no installed skill <layer>:<name>`; 500 when the skill's layer can't be read. |
+
+The writes run what `rupu skill install|update|validate` run, through the same
+`rupu_skills` functions (an install is staged, validated and renamed in by
+`install_from`). They are local only: a `host` other than `local` is 501.
+Install and update need `cp serve` (501 otherwise), which provides the git
+fetch.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| POST | `/api/skills/install` | Install skills (`rupu skill install`). | Body `{source, ref?, skills?, all?, project?, force?}`: `source` is an absolute directory, `owner/repo`, a GitHub tree URL or an https git URL (`#path` narrows it); `project` is a `ws_id` (its `.rupu/skills`). → `{installed: [{name, layer, path, outcome: created\|replaced, content_hash, tracked}], skipped: [{name, reason}]}`; `tracked` is false for a project install from a directory outside the project (`update` can't follow it). 400 bad source, relative directory, unknown or invalid skill, `skills` with `all`; 404 unknown project; 409 a skill of that name is installed and `force` isn't set, or the project has no `.rupu/`; 502 the fetch failed. A batch that fails part-way names what landed in its error. |
+| POST | `/api/skills/update` | Re-fetch installed skills from their source (`rupu skill update`). | Body `{names?, project?, force?}`; no names = every skill with a source record. → `{layer, results: [{name, outcome, from?, to?, error?}]}`, `outcome` `updated` / `up_to_date` / `no_record` / `locally_modified` / `not_installed` / `failed`: per skill, never an error status. |
+| POST | `/api/skills/validate` | Check skills against the format (`rupu skill validate`). | Body `{path}` (an absolute directory: every skill under it, installed or not) or `{name, layer?, ws_id?}` (an installed skill, both layers without `layer`). → `{ok, skills: [{name, layer?, path, status, error?, warnings}]}`. 400 neither or a relative path; 404 no installed skill of that name. |
 
 Hosts receive the skills of a placed unit through two more routes, behind the
 `agent.skill_bundle` feature in `/api/host/info` (see
@@ -499,6 +512,8 @@ Query language, tags and report export are covered in depth in
 | GET | `/api/findings/:id/export` | One finding as a report file. | `format=md\|html\|pdf` (required), `ws_id`. 400 bad format; 501 PDF in a build without the `pdf` feature; 404; 409 ambiguous id, as above. |
 | POST | `/api/findings/export` | Several findings as one report. | Body `ExportBody`: `format` (required), `title`, `ids`, `ws_id`, `run_id`, `min_severity`, `owner`, `cwe`, `include_summaries`, `split`. Returns `text/markdown`, `text/html`, `application/pdf`, or `application/zip` when `split`; always an attachment with `nosniff`. 404 when nothing matches. |
 | GET | `/api/findings/tags` | Tags in use, most used first. | Query: `ws_id`. |
+| POST | `/api/findings/import` | Attach Markdown reports written before the full profile to their findings: what `rupu findings import` runs. | Local-only (`host` other than `local` → 501). Body `{paths, id?, dry_run?}`: `paths` are absolute paths on this machine, report files or directories searched for `*.md` (hidden entries skipped, symlinks not followed); `id` names the finding of a single report with no `Finding ID:` line. Each report attaches to the summary finding it names, whole or not at all; a finding that already has a report is left alone. Every changed ledger is backed up first (`findings.jsonl.pre-import-<time>`) and written under the findings lock; `dry_run` writes nothing (no change, backup or lock file) and needs no `rupu cp serve`, a real import does (501). Limits are the global config's `[findings]`. 200 `ImportReport {dry_run, files: [{path, status: attached\|skipped\|failed, finding_id \| reason, details?}], backups, attached, skipped, failed, warnings?}`; a file that could not be imported, a named but unreadable one included, is a `failed` line, not an error status. 400 for a relative or missing path, or a directory that cannot be listed; for a search that passes 100,000 directory entries (name narrower `paths`); for an `id` with more than one file; or for nothing to import. |
+| GET | `/api/findings/schema` | The finding report JSON Schema embedded in this build: what `rupu findings schema` prints. | `advertised=true` returns the simplified copy used in tool definitions instead of the canonical draft-07 schema. |
 | POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `{finding_ids, add, remove}` — each id tagged in every workspace that holds it — or `{findings: [{ws_id, id}], add, remove}` — each finding tagged only in its own workspace (what the web sends). Exactly one of `finding_ids` / `findings`; at most 1000. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}` — a workspace whose tag log couldn't be written carries its `error` there. 400 for a bad change (empty, conflicting, too many tags); 500 if writing the tag log fails outright. 404 only when *every* finding is unknown. Recorded as `via: cp`. |
 | GET | `/api/findings/:id/artifacts/:sha256` | An artifact or evidence-block file the finding references. | `ws_id`; 409 for an ambiguous id, as above. Text inline as `text/plain`, raster images inline as `image/*`, everything else as an attachment; always `nosniff` + `Content-Security-Policy: sandbox`. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 `{"unavailable": reason}`. |
 | GET | `/api/findings/artifacts/:sha256` | **Host-internal.** Raw blob from this host's artifact store. | Used by a coordinator pulling a remote unit's artifact (`findings.artifact_blob` feature). Not finding-scoped. 404 if not in the store. |
@@ -518,7 +533,29 @@ the target is used.
 | GET | `/api/coverage/:target/audit` | Per-concern gap audit (`AuditReport`). | `ws_id`. |
 | GET | `/api/coverage/:target/runs` | Runs that contributed to the target. | `ws_id`. |
 | GET | `/api/coverage/:target/diff` | Two runs' contributions side by side (`RunDiff`). | `ws_id`, `base` (default `previous`), `compare` (default `latest`, or a run id). 400 unknown run. |
+| GET | `/api/coverage/:target/gap` | The coverage gaps alone: each in-scope file a concern has no assertion for, what `rupu coverage gap` prints. | `ws_id`. `{kind: "coverage_gaps", version: 1, rows: [{concern_id, file}]}`, in concern order. 404 unknown target; `host` other than `local` → 501. |
+| POST | `/api/coverage/:target/rerun` | Replay a recorded agent run on its target, what `rupu coverage rerun` launches: a new run appended to the same target. | `ws_id`. Body `{run}`: a full run id from `…/runs`. The run's agent, prompt, permission mode and launch skills start again through the agent launcher, detached, in the workspace the run was recorded in; provider, model and concerns come from the agent's current file and config, as on the CLI. 202 `{run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `…/diff?base=<run>&compare=latest`. 404 unknown target or no manifest for the run; 409 a run that continued another (rerun that one) or was recorded in another workspace; 501 a session, workflow or autoflow run, a `host` other than `local`, or no `rupu cp serve`. |
 | GET | `/api/assets` | Asset inventory (`AssetListResponse`). | `ws_id`, `target`. |
+
+## Query help
+
+What each list's `q` takes, and a check of a query without running it. The
+registries are the ones the lists filter with, so the answer is the list's
+own; the field shapes are the ones `crates/rupu-cp/tests/fixtures/list_query/`
+and `crates/rupu-coverage/tests/fixtures/finding_query/fields.json` pin.
+`:list` is `findings`, `workflow_runs`, `agent_runs`, `sessions`,
+`autoflow_runs` or `events`; any other is a 404 naming them.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/query/:list/fields` | The list's query fields, in suggestion order. | `{list, fields}`; each field has `key`, `aliases`, `kind` (`severity`, `enum`, `text`, `time` or a custom kind such as `tag`) and allowed `values`; the run, session and event lists also give `match`, `facet` and `text`. |
+| POST | `/api/query/:list/check` | Parse a query with the list's fields. | Body `{q}`. 200 `{ok: true, terms: [{neg, key, op, values}]}` (aliases resolved, values normalized), or 200 `{ok: false, error, token, code, start, end}`: the body of the list's own 400 for that query. |
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"q":"sev>=high -tag:noise"}' http://127.0.0.1:7878/api/query/findings/check
+# {"ok":true,"terms":[{"neg":false,"key":"severity","op":"ge","values":["high"]},{"neg":true,"key":"tag","op":"eq","values":["noise"]}]}
+```
 
 ## Usage and dashboard
 
@@ -577,6 +614,21 @@ An unknown `ws_id` is a 404 on every route except the list.
 | GET | `/api/projects/:ws_id/source` | One file's contents (`FileContent`). | `path`. A missing, binary or > 2 MiB file is 200 with `available: false` and a `reason`. |
 | GET | `/api/projects/:ws_id/files` | Flat file list for search. | Capped at 20 000 (`truncated`). |
 
+## Stock fleet, project init and engagement profiles
+
+What `rupu fleet list|install`, `rupu init` and the run assembler's profile
+registry do, through the same functions (`rupu_templates`,
+`rupu_coverage::profile`). All local only: a `host` other than `local` is 501.
+The writes need `cp serve` (501 otherwise).
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/fleet` | The stock security-assessment fleet and where it is installed. | `ws_id`. → `{entries: [{kind: agent\|workflow, name, path, global, project?}], global_root, project_root}`; `global` / `project` are `missing`, `current` (the shipped file), `modified` or `unreadable`. |
+| POST | `/api/fleet/install` | Install the fleet (`rupu fleet install`). | Body `{force?, project?}`: the global root, or that project's `.rupu/`; existing files are kept unless `force`. → `{root, created, skipped, overwrote, files: [{path, action}]}`. 404 unknown project; 409 the project has no `.rupu/`. |
+| POST | `/api/projects/init` | Initialise a directory as a rupu project (`rupu init`). | Body `{path, with_samples?, force?}`. `path` must be absolute and exist (400 otherwise). 409 when `.rupu/config.toml` exists and `force` isn't set; `force` re-runs it, overwriting samples (never `config.toml`). → `{root, created, skipped, overwrote, files}`, `action` `created` / `skipped` / `overwrote` / `updated` (`.gitignore` lines appended, named in `detail`). It doesn't register the project. |
+| GET | `/api/engagement-profiles` | The engagement profiles a launch can select. | `ws_id` overlays that project's `.rupu/profiles` on `<RUPU_HOME>/profiles` on the built-ins (a later layer wins by id). → `{profiles, errors}`: each profile's TOML fields (`id`, `name`, `includes`, `asset_kinds`, `completeness`, `coverage`, `bundle`, …) plus its `layer` (`builtin` / `global` / `project`). `errors` names profile files that don't load (and a missing include); while it's non-empty every engagement launch fails. |
+| GET | `/api/engagement-profiles/:id` | One profile. | `ws_id`. The profile with its `layer` and the overlay's `errors`. 404 unknown id. |
+
 ## Hosts, workers and fleet
 
 | Method | Path | Purpose | Notes |
@@ -617,6 +669,28 @@ and pulls back the diff. The web UI never calls these.
 | GET | `/api/tools` | MCP tool catalog with JSON input schemas (`ToolsResponse`). | Feeds the workflow editor's action forms. |
 | GET | `/api/repos` | Repositories visible to the configured SCM accounts. | 501 with no SCM credentials. |
 | GET | `/api/fs/browse` | Subdirectories of a server path, for the folder picker. | `path` (default `$HOME`). Only under `$HOME` or a registered project: anything else (missing or not) is a 403, and `parent` is `null` at the top of a browsable directory. |
+
+## SCM, repos and auth status
+
+What `rupu scm accounts` / `scm bind`, `rupu repos tracked` / `attach` /
+`prefer` / `forget` and `rupu auth status` show and write. Local host only:
+`?host=` other than `local` is a 501 that says so. The SCM endpoints read
+and write the **global** config (where `rupu scm bind` writes). No answer
+carries any part of a credential: not a token, an API key or a refresh
+token, and a tracked repo's origin urls (which can embed one) are never
+returned. Logging in stays `rupu auth login`. A global config that does not
+parse is a 500 naming the file, never an answer built from defaults.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/scm/accounts` | The configured GitHub/GitLab accounts: `github`, `gitlab`, then each `[scm.<name>]` whose kind is a repo platform. | Rows `{account, kind, base_url, rules, credentials, state}`; `rules` are the `[[scm.rules]]` selecting it, each `{owner}` or `{path}`; `credentials` is whether an API key or SSO token is stored (or `RUPU_<ACCOUNT>_API_KEY` is set); `state` is `ok`, `needs_login` (only an expired SSO token with no way to refresh it) or `absent`; an expired token that has a refresh token is `ok`, since it is renewed on use. |
+| GET | `/api/scm/rules` | The global config's `[[scm.rules]]`, in order. | Rows `{owner?, path?, account}`. |
+| POST | `/api/scm/rules` | Append a rule (`rupu scm bind`). | Body `{owner?, path?, account}`, exactly one of `owner` (owner glob) or `path` (path glob); unknown fields are refused. → `{rule, warning?, rules}`; `warning` when `account` is neither a declared `[scm.*]` account nor `github`/`gitlab` (the rule is written but may never match). Comments survive; the result is validated before it is written, under the config file's lock. 400 a bad rule or a config that would not validate; 501 without `rupu cp serve`. |
+| GET | `/api/repos/tracked` | The local repo registry (`~/.rupu/repos/`). | Rows `{id, repo, preferred_path, known_paths, default_branch?, last_seen_at}`; `id` is the record key `DELETE` takes, `repo` is `<platform>:<owner>/<repo>`. |
+| POST | `/api/repos/tracked` | Track a checkout as a copy of a repo (`rupu repos attach`). | Body `{repo, path}`: `repo` in run-target syntax (`github:owner/repo`; a PR or GitHub/GitLab issue target names its repo), `path` absolute. The checkout's `origin` must point at `repo`; its origin url and default branch are recorded. → the tracked repo row. 400 a relative or missing path, no git checkout, or a checkout of another repo; 501 without `rupu cp serve`. |
+| POST | `/api/repos/tracked/prefer` | Track a checkout and make it the repo's preferred path (`rupu repos prefer`). | As `POST /api/repos/tracked`. |
+| DELETE | `/api/repos/tracked/:id` | Forget a tracked repo, or one path (`rupu repos forget`). | `path` (query) forgets only that path; forgetting the last path forgets the repo. → `{repo, path?, remaining}`, `remaining` the record left or `null`. 404 unknown id or untracked path; 501 without `rupu cp serve`. |
+| GET | `/api/auth/status` | Credential state per account (`rupu auth status`): the built-in vendors, then every declared `[providers.*]` / `[scm.*]` account. | Rows `{account, kind, api_key, sso, state}`; `sso` is `{expires_at, expired, refreshable, summary}` or `null`, `state` as above. Read from the global config and this host's credential store. |
 
 ## Customers
 

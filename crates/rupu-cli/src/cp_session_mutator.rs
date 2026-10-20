@@ -1,11 +1,14 @@
 //! `cp serve` adapter for rupu-cp's `SessionMutator` port. Shells
-//! `rupu session archive|restore|delete <id>` using this same binary.
+//! `rupu session archive|restore|delete|stop <id>` using this same binary,
+//! and starts `rupu session compact <id>` detached.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rupu_cp::session_mutator::{SessionAction, SessionMutateError, SessionMutator};
+use rupu_runtime::argv::{RunArgv, SessionCompact};
+use rupu_runtime::spawn::{spawn_detached, SpawnSpec, SpawnStdio};
 
-/// Shells `rupu session archive|restore|delete <id>` children. `exe` is the
+/// Shells `rupu session archive|restore|delete|stop <id>` children. `exe` is the
 /// path to the running `rupu` binary (resolved via `std::env::current_exe()`
 /// in `cp serve`).
 pub struct SubprocessSessionMutator {
@@ -37,6 +40,8 @@ pub(crate) fn build_argv(id: &str, action: SessionAction) -> Vec<String> {
 /// - `"session delete requires --force"` → [`SessionMutateError::Invalid`]
 /// - `"cannot {action} session {id} while the worker is still running"` →
 ///   [`SessionMutateError::Invalid`]
+/// - `"session stop does not support archived sessions; …"` →
+///   [`SessionMutateError::Invalid`]
 /// - anything else → [`SessionMutateError::Failed`]
 pub(crate) fn classify_failure(action: SessionAction, stderr: &str) -> SessionMutateError {
     let s = stderr.to_ascii_lowercase();
@@ -46,6 +51,8 @@ pub(crate) fn classify_failure(action: SessionAction, stderr: &str) -> SessionMu
         || s.contains("already active")
         || s.contains("requires --force")
         || s.contains("while the worker is still running")
+        || s.contains("does not support archived sessions")
+        || s.contains("is being compacted")
     {
         SessionMutateError::Invalid(stderr.trim().to_string())
     } else {
@@ -80,6 +87,43 @@ impl SessionMutator for SubprocessSessionMutator {
             &String::from_utf8_lossy(&out.stderr),
         ))
     }
+
+    async fn compact(
+        &self,
+        id: &str,
+        compaction_id: &str,
+        window: Option<u32>,
+        log: &Path,
+    ) -> Result<u32, SessionMutateError> {
+        spawn_detached(compact_spec(&self.exe, id, compaction_id, window, log))
+            .map(|s| s.pid)
+            .map_err(|e| SessionMutateError::Failed {
+                action: "compact",
+                message: e.to_string(),
+            })
+    }
+}
+
+/// `rupu session compact <id> [--window <window>] --compaction-id
+/// <compaction_id>`, its stderr to `log` (its outcome is also recorded in the
+/// session's `compaction.result.json`).
+pub(crate) fn compact_spec(
+    exe: &Path,
+    id: &str,
+    compaction_id: &str,
+    window: Option<u32>,
+    log: &Path,
+) -> SpawnSpec {
+    let mut spec = SpawnSpec::new(
+        exe,
+        RunArgv::SessionCompact(SessionCompact {
+            session_id: id.to_string(),
+            window,
+            compaction_id: Some(compaction_id.to_string()),
+        }),
+    );
+    spec.stdio = SpawnStdio::Log(log.to_path_buf());
+    spec
 }
 
 #[cfg(test)]
@@ -99,6 +143,55 @@ mod tests {
         assert_eq!(
             build_argv("ses_abc", SessionAction::Delete),
             vec!["session", "delete", "ses_abc", "--force"]
+        );
+        assert_eq!(
+            build_argv("ses_abc", SessionAction::Stop),
+            vec!["session", "stop", "ses_abc"]
+        );
+    }
+
+    #[test]
+    fn compact_runs_detached_with_its_window_and_a_log() {
+        let spec = compact_spec(
+            Path::new("/bin/rupu"),
+            "ses_abc",
+            "cmp_1",
+            Some(200_000),
+            Path::new("/s/compact.log"),
+        );
+        assert_eq!(
+            spec.argv.to_args(),
+            [
+                "session",
+                "compact",
+                "--window",
+                "200000",
+                "--compaction-id",
+                "cmp_1",
+                "--",
+                "ses_abc"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        assert_eq!(spec.stdio, SpawnStdio::Log("/s/compact.log".into()));
+        let bare = compact_spec(
+            Path::new("/bin/rupu"),
+            "ses_abc",
+            "cmp_2",
+            None,
+            Path::new("/l"),
+        );
+        assert_eq!(
+            bare.argv.to_args(),
+            [
+                "session",
+                "compact",
+                "--compaction-id",
+                "cmp_2",
+                "--",
+                "ses_abc"
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 
@@ -122,6 +215,14 @@ mod tests {
             classify_failure(
                 SessionAction::Archive,
                 "cannot archive session ses_abc while the worker is still running"
+            ),
+            SessionMutateError::Invalid(_)
+        ));
+        // Invalid: stop on an archived session
+        assert!(matches!(
+            classify_failure(
+                SessionAction::Stop,
+                "session stop does not support archived sessions; restore the session first"
             ),
             SessionMutateError::Invalid(_)
         ));

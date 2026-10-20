@@ -4704,6 +4704,7 @@ dependencies = [
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
+ "rupu-templates",
  "rupu-tools",
  "rupu-transcript",
  "rupu-update",
@@ -4820,6 +4821,7 @@ dependencies = [
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
+ "rupu-templates",
  "rupu-tools",
  "rupu-transcript",
  "rupu-workspace",
@@ -4855,7 +4857,9 @@ dependencies = [
  "chrono",
  "pulldown-cmark",
  "rupu-coverage",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "typst",
  "typst-assets",
@@ -5049,6 +5053,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "fs2",
  "futures-util",
  "hex",
  "httpmock",
@@ -5075,6 +5080,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -5128,6 +5134,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "walkdir",
+]
+
+[[package]]
+name = "rupu-templates"
+version = "0.85.0"
+dependencies = [
+ "rupu-netflow",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -5231,6 +5246,7 @@ dependencies = [
  "rand 0.8.6",
  "rupu-config",
  "rupu-runtime",
+ "rupu-scm",
  "serde",
  "serde_json",
  "serial_test",

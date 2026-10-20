@@ -11,7 +11,7 @@
 //!   gitlab:group/project/issues/9              # Issue
 //! ```
 
-use rupu_scm::{IssueTracker, Platform};
+use crate::{IssueTracker, Platform, RepoRef};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,57 @@ pub enum RunTargetParseError {
     UnknownPlatform(String),
     #[error("invalid number in target: {0}")]
     BadNumber(String),
+}
+
+/// A target that names no GitHub/GitLab repository.
+#[derive(Debug, thiserror::Error)]
+pub enum NotARepo {
+    #[error("issue project `{0}` is not `<owner>/<repo>`")]
+    Project(String),
+    #[error("tracker {0} not yet supported (only GitHub / GitLab issues name a repository)")]
+    Tracker(IssueTracker),
+}
+
+impl RunTarget {
+    /// The repository this target names: the repo itself, a PR's repo, or
+    /// the project of a GitHub / GitLab issue.
+    pub fn repo_ref(&self) -> Result<RepoRef, NotARepo> {
+        match self {
+            RunTarget::Repo {
+                platform,
+                owner,
+                repo,
+                ..
+            }
+            | RunTarget::Pr {
+                platform,
+                owner,
+                repo,
+                ..
+            } => Ok(RepoRef {
+                platform: *platform,
+                owner: owner.clone(),
+                repo: repo.clone(),
+            }),
+            RunTarget::Issue {
+                tracker, project, ..
+            } => {
+                let (owner, repo) = project
+                    .split_once('/')
+                    .ok_or_else(|| NotARepo::Project(project.clone()))?;
+                let platform = match tracker {
+                    IssueTracker::Github => Platform::Github,
+                    IssueTracker::Gitlab => Platform::Gitlab,
+                    other => return Err(NotARepo::Tracker(*other)),
+                };
+                Ok(RepoRef {
+                    platform,
+                    owner: owner.into(),
+                    repo: repo.into(),
+                })
+            }
+        }
+    }
 }
 
 pub fn parse_run_target(s: &str) -> Result<RunTarget, RunTargetParseError> {

@@ -32,7 +32,7 @@ fn with_samples_seeds_every_manifest_entry() {
 
 #[test]
 fn samples_byte_match_dogfooded_files() {
-    // Catches drift between crates/rupu-cli/templates/* and the
+    // Catches drift between crates/rupu-templates/templates/* and the
     // .rupu/* files in the rupu repo. If this fails, copy the
     // newer one over the older.
     for t in MANIFEST {

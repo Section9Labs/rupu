@@ -57,7 +57,7 @@ SaaS control plane and remote sandboxing are still out of scope here; SCM and is
 - Credential storage: a chmod-600 JSON file, `~/.rupu/auth.json` (the OS keychain backend was retired).
 - `rupu agent list|show`, `rupu workflow list|show|run`, `rupu transcript list|show`,
   `rupu config get|set`, `rupu auth login|logout|status`.
-- Curated starter samples in `crates/rupu-cli/templates/` plus richer repo-local examples under `examples/`.
+- Curated starter samples in `crates/rupu-templates/templates/` plus richer repo-local examples under `examples/`.
 - `cargo install`-able; tag-triggered GitHub Releases (macOS arm64/x86_64, Linux x86_64/arm64).
 
 ### Deferred to Slice B+

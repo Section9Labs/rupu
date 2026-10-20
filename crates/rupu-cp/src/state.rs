@@ -109,6 +109,10 @@ pub struct AppState {
     /// to `None`; rupu-cli's `cp serve` installs its detached-start adapter
     /// via [`AppState::with_agentiflow_launcher`].
     pub agentiflow_launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    /// Optional skill-installer port (the git fetch behind
+    /// `/api/skills/install|update`). Defaults to `None`; rupu-cli's `cp
+    /// serve` installs `GitFetcher` via [`AppState::with_skill_installer`].
+    pub skill_installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
     /// The autoflow / cron / maintenance operations port (rupu-cli's
     /// `cp serve` provides it). `None` → those endpoints return 501.
     pub admin_ops: Option<Arc<dyn crate::admin_ops::AdminOps>>,
@@ -185,6 +189,7 @@ impl AppState {
             )),
             host_probes: Arc::default(),
             agentiflow_launcher: None,
+            skill_installer: None,
             admin_ops: None,
         }
     }
@@ -273,6 +278,15 @@ impl AppState {
         launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
     ) -> Self {
         self.agentiflow_launcher = launcher;
+        self
+    }
+
+    /// Install a skill-installer adapter (or clear it with `None`).
+    pub fn with_skill_installer(
+        mut self,
+        installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
+    ) -> Self {
+        self.skill_installer = installer;
         self
     }
 

@@ -65,6 +65,7 @@ rupu-scm = { path = "../rupu-scm" }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
 rupu-skills = { workspace = true }
+rupu-templates = { workspace = true }
 rupu-query = { workspace = true }
 # The operator MCP endpoint (`/mcp`): the protocol core over tool sources.
 rupu-mcp = { path = "../rupu-mcp" }
