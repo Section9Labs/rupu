@@ -1167,13 +1167,20 @@ pub(crate) struct LocalHostQuery {
 }
 
 impl LocalHostQuery {
-    fn require_local(&self, what: &str) -> ApiResult<()> {
-        match self.host.as_deref() {
-            None | Some("local") => Ok(()),
-            Some(h) => Err(ApiError::not_available(format!(
-                "{what} is local-only: host `{h}` can't be reached for it"
-            ))),
-        }
+    pub(crate) fn require_local(&self, what: &str) -> ApiResult<()> {
+        require_local(self.host.as_deref(), what)
+    }
+}
+
+/// A 501 for any `host` but this one (absent or `local`): `what` has no host
+/// transport, so it would otherwise act on this host's files under a remote's
+/// name.
+pub(crate) fn require_local(host: Option<&str>, what: &str) -> ApiResult<()> {
+    match host {
+        None | Some("local") => Ok(()),
+        Some(h) => Err(ApiError::not_available(format!(
+            "{what} is local-only: host `{h}` can't be reached for it"
+        ))),
     }
 }
 
@@ -1310,9 +1317,11 @@ pub(crate) struct StopRequest {
 
 /// `POST /api/agentiflows/:id/stop` — stop a running agentiflow.
 ///
-/// Graceful (the default, the same stop `steer {stop: true}` queues): `202
-/// {queued: true}` once it is on the control queue; 409 unless a live
-/// coordinator will read it ([`steerable`]). With `now`: the hard stop
+/// Graceful (the default, the same stop `steer {stop: true}` queues), and
+/// answered the same: `200 {queued: true}` once it is on the control queue;
+/// 409 unless a live coordinator will read it ([`steerable`]). A body that is
+/// not a `StopRequest` (`{"now": "true"}`) is a 400, never a graceful stop;
+/// no body is the graceful stop. With `now`: the hard stop
 /// `rupu agentiflow stop --now` runs (`rupu_agentiflow::hard_stop`: SIGTERM
 /// the coordinator and every unit still running, SIGKILL what outlives the
 /// grace, record the run failed), answered once it is done with `{stopped:
@@ -1323,14 +1332,14 @@ async fn stop_agentiflow(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<LocalHostQuery>,
-    body: Option<Json<StopRequest>>,
+    crate::api::runs::OptionalJson(body): crate::api::runs::OptionalJson<StopRequest>,
 ) -> ApiResult<Response> {
     q.require_local("stopping an agentiflow")?;
     if !valid_run_id(&id) {
         return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
     }
     crate::api::config::require_writable_to(&s, "stopping an agentiflow")?;
-    let now = body.map(|b| b.0.now).unwrap_or_default();
+    let now = body.is_some_and(|b| b.now);
     let run_dir = agentiflow_dir(&s.global_dir).join(&id);
     let record = read_record(&id, &run_dir)?;
     if !now {
@@ -1338,11 +1347,7 @@ async fn stop_agentiflow(
         OperatorQueue::new(&run_dir)
             .request_stop()
             .map_err(|e| ApiError::internal(format!("could not queue a stop: {e}")))?;
-        return Ok((
-            axum::http::StatusCode::ACCEPTED,
-            Json(StopQueued { queued: true }),
-        )
-            .into_response());
+        return Ok(Json(StopQueued { queued: true }).into_response());
     }
     if record.status != "running" {
         return Err(ApiError::conflict(format!(

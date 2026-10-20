@@ -527,8 +527,11 @@ pub(crate) async fn start_detached(
     let log_path = run_dir.join(DETACH_LOG);
 
     let launch = detached_spawn_spec(exe, def_name, run_id, global, cwd);
+    // Owned by the guard from here on: whichever way this returns, or if the
+    // caller drops it mid-wait (a client that hung up), the child is reaped
+    // when it ends.
     let mut child = match rupu_runtime::spawn::spawn_detached(launch).map(|s| s.child) {
-        Ok(Some(child)) => child,
+        Ok(Some(child)) => ReapOnDrop(Some(child)),
         Ok(None) => {
             return Err(DetachError::Spawn(
                 "the detached agentiflow's child was not kept".into(),
@@ -540,26 +543,51 @@ pub(crate) async fn start_detached(
         }
     };
 
-    let startup = await_startup(&mut child, &run_dir, DETACH_STARTUP_WAIT)
-        .await
-        .map_err(|e| DetachError::Spawn(format!("wait for the detached run to start: {e}")))?;
-    let started = match startup {
-        Startup::Started => DetachedStart::Started,
-        Startup::Pending => DetachedStart::Pending { log: log_path },
+    let startup = match await_startup(child.get(), &run_dir, DETACH_STARTUP_WAIT).await {
+        Ok(startup) => startup,
+        Err(e) => {
+            // Nothing can say whether it started: stop it, so it does not
+            // run on unreported, and leave nothing behind.
+            let _ = child.get().kill();
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(DetachError::Spawn(format!(
+                "wait for the detached run to start: {e}"
+            )));
+        }
+    };
+    match startup {
+        Startup::Started => Ok(DetachedStart::Started),
+        Startup::Pending => Ok(DetachedStart::Pending { log: log_path }),
         Startup::Exited(status) => {
             // Read the log before the directory that holds it goes.
             let tail = log_tail(&log_path);
             let _ = std::fs::remove_dir_all(&run_dir);
-            return Err(DetachError::Exited { status, tail });
+            Err(DetachError::Exited { status, tail })
         }
-    };
-    // Reap the run when it ends, so a long-lived caller (`cp serve`) is not
-    // left holding a zombie whose pid still reads as running. The CLI exits
-    // next, and the child is then reparented.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(started)
+    }
+}
+
+/// A detached child that is reaped on a thread when this is dropped, so a
+/// long-lived caller (`cp serve`) is never left holding a zombie whose pid
+/// still reads as running (off Linux nothing tells a zombie from a live
+/// process, so its run would stay `running` and never be reaped). A child
+/// already collected by `try_wait` is waited on again at once.
+struct ReapOnDrop(Option<std::process::Child>);
+
+impl ReapOnDrop {
+    fn get(&mut self) -> &mut std::process::Child {
+        self.0.as_mut().expect("the child is only taken on drop")
+    }
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
 }
 
 /// Everything after the netflow sink exists: the run's assembler, the lead's
@@ -2282,6 +2310,57 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// The state `ps` reports for `pid`, or `None` once it is gone.
+    fn ps_state(pid: &str) -> Option<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!state.is_empty()).then_some(state)
+    }
+
+    /// A caller that stops waiting (a client that hung up mid-launch) still
+    /// leaves the child reaped when it ends, never a zombie.
+    #[tokio::test]
+    async fn a_dropped_start_still_reaps_its_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let exe = tmp.path().join("fake-rupu");
+        write(
+            &exe,
+            &format!("#!/bin/sh\necho $$ > {}\nsleep 0.3\n", pid_file.display()),
+        );
+        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let global = tmp.path().join("home");
+        let start = start_detached(&exe, "acme", "af_01DROP", &global, None);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), start)
+                .await
+                .is_err(),
+            "the start is still waiting when it is dropped"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pid = loop {
+            match std::fs::read_to_string(&pid_file) {
+                Ok(p) if p.ends_with('\n') => break p,
+                _ => {
+                    assert!(std::time::Instant::now() < deadline, "the child never ran");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        let pid = pid.trim();
+        while let Some(state) = ps_state(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child {pid} was never reaped (state {state})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

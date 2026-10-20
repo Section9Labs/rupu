@@ -15,11 +15,13 @@
 //! read with `rupu_agentiflow::AgentiflowDef::parse_str`, the parser the
 //! CLI's loader (`rupu_agentiflow::locate_agentiflow_def`) uses; only `.yaml`
 //! files are definitions, and the run directories (`af_<ULID>/`) that share
-//! the global directory are never read.
+//! the global directory are never read. Definitions have no host transport,
+//! so every route answers a remote `?host=` with a 501.
 
 use crate::{
+    api::agentiflows::{require_local, LocalHostQuery},
     api::fs_safety,
-    api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
+    api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind},
     error::{ApiError, ApiResult},
     state::AppState,
 };
@@ -42,6 +44,40 @@ pub fn routes() -> Router<AppState> {
         )
         // A literal segment wins over `:name`, so this is not shadowed.
         .route("/api/agentiflow-defs/validate", post(validate_def))
+}
+
+/// The query of the routes that act on one definition: which layer's file
+/// (`scope_kind` + `scope_id`, as `repo_scope::ScopeQuery`), and `host`,
+/// which can only be this one.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DefQuery {
+    /// `global` | `project`: act on exactly this layer's file; without it, the
+    /// project-first match.
+    #[serde(default)]
+    scope_kind: Option<ScopeKind>,
+    /// For `project`: the registered workspace's id.
+    #[serde(default)]
+    scope_id: Option<String>,
+    /// Only `local` (or absent): definitions live on this control plane's
+    /// host.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// The route segments under `/api/agentiflow-defs/` that are not names: a
+/// definition named one could never be read, saved or deleted by name.
+const RESERVED_NAMES: &[&str] = &["validate"];
+
+/// [`fs_safety::validate_name`], and not a [`RESERVED_NAMES`] segment.
+fn writable_name(name: &str) -> ApiResult<()> {
+    fs_safety::validate_name(name)?;
+    if RESERVED_NAMES.contains(&name) {
+        return Err(ApiError::bad_request(format!(
+            "`{name}` can't name an agentiflow definition: `/api/agentiflow-defs/{name}` is \
+             another route"
+        )));
+    }
+    Ok(())
 }
 
 /// The global layer's definitions directory.
@@ -154,7 +190,7 @@ fn resolve_explicit(
 
 /// The resolution a request's selector asks for: strict with `scope_kind`,
 /// project-first without.
-fn resolve_for(s: &AppState, name: &str, q: &ScopeQuery) -> ApiResult<Resolved> {
+fn resolve_for(s: &AppState, name: &str, q: &DefQuery) -> ApiResult<Resolved> {
     match q.scope_kind {
         Some(kind) => resolve_explicit(s, name, kind, q.scope_id.as_deref()).ok_or_else(|| {
             ApiError::not_found(format!(
@@ -240,7 +276,11 @@ fn scan(dir: &FsPath, scope: &str, scope_kind: ScopeKind, scope_id: Option<&str>
 /// A project definition hides a same-named global one (it is the one
 /// `agentiflow run` loads there); two repos defining the same name both
 /// appear.
-async fn list_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<DefRow>>> {
+async fn list_defs(
+    State(s): State<AppState>,
+    Query(q): Query<LocalHostQuery>,
+) -> ApiResult<Json<Vec<DefRow>>> {
+    q.require_local("listing agentiflow definitions")?;
     let mut rows = scan(&global_dir(&s), "global", ScopeKind::Global, None);
     let mut project_rows = Vec::new();
     for r in distinct_repo_workspaces(store(&s).list().unwrap_or_default(), &repo_store(&s)) {
@@ -283,8 +323,9 @@ fn detail(name: &str, r: &Resolved) -> ApiResult<Json<serde_json::Value>> {
 async fn get_def(
     State(s): State<AppState>,
     Path(name): Path<String>,
-    Query(q): Query<ScopeQuery>,
+    Query(q): Query<DefQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    require_local(q.host.as_deref(), "reading an agentiflow definition")?;
     fs_safety::validate_stem(&name)?;
     let r = resolve_for(&s, &name, &q)?;
     detail(&name, &r)
@@ -321,10 +362,11 @@ fn write(target: &FsPath, dir: &FsPath, raw: &str) -> ApiResult<()> {
 async fn write_def(
     State(s): State<AppState>,
     Path(name): Path<String>,
-    Query(q): Query<ScopeQuery>,
+    Query(q): Query<DefQuery>,
     Json(body): Json<DefWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    fs_safety::validate_name(&name)?;
+    require_local(q.host.as_deref(), "editing an agentiflow definition")?;
+    writable_name(&name)?;
     crate::api::config::require_writable_to(&s, "editing an agentiflow definition")?;
     let def = parse(&body.raw)?;
     if def.name != name {
@@ -356,11 +398,13 @@ async fn write_def(
 /// so a create never shadows (or is shadowed by) an existing definition.
 async fn create_def(
     State(s): State<AppState>,
+    Query(q): Query<LocalHostQuery>,
     Json(body): Json<DefWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    q.require_local("creating an agentiflow definition")?;
     crate::api::config::require_writable_to(&s, "creating an agentiflow definition")?;
     let name = parse(&body.raw)?.name;
-    fs_safety::validate_name(&name)?;
+    writable_name(&name)?;
     if resolve(&s, &name).is_some() {
         return Err(ApiError::conflict(format!(
             "agentiflow definition {name} already exists"
@@ -384,8 +428,9 @@ async fn create_def(
 async fn delete_def(
     State(s): State<AppState>,
     Path(name): Path<String>,
-    Query(q): Query<ScopeQuery>,
+    Query(q): Query<DefQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    require_local(q.host.as_deref(), "deleting an agentiflow definition")?;
     fs_safety::validate_name(&name)?;
     crate::api::config::require_writable_to(&s, "deleting an agentiflow definition")?;
     let r = resolve_for(&s, &name, &q)?;
@@ -417,8 +462,10 @@ pub(crate) struct ValidateBody {
 /// a 400 naming the first problem (404 for an unknown `scope_id`).
 async fn validate_def(
     State(s): State<AppState>,
+    Query(q): Query<LocalHostQuery>,
     Json(body): Json<ValidateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    q.require_local("validating an agentiflow definition")?;
     let def = parse(&body.raw)?;
     let workspace = match body.scope_id.as_deref() {
         Some(id) => {

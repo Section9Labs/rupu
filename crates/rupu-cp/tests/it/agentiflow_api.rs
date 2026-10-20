@@ -396,14 +396,43 @@ async fn a_graceful_stop_is_queued_for_a_live_flow() {
     let addr = serve(state(&global, true, None)).await;
     let path = format!("/api/agentiflows/{LIVE}/stop");
 
+    // Answered as `steer {stop: true}` answers.
     let (status, body) = post(addr, &path, json!({})).await;
-    assert_eq!(status, 202, "{body}");
+    assert_eq!(status, 200, "{body}");
     assert_eq!(body, json!({"queued": true}));
     assert!(stop_queued(&global, LIVE));
 
     // A bodyless POST is the graceful stop too.
     let (status, _) = send(addr, reqwest::Method::POST, &path, None).await;
-    assert_eq!(status, 202);
+    assert_eq!(status, 200);
+    assert!(stop_queued(&global, LIVE));
+}
+
+#[tokio::test]
+async fn a_stop_body_that_is_not_a_stop_request_is_a_400_not_a_graceful_stop() {
+    let (_tmp, global) = home();
+    seed_flow(&global, LIVE, "running", Some(std::process::id()));
+    let addr = serve(state(&global, true, None)).await;
+    let url = format!("http://{addr}/api/agentiflows/{LIVE}/stop");
+
+    let (status, body) = post(
+        addr,
+        &format!("/api/agentiflows/{LIVE}/stop"),
+        json!({"now": "true"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    // ...and with no content-type, the body is still read, not dropped.
+    let r = reqwest::Client::new()
+        .post(&url)
+        .body(r#"{"now": 1}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    assert!(!stop_queued(&global, LIVE));
+    let record = AgentiflowRecord::read(&agentiflow_dir(&global).join(LIVE)).unwrap();
+    assert_eq!(record.status, "running");
 }
 
 #[tokio::test]
@@ -645,6 +674,72 @@ async fn create_save_and_delete_write_the_layer_they_name() {
     )
     .await;
     assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn definition_routes_are_local_only() {
+    let (_tmp, global) = home();
+    write(&global.join("agentiflows/itest.yaml"), DEF);
+    let addr = serve(state(&global, true, None)).await;
+    let fresh = json!({"raw": named("fresh")});
+    let cases = [
+        (reqwest::Method::GET, "/api/agentiflow-defs?host=peer", None),
+        (
+            reqwest::Method::GET,
+            "/api/agentiflow-defs/itest?host=peer",
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/agentiflow-defs?host=peer",
+            Some(fresh.clone()),
+        ),
+        (
+            reqwest::Method::PUT,
+            "/api/agentiflow-defs/itest?host=peer",
+            Some(json!({"raw": DEF})),
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/api/agentiflow-defs/itest?host=peer",
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/agentiflow-defs/validate?host=peer",
+            Some(json!({"raw": DEF})),
+        ),
+    ];
+    for (method, path, body) in cases {
+        let (status, resp) = send(addr, method.clone(), path, body).await;
+        assert_eq!(status, 501, "{method} {path}: {resp}");
+        assert!(
+            resp["error"].as_str().unwrap().contains("local-only"),
+            "{resp}"
+        );
+    }
+    assert!(global.join("agentiflows/itest.yaml").exists());
+    assert!(!global.join("agentiflows/fresh.yaml").exists());
+    let (status, _) = get(addr, "/api/agentiflow-defs?host=local").await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn a_route_segment_cannot_name_a_definition() {
+    let (_tmp, global) = home();
+    let addr = serve(state(&global, true, None)).await;
+    let (status, body) = post(
+        addr,
+        "/api/agentiflow-defs",
+        json!({"raw": named("validate")}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("another route"),
+        "{body}"
+    );
+    assert!(!global.join("agentiflows/validate.yaml").exists());
 }
 
 #[tokio::test]
