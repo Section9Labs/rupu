@@ -207,10 +207,13 @@ Behaviour:
 - **Remote hosts** (`host` on the four run/message kinds). A remote run is
   read from the host's event stream; its gates and a remote message space are
   polled every 2 s, or every 10 s over SSH, where each poll is a new `ssh`
-  connection. Over SSH the spacing holds across calls too: a call within 10 s
+  connection. Over SSH the spacing holds across calls too. A call within 10 s
   of the last ask reuses that ask's answer when it can't be wrong (no parked
-  gate; messages past the call's cursor), else asks once 10 s have passed. A remote `run_settled` fires once the host's stream ends,
-  about 2 s after the run's last event. A call watching a remote host can
+  gate; messages past the call's cursor). Otherwise it waits for the ask's
+  turn, up to 5 s past a shorter timeout as for a first answer, and names the
+  source in `warnings` (`asked N s ago over SSH; next ask in M s`) when the
+  turn comes later than that. A remote `run_settled` fires once the host's
+  stream ends, about 2 s after the run's last event. A call watching a remote host can
   wait up to 5 s from its start for that host's first answer, even with
   `timeout_ms: 0` or when something already fired. A `timeout_ms: 0` peek at
   a remote run's events returns the events the host already has. A host that

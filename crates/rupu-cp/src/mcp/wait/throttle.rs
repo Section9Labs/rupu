@@ -8,8 +8,9 @@
 //! One [`Throttle`] is shared by every call on the CP. It remembers, per host
 //! and gate run or message space, when it was last asked and the answer to
 //! that ask. An ask within [`SSH_POLL`] of the last one doesn't go to the
-//! host: it takes that answer when the answer can say nothing false, else
-//! nothing, and the call asks for real once the spacing allows.
+//! host: it takes that answer when the answer can say nothing false, else it
+//! waits until the spacing allows and asks then ([`Claim::Wait`]; the caller
+//! does the waiting, bounded by its call).
 //!
 //! - A gate answer is reused only when it says no gate is parked. A parked
 //!   gate may have been decided since, so it is asked again, never replayed.
@@ -33,17 +34,13 @@ use tokio::time::Instant;
 
 use super::remote::{gates_of, SSH_POLL};
 
-/// How long an entry is kept after its ask: past [`SSH_POLL`] it throttles
+/// How long an entry is kept after its ask: past the spacing it throttles
 /// nothing, so this only bounds the map.
 const KEEP: Duration = Duration::from_secs(60);
-/// An ask this close to its due time counts as due: a call's own next poll
-/// is set [`SSH_POLL`] from just before its last ask was recorded, and must
-/// not land a hair early and take that ask's answer instead of asking.
-const SLACK: Duration = Duration::from_millis(250);
 
 /// What an ask is about.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) enum Key {
+enum Key {
     /// A run's gates (`get_run`).
     Gate(String),
     /// A message space (`list_messages`), by its root.
@@ -64,40 +61,99 @@ struct Entry {
 }
 
 /// What an ask may do now.
-pub(super) enum Claim {
-    /// Ask the host; the ask is recorded as made now.
-    Ask,
-    /// Asked within [`SSH_POLL`]: this answer stands in.
-    Gate(Value),
-    /// Asked within [`SSH_POLL`]: this page stands in.
-    Msgs(MessagesView),
-    /// Asked within [`SSH_POLL`], with nothing to stand in: ask at this
-    /// instant.
-    Wait(Instant),
+pub(super) enum Claim<T> {
+    /// Ask the host. The ask is recorded as made at `asked`; its answer is
+    /// recorded against that instant.
+    Ask { asked: Instant },
+    /// Asked within the spacing: this answer stands in. The next ask may go
+    /// out at `due`.
+    Reuse { answer: T, due: Instant },
+    /// Asked at `asked`, with nothing to stand in: ask once `due` comes.
+    Wait { asked: Instant, due: Instant },
 }
 
-#[derive(Default)]
 pub(crate) struct Throttle {
+    /// [`SSH_POLL`]; shorter in tests.
+    spacing: Duration,
     entries: Mutex<HashMap<(String, Key), Entry>>,
 }
 
+impl Default for Throttle {
+    fn default() -> Self {
+        Self::with_spacing(SSH_POLL)
+    }
+}
+
 impl Throttle {
-    /// Whether `key` on `host` may be asked now, for the message query `q`
-    /// (for a [`Key::Msgs`]).
-    pub(super) fn claim(&self, host: &str, key: &Key, q: Option<&ViewQuery>) -> Claim {
+    pub(super) fn with_spacing(spacing: Duration) -> Self {
+        Self {
+            spacing,
+            entries: Mutex::default(),
+        }
+    }
+
+    /// How far apart two asks of one key go out.
+    pub(super) fn spacing(&self) -> Duration {
+        self.spacing
+    }
+
+    /// Whether `run`'s gates on `host` may be asked now.
+    pub(super) fn claim_gate(&self, host: &str, run: &str) -> Claim<Value> {
+        self.claim(host, Key::Gate(run.to_string()), |last| match last {
+            Last::Gate(v) if gates_of(v).is_empty() => Some(v.clone()),
+            _ => None,
+        })
+    }
+
+    /// Whether `root`'s space on `host` may be read with `q` now.
+    pub(super) fn claim_msgs(&self, host: &str, root: &str, q: &ViewQuery) -> Claim<MessagesView> {
+        self.claim(host, Key::Msgs(root.to_string()), |last| match last {
+            Last::Msgs(asked, view) => page_from(asked, view, q),
+            Last::Gate(_) => None,
+        })
+    }
+
+    /// The answer to the gate ask recorded at `asked`.
+    pub(super) fn gate_answered(&self, host: &str, run: &str, asked: Instant, v: &Value) {
+        self.answered(
+            host,
+            Key::Gate(run.to_string()),
+            asked,
+            Last::Gate(v.clone()),
+        );
+    }
+
+    /// The page `q` read, by the ask recorded at `asked`.
+    pub(super) fn msgs_answered(
+        &self,
+        host: &str,
+        root: &str,
+        asked: Instant,
+        q: ViewQuery,
+        view: &MessagesView,
+    ) {
+        self.answered(
+            host,
+            Key::Msgs(root.to_string()),
+            asked,
+            Last::Msgs(q, view.clone()),
+        );
+    }
+
+    fn claim<T>(&self, host: &str, key: Key, reuse: impl FnOnce(&Last) -> Option<T>) -> Claim<T> {
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|_, e| now.saturating_duration_since(e.asked) < KEEP);
-        let k = (host.to_string(), key.clone());
+        let k = (host.to_string(), key);
         if let Some(e) = entries.get(&k) {
-            let due = e.asked + SSH_POLL;
-            if now + SLACK < due {
-                return match (&e.last, q) {
-                    (Some(Last::Gate(v)), _) if gates_of(v).is_empty() => Claim::Gate(v.clone()),
-                    (Some(Last::Msgs(asked, view)), Some(q)) => {
-                        page_from(asked, view, q).map_or(Claim::Wait(due), Claim::Msgs)
-                    }
-                    _ => Claim::Wait(due),
+            let due = e.asked + self.spacing;
+            if now < due {
+                return match e.last.as_ref().and_then(reuse) {
+                    Some(answer) => Claim::Reuse { answer, due },
+                    None => Claim::Wait {
+                        asked: e.asked,
+                        due,
+                    },
                 };
             }
         }
@@ -108,27 +164,17 @@ impl Throttle {
                 last: None,
             },
         );
-        Claim::Ask
+        Claim::Ask { asked: now }
     }
 
-    /// The answer to the ask of `run`'s gates on `host`.
-    pub(super) fn gate_answered(&self, host: &str, run: &str, v: &Value) {
-        self.answered(host, Key::Gate(run.to_string()), Last::Gate(v.clone()));
-    }
-
-    /// The page `q` read of `root`'s space on `host`.
-    pub(super) fn msgs_answered(&self, host: &str, root: &str, q: ViewQuery, view: &MessagesView) {
-        self.answered(
-            host,
-            Key::Msgs(root.to_string()),
-            Last::Msgs(q, view.clone()),
-        );
-    }
-
-    fn answered(&self, host: &str, key: Key, last: Last) {
+    /// Record `last` as the answer to the ask made at `asked`, unless a newer
+    /// ask has taken the entry since (a slow answer never overwrites it).
+    fn answered(&self, host: &str, key: Key, asked: Instant, last: Last) {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(e) = entries.get_mut(&(host.to_string(), key)) {
-            e.last = Some(last);
+            if e.asked == asked {
+                e.last = Some(last);
+            }
         }
     }
 }
@@ -166,32 +212,43 @@ mod tests {
     #[tokio::test]
     async fn a_second_ask_within_the_spacing_reuses_a_gate_free_answer_only() {
         let t = Throttle::default();
-        let key = Key::Gate("run_a".into());
-        assert!(matches!(t.claim("h", &key, None), Claim::Ask));
+        let Claim::Ask { asked } = t.claim_gate("h", "run_a") else {
+            panic!("first ask")
+        };
         // Still out: nothing to reuse.
-        assert!(matches!(t.claim("h", &key, None), Claim::Wait(_)));
+        assert!(matches!(t.claim_gate("h", "run_a"), Claim::Wait { .. }));
         let idle = json!({"run": {"status": "running", "awaiting": []}});
-        t.gate_answered("h", "run_a", &idle);
-        assert!(matches!(t.claim("h", &key, None), Claim::Gate(v) if v == idle));
+        t.gate_answered("h", "run_a", asked, &idle);
+        assert!(
+            matches!(t.claim_gate("h", "run_a"), Claim::Reuse { answer, .. } if answer == idle)
+        );
         // Another host or run is its own entry.
-        assert!(matches!(t.claim("h2", &key, None), Claim::Ask));
+        assert!(matches!(t.claim_gate("h2", "run_a"), Claim::Ask { .. }));
         // A parked gate is never replayed.
         let parked = json!({"run": {"awaiting": [{"step_id": "g"}]}});
-        let key_b = Key::Gate("run_b".into());
-        assert!(matches!(t.claim("h", &key_b, None), Claim::Ask));
-        t.gate_answered("h", "run_b", &parked);
-        assert!(matches!(t.claim("h", &key_b, None), Claim::Wait(_)));
+        let Claim::Ask { asked } = t.claim_gate("h", "run_b") else {
+            panic!("first ask")
+        };
+        t.gate_answered("h", "run_b", asked, &parked);
+        assert!(matches!(t.claim_gate("h", "run_b"), Claim::Wait { .. }));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn past_the_spacing_the_host_is_asked_again() {
+    async fn at_the_spacing_the_host_is_asked_again_and_a_slow_answer_is_dropped() {
         let t = Throttle::default();
-        let key = Key::Gate("run_a".into());
-        assert!(matches!(t.claim("h", &key, None), Claim::Ask));
-        t.gate_answered("h", "run_a", &json!({"run": {"awaiting": []}}));
-        // A call's next poll, a hair before the spacing is up: a real ask.
-        tokio::time::advance(SSH_POLL - Duration::from_millis(1)).await;
-        assert!(matches!(t.claim("h", &key, None), Claim::Ask));
+        let Claim::Ask { asked: old } = t.claim_gate("h", "run_a") else {
+            panic!("first ask")
+        };
+        tokio::time::advance(SSH_POLL).await;
+        let Claim::Ask { asked: new } = t.claim_gate("h", "run_a") else {
+            panic!("due again")
+        };
+        // The first ask's answer lands after the second went out: it is not
+        // the entry's answer.
+        t.gate_answered("h", "run_a", old, &json!({"run": {"awaiting": []}}));
+        assert!(matches!(t.claim_gate("h", "run_a"), Claim::Wait { .. }));
+        t.gate_answered("h", "run_a", new, &json!({"run": {"awaiting": []}}));
+        assert!(matches!(t.claim_gate("h", "run_a"), Claim::Reuse { .. }));
     }
 
     #[test]

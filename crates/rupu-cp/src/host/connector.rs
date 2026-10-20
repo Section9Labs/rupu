@@ -1477,7 +1477,7 @@ pub(crate) mod testing {
         /// What `connects_per_request` answers (an SSH-like host).
         pub connects_per_request: bool,
         /// Canned `get_run` reply. `None` → not configured.
-        pub get_run: Option<serde_json::Value>,
+        pub get_run: Option<Result<serde_json::Value, HostConnectorError>>,
         /// How many times `get_run` was called.
         pub get_run_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1581,10 +1581,9 @@ pub(crate) mod testing {
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
             self.get_run_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self
-                .get_run
+            self.get_run
                 .clone()
-                .expect("StubConnector: get_run not configured"))
+                .expect("StubConnector: get_run not configured")
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!("StubConnector: approve_run not configured")

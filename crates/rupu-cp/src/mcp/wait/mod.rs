@@ -385,9 +385,9 @@ impl WaitSource {
                         break;
                     }
                 }
-                Wake::Remote(RemoteWake::Round(host, answers)) => {
+                Wake::Remote(RemoteWake::Round(host, round)) => {
                     let first_was_pending = remote.first_pending();
-                    if let Err(e) = remote.landed(host, answers, &req.watch, &mut got) {
+                    if let Err(e) = remote.landed(host, round, &req.watch, &mut got) {
                         return ToolResult::Error(e);
                     }
                     if got.any() {
@@ -466,27 +466,71 @@ mod tests {
         assert_eq!(progress_wake(true, deadline, deadline), None);
     }
 
+    use crate::host::connector::testing::{state_with_host, StubConnector};
+    use crate::host::connector::HostConnectorError;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    const GATE: &str =
+        r#"{"watch": [{"kind": "run_gate", "run": "run_r", "host": "host_s"}], "timeout_ms": 0}"#;
+
+    /// A `wait` source over a host `host_s` answering `get_run` with `reply`,
+    /// SSH-like when `spaced`, its throttle spacing `spacing`.
+    fn source_with(
+        tmp: &tempfile::TempDir,
+        spaced: bool,
+        reply: Result<Value, HostConnectorError>,
+        spacing: Duration,
+    ) -> (WaitSource, Arc<StubConnector>) {
+        let stub = Arc::new(StubConnector {
+            connects_per_request: spaced,
+            get_run: Some(reply),
+            ..Default::default()
+        });
+        let source = WaitSource {
+            state: state_with_host(tmp, "host_s", stub.clone()),
+            throttle: Arc::new(throttle::Throttle::with_spacing(spacing)),
+        };
+        (source, stub)
+    }
+
+    async fn call(source: &WaitSource, args: &str) -> ToolResult {
+        let args: Value = serde_json::from_str(args).unwrap();
+        source.wait(parse(args).unwrap(), None).await
+    }
+
+    fn json_of(r: ToolResult) -> Value {
+        match r {
+            ToolResult::Json(v) => v,
+            ToolResult::Error(e) => panic!("an error: {e}"),
+            _ => panic!("not JSON"),
+        }
+    }
+
+    fn gate(parked: bool) -> Value {
+        let awaiting = if parked {
+            json!([{"step_id": "g", "prompt": "ok?"}])
+        } else {
+            json!([])
+        };
+        json!({"run": {"id": "run_r", "status": "running", "awaiting": awaiting}})
+    }
+
     /// An SSH-like host (every request its own connection) is asked once for
     /// two back-to-back calls on the same gate: the second takes the first's
     /// answer. Any other host is asked by each call.
     #[tokio::test]
     async fn back_to_back_calls_ask_a_per_request_host_once() {
-        use crate::host::connector::testing::{state_with_host, StubConnector};
-        use std::sync::atomic::Ordering;
         for (spaced, asks) in [(true, 1), (false, 2)] {
             let tmp = tempfile::tempdir().unwrap();
-            let stub = std::sync::Arc::new(StubConnector {
-                connects_per_request: spaced,
-                get_run: Some(json!({"run": {"id": "run_r", "status": "running", "awaiting": []}})),
-                ..Default::default()
-            });
-            let source = WaitSource::new(state_with_host(&tmp, "host_s", stub.clone()));
-            let args = json!({"watch": [{"kind": "run_gate", "run": "run_r", "host": "host_s"}], "timeout_ms": 0});
+            let (source, stub) = source_with(
+                &tmp,
+                spaced,
+                Ok(gate(false)),
+                throttle::Throttle::default().spacing(),
+            );
             for _ in 0..2 {
-                let ToolResult::Json(r) = source.wait(parse(args.clone()).unwrap(), None).await
-                else {
-                    panic!("not a result")
-                };
+                let r = json_of(call(&source, GATE).await);
                 assert_eq!(r["timed_out"], true, "{r}");
                 assert!(r.get("warnings").is_none(), "{r}");
             }
@@ -496,6 +540,76 @@ mod tests {
                 "spaced: {spaced}"
             );
         }
+    }
+
+    /// A parked gate is never replayed from another call's answer. A peek
+    /// whose ask can't go out before it ends (the spacing outlasts its 5 s
+    /// budget) says so in `warnings`, rather than time out in silence.
+    #[tokio::test]
+    async fn a_peek_held_back_past_its_budget_names_the_deferral() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, stub) = source_with(&tmp, true, Ok(gate(true)), Duration::from_secs(10));
+        let r = json_of(call(&source, GATE).await);
+        assert_eq!(r["fired"][0]["kind"], "run_gate", "{r}");
+        let r = json_of(call(&source, GATE).await);
+        assert_eq!(r["timed_out"], true, "{r}");
+        let w = r["warnings"][0].as_str().unwrap_or_else(|| panic!("{r}"));
+        assert!(
+            w.starts_with("run:run_r@host_s: asked 0 s ago over SSH; next ask in "),
+            "{w}"
+        );
+        assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A held-back ask whose turn comes within the first-round budget waits
+    /// for it and goes out: the parked gate fires.
+    #[tokio::test]
+    async fn a_held_back_ask_within_the_budget_goes_out_and_fires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, stub) = source_with(&tmp, true, Ok(gate(true)), Duration::from_secs(2));
+        let r = json_of(call(&source, GATE).await);
+        assert_eq!(r["fired"][0]["kind"], "run_gate", "{r}");
+        let t = Instant::now();
+        let r = json_of(call(&source, GATE).await);
+        assert!(
+            t.elapsed() >= Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(r["fired"][0]["kind"], "run_gate", "{r}");
+        assert_eq!(r["fired"][0]["detail"]["gates"][0]["step_id"], "g", "{r}");
+        assert!(r.get("warnings").is_none(), "{r}");
+        assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Within a call, a spaced host's next poll is due when its last ask's
+    /// spacing is up, so each poll asks the host rather than take the last
+    /// ask's answer back.
+    #[tokio::test]
+    async fn in_a_call_each_spaced_poll_asks_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, stub) = source_with(&tmp, true, Ok(gate(false)), Duration::from_secs(1));
+        let args = GATE.replace(r#""timeout_ms": 0"#, r#""timeout_ms": 2500"#);
+        let r = json_of(call(&source, &args).await);
+        assert_eq!(r["timed_out"], true, "{r}");
+        // At 0, 1 and 2 s.
+        assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A held-back ask that goes out and fails is the call's error, as the
+    /// first round's ask it stands for would be.
+    #[tokio::test]
+    async fn an_unknown_run_on_a_held_back_ask_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = Err(HostConnectorError::NotFound("run_r".into()));
+        let (source, stub) = source_with(&tmp, true, missing, Duration::from_secs(2));
+        for _ in 0..2 {
+            match call(&source, GATE).await {
+                ToolResult::Error(e) => assert_eq!(e, "no run `run_r` on host `host_s`"),
+                _ => panic!("not an error"),
+            }
+        }
+        assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 2);
     }
 }
 
