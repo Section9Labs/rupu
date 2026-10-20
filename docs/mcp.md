@@ -107,12 +107,14 @@ catalog tools for everything.
 
 Thirteen tools over the CP's own endpoints. Each takes the arguments of the
 endpoint it wraps, an optional `host` where the API takes `?host=`, refuses
-unknown arguments, and returns the API's JSON as `structuredContent`.
+unknown arguments, and returns the API's JSON as text. A JSON object is also
+sent as `structuredContent`; a list (a JSON array) is sent as text only,
+since MCP allows only an object there.
 
 | Tool | Does |
 |---|---|
-| `runs.list` | List workflow and agent runs (the CP's `?q=` query language applies) |
-| `runs.get` | One run, with its steps |
+| `runs.list` | List workflow runs started by hand (the CP's `?q=` query language applies; not standalone agent runs, not event- or cron-started runs) |
+| `runs.get` | One workflow run, with its steps |
 | `runs.approve` | Approve a parked approval gate |
 | `runs.reject` | Reject a parked gate |
 | `runs.cancel` | Cancel a run |
@@ -136,7 +138,7 @@ An MCP client cannot read the CP's SSE streams, so `wait` long-polls:
 
 ```json
 { "watch": [ {"kind": "run_settled", "run": "run_01J..."} ],
-  "cursor": "...", "timeout_ms": 30000 }
+  "cursor": {"run:run_01J...": 12}, "timeout_ms": 30000 }
 ```
 
 | Condition | Fires when |
@@ -152,8 +154,9 @@ Behaviour:
   once. Then it catches up from `cursor` (ids are the SSE `id:` lines, so it
   mixes safely with the streams) and waits for a new line.
 - The timeout defaults to 30 s and is capped at 55 s.
-- The reply carries `events`, the advanced `cursor`, which conditions `fired`,
-  and `timed_out`. Pass the returned `cursor` back on the next call.
+- The reply carries `events`, the advanced `cursor` (an object: the last line
+  id read per watched source, `run:<id>` or `messages:<id>`), which conditions
+  `fired`, and `timed_out`. Pass the returned `cursor` back on the next call.
 - Local host only for now: a `host` naming a remote is not yet supported.
 - **Once `run_gate` has fired, drop it from `watch`** (or approve / reject the
   gate): a parked gate is state, so it fires immediately on every call.
@@ -182,9 +185,12 @@ that project's layered config (global, then customer, then project), its SCM
 registry and its findings ledger. A project's config and registry are cached
 until the server restarts.
 
-`agents.list` / `agents.get`, `workflows.list` / `workflows.get` and
-`findings.query` / `findings.tag` from the catalog are hidden from the list,
-because the operator tools cover them.
+Where a catalog tool has the name of an operator tool (`agents.list`,
+`workflows.list`), the operator tool is the one served. Every other catalog
+tool the server can serve is listed, `findings.query` and `findings.tag`
+included. A catalog tool whose service the server lacks (`agents.get` and
+`workflows.get` need a definitions catalog the MCP context does not have) is
+left out and named once in the server log at startup.
 Findings filed over MCP record under the `mcp` scope. A served `bash`'s network
 flows are not captured: the call is no run, so there is no run ledger for them.
 
@@ -204,14 +210,17 @@ rupu cp serve --no-web --tools read_file,grep
 ```
 
 A narrow grant such as `read_file,grep` therefore drops the operator tools
-and `wait`; name them (`runs.*,wait,...`) to keep them. An unknown name fails
-startup with a did-you-mean.
+and `wait`; name them (`runs.*,wait,...`) to keep them. A name that matches no
+tool fails startup, listing the namespaces served.
 
 ## Attribution
 
 An operator message sent through `messages.send` is recorded with
 `client: "mcp"` beside `via: "cp"`, so the Messages tab and the log can tell an
-MCP client from the web UI.
+MCP client from the web UI. A gate decision or cancel through `runs.approve`,
+`runs.reject` or `runs.cancel` on the local host records the actor `mcp`
+where the web UI records `web`. The mark comes from the `/mcp` endpoint
+itself, never from a request header, so a plain HTTP call can't claim it.
 
 ## Protocol
 
@@ -247,7 +256,7 @@ HTTP URL as above (for a client that only speaks stdio, use `mcp-remote`).
 | A fs / shell / findings tool says `workspace` is required | Pass a project id or the absolute path of a registered project |
 | `wait` returns instantly with `run_gate` | The gate is still parked; approve it or drop `run_gate` from `watch` |
 | `wait` on a remote host is refused | Remote hosts are not yet supported by `wait` |
-| Tool is missing from `tools/list` | `--tools` excludes it, or it is hidden because an operator tool covers it |
+| Tool is missing from `tools/list` | `--tools` excludes it, or it is a catalog tool whose service the server lacks (logged at startup) |
 
 ## See also
 

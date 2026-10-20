@@ -623,8 +623,9 @@ rupu repos {list, attach, prefer, tracked, forget}
 rupu scm {bind, accounts}             Multi-account SCM routing rules and account roster
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
 rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear / Jira
-rupu cp serve [--no-web] [--no-mcp]    Control plane; MCP at /mcp (rupu mcp serve is deprecated)
-rupu cp serve [--bind] [--token]      Local control-plane HTTP server for the rupu web UI
+rupu cp serve [--bind] [--token] [--no-web] [--no-mcp] [--tools]
+                                       Control plane: the web UI, its API and MCP at /mcp
+                                       (rupu mcp serve is deprecated)
 rupu host {add, list, remove}         Manage named remote hosts (SSH / HTTP / tunnel / bucket)
 rupu node [--cp-url] | {enroll, pull} Dial-home tunnel agent, node enrollment, bucket worker
 rupu auth {login, logout, status, backend}
