@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import fixture from '../../../../rupu-coverage/tests/fixtures/finding_report/valid_full.json';
 import { api, ApiError, type FindingDetail as Detail } from '../lib/api';
 import type { FindingReport } from '../lib/findingReport';
@@ -37,6 +37,11 @@ function base(over: Partial<Detail>): Detail {
     tags_editable: true,
     ...over,
   };
+}
+
+function BackProbe() {
+  const { state } = useLocation();
+  return <pre data-testid="back-probe">{JSON.stringify(state)}</pre>;
 }
 
 function renderAt(id = 'fnd_1') {
@@ -150,6 +155,43 @@ describe('FindingDetail page', () => {
     expect(back).toHaveAttribute('href', '/findings');
     const h1 = screen.getByRole('heading', { level: 1 });
     expect(back.compareDocumentPosition(h1) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('returns to the page the report was opened from when the link carried it', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'full', report, evidence_status: ['current'] }));
+    const originState = { back: { to: '/projects', label: 'Back' } };
+    render(
+      <MemoryRouter
+        initialEntries={[{
+          pathname: '/findings/fnd_1',
+          state: { back: { to: '/projects/ws1/findings?q=sev%3Ahigh', label: 'Project', state: originState } },
+        }]}
+      >
+        <Routes>
+          <Route path="/findings/:id" element={<FindingDetail />} />
+          <Route path="/projects/:wsId/findings" element={<BackProbe />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const back = await screen.findByRole('link', { name: '← Project' });
+    expect(back).toHaveAttribute('href', '/projects/ws1/findings?q=sev%3Ahigh');
+    expect(screen.queryByRole('link', { name: '← Findings' })).toBeNull();
+    fireEvent.click(back);
+    // The origin's own state rides back with it, so its back link still works.
+    expect(JSON.parse((await screen.findByTestId('back-probe')).textContent!)).toEqual(originState);
+  });
+
+  it('falls back to the findings list when the state is not a back entry', async () => {
+    vi.spyOn(api, 'getFinding').mockResolvedValue(base({ profile: 'summary', report: null }));
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/findings/fnd_1', state: { back: { to: 'https://elsewhere.example' } } }]}>
+        <Routes>
+          <Route path="/findings/:id" element={<FindingDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const back = await screen.findByRole('link', { name: '← Findings' });
+    expect(back).toHaveAttribute('href', '/findings');
   });
 
   it('links provenance to the originating run', async () => {
