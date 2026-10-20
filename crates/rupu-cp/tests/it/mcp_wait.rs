@@ -751,3 +751,39 @@ async fn a_timeout_shorter_than_the_grace_times_out_cleanly() {
     assert_ne!(r["isError"], json!(true), "{r}");
     assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
 }
+
+#[tokio::test]
+async fn a_fast_turn_between_rechecks_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    let old_entry = json!({"run_id": "run_old", "transcript_path": old.to_str().unwrap()});
+    session(
+        tmp.path(),
+        "ses_F",
+        "idle",
+        None,
+        json!([old_entry.clone()]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let new = transcript(&g, "run_fast", "fast answer.", "ok");
+        session(
+            &g,
+            "ses_F",
+            "idle",
+            None,
+            json!([old_entry, {"run_id": "run_fast", "transcript_path": new.to_str().unwrap()}]),
+        );
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_F"}], "timeout_ms": 10000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_fast", "{r}");
+    assert_eq!(d["final_answer"], "fast answer.", "{r}");
+}

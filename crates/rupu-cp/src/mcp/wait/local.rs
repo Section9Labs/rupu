@@ -128,10 +128,10 @@ impl WaitSource {
         &self,
         watch: &[Condition],
         located: &HashMap<String, Located>,
-        since: tokio::time::Instant,
+        memo: &mut super::turns::Turns,
         fired: &mut BTreeMap<usize, Value>,
     ) -> Result<(), String> {
-        super::turns::check(&self.state, watch, since, fired).await?;
+        super::turns::check(&self.state, watch, memo, fired).await?;
         for (i, c) in watch.iter().enumerate() {
             if fired.contains_key(&i) {
                 continue;

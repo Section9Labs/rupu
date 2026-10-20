@@ -194,9 +194,9 @@ impl WaitSource {
         // State first, then what is already on disk past the cursor: a run
         // seen settled has written its last line, so the catch-up after it
         // has every event. Either returns at once.
-        let started = Instant::now();
+        let mut started = turns::Turns::new();
         if let Err(e) = self
-            .check_state(&req.watch, &located, started, &mut got.fired)
+            .check_state(&req.watch, &located, &mut started, &mut got.fired)
             .await
         {
             return ToolResult::Error(e);
@@ -265,7 +265,7 @@ impl WaitSource {
                     if has_state && last_check.elapsed() >= RECHECK_MIN_GAP {
                         last_check = Instant::now();
                         if let Err(e) = self
-                            .check_state(&req.watch, &located, started, &mut got.fired)
+                            .check_state(&req.watch, &located, &mut started, &mut got.fired)
                             .await
                         {
                             return ToolResult::Error(e);
@@ -282,7 +282,7 @@ impl WaitSource {
                     if has_state {
                         last_check = Instant::now();
                         if let Err(e) = self
-                            .check_state(&req.watch, &located, started, &mut got.fired)
+                            .check_state(&req.watch, &located, &mut started, &mut got.fired)
                             .await
                         {
                             return ToolResult::Error(e);
