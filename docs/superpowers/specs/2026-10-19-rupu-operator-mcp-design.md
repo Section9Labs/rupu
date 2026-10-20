@@ -124,7 +124,7 @@ A new module in `rupu-mcp` (or a new crate `rupu-mcp-ops` if `rupu-mcp` must not
 3. Add an internal marker header that the router trusts only from in-process callers (see Auth), plus `X-Rupu-Via: mcp`.
 4. Send it through the router with `oneshot`.
 5. Map the response:
-   - **2xx JSON:** `structuredContent` = the body; `content` = one text block with the same JSON.
+   - **2xx JSON:** `content` = one text block with the JSON; when the body is a JSON object, `structuredContent` = the body too (MCP clients reject a non-object `structuredContent`, so list results go as text only).
    - **2xx bytes:** an embedded resource with its content type.
    - **4xx/5xx:** `isError: true`, with the status and body. The CP's error bodies (`{error, token, code, …}`) stay intact.
 
@@ -178,10 +178,7 @@ Every tool that takes `?host=` in the API takes a `host` argument, with the API'
 
 The `rupu-tools` catalog tools (`scm.*`, `issues.*`, `github.*`, `gitlab.*`, `findings.report` / `findings.verify`, the core fs/shell tools) stay on the MCP.
 
-- **Collisions.** Where a catalog name collides with an operator tool name, the operator tool wins and the catalog tool is not listed:
-  - `agents.list` / `agents.get` / `workflows.list` / `workflows.get` (roster tools)
-  - `findings.query` / `findings.tag`, which the CP's `findings.list` / `findings.tag` cover with host fan-out
-  A test pins the resolved list.
+- **Collisions.** Resolved dynamically: sources are ordered operator → `wait` → catalog, and a catalog tool is dropped only when an earlier source serves the same name (ruled during Plan 1; a fixed list hid catalog tools no operator tool served yet). As Plan 2 adds `findings.tag`, `agents.get` and the rest, they shadow their catalog namesakes automatically. A test pins that every name is served once.
 - **Workspace.** The catalog tools act on a workspace. The MCP layer adds a required `workspace` argument (a project id, or the absolute path of a registered project) to every catalog tool that needs one: fs/shell, `findings.report` / `findings.verify`. It builds that call's `ToolContext` for that workspace. How contexts are cached is the builder's call. A daemon has no meaningful working directory, so nothing defaults to one.
 - **Attribution.** Findings filed through the MCP keep today's `mcp` scope and `mcp_<ULID>` session run id.
 
