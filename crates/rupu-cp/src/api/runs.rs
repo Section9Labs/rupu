@@ -563,7 +563,9 @@ pub(crate) const RETRY_LOG: &str = "retry.log";
 /// that never took it.
 ///
 /// 409 for a run that is running, pending, paused (`runs.resume`),
-/// awaiting approval or completed; 404 for an unknown run. Local-only:
+/// awaiting approval or completed, and for a standalone agent run
+/// (`agent:<name>`, which `agent_runs.continue` continues); 404 for an
+/// unknown run. Local-only:
 /// `?host=<remote>` is a 501, since a host's resume path serves only paused
 /// runs.
 async fn retry_run(
@@ -591,6 +593,16 @@ async fn retry_run(
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
     })?;
+    // A standalone agent run's record lists beside workflow runs, but
+    // `workflow resume` can't run it: continue it instead.
+    if record
+        .workflow_name
+        .starts_with(rupu_orchestrator::AGENT_RUN_PREFIX)
+    {
+        return Err(ApiError::conflict(format!(
+            "run {id} is a standalone agent run: continue it (`agent_runs.continue`) instead of retrying it"
+        )));
+    }
     if matches!(record.status, RunStatus::Running | RunStatus::Pending) {
         let now = chrono::Utc::now();
         let mut listed = record;
