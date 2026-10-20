@@ -13,17 +13,16 @@
 
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { PageHeader } from '../components/ui/PageHeader';
 
 export default function Netflow() {
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Network</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Every flow recorded across all runs — same views at every scope; the scope only
-          narrows the data.
-        </p>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Network"
+        subtitle="Every flow recorded across all runs — same views at every scope; the scope only narrows the data."
+      />
       <UnscopedNote className="mb-4">Flows here cover every customer.</UnscopedNote>
       <NetflowExplorer scope="global" />
     </div>

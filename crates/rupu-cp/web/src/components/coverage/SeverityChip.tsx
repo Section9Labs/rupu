@@ -1,18 +1,17 @@
-// Shared severity pill, used across the coverage concern tabs. Colour-coded off
-// the canonical SEVERITY_STYLE ramp (previously every severity rendered the
-// same gray).
-import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
+// Shared severity pill — the ONE status/severity chip of the visual language
+// (spec §"Chips"), so a finding's severity reads the same in the findings
+// table, the coverage concern tabs and a report header. Colour comes from the
+// canonical SEVERITY_STYLE ramp (StatusChip resolves severity tones from the
+// same map); an unrecognised value falls back to the neutral tone.
 
-const FALLBACK = 'bg-surface text-ink-mute ring-border';
+import { StatusChip, type ChipTone } from '../ui/StatusChip';
+
+const SEVERITIES: ReadonlySet<string> = new Set(['critical', 'high', 'medium', 'low', 'info']);
 
 export default function SeverityChip({ severity }: { severity: string }) {
-  const style = SEVERITY_STYLE[severity as Severity];
-  const pill = style ? style.pill : FALLBACK;
   return (
-    <span
-      className={`inline-flex items-center whitespace-nowrap rounded px-1.5 py-0.5 text-meta font-medium ring-1 ${pill}`}
-    >
+    <StatusChip tone={SEVERITIES.has(severity) ? (severity as ChipTone) : 'neutral'}>
       {severity}
-    </span>
+    </StatusChip>
   );
 }
