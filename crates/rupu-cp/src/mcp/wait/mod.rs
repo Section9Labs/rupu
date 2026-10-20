@@ -315,17 +315,19 @@ impl WaitSource {
             } else {
                 deadline
             };
-            if let Some(r) = reporter.as_mut() {
+            // Progress stops at the deadline: it never passes `total`.
+            let reporting = Instant::now() < deadline;
+            if let (true, Some(r)) = (reporting, reporter.as_mut()) {
                 if Instant::now() >= next_progress {
                     r.report();
                     next_progress = Instant::now() + PROGRESS_EVERY;
                 }
             }
-            let mut wake_at = match remote.next_poll_at() {
+            let mut wake_at = match remote.next_poll_at(deadline) {
                 Some(at) => next_check.min(at).min(end),
                 None => next_check.min(end),
             };
-            if reporter.is_some() {
+            if reporter.is_some() && next_progress < deadline {
                 wake_at = wake_at.min(next_progress);
             }
             let wake = tokio::select! {

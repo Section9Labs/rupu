@@ -292,8 +292,13 @@ impl Remote {
         }
     }
 
-    /// When the next idle host's poll round is due.
-    pub(super) fn next_poll_at(&self) -> Option<Instant> {
+    /// When the next idle host's poll round is due; none once `deadline` has
+    /// passed, since `schedule` starts no round then and a due time already
+    /// behind us would wake the loop again at once.
+    pub(super) fn next_poll_at(&self, deadline: Instant) -> Option<Instant> {
+        if Instant::now() >= deadline {
+            return None;
+        }
         self.hosts
             .iter()
             .filter(|h| !h.busy)
@@ -780,6 +785,34 @@ fn take_messages(watch: &[Condition], source: &str, view: MessagesView, got: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn past_the_deadline_no_poll_is_due_to_wake_the_loop() {
+        use crate::host::connector::testing::StubConnector;
+        let now = Instant::now();
+        let mut r = Remote {
+            hosts: vec![Host {
+                id: "h".into(),
+                conn: Arc::new(StubConnector::default()),
+                busy: false,
+                answered: true,
+                next_poll: now - Duration::from_secs(1),
+            }],
+            runs: Vec::new(),
+            gates: Vec::new(),
+            msgs: Vec::new(),
+            turn: 0,
+            inflight: FuturesUnordered::new(),
+        };
+        // Before the deadline the due poll is the wake target.
+        assert!(r.next_poll_at(now + Duration::from_secs(5)).is_some());
+        // Past it nothing is: `schedule` would start no round and leave
+        // `next_poll` behind, so the loop would spin on it.
+        let past = now - Duration::from_millis(1);
+        assert!(r.next_poll_at(past).is_none());
+        r.schedule(&[], &Got::default(), past);
+        assert!(!r.hosts[0].busy);
+    }
 
     #[test]
     fn gates_come_from_the_awaiting_set_else_the_legacy_fields() {
