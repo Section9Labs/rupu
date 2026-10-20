@@ -196,3 +196,71 @@ fn the_mode_word_has_one_parser() {
         assert_eq!(PermissionMode::parse(m.as_str()), Ok(m));
     }
 }
+
+/// Tool A, whose call counts itself in and waits until `release` is
+/// notified.
+struct Gated {
+    entered: std::sync::atomic::AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl rupu_tools::Tool for Gated {
+    fn descriptor(&self) -> &'static ToolDescriptor {
+        &TOOL_A
+    }
+    async fn invoke(
+        &self,
+        _input: Value,
+        _ctx: &rupu_tools::ToolContext,
+    ) -> Result<rupu_tools::ToolOutput, rupu_tools::ToolError> {
+        let released = self.release.notified();
+        self.entered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        released.await;
+        Ok(rupu_tools::output::ok("done"))
+    }
+}
+
+/// `call_shared` (concurrent callers, `rupu mcp serve`): the "allow always"
+/// answer is recorded as the call is decided, and the set is not held while
+/// the tool runs, so a second call of the same tool runs alongside the first
+/// without prompting again.
+#[tokio::test]
+async fn call_shared_decides_under_the_lock_and_runs_outside_it() {
+    use rupu_tools::call::{call_shared, CallOutcome};
+    use std::sync::atomic::Ordering;
+    let p = Scripted::new(PromptAnswer::AllowAlways);
+    let policy = PermissionPolicy::new(PermissionMode::Ask, Some(p.clone()));
+    let always = Arc::new(Mutex::new(AllowAlways::default()));
+    let tool = Arc::new(Gated {
+        entered: Default::default(),
+        release: tokio::sync::Notify::new(),
+    });
+    let ctx = rupu_tools::ToolContext::default();
+    let spawn_call = || {
+        let (tool, ctx, policy, always) =
+            (tool.clone(), ctx.clone(), policy.clone(), always.clone());
+        tokio::spawn(async move { call_shared(&*tool, json!({}), &ctx, &policy, &always).await })
+    };
+
+    let first = spawn_call();
+    let second = spawn_call();
+    // Both calls are inside the tool at once: neither holds the set.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while tool.entered.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the second call waited for the first");
+    assert!(always.try_lock().is_ok(), "the set is free while tools run");
+    assert_eq!(
+        p.asked(),
+        ["tool.a"],
+        "allow always held for the second call"
+    );
+    tool.release.notify_waiters();
+    assert_eq!(first.await.unwrap(), CallOutcome::Done("done".into()));
+    assert_eq!(second.await.unwrap(), CallOutcome::Done("done".into()));
+}

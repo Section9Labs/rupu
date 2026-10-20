@@ -107,3 +107,91 @@ async fn the_run_marker_reaches_every_command() {
         out.stdout
     );
 }
+
+/// A command whose shell runs an inner shell that starts a `sleep`: the
+/// sleep is two levels below the tool's shell, and writes its pid where the
+/// test can read it.
+const NESTED_SLEEP: &str = "/bin/sh -c 'sleep 60 & echo $! > grandchild.pid; wait'; echo x";
+
+fn grandchild_pid(dir: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(dir.join("grandchild.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Whether `pid` is alive. A zombie is dead: under a PID 1 that never
+/// reaps (the musl CI container, where it is `cargo`) a killed orphan stays a
+/// zombie, and `kill(pid, 0)` still succeeds on it.
+#[cfg(target_os = "linux")]
+fn is_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state is the first field after the parenthesised command name.
+    let state = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next());
+    !matches!(state, Some("Z" | "X"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_running(pid: u32) -> bool {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    rustix::process::test_kill_process(pid).is_ok()
+}
+
+/// Wait (at most 5 s) for `pid` to be gone: dead, or a zombie no one has
+/// reaped yet.
+async fn assert_gone(pid: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while is_running(pid) {
+        if std::time::Instant::now() >= deadline {
+            let _ = rustix::process::kill_process(
+                rustix::process::Pid::from_raw(pid as i32).unwrap(),
+                rustix::process::Signal::KILL,
+            );
+            panic!("the grandchild sleep {pid} outlived its bash call");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn timeout_kills_the_shells_grandchildren() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = ToolContext::in_workspace(dir.path());
+    ctx.workspace.bash.timeout_secs = 2;
+    let out = BashTool
+        .invoke(json!({ "command": NESTED_SLEEP }), &ctx)
+        .await
+        .unwrap();
+    assert!(
+        out.error.as_deref().unwrap_or("").contains("timeout"),
+        "{out:?}"
+    );
+    let pid = grandchild_pid(dir.path()).expect("the grandchild wrote its pid");
+    assert_gone(pid).await;
+}
+
+#[tokio::test]
+async fn a_dropped_call_kills_the_shells_grandchildren() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolContext::in_workspace(dir.path());
+    let mut call = Box::pin(BashTool.invoke(json!({ "command": NESTED_SLEEP }), &ctx));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let pid = loop {
+        tokio::select! {
+            out = &mut call => panic!("the call finished before it was dropped: {out:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        if let Some(pid) = grandchild_pid(dir.path()) {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no grandchild pid");
+    };
+    assert!(is_running(pid));
+    drop(call);
+    assert_gone(pid).await;
+}

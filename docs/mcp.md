@@ -45,6 +45,26 @@ Cursor's MCP config lives at the IDE's settings level:
 }
 ```
 
+## Wiring into Claude Code
+
+```sh
+claude mcp add rupu -- rupu mcp serve --tools '<grant>'
+```
+
+`<grant>` is a [`--tools`](#choosing-the-tools---tools) grant, for example
+`'scm.*,issues.*,findings.*'`; leave `--tools` out for the default set. Add
+`--mode readonly` after it to refuse writes (see [Permissions](#permissions)).
+`claude mcp add` registers the server for you in the current project; pass
+`--scope user` to have it in every project. Claude Code starts the server
+in the directory it runs in, so the fs/shell tools and the findings ledger act
+on that project.
+
+Claude Code names each tool `mcp__rupu__<tool>` with the dots of rupu's
+name turned into underscores: `scm.repos.list` is
+`mcp__rupu__scm_repos_list`, `findings.report` is
+`mcp__rupu__findings_report`. `claude mcp list` shows whether the server
+connected.
+
 ## Tool catalog
 
 Without `--tools`, the server serves the connector and findings tools
@@ -110,6 +130,30 @@ Connector reads are `read`, connector writes are `external`, `findings.report`
 `read`. A refused call returns an MCP error result (`isError: true`) saying
 which mode refused which effect.
 
+## Protocol
+
+The server speaks MCP over stdio, one JSON-RPC message per line:
+
+- **Versions.** `initialize` answers the client's `protocolVersion` when the
+  server speaks it (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`),
+  and otherwise its newest (`2025-11-25`), leaving the client to decide
+  whether to go on. `2026-07-28` and later drop the `initialize` handshake and
+  are not served.
+- **Methods.** `initialize`, `ping`, `tools/list` and `tools/call`; any other
+  method is a `-32601` error. A tool that fails, refuses its arguments, is
+  unknown or is not served comes back as a `tools/call` result with
+  `isError: true`, so the model sees why.
+- **Concurrency and cancellation.** Each `tools/call` runs on its own, so a
+  slow call (a long `bash`, a connector that is rate-limited) holds up neither
+  a `ping` nor another call, and replies arrive in the order the calls finish.
+  A `notifications/cancelled` naming a running call's request id aborts it,
+  and that call gets no reply. When the client closes stdin, the calls still
+  running finish and are answered before the server exits.
+- **Bad input.** A line that is not JSON gets a `-32700` parse error (id
+  `null`) and the server keeps serving; blank lines are skipped. JSON that is
+  not a request, notification or response gets `-32600`. A batch (a JSON
+  array) is answered with one array of its requests' replies, in order.
+
 ## Troubleshooting
 
 | Symptom                                       | Likely cause                                        |
@@ -117,7 +161,7 @@ which mode refused which effect.
 | Claude Desktop says `rupu` server failed      | `rupu` not on PATH, or no SCM credentials present    |
 | Tool returns "no connector for github"        | `rupu auth login --provider github` needed           |
 | Tools/list lacks a tool `--tools` names       | It needs a service the server lacks (see the `tool_unavailable` stderr line) |
-| Stdio hangs after `tools/call`                | Long-running connector op; check rate limits         |
+| A `tools/call` never answers                  | Long-running connector op or command; check rate limits, or cancel it (other calls keep running) |
 
 ## See also
 
