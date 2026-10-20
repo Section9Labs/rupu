@@ -85,9 +85,13 @@ fn global_dir(s: &AppState) -> PathBuf {
     rupu_agentiflow::agentiflow_dir(&s.global_dir)
 }
 
-/// A workspace's definitions directory.
-fn project_dir(workspace: &str) -> PathBuf {
-    FsPath::new(workspace).join(".rupu").join("agentiflows")
+/// A workspace's definitions directory, or `None` when its `.rupu/` is the
+/// global dir (R5, `rupu_workspace::project_layer_dir`): a global-layer
+/// launch starts in the global dir's parent and registers it, and its
+/// "project" definitions would be the global ones a second time.
+fn project_dir(s: &AppState, workspace: &str) -> Option<PathBuf> {
+    rupu_workspace::project_layer_dir(&s.global_dir, Some(FsPath::new(workspace)))
+        .map(|d| d.join("agentiflows"))
 }
 
 fn store(s: &AppState) -> WorkspaceStore {
@@ -124,7 +128,9 @@ struct Resolved {
 fn resolve(s: &AppState, name: &str) -> Option<Resolved> {
     let workspaces = store(s).list().unwrap_or_default();
     for r in distinct_repo_workspaces(workspaces, &repo_store(s)) {
-        let dir = project_dir(&r.workspace.path);
+        let Some(dir) = project_dir(s, &r.workspace.path) else {
+            continue;
+        };
         if let Some(path) = definition_file(&dir, name) {
             return Some(Resolved {
                 path,
@@ -175,7 +181,7 @@ fn resolve_explicit(
                 .unwrap_or_default()
                 .into_iter()
                 .find(|w| w.id == scope_id)?;
-            let dir = project_dir(&w.path);
+            let dir = project_dir(s, &w.path)?;
             let path = definition_file(&dir, name)?;
             Some(Resolved {
                 path,
@@ -284,8 +290,11 @@ async fn list_defs(
     let mut rows = scan(&global_dir(&s), "global", ScopeKind::Global, None);
     let mut project_rows = Vec::new();
     for r in distinct_repo_workspaces(store(&s).list().unwrap_or_default(), &repo_store(&s)) {
+        let Some(dir) = project_dir(&s, &r.workspace.path) else {
+            continue;
+        };
         project_rows.extend(scan(
-            &project_dir(&r.workspace.path),
+            &dir,
             &r.scope,
             ScopeKind::Project,
             Some(&r.workspace.id),
