@@ -152,8 +152,8 @@ fn customers(s: &AppState) -> CustomerStore {
     CustomerStore::new(s.global_dir.clone())
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct RangeQuery {
+#[derive(Debug, Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct RangeQuery {
     archived: Option<String>,
     range: Option<String>,
 }
@@ -440,8 +440,8 @@ async fn get_customer(
     Ok(Json(detail))
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateBody {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CreateBody {
     slug: String,
     name: String,
     notes: Option<String>,
@@ -473,8 +473,8 @@ async fn create_customer(
     Ok((StatusCode::CREATED, Json(customer_dto(&c))))
 }
 
-#[derive(Debug, Deserialize)]
-struct PatchBody {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct PatchBody {
     name: Option<String>,
     notes: Option<String>,
     contact: Option<String>,

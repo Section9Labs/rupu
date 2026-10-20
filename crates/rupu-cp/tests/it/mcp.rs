@@ -391,7 +391,7 @@ async fn serve_on_refuses_nothing_to_serve() {
 
 // ---- operator tools (in-process calls over the CP API) ----
 
-struct NoopLauncher;
+pub(super) struct NoopLauncher;
 
 #[async_trait]
 impl rupu_cp::launcher::RunLauncher for NoopLauncher {

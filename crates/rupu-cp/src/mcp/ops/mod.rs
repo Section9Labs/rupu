@@ -194,29 +194,6 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
 
 /// Routes not yet operator tools; Plan 2 empties this list.
 pub const PENDING_PLAN_2: &[(&str, &str)] = &[
-    ("GET", "/api/config"),
-    ("PUT", "/api/config/customer/:slug"),
-    ("PUT", "/api/config/global"),
-    ("PUT", "/api/config/policy"),
-    ("PUT", "/api/config/project/:id"),
-    ("GET", "/api/customers"),
-    ("POST", "/api/customers"),
-    ("DELETE", "/api/customers/:slug"),
-    ("GET", "/api/customers/:slug"),
-    ("PATCH", "/api/customers/:slug"),
-    ("POST", "/api/customers/:slug/archive"),
-    ("DELETE", "/api/customers/:slug/projects/:ws_id"),
-    ("PUT", "/api/customers/:slug/projects/:ws_id"),
-    ("POST", "/api/customers/:slug/unarchive"),
-    ("GET", "/api/host/info"),
-    ("GET", "/api/hosts"),
-    ("POST", "/api/hosts"),
-    ("DELETE", "/api/hosts/:id"),
-    ("POST", "/api/hosts/bucket"),
-    ("POST", "/api/hosts/node"),
-    ("GET", "/api/hosts/registered"),
-    ("POST", "/api/hosts/ssh"),
-    ("POST", "/api/launch/preview"),
     ("GET", "/api/projects"),
     ("GET", "/api/projects/:ws_id"),
     ("GET", "/api/projects/:ws_id/agents"),
@@ -229,8 +206,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/projects/:ws_id/source"),
     ("GET", "/api/projects/:ws_id/tree"),
     ("GET", "/api/projects/:ws_id/workflows"),
-    ("GET", "/api/repos"),
-    ("GET", "/api/workers"),
 ];
 
 #[cfg(test)]
