@@ -183,6 +183,45 @@ impl<E> Stream for NumberedTail<E> {
     }
 }
 
+/// The lines of the JSONL file at `path` past line `after`, numbered exactly
+/// as [`NumberedTail`] numbers them (every non-blank line from 1), at most
+/// `max` of them, all `send: true`. Lines up to `after` are counted, never
+/// parsed. Also returns the id to resume after: the last line returned when
+/// `max` cut the read short, else the file's last line (`after` when the
+/// file has no line past it). A missing file has no lines. Blocking.
+pub fn read_numbered<E: serde::de::DeserializeOwned>(
+    path: &Path,
+    after: u64,
+    max: usize,
+) -> std::io::Result<(Vec<NumberedLine<E>>, u64)> {
+    let (mut out, mut seq, mut capped) = (Vec::new(), 0u64, false);
+    JsonlCursor::new().drain_with(
+        path,
+        || {},
+        |l| {
+            seq += 1;
+            if seq <= after || capped {
+                return;
+            }
+            if out.len() >= max {
+                capped = true;
+                return;
+            }
+            out.push(NumberedLine {
+                id: seq,
+                event: serde_json::from_str::<E>(l).ok(),
+                send: true,
+            });
+        },
+    )?;
+    let last = match (capped, out.last()) {
+        (true, Some(l)) => l.id,
+        (true, None) => after,
+        (false, _) => seq.max(after),
+    };
+    Ok((out, last))
+}
+
 /// One item of a resumable transcript stream ([`sequenced`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptFrame {
@@ -236,6 +275,40 @@ pub fn sequenced(path: &Path, after: u64) -> impl Stream<Item = TranscriptFrame>
 mod numbered_tests {
     use super::*;
     use futures_util::StreamExt as _;
+
+    /// `read_numbered` numbers like the tail (blank lines don't count,
+    /// unparseable ones do), skips up to `after`, and stops at `max` with
+    /// the last returned id to resume from.
+    #[tokio::test]
+    async fn read_numbered_numbers_like_the_tail_and_resumes_past_a_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        std::fs::write(&p, "1\n\n  \nnot json\n3\n4\npartial").unwrap();
+        let ids =
+            |v: &Vec<NumberedLine<u32>>| v.iter().map(|l| (l.id, l.event)).collect::<Vec<_>>();
+        let (all, last) = read_numbered::<u32>(&p, 0, 1000).unwrap();
+        assert_eq!(
+            ids(&all),
+            vec![(1, Some(1)), (2, None), (3, Some(3)), (4, Some(4))]
+        );
+        assert_eq!(last, 4);
+        let mut tail = NumberedTail::<u32>::open(&p, 0);
+        for want in &all {
+            assert_eq!(next(&mut tail).await, *want);
+        }
+        let (some, last) = read_numbered::<u32>(&p, 1, 2).unwrap();
+        assert_eq!(ids(&some), vec![(2, None), (3, Some(3))]);
+        assert_eq!(last, 3);
+        let (rest, last) = read_numbered::<u32>(&p, last, 2).unwrap();
+        assert_eq!(ids(&rest), vec![(4, Some(4))]);
+        assert_eq!(last, 4);
+        let (none, last) = read_numbered::<u32>(&p, 9, 2).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(last, 9);
+        let (none, last) = read_numbered::<u32>(&dir.path().join("missing"), 0, 2).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(last, 0);
+    }
 
     async fn next<E>(t: &mut NumberedTail<E>) -> NumberedLine<E> {
         tokio::time::timeout(std::time::Duration::from_secs(3), t.next())

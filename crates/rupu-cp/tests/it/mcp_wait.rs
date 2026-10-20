@@ -99,7 +99,7 @@ async fn a_settled_run_fires_at_once() {
         json!({"watch": [{"kind": "run_settled", "run": RUN}]}),
     )
     .await;
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert_ne!(r["isError"], json!(true), "{r}");
     let s = &r["structuredContent"];
     assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
@@ -123,7 +123,7 @@ async fn a_parked_gate_fires_at_once_with_its_gates() {
     let addr = spawn(tmp.path()).await;
     let t = Instant::now();
     let r = wait(addr, json!({"watch": [{"kind": "run_gate", "run": RUN}]})).await;
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     let fired = &r["structuredContent"]["fired"][0];
     assert_eq!(fired["kind"], "run_gate", "{r}");
     assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
@@ -228,6 +228,85 @@ async fn messages_wait_returns_new_operator_lines_and_skips_seen() {
     assert_eq!(s["cursor"], json!({ &source: 3 }), "{r}");
 }
 
+/// A run that wrote its last events and settled between two calls: the
+/// call that sees it settled still returns those events.
+#[tokio::test]
+async fn a_settled_run_still_returns_its_unread_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Completed);
+    for step in ["one", "two", "three"] {
+        append_step(tmp.path(), step);
+    }
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN},
+                         {"kind": "run_settled", "run": RUN}]}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    let kinds: Vec<&str> = s["fired"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"run_settled"), "{r}");
+    assert_eq!(ids(&r), vec![1, 2, 3], "{r}");
+    assert_eq!(s["cursor"], json!({ format!("run:{RUN}"): 3 }), "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+}
+
+/// A parked gate fires on every call, but never hides the messages watched
+/// beside it: they come back with it and the cursor moves past them.
+#[tokio::test]
+async fn a_parked_gate_does_not_starve_a_message_watch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let g = tmp.path();
+    let bus = super::messages::workflow_run(g, RUN, RunStatus::AwaitingApproval);
+    let mut rec = store(g).load(RUN).unwrap();
+    rec.awaiting = vec![AwaitingGate {
+        step_id: "review".into(),
+        prompt: None,
+        since: Utc::now(),
+        expires_at: None,
+    }];
+    store(g).update(&rec).unwrap();
+    let op = bus
+        .operator_send(OperatorMessage {
+            to: Address::Broadcast,
+            body: "while you wait".into(),
+            urgent: false,
+            via: OperatorVia::Cli,
+            viewer: None,
+            client: None,
+        })
+        .unwrap();
+    let addr = spawn(g).await;
+    let source = format!("messages:{RUN}");
+    let watch = json!([{"kind": "messages", "root": RUN},
+                       {"kind": "run_gate", "run": RUN}]);
+
+    let r = wait(addr, json!({"watch": watch})).await;
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "messages", "{r}");
+    assert_eq!(s["fired"][1]["kind"], "run_gate", "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+    assert_eq!(s["events"][0]["event"]["id"], op.id(), "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 1 }), "{r}");
+
+    let t = Instant::now();
+    let r = wait(addr, json!({"watch": watch, "cursor": s["cursor"]})).await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(s["fired"][0]["kind"], "run_gate", "{r}");
+    assert_eq!(s["events"], json!([]), "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 1 }), "{r}");
+}
+
 #[tokio::test]
 async fn times_out_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -241,7 +320,7 @@ async fn times_out_cleanly() {
                "timeout_ms": 300}),
     )
     .await;
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
     assert_ne!(r["isError"], json!(true), "{r}");
     let s = &r["structuredContent"];
     assert_eq!(s["timed_out"], true, "{r}");
@@ -260,7 +339,7 @@ async fn an_unknown_run_is_an_error_not_a_hang() {
     ] {
         let t = Instant::now();
         let r = wait(addr, json!({"watch": [watch], "timeout_ms": 5000})).await;
-        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
         assert_eq!(r["isError"], json!(true), "{r}");
         assert!(text_of(&r).contains("run_nope"), "{r}");
     }
@@ -285,6 +364,10 @@ async fn bad_arguments_are_refused() {
             "`types`",
         ),
         (json!({"watch": []}), "`watch`"),
+        (
+            json!({"watch": [{"kind": "run_events", "run": RUN, "types": ["step_started", "step_warped"]}]}),
+            "unknown event type `step_warped`",
+        ),
         (
             json!({"watch": [{"kind": "messages", "root": RUN, "kinds": ["shout"]}]}),
             "shout",

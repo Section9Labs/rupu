@@ -24,16 +24,15 @@ use serde_json::{json, Map, Value};
 use tokio::time::Instant;
 
 use crate::state::AppState;
-use crate::transcript_tail::{NumberedLine, NumberedTail};
+use crate::transcript_tail::{read_numbered, NumberedLine, NumberedTail};
 
 /// The timeout when a call names none.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30_000);
 /// The longest a call waits, whatever it asks for.
 pub const MAX_TIMEOUT: Duration = Duration::from_millis(55_000);
-/// How long a fired call keeps reading lines already on their way.
-const DRAIN_MAX: Duration = Duration::from_millis(250);
-/// A pause this long between lines ends the drain early.
-const DRAIN_QUIET: Duration = Duration::from_millis(50);
+/// The most lines one catch-up read returns per source; the cursor then
+/// stops at the last of them, so the next call reads on.
+const CATCH_UP_MAX: usize = 1000;
 /// How often the state conditions are re-checked with no line arriving.
 const RECHECK_EVERY: Duration = Duration::from_secs(1);
 /// The least time between two re-checks a line triggers.
@@ -158,8 +157,7 @@ fn input_schema() -> Value {
             "timeout_ms": {
                 "type": "integer",
                 "minimum": 0,
-                "maximum": MAX_TIMEOUT.as_millis() as u64,
-                "description": "How long to wait (default 30000, at most 55000). A timeout returns `timed_out: true`, not an error."
+                "description": "How long to wait (default 30000; a longer one is clamped to 55000). A timeout returns `timed_out: true`, not an error."
             }
         }
     })
@@ -309,7 +307,13 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         "run_events" => Kind::Events {
             types: o
                 .remove("types")
-                .map(|v| strings(v, "types", &what))
+                .map(|v| {
+                    let types = strings(v, "types", &what)?;
+                    match types.iter().find(|t| !is_event_type(t)) {
+                        Some(t) => Err(format!("{what}: unknown event type `{t}`")),
+                        None => Ok(types),
+                    }
+                })
                 .transpose()?,
         },
         _ => Kind::Messages {
@@ -336,6 +340,16 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         target,
         source,
     })
+}
+
+/// Whether `t` is one of [`Event`]'s `type` tags: an unknown tag reads as
+/// [`Event::Unknown`], a known one as its variant (or fails on its missing
+/// fields).
+fn is_event_type(t: &str) -> bool {
+    !matches!(
+        serde_json::from_value::<Event>(json!({ "type": t })),
+        Ok(Event::Unknown)
+    )
 }
 
 /// One line of a watched source.
@@ -409,18 +423,40 @@ impl WaitSource {
             feeds.push((c.source.clone(), feed));
         }
 
-        let mut cursor = req.cursor.clone();
-        let mut fired: BTreeMap<usize, Value> = BTreeMap::new();
+        // Which conditions read each source, and whether any collects.
+        let mut by_source: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, c) in req.watch.iter().enumerate() {
+            by_source.entry(c.source.as_str()).or_default().push(i);
+        }
+        let collects: Vec<bool> = feeds
+            .iter()
+            .map(|(s, _)| {
+                by_source[s.as_str()]
+                    .iter()
+                    .any(|&i| req.watch[i].kind.collects())
+            })
+            .collect();
+        let has_state = req.watch.iter().any(|c| !c.kind.collects());
 
-        // State first: a run already settled or parked returns at once.
-        self.check_state(&req.watch, &mut fired).await;
-        if !fired.is_empty() {
-            return finish(&req.watch, fired, Vec::new(), cursor, false);
+        let mut got = Got {
+            cursor: req.cursor.clone(),
+            ..Got::default()
+        };
+
+        // State first, then what is already on disk past the cursor: a run
+        // seen settled has written its last line, so the catch-up after it
+        // has every event. Either returns at once.
+        self.check_state(&req.watch, &mut got.fired).await;
+        if let Err(e) = catch_up(&req.watch, &feeds, &collects, &by_source, &mut got).await {
+            return ToolResult::Error(e);
+        }
+        if got.any() {
+            return got.finish(&req.watch);
         }
 
         let mut tails: Vec<Tail> = Vec::new();
         for (i, (source, feed)) in feeds.iter().enumerate() {
-            let after = req.cursor.get(source).copied().unwrap_or(0);
+            let after = got.cursor.get(source).copied().unwrap_or(0);
             tails.push(match feed {
                 Feed::Run(p) => {
                     Box::pin(NumberedTail::<Event>::open(p, after).map(move |l| (i, Line::Run(l))))
@@ -432,28 +468,10 @@ impl WaitSource {
         }
         let mut lines = futures_util::stream::select_all(tails);
 
-        // Which conditions read each source.
-        let mut by_source: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, c) in req.watch.iter().enumerate() {
-            by_source.entry(c.source.as_str()).or_default().push(i);
-        }
-        let has_state = req.watch.iter().any(|c| !c.kind.collects());
-
         let deadline = Instant::now() + req.timeout;
-        // Set once something fires: read what is already on its way, then
-        // return.
-        let mut drain_until: Option<Instant> = None;
         let mut next_check = Instant::now() + RECHECK_EVERY;
         let mut last_check = Instant::now();
-        let mut collected: Vec<Value> = Vec::new();
-        let mut counts: BTreeMap<usize, u64> = BTreeMap::new();
-
         loop {
-            let now = Instant::now();
-            let wake = match drain_until {
-                Some(d) => d.min(now + DRAIN_QUIET).min(deadline),
-                None => next_check.min(deadline),
-            };
             tokio::select! {
                 line = lines.next() => {
                     let Some((src, line)) = line else { break };
@@ -461,47 +479,45 @@ impl WaitSource {
                         continue;
                     }
                     let source = feeds[src].0.as_str();
-                    let conds = &by_source[source];
-                    if conds.iter().any(|&i| req.watch[i].kind.collects()) {
-                        cursor.insert(source.to_string(), line.id());
+                    if collects[src] {
+                        got.cursor.insert(source.to_string(), line.id());
                     }
-                    if let Some(event) = matching(&req.watch, conds, &line, &mut counts) {
-                        collected.push(json!({"source": source, "id": line.id(), "event": event}));
-                        drain_until.get_or_insert(Instant::now() + DRAIN_MAX);
+                    if got.take(&req.watch, &by_source[source], source, &line) {
+                        break;
                     }
-                    if drain_until.is_none()
-                        && has_state
-                        && last_check.elapsed() >= RECHECK_MIN_GAP
-                    {
+                    if has_state && last_check.elapsed() >= RECHECK_MIN_GAP {
                         last_check = Instant::now();
-                        self.check_state(&req.watch, &mut fired).await;
-                        if !fired.is_empty() {
-                            drain_until = Some(Instant::now() + DRAIN_MAX);
+                        self.check_state(&req.watch, &mut got.fired).await;
+                        if !got.fired.is_empty() {
+                            break;
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(wake) => {
-                    let now = Instant::now();
-                    if drain_until.is_some() || now >= deadline {
+                _ = tokio::time::sleep_until(next_check.min(deadline)) => {
+                    if Instant::now() >= deadline {
                         break;
                     }
                     if has_state {
-                        last_check = now;
-                        self.check_state(&req.watch, &mut fired).await;
-                        if !fired.is_empty() {
-                            drain_until = Some(Instant::now() + DRAIN_MAX);
+                        last_check = Instant::now();
+                        self.check_state(&req.watch, &mut got.fired).await;
+                        if !got.fired.is_empty() {
+                            break;
                         }
                     }
                     next_check = Instant::now() + RECHECK_EVERY;
                 }
             }
         }
+        drop(lines);
 
-        for (i, n) in counts {
-            fired.insert(i, json!({"count": n}));
+        // Something fired: return the lines on disk past the cursor with it,
+        // rather than racing the tails' next poll for them.
+        if got.any() {
+            if let Err(e) = catch_up(&req.watch, &feeds, &collects, &by_source, &mut got).await {
+                return ToolResult::Error(e);
+            }
         }
-        let timed_out = fired.is_empty();
-        finish(&req.watch, fired, collected, cursor, timed_out)
+        got.finish(&req.watch)
     }
 
     /// Record each state condition (`run_settled`, `run_gate`) that holds now
@@ -594,23 +610,100 @@ fn matching(
     taken.then_some(event)
 }
 
-fn finish(
-    watch: &[Condition],
+/// What a call has found so far.
+#[derive(Default)]
+struct Got {
+    /// State conditions that fired, with their detail.
     fired: BTreeMap<usize, Value>,
+    /// `{source, id, event}` per line returned.
     events: Vec<Value>,
+    /// Lines taken per collecting condition.
+    counts: BTreeMap<usize, u64>,
     cursor: BTreeMap<String, u64>,
-    timed_out: bool,
-) -> ToolResult {
-    let fired: Vec<Value> = fired
-        .into_iter()
-        .map(|(i, detail)| json!({"index": i, "kind": watch[i].kind.name(), "detail": detail}))
-        .collect();
-    ToolResult::Json(json!({
-        "fired": fired,
-        "events": events,
-        "cursor": cursor,
-        "timed_out": timed_out,
-    }))
+}
+
+impl Got {
+    fn any(&self) -> bool {
+        !self.fired.is_empty() || !self.events.is_empty()
+    }
+
+    /// Keep `line` of `source` when a condition among `conds` takes it.
+    fn take(&mut self, watch: &[Condition], conds: &[usize], source: &str, line: &Line) -> bool {
+        match matching(watch, conds, line, &mut self.counts) {
+            Some(event) => {
+                self.events
+                    .push(json!({"source": source, "id": line.id(), "event": event}));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn finish(mut self, watch: &[Condition]) -> ToolResult {
+        for (i, n) in std::mem::take(&mut self.counts) {
+            self.fired.insert(i, json!({ "count": n }));
+        }
+        let timed_out = self.fired.is_empty();
+        let fired: Vec<Value> = self
+            .fired
+            .into_iter()
+            .map(|(i, detail)| json!({"index": i, "kind": watch[i].kind.name(), "detail": detail}))
+            .collect();
+        ToolResult::Json(json!({
+            "fired": fired,
+            "events": self.events,
+            "cursor": self.cursor,
+            "timed_out": timed_out,
+        }))
+    }
+}
+
+/// Read each collecting source past its cursor ([`read_numbered`], at most
+/// [`CATCH_UP_MAX`] lines), keep what its conditions take and move its
+/// cursor past what was read.
+async fn catch_up(
+    watch: &[Condition],
+    feeds: &[(String, Feed)],
+    collects: &[bool],
+    by_source: &HashMap<&str, Vec<usize>>,
+    got: &mut Got,
+) -> Result<(), String> {
+    for (i, (source, feed)) in feeds.iter().enumerate() {
+        if !collects[i] {
+            continue;
+        }
+        let after = got.cursor.get(source).copied().unwrap_or(0);
+        let read = match feed {
+            Feed::Run(p) => {
+                let p = p.clone();
+                tokio::task::spawn_blocking(move || {
+                    read_numbered::<Event>(&p, after, CATCH_UP_MAX)
+                        .map(|(l, last)| (l.into_iter().map(Line::Run).collect::<Vec<_>>(), last))
+                })
+                .await
+            }
+            Feed::Log(p) => {
+                let p = p.clone();
+                tokio::task::spawn_blocking(move || {
+                    read_numbered::<LogLine>(&p, after, CATCH_UP_MAX)
+                        .map(|(l, last)| (l.into_iter().map(Line::Msg).collect::<Vec<_>>(), last))
+                })
+                .await
+            }
+        };
+        let (lines, last) = match read {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => return Err(format!("reading {source}: {e}")),
+            Err(e) => return Err(format!("reading {source}: {e}")),
+        };
+        for line in &lines {
+            got.take(watch, &by_source[source.as_str()], source, line);
+        }
+        if last > after {
+            got.cursor.insert(source.clone(), last);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -633,6 +726,29 @@ mod tests {
             }
         );
         assert_eq!(r.timeout, DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn the_schema_leaves_the_timeout_cap_to_the_server() {
+        let schema = input_schema();
+        let t = &schema["properties"]["timeout_ms"];
+        assert_eq!(t["type"], "integer");
+        assert!(t.get("maximum").is_none(), "{t}");
+    }
+
+    #[test]
+    fn event_types_are_events_own_tags() {
+        for t in [
+            "run_started",
+            "step_started",
+            "run_completed",
+            "attempt_resumed",
+        ] {
+            assert!(is_event_type(t), "{t}");
+        }
+        for t in ["step_warped", "unknown", "StepStarted", ""] {
+            assert!(!is_event_type(t), "{t}");
+        }
     }
 
     #[test]
