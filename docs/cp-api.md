@@ -470,6 +470,8 @@ Query language, tags and report export are covered in depth in
 | GET | `/api/findings/:id/export` | One finding as a report file. | `format=md\|html\|pdf` (required), `ws_id`. 400 bad format; 501 PDF in a build without the `pdf` feature; 404; 409 ambiguous id, as above. |
 | POST | `/api/findings/export` | Several findings as one report. | Body `ExportBody`: `format` (required), `title`, `ids`, `ws_id`, `run_id`, `min_severity`, `owner`, `cwe`, `include_summaries`, `split`. Returns `text/markdown`, `text/html`, `application/pdf`, or `application/zip` when `split`; always an attachment with `nosniff`. 404 when nothing matches. |
 | GET | `/api/findings/tags` | Tags in use, most used first. | Query: `ws_id`. |
+| POST | `/api/findings/import` | Attach Markdown reports written before the full profile to their findings: what `rupu findings import` runs. | Local-only (`host` other than `local` → 501). Body `{paths, id?, dry_run?}`: `paths` are absolute paths on this machine, report files or directories searched for `*.md` (hidden entries skipped, symlinks not followed); `id` names the finding of a single report with no `Finding ID:` line. Each report attaches to the summary finding it names, whole or not at all; a finding that already has a report is left alone. Every changed ledger is backed up first (`findings.jsonl.pre-import-<time>`) and written under the findings lock; `dry_run` writes nothing (no change, backup or lock file) and needs no `rupu cp serve`, a real import does (501). Limits are the global config's `[findings]`. 200 `ImportReport {dry_run, files: [{path, status: attached\|skipped\|failed, finding_id \| reason, details?}], backups, attached, skipped, failed, warnings?}`; a file that could not be imported, a named but unreadable one included, is a `failed` line, not an error status. 400 for a relative or missing path, or a directory that cannot be listed; for a search that passes 100,000 directory entries (name narrower `paths`); for an `id` with more than one file; or for nothing to import. |
+| GET | `/api/findings/schema` | The finding report JSON Schema embedded in this build: what `rupu findings schema` prints. | `advertised=true` returns the simplified copy used in tool definitions instead of the canonical draft-07 schema. |
 | POST | `/api/findings/tags` | Add / remove tags on many findings. | Body `{finding_ids, add, remove}` — each id tagged in every workspace that holds it — or `{findings: [{ws_id, id}], add, remove}` — each finding tagged only in its own workspace (what the web sends). Exactly one of `finding_ids` / `findings`; at most 1000. Atomic per workspace; response `TagAcrossResult {workspaces, unknown}` — a workspace whose tag log couldn't be written carries its `error` there. 400 for a bad change (empty, conflicting, too many tags); 500 if writing the tag log fails outright. 404 only when *every* finding is unknown. Recorded as `via: cp`. |
 | GET | `/api/findings/:id/artifacts/:sha256` | An artifact or evidence-block file the finding references. | `ws_id`; 409 for an ambiguous id, as above. Text inline as `text/plain`, raster images inline as `image/*`, everything else as an attachment; always `nosniff` + `Content-Security-Policy: sandbox`. 404 if the finding doesn't reference it; 409 if a referenced workspace file changed since it was recorded; a remote artifact is pulled from its host on first view, and a failed pull is 404 `{"unavailable": reason}`. |
 | GET | `/api/findings/artifacts/:sha256` | **Host-internal.** Raw blob from this host's artifact store. | Used by a coordinator pulling a remote unit's artifact (`findings.artifact_blob` feature). Not finding-scoped. 404 if not in the store. |
@@ -489,7 +491,29 @@ the target is used.
 | GET | `/api/coverage/:target/audit` | Per-concern gap audit (`AuditReport`). | `ws_id`. |
 | GET | `/api/coverage/:target/runs` | Runs that contributed to the target. | `ws_id`. |
 | GET | `/api/coverage/:target/diff` | Two runs' contributions side by side (`RunDiff`). | `ws_id`, `base` (default `previous`), `compare` (default `latest`, or a run id). 400 unknown run. |
+| GET | `/api/coverage/:target/gap` | The coverage gaps alone: each in-scope file a concern has no assertion for, what `rupu coverage gap` prints. | `ws_id`. `{kind: "coverage_gaps", version: 1, rows: [{concern_id, file}]}`, in concern order. 404 unknown target; `host` other than `local` → 501. |
+| POST | `/api/coverage/:target/rerun` | Replay a recorded agent run on its target, what `rupu coverage rerun` launches: a new run appended to the same target. | `ws_id`. Body `{run}`: a full run id from `…/runs`. The run's agent, prompt, permission mode and launch skills start again through the agent launcher, detached, in the workspace the run was recorded in; provider, model and concerns come from the agent's current file and config, as on the CLI. 202 `{run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `…/diff?base=<run>&compare=latest`. 404 unknown target or no manifest for the run; 409 a run that continued another (rerun that one) or was recorded in another workspace; 501 a session, workflow or autoflow run, a `host` other than `local`, or no `rupu cp serve`. |
 | GET | `/api/assets` | Asset inventory (`AssetListResponse`). | `ws_id`, `target`. |
+
+## Query help
+
+What each list's `q` takes, and a check of a query without running it. The
+registries are the ones the lists filter with, so the answer is the list's
+own; the field shapes are the ones `crates/rupu-cp/tests/fixtures/list_query/`
+and `crates/rupu-coverage/tests/fixtures/finding_query/fields.json` pin.
+`:list` is `findings`, `workflow_runs`, `agent_runs`, `sessions`,
+`autoflow_runs` or `events`; any other is a 404 naming them.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/query/:list/fields` | The list's query fields, in suggestion order. | `{list, fields}`; each field has `key`, `aliases`, `kind` (`severity`, `enum`, `text`, `time` or a custom kind such as `tag`) and allowed `values`; the run, session and event lists also give `match`, `facet` and `text`. |
+| POST | `/api/query/:list/check` | Parse a query with the list's fields. | Body `{q}`. 200 `{ok: true, terms: [{neg, key, op, values}]}` (aliases resolved, values normalized), or 200 `{ok: false, error, token, code, start, end}`: the body of the list's own 400 for that query. |
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"q":"sev>=high -tag:noise"}' http://127.0.0.1:7878/api/query/findings/check
+# {"ok":true,"terms":[{"neg":false,"key":"severity","op":"ge","values":["high"]},{"neg":true,"key":"tag","op":"eq","values":["noise"]}]}
+```
 
 ## Usage and dashboard
 
