@@ -831,12 +831,12 @@ async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     let named = |n: &str| tools.iter().filter(|t| t["name"] == n).collect::<Vec<_>>();
-    // Served once each: the operator's `agents.list`, `wait`'s own `wait`,
-    // the catalog's `agents.get` and `findings.query`.
+    // Served once each: the operator's `agents.list` and `agents.get`,
+    // `wait`'s own `wait`, the catalog's `findings.query`.
     for (name, from_catalog) in [
         ("agents.list", false),
         ("wait", false),
-        ("agents.get", true),
+        ("agents.get", false),
         ("findings.query", true),
     ] {
         let t = named(name);
@@ -847,8 +847,8 @@ async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name
             "{name}: {t:?}"
         );
     }
-    let r = call_tool(addr, "agents.get", json!({})).await;
-    assert_eq!(text_of(&r), "catalog agents.get", "{r}");
+    let r = call_tool(addr, "findings.query", json!({})).await;
+    assert_eq!(text_of(&r), "catalog findings.query", "{r}");
     let r = call_tool(addr, "agents.list", json!({})).await;
     assert!(text_of(&r).starts_with('['), "{r}");
     // `--tools` checks names the same way.

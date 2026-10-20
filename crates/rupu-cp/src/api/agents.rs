@@ -816,8 +816,8 @@ async fn get_agent(
 
 /// Request body for `PUT /api/agents/:name` and `POST /api/agents`: the full
 /// raw `.md` (frontmatter + body) to validate and persist.
-#[derive(Deserialize)]
-struct AgentWriteBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AgentWriteBody {
     raw: String,
 }
 
@@ -1453,8 +1453,8 @@ async fn start_session(
     ))
 }
 
-#[derive(Deserialize)]
-struct GenerateAgentBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct GenerateAgentBody {
     description: String,
     #[serde(default)]
     provider: Option<String>,

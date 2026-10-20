@@ -99,11 +99,11 @@ impl OpSpec {
         self
     }
 
-    /// A `POST` that changes nothing (validate, preview, export).
-    // First used by the area tools that follow Plan 2's Task 4.
-    #[allow(dead_code)]
+    /// A `POST` that changes nothing (validate, preview, export); repeating
+    /// it changes nothing either, so it is also idempotent.
     pub(crate) fn read_only(mut self) -> Self {
         self.hints.read_only = true;
+        self.hints.idempotent = true;
         self
     }
 
@@ -197,18 +197,7 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
 /// Routes not yet operator tools; Plan 2 empties this list.
 pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/agentiflows/:id/netflow"),
-    ("POST", "/api/agents"),
-    ("DELETE", "/api/agents/:name"),
-    ("GET", "/api/agents/:name"),
-    ("PUT", "/api/agents/:name"),
-    ("POST", "/api/agents/generate"),
     ("GET", "/api/assets"),
-    ("GET", "/api/autoflows"),
-    ("POST", "/api/autoflows/:name/disable"),
-    ("POST", "/api/autoflows/:name/enable"),
-    ("GET", "/api/autoflows/claims"),
-    ("POST", "/api/autoflows/claims/release"),
-    ("POST", "/api/autoflows/claims/requeue"),
     ("GET", "/api/config"),
     ("PUT", "/api/config/customer/:slug"),
     ("PUT", "/api/config/global"),
@@ -239,7 +228,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("POST", "/api/findings/export"),
     ("GET", "/api/findings/tags"),
     ("POST", "/api/findings/tags"),
-    ("GET", "/api/generate/models"),
     ("GET", "/api/host/info"),
     ("GET", "/api/hosts"),
     ("POST", "/api/hosts"),
@@ -249,8 +237,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/hosts/registered"),
     ("POST", "/api/hosts/ssh"),
     ("POST", "/api/launch/preview"),
-    ("GET", "/api/models"),
-    ("POST", "/api/models/refresh"),
     ("GET", "/api/netflow"),
     ("GET", "/api/netflow/explorer"),
     ("GET", "/api/netflow/graph"),
@@ -271,20 +257,11 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/projects/:ws_id/workflows"),
     ("GET", "/api/repos"),
     ("GET", "/api/runs/:id/netflow"),
-    ("GET", "/api/skills"),
-    ("GET", "/api/skills/:layer/:name"),
-    ("GET", "/api/tools"),
     ("GET", "/api/usage"),
     ("GET", "/api/usage/outliers"),
     ("GET", "/api/usage/runs"),
     ("GET", "/api/usage/timeline"),
     ("GET", "/api/workers"),
-    ("POST", "/api/workflows"),
-    ("DELETE", "/api/workflows/:name"),
-    ("GET", "/api/workflows/:name"),
-    ("PUT", "/api/workflows/:name"),
-    ("POST", "/api/workflows/generate"),
-    ("POST", "/api/workflows/validate"),
 ];
 
 #[cfg(test)]
@@ -307,7 +284,7 @@ mod tests {
         assert_eq!(hints(o(Method::PATCH)), (false, false, false, false));
         assert_eq!(
             hints(o(Method::POST).read_only()),
-            (true, false, false, false)
+            (true, false, true, false)
         );
         assert_eq!(
             hints(o(Method::POST).open_world()),

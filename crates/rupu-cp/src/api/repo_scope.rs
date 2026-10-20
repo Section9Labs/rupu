@@ -43,7 +43,7 @@ pub(crate) struct RepoScope {
 /// (the underlying registered workspace's unique id) alongside this, passed
 /// as the `?scope_kind=&scope_id=` query params those endpoints accept — see
 /// `resolve_agent_scoped_explicit` / `resolve_workflow_scoped_explicit`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ScopeKind {
     Global,
@@ -83,7 +83,7 @@ impl std::str::FromStr for ScopeKind {
 /// string, which can collide across two different repos) whose `.rupu/`
 /// definition to target; a missing/unmatched `scope_id` in that case resolves
 /// to nothing (404), never a guess.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ScopeQuery {
     #[serde(default)]
     pub(crate) scope_kind: Option<ScopeKind>,

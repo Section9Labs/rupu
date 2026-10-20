@@ -20,7 +20,7 @@ pub fn routes() -> Router<AppState> {
 
 /// `deny_unknown_fields`: a misspelled `provider` key must be a 400, not a
 /// silent "refresh every provider".
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RefreshBody {
     #[serde(default)]
