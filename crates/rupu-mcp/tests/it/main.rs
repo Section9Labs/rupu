@@ -5,6 +5,7 @@
 //! enforces this.
 
 mod catalog;
+mod content;
 mod filter;
 mod protocol;
 mod schema_snapshot;
