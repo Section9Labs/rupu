@@ -2,7 +2,7 @@
 // raw definition file (YAML frontmatter + markdown body) shown with syntax
 // highlighting. Route: /agents/:name
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
 import { api, scopeSelectorFor, skillNamesOf, type AgentDetail } from '../lib/api';
@@ -15,6 +15,7 @@ import { Button } from '../components/ui/Button';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+import { launchApi } from '../lib/api3b/launch';
 
 export default function AgentDetailPage() {
   const { name = '' } = useParams<{ name: string }>();
@@ -30,6 +31,14 @@ export default function AgentDetailPage() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [skillNames, setSkillNames] = useState<string[]>([]);
+
+  // The builder's server check, against the project layer a project agent
+  // lives in (its skills resolve there), else the global one.
+  const validateWsId = agent?.scope_kind === 'project' ? (agent.scope_id ?? undefined) : undefined;
+  const serverValidate = useCallback(
+    (raw: string) => launchApi.validateAgentRaw(raw, validateWsId),
+    [validateWsId],
+  );
 
   useEffect(() => {
     if (!name) return;
@@ -246,6 +255,7 @@ export default function AgentDetailPage() {
               onSubmit={saveFrom}
               onCancel={cancelEdit}
               skillNames={skillNames}
+              serverValidate={serverValidate}
             />
           </div>
         ) : agent.raw ? (
@@ -258,6 +268,8 @@ export default function AgentDetailPage() {
       {runOpen && (
         <AgentLauncherSheet
           agent={agent.name}
+          agentProvider={agent.provider}
+          agentModel={agent.model}
           onClose={() => setRunOpen(false)}
         />
       )}
