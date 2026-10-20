@@ -371,6 +371,48 @@ async fn an_unknown_run_is_an_error_not_a_hang() {
 }
 
 #[tokio::test]
+async fn a_project_local_run_is_found() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+    RunStore::new(project.path().join(".rupu").join("runs"))
+        .create(
+            super::sse::seed_run(RUN, RunStatus::Completed),
+            "name: test\nsteps: []\n",
+        )
+        .unwrap();
+    let addr = spawn(global.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+}
+
+#[tokio::test]
+async fn a_string_cursor_on_a_local_source_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let key = format!("run:{RUN}");
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN}],
+               "cursor": {key.clone(): "msg_01"}, "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains(&format!("cursor.{key}")), "{r}");
+}
+
+#[tokio::test]
 async fn bad_arguments_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     seed(tmp.path(), RunStatus::Running);
