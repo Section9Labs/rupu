@@ -13,7 +13,6 @@ use crate::output::report;
 use anyhow::Context;
 use clap::{Subcommand, ValueEnum};
 use rupu_cp::api::findings as cp_findings;
-use rupu_cp::api::findings_import as cp_findings_import;
 use rupu_findings_report::{ExportError, Format};
 use rupu_orchestrator::runs::RunStore;
 use std::path::{Path, PathBuf};
@@ -611,18 +610,20 @@ fn export_cmd(args: &ExportArgs) -> anyhow::Result<()> {
 }
 
 fn import_cmd(args: &ImportArgs) -> anyhow::Result<()> {
-    use cp_findings_import::FileOutcome;
-    let global = crate::paths::global_dir()?;
-    let req = cp_findings_import::ImportRequest {
+    use rupu_findings_report::import_files::{FileOutcome, ImportPlan, ImportRequest};
+    let plan = ImportPlan::find(ImportRequest {
         paths: args.paths.clone(),
         id: args.id.clone(),
         dry_run: args.dry_run,
         id_flag: "--id",
-    };
-    let report = cp_findings_import::import_reports(&global, &req)?;
-    for w in &report.warnings {
+        max_entries: None,
+    })?;
+    let global = crate::paths::global_dir()?;
+    let (opts, warning) = rupu_runtime::findings_opts::global_options(&global);
+    if let Some(w) = warning {
         crate::output::diag::warn(&crate::output::diag::prefs_for_diag(false), w);
     }
+    let report = plan.run(&cp_findings::finding_ledgers(&global), &opts);
     let verb = if args.dry_run {
         "would attach"
     } else {

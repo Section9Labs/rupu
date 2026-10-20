@@ -331,6 +331,17 @@ async fn a_dry_run_import_reports_what_would_attach_and_writes_nothing() {
     );
     assert_eq!(ledger(tmp.path()), before);
     assert!(backups(tmp.path()).is_empty());
+    // Not even the lock file: a dry run takes no lock.
+    let target = CoveragePaths::new(&repo(tmp.path()), TARGET).root;
+    assert!(!target.join("findings.jsonl.lock").exists());
+    let names: Vec<String> = std::fs::read_dir(&target)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("findings.jsonl.")),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]

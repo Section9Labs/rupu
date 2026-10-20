@@ -23,6 +23,25 @@ pub fn base_options(global: &Path, cfg: &rupu_config::FindingsConfig) -> Finding
     }
 }
 
+/// [`base_options`] from the GLOBAL config's `[findings]`: the limits an
+/// import of finding reports writes under. An unreadable config gives the
+/// defaults, with the warning to show.
+pub fn global_options(global: &Path) -> (FindingWriteOptions, Option<String>) {
+    let cfg_path = global.join("config.toml");
+    let layers = rupu_config::LayerPaths::global_only(&cfg_path);
+    let (cfg, warning) = match rupu_config::layer_files_locked(layers) {
+        Ok(c) => (c.findings, None),
+        Err(e) => (
+            Default::default(),
+            Some(format!(
+                "cannot read {}: {e}; using the default findings limits",
+                cfg_path.display()
+            )),
+        ),
+    };
+    (base_options(global, &cfg), warning)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
