@@ -1,6 +1,9 @@
 // Build › Autoflows — autoflow-enabled workflow definitions.
 // Shows the static list of workflows that have autoflow triggers configured,
-// filtered in the browser by the query line (`AUTOFLOW_DEF_FIELDS`).
+// filtered in the browser by the query line (`AUTOFLOW_DEF_FIELDS`). Each row
+// also carries Run now (an inline issue-ref field under the table, `POST
+// /api/autoflows/:name/run`) and Explain (a drawer, `GET
+// /api/autoflows/explain`) — Plan 3b mock §9.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Inbox, RefreshCw } from 'lucide-react';
@@ -17,6 +20,8 @@ import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { AUTOFLOW_DEF_FIELDS } from '../lib/query/lists/autoflowDefs';
+import { AutoflowRunNow } from '../components/admin/AutoflowRunNow';
+import { AutoflowExplainDrawer } from '../components/admin/AutoflowExplainDrawer';
 
 const ENABLED_CLS = 'bg-ok-bg text-ok ring-ok/30';
 const DISABLED_CLS = 'bg-surface text-ink-mute ring-border';
@@ -67,7 +72,13 @@ function TriggerChip({ trigger }: { trigger: string }) {
 // then the trailing action column (the Enable/Disable toggle). There is no
 // Runs/Tokens/Cost/Last-run data on this row type — those columns are not
 // fabricated (see the plan's "Out of scope" note).
-function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRow>[] {
+interface RowActions {
+  onToggle: (d: AutoflowDefRow) => void;
+  onRunNow: (d: AutoflowDefRow) => void;
+  onExplain: (d: AutoflowDefRow) => void;
+}
+
+function defColumns({ onToggle, onRunNow, onExplain }: RowActions): Column<AutoflowDefRow>[] {
   return [
     {
       key: 'name',
@@ -121,7 +132,7 @@ function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRo
       interactive: true,
       render: (d) => (
         <div
-          className="flex items-center justify-end"
+          className="flex items-center justify-end gap-1"
           onClick={(e) => {
             // The row is link-wrapped (rowHref) — without both of these,
             // this click either soft- or hard-navigates to the workflow
@@ -131,6 +142,12 @@ function defColumns(onToggle: (d: AutoflowDefRow) => void): Column<AutoflowDefRo
             e.stopPropagation();
           }}
         >
+          <Button variant="ring" onClick={() => onRunNow(d)} aria-label={`Run ${d.name} now`}>
+            Run now
+          </Button>
+          <Button variant="ring" onClick={() => onExplain(d)} aria-label={`Explain ${d.name}`}>
+            Explain
+          </Button>
           {d.enabled ? (
             <Button
               variant="ring-danger"
@@ -159,6 +176,10 @@ export default function AutoflowsDefs() {
   // shown in the same banner (mirrors Sessions.tsx / WorkflowRuns.tsx's
   // `actionError`).
   const [actionError, setActionError] = useState<string | null>(null);
+  // The row whose Run now field is open, and the Explain drawer's autoflow
+  // (with the issue it opens on, when Run now started one).
+  const [runFor, setRunFor] = useState<AutoflowDefRow | null>(null);
+  const [explain, setExplain] = useState<{ name: string; issueRef?: string } | null>(null);
 
   const load = useCallback(async () => {
     setRefreshing(true);
@@ -194,7 +215,11 @@ export default function AutoflowsDefs() {
     }
   }
 
-  const columns = defColumns(handleToggle);
+  const columns = defColumns({
+    onToggle: (d) => void handleToggle(d),
+    onRunNow: setRunFor,
+    onExplain: (d) => setExplain({ name: d.name }),
+  });
 
   const [q, setQ] = useListQuery();
   const all = useMemo(() => (defs ?? []).slice().sort((a, b) => a.name.localeCompare(b.name)), [defs]);
@@ -264,9 +289,25 @@ export default function AutoflowsDefs() {
                   scroll for more
                 </div>
               )}
+              {runFor && (
+                <AutoflowRunNow
+                  key={runFor.slug}
+                  name={runFor.name}
+                  onExplain={(issueRef) => setExplain({ name: runFor.name, issueRef })}
+                  onClose={() => setRunFor(null)}
+                />
+              )}
             </section>
           )}
         </>
+      )}
+      {explain && (
+        <AutoflowExplainDrawer
+          key={`${explain.name}:${explain.issueRef ?? ''}`}
+          autoflow={explain.name}
+          initialRef={explain.issueRef}
+          onClose={() => setExplain(null)}
+        />
       )}
     </div>
   );
