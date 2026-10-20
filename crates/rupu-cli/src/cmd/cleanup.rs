@@ -1,10 +1,8 @@
-use crate::cmd::session::prune_archived_sessions;
-use crate::cmd::transcript::prune_archived_transcripts;
 use crate::output::formats::OutputFormat;
 use crate::output::report::{self, CollectionOutput};
-use anyhow::Context;
 use clap::Args as ClapArgs;
 use comfy_table::Cell;
+use rupu_orchestrator::cleanup::{cleanup_report, CleanupReport, CleanupSelection};
 use serde::Serialize;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -27,16 +25,6 @@ pub struct Args {
 }
 
 #[derive(Serialize)]
-struct CleanupRow {
-    kind: String,
-    id: String,
-    scope: String,
-    retained_at: String,
-    action: String,
-    detail: String,
-}
-
-#[derive(Serialize)]
 struct CleanupCsvRow {
     kind: String,
     id: String,
@@ -44,13 +32,6 @@ struct CleanupCsvRow {
     retained_at: String,
     action: String,
     detail: String,
-}
-
-#[derive(Serialize)]
-struct CleanupReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<CleanupRow>,
 }
 
 struct CleanupOutput {
@@ -184,15 +165,27 @@ async fn run(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<
     if args.stats {
         return render_stats(args, global_format).await;
     }
-    let include_sessions = args.sessions || !args.transcripts;
-    let include_transcripts = args.transcripts || !args.sessions;
-    let rows = cleanup_rows(
+    let selection = CleanupSelection {
+        sessions: args.sessions || !args.transcripts,
+        transcripts: args.transcripts || !args.sessions,
+    };
+    let global = crate::paths::global_dir()?;
+    // Only a transcript prune reads the working directory's project.
+    let project_root = if selection.transcripts {
+        crate::paths::project_root_for(&std::env::current_dir()?)?
+    } else {
+        None
+    };
+    let report = cleanup_report(
+        &global,
+        project_root.as_deref(),
         args.older_than.as_deref(),
         args.dry_run,
-        include_sessions,
-        include_transcripts,
+        selection,
+        &mut |warning| eprintln!("{warning}"),
     )?;
-    let csv_rows = rows
+    let csv_rows = report
+        .rows
         .iter()
         .map(|row| CleanupCsvRow {
             kind: row.kind.clone(),
@@ -203,73 +196,8 @@ async fn run(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<
             detail: row.detail.clone(),
         })
         .collect();
-    let output = CleanupOutput {
-        report: CleanupReport {
-            kind: "cleanup",
-            version: 1,
-            rows,
-        },
-        csv_rows,
-    };
+    let output = CleanupOutput { report, csv_rows };
     report::emit_collection(global_format, &output)
-}
-
-/// `rupu cleanup`'s JSON report (archived sessions and transcripts), for the
-/// control plane's `POST /api/maintenance/prune {kind: cleanup}`.
-pub(crate) fn cleanup_json(
-    older_than: Option<&str>,
-    dry_run: bool,
-) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::to_value(CleanupReport {
-        kind: "cleanup",
-        version: 1,
-        rows: cleanup_rows(older_than, dry_run, true, true)?,
-    })?)
-}
-
-fn cleanup_rows(
-    older_than: Option<&str>,
-    dry_run: bool,
-    include_sessions: bool,
-    include_transcripts: bool,
-) -> anyhow::Result<Vec<CleanupRow>> {
-    let mut rows = Vec::new();
-    if include_sessions {
-        for session in
-            prune_archived_sessions(older_than, dry_run).context("cleanup archived sessions")?
-        {
-            rows.push(CleanupRow {
-                kind: "session".into(),
-                id: session.session_id,
-                scope: session.scope,
-                retained_at: session.updated_at,
-                action: session.action,
-                detail: format!("status {}", session.status),
-            });
-        }
-    }
-    if include_transcripts {
-        for transcript in prune_archived_transcripts(older_than, dry_run)
-            .context("cleanup archived transcripts")?
-            .rows
-        {
-            rows.push(CleanupRow {
-                kind: "transcript".into(),
-                id: transcript.run_id,
-                scope: transcript.scope,
-                retained_at: transcript.archived_at,
-                action: transcript.action,
-                detail: transcript.location,
-            });
-        }
-    }
-    rows.sort_by(|a, b| {
-        a.kind
-            .cmp(&b.kind)
-            .then_with(|| a.id.cmp(&b.id))
-            .then_with(|| a.scope.cmp(&b.scope))
-    });
-    Ok(rows)
 }
 
 async fn render_stats(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<()> {

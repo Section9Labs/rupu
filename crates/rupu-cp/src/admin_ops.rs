@@ -1,37 +1,33 @@
-//! Port: the operations whose logic still lives in rupu-cli. rupu-cp defines
-//! it; rupu-cli's `cp serve` implements it (`cp_admin_ops.rs`) over the
-//! functions the CLI commands run, so the API and the CLI share one
-//! implementation. `None` → those endpoints answer 501.
+//! Port: the two operations that can't run in a library call. rupu-cp
+//! defines it; rupu-cli's `cp serve` implements it (`cp_admin_ops.rs`).
+//! `None` → those endpoints answer 501.
 //!
-//! - `cron_tick` and `autoflow_run`: they run a workflow / spawn a `rupu`
-//!   child, which needs the CLI's workflow runtime.
-//! - The autoflow reads (`autoflow_show|explain|doctor|wakes`),
-//!   `autoflow_repair`, and the session prunes (`sessions`, `cleanup`):
-//!   their logic is still in `cmd/autoflow.rs` and `cmd/session.rs`, to be
-//!   extracted into libraries (operator MCP Plan 3a, package E follow-up).
+//! - `cron_tick` runs due workflows through the CLI's workflow runtime,
+//!   single-flight with `cp serve`'s own cron loop.
+//! - `autoflow_run` spawns a detached `rupu autoflow run` child.
 //!
-//! The cron listings and the transcript / netflow prunes are served from
-//! their libraries directly (`rupu_orchestrator::cron_triggers`,
-//! `rupu_orchestrator::archived_transcripts`, [`crate::netflow_prune`]).
+//! Everything else the autoflow, cron and maintenance endpoints do is
+//! served from its library directly: the autoflow reads, repair and the run
+//! precheck from `rupu_autoflow`, the cron listings from
+//! `rupu_orchestrator::cron_triggers`, the prunes from
+//! `rupu_orchestrator::{archived_transcripts, cleanup}`,
+//! `rupu_runtime::sessions` and [`crate::netflow_prune`].
 //!
-//! Every report is the JSON the CLI command prints with `--format json`
-//! (its `kind` + `version` + rows/item), carried through as it is.
+//! This module also holds what those endpoints share: [`local_only`],
+//! [`full_issue_ref`], [`HostQuery`], and [`blocking`], which runs a library
+//! call off the executor and maps its refusals onto statuses.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-/// Why an operation was refused, by the status the endpoint answers.
+/// Why a port operation was refused, by the status the endpoint answers.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdminOpError {
-    /// 400: an argument the operation can't take (a bad issue ref, a bad
-    /// duration, conflicting flags).
+    /// 400: an argument the operation can't take (a mode autoflows don't
+    /// run in).
     #[error("{0}")]
     Invalid(String),
-    /// 404: nothing by that name (no visible autoflow, no claim).
-    #[error("{0}")]
-    NotFound(String),
-    /// 409: the state forbids it now (an ambiguous autoflow name, a claim
-    /// another cycle holds, a tick already running).
+    /// 409: the state forbids it now (a tick already running).
     #[error("{0}")]
     Conflict(String),
     /// 500: the operation failed.
@@ -50,18 +46,6 @@ pub struct AutoflowRunRequest {
     pub repo: Option<String>,
     /// `--mode`: `bypass` | `readonly`.
     pub mode: Option<String>,
-}
-
-/// `POST /api/autoflows/claims/repair`: `rupu autoflow repair <ref>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepairRequest {
-    pub issue_ref: String,
-    /// Release the claim after repairing.
-    pub release: bool,
-    /// Queue a follow-up wake after repairing.
-    pub requeue: bool,
-    /// Report what would be repaired; change nothing.
-    pub dry_run: bool,
 }
 
 /// `POST /api/cron/tick`: `rupu cron tick`.
@@ -83,63 +67,12 @@ pub enum CronTickOutcome {
     DryRun(serde_json::Value),
 }
 
-/// What `POST /api/maintenance/prune` removes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PruneKind {
-    /// Archived standalone transcripts (`rupu transcript prune`).
-    Transcripts,
-    /// Archived sessions (`rupu session prune`).
-    Sessions,
-    /// Netflow ledgers (`rupu netflow prune`).
-    Netflow,
-    /// Archived sessions and transcripts together (`rupu cleanup`).
-    Cleanup,
-}
-
-impl PruneKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Transcripts => "transcripts",
-            Self::Sessions => "sessions",
-            Self::Netflow => "netflow",
-            Self::Cleanup => "cleanup",
-        }
-    }
-}
-
-/// `POST /api/maintenance/prune`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PruneRequest {
-    pub kind: PruneKind,
-    /// `--older-than` (`30d`, `12h`, `1w`); `None` = the command's default.
-    pub older_than: Option<String>,
-    pub dry_run: bool,
-}
-
 #[async_trait]
 pub trait AdminOps: Send + Sync {
-    /// `rupu autoflow show <name> [--repo]`: the `autoflow_show` report.
-    async fn autoflow_show(
-        &self,
-        name: &str,
-        repo: Option<&str>,
-    ) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu autoflow explain <ref> [--repo]`: the `autoflow_explain` report.
-    async fn autoflow_explain(
-        &self,
-        issue_ref: &str,
-        repo: Option<&str>,
-    ) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu autoflow doctor [--repo]`: the `autoflow_doctor` report.
-    async fn autoflow_doctor(&self, repo: Option<&str>) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu autoflow wakes [--repo]`: the `autoflow_wakes` report.
-    async fn autoflow_wakes(&self, repo: Option<&str>) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu autoflow repair`: `{issue_ref, dry_run, repairs}`.
-    async fn autoflow_repair(&self, req: RepairRequest) -> Result<serde_json::Value, AdminOpError>;
-    /// Check that the cycle can start (the autoflow resolves for the issue,
-    /// no other cycle holds its claim), then start `rupu autoflow run`
-    /// detached. Returns `{name, issue}` once the child is spawned.
+    /// Start `rupu autoflow run` detached. The endpoint has already run
+    /// `rupu_autoflow::run_precheck` (the autoflow resolves for the issue,
+    /// no other cycle holds its claim). Returns `{name, issue}` once the
+    /// child is spawned.
     async fn autoflow_run(
         &self,
         req: AutoflowRunRequest,
@@ -147,17 +80,12 @@ pub trait AdminOps: Send + Sync {
     /// The tick `cp serve`'s cron loop runs. Single-flight with that loop:
     /// [`AdminOpError::Conflict`] while a tick is in progress.
     async fn cron_tick(&self, req: CronTickRequest) -> Result<CronTickOutcome, AdminOpError>;
-    /// `rupu session prune` (`kind: sessions`) or `rupu cleanup` (`kind:
-    /// cleanup`): the command's JSON report. Only those two kinds reach the
-    /// port; the control plane prunes transcripts and netflow itself.
-    async fn prune_sessions(&self, req: PruneRequest) -> Result<serde_json::Value, AdminOpError>;
 }
 
 impl From<AdminOpError> for crate::error::ApiError {
     fn from(e: AdminOpError) -> Self {
         match e {
             AdminOpError::Invalid(m) => Self::bad_request(m),
-            AdminOpError::NotFound(m) => Self::not_found(m),
             AdminOpError::Conflict(m) => Self::conflict(m),
             AdminOpError::Failed(m) => Self::internal(m),
         }
@@ -199,9 +127,64 @@ pub(crate) fn full_issue_ref(value: &str) -> crate::error::ApiResult<String> {
         })
 }
 
+/// An autoflow library failure as its status: a [`rupu_autoflow::Refusal`]
+/// anywhere in the chain is its 400 / 404 / 409 (its own message), anything
+/// else a 500 with the whole chain.
+pub(crate) fn autoflow_error(e: anyhow::Error) -> crate::error::ApiError {
+    use rupu_autoflow::Refusal;
+    match rupu_autoflow::refusal_of(&e) {
+        Some(Refusal::Invalid(m)) => crate::error::ApiError::bad_request(m.clone()),
+        Some(Refusal::NotFound(m)) => crate::error::ApiError::not_found(m.clone()),
+        Some(Refusal::Conflict(m)) => crate::error::ApiError::conflict(m.clone()),
+        None => crate::error::ApiError::internal(format!("{e:#}")),
+    }
+}
+
+/// Run a synchronous autoflow library call on the blocking pool, its
+/// failure mapped by [`autoflow_error`].
+pub(crate) async fn blocking<T, F>(f: F) -> crate::error::ApiResult<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| crate::error::ApiError::internal(format!("task panicked: {e}")))?
+        .map_err(autoflow_error)
+}
+
 /// `?host=` on a local-only operation.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct HostQuery {
     /// A host id; only `local` (or none) is served, any other is a 501.
     pub(crate) host: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use rupu_autoflow::Refusal;
+
+    #[test]
+    fn a_library_refusal_keeps_its_status_and_message() {
+        for (refusal, status) in [
+            (Refusal::Invalid("bad ref".into()), StatusCode::BAD_REQUEST),
+            (Refusal::NotFound("no claim".into()), StatusCode::NOT_FOUND),
+            (Refusal::Conflict("held".into()), StatusCode::CONFLICT),
+        ] {
+            let message = refusal.to_string();
+            let e = anyhow::Error::from(refusal).context("repair");
+            let got = autoflow_error(e);
+            assert_eq!((got.0, got.1), (status, message));
+        }
+        let got = autoflow_error(anyhow::anyhow!("disk on fire").context("doctor"));
+        assert_eq!(
+            (got.0, got.1),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "doctor: disk on fire".into()
+            )
+        );
+    }
 }

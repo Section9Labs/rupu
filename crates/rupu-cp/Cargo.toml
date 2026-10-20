@@ -55,6 +55,7 @@ rupu-launch = { workspace = true }
 rupu-config = { path = "../rupu-config" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-workspace = { path = "../rupu-workspace" }
+rupu-autoflow = { workspace = true }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-auth = { path = "../rupu-auth" }
