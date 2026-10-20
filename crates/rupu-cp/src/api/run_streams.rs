@@ -490,8 +490,8 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
     // when it's present and the process is still alive, the run is
     // running right now, no matter how stale the on-disk metadata looks.
     // No pid at all (legacy metadata, or the process has already
-    // exited and nothing has updated the row) falls through to `None`
-    // exactly as before — never guessed at.
+    // exited) falls through to the run's record below, else `None` —
+    // never guessed at.
     //
     // `pid_is_running` is a `kill(2)` syscall, so every pid-bearing row is
     // resolved. A pid repeated across multiple rows (e.g. two session-turn
@@ -522,6 +522,23 @@ fn collect_standalone_runs(global_dir: &std::path::Path) -> Vec<AgentRunRow> {
         };
         if live {
             row.status = Some("running".to_string());
+        }
+    }
+
+    // A `rupu run` that is not running records how it ended in its
+    // `runs/<id>/run.json` (written at its end — a failed one too, including
+    // a `--run-id` launch whose provider never built). Read through the
+    // stat-validated record cache; a run with no finished record (legacy, a
+    // session turn, a crashed run) keeps `None`.
+    let store = rupu_orchestrator::RunStore::new(global_dir.join("runs"));
+    for (row, _) in &mut drafts {
+        if row.status.is_some() || row.trigger_source.as_deref() == Some("session_turn") {
+            continue;
+        }
+        if let Ok(rec) = store.load(&row.run_id) {
+            if rec.finished_at.is_some() {
+                row.status = Some(rec.status.as_str().to_string());
+            }
         }
     }
 

@@ -358,3 +358,125 @@ async fn list_agent_runs_empty_when_no_dirs() {
         "no data seeded, response should be []; got {arr:?}"
     );
 }
+
+/// What a `rupu run --run-id <id>` the CP launched leaves when its provider
+/// can't be built (no credential): its metadata, the transcript
+/// `AssembleError::record_unstarted` writes for the real missing-credential
+/// error, and a failed run.json. `rupu-cli`'s
+/// `run_id_launch_without_credentials_records_a_failed_run` pins that the
+/// CLI writes exactly these.
+async fn seed_unstarted_run(global: &std::path::Path, run_id: &str) {
+    seed_standalone_meta(global, run_id);
+    let transcript = global.join("transcripts").join(format!("{run_id}.jsonl"));
+    let source = match rupu_runtime::provider_factory::build_for_provider(
+        "anthropic",
+        "claude-sonnet-4-6",
+        None,
+        &rupu_auth::in_memory::InMemoryResolver::new(),
+        std::sync::Arc::new(rupu_netflow::NullSink),
+    )
+    .await
+    {
+        Ok(_) => panic!("no credential: the provider must not build"),
+        Err(e) => e,
+    };
+    let failure = rupu_runtime::assembly::AssembleError::ProviderBuild {
+        provider: "anthropic".into(),
+        model: "claude-sonnet-4-6".into(),
+        source,
+    }
+    .record_unstarted(rupu_agent::UnstartedRun {
+        transcript_path: &transcript,
+        run_id,
+        workspace_id: "ws_1",
+        agent: "echo",
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+        mode: rupu_tools::PermissionMode::Bypass,
+        codename: None,
+        customer: None,
+        system_prompt: Some("you echo."),
+        prompt: &rupu_agent::UserTurn::new("go".to_string()),
+        launch_skills: &[],
+        launch_preload_skills: &[],
+    });
+
+    let now = Utc::now();
+    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let record: rupu_orchestrator::RunRecord = serde_json::from_value(serde_json::json!({
+        "id": run_id,
+        "workflow_name": format!("{}echo", rupu_orchestrator::AGENT_RUN_PREFIX),
+        "status": "failed",
+        "inputs": {},
+        "workspace_id": "ws_1",
+        "workspace_path": "/tmp/repo",
+        "transcript_dir": global.join("transcripts"),
+        "started_at": now,
+        "finished_at": now,
+        "error_message": failure.to_string(),
+    }))
+    .unwrap();
+    store.create(record, "").unwrap();
+}
+
+/// A `--run-id` launch that failed before its agent loop started (no
+/// credential) is listed under its id as `failed`, and its transcript reads
+/// the real error with the `rupu auth login` hint.
+#[tokio::test]
+async fn unstarted_agent_run_is_listed_failed_with_its_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run_id = "run_unstarted_01";
+    seed_unstarted_run(tmp.path(), run_id).await;
+    // A run with no run.json (legacy, or a session turn) keeps no status.
+    seed_standalone_meta(tmp.path(), "run_no_record_02");
+
+    let addr = spawn_server(tmp.path()).await;
+    let body: serde_json::Value = reqwest::get(format!("http://{addr}/api/runs/agents"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = body.as_array().expect("an array of rows");
+    let row = rows
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some(run_id))
+        .expect("the unstarted run is listed");
+    assert_eq!(row["status"].as_str(), Some("failed"), "row: {row}");
+    assert_eq!(row["agent"].as_str(), Some("echo"));
+    let unrecorded = rows
+        .iter()
+        .find(|r| r["run_id"].as_str() == Some("run_no_record_02"))
+        .expect("a run without a record is still listed");
+    assert!(unrecorded["status"].is_null(), "no record, no status");
+
+    let failed: serde_json::Value =
+        reqwest::get(format!("http://{addr}/api/runs/agents?lifecycle=failed"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let failed_ids: Vec<_> = failed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["run_id"].as_str())
+        .collect();
+    assert_eq!(failed_ids, [run_id]);
+
+    let transcript = row["transcript_path"].as_str().unwrap();
+    let text = reqwest::Client::new()
+        .get(format!("http://{addr}/api/transcript"))
+        .query(&[("path", transcript)])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        text.contains("rupu auth login --provider anthropic"),
+        "the transcript carries the error and its hint: {text}"
+    );
+}
