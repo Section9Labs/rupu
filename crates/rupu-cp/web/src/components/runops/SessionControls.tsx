@@ -102,8 +102,7 @@ export function SessionControls({
       {confirmStop && (
         <DialogFrame title="Stop this session?" onRequestClose={() => setConfirmStop(false)}>
           <p className="mt-1.5 text-ui text-ink-dim">
-            Ends the session’s worker and any turn it is running, and marks the session stopped. Sending a message
-            later starts it again.
+            Ends the session’s worker and any turn it is running, and marks the session stopped.
           </p>
           <div className="mt-4 flex justify-end gap-2">
             <Button variant="secondary" onClick={() => setConfirmStop(false)}>

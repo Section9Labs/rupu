@@ -30,7 +30,7 @@ import {
   type RunListRow,
   type RunStatusStr,
 } from '../api';
-import { runsApi } from '../api3b/runs';
+import { isAgentRunRecord, runsApi } from '../api3b/runs';
 import {
   activeSnoozes,
   addDismissed,
@@ -272,7 +272,7 @@ export function useInbox(customer?: CustomerScope): UseInbox {
 
   const retry = useCallback(
     (item: InboxItem) => {
-      if (item.host !== 'local') return;
+      if (item.host !== 'local' || isAgentRunRecord(item.workflowName)) return;
       setRetryErrors(({ [item.id]: _drop, ...rest }) => rest);
       setPending((p) => ({ ...p, [item.id]: 'retry' }));
       runsApi.retryRun(item.id, {}).then(

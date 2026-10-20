@@ -21,6 +21,7 @@ import { WaitBar } from './WaitBar';
 import { SnoozeMenu } from './SnoozeMenu';
 import { formatDuration } from '../../lib/duration';
 import { runHref } from '../../lib/runs';
+import { isAgentRunRecord } from '../../lib/api3b/runs';
 import type { InboxItem, SnoozedEntry, UseInbox } from '../../lib/dashboard/useInbox';
 import { ChevronRight } from 'lucide-react';
 
@@ -153,6 +154,7 @@ function Row({
           </Button>
         )}
         {item.kind === 'failed' &&
+          !isAgentRunRecord(item.workflowName) &&
           (data.retryRequested[item.id] ? (
             <StatusChip tone="running" dot>
               retry requested

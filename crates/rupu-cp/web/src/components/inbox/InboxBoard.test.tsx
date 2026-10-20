@@ -157,4 +157,10 @@ describe('InboxBoard', () => {
     expect(btn).toBeDisabled();
     expect(btn).toHaveAttribute('title', expect.stringContaining('local-only'));
   });
+  it('a failed standalone agent run offers no Retry (it is continued, not retried)', () => {
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed', workflowName: 'agent:code-reviewer' });
+    wrap(<InboxBoard data={base({ failures: [it0] })} />);
+    expect(screen.getByRole('link', { name: 'View run' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
 });

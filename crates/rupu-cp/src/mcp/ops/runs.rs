@@ -211,7 +211,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.retry",
             Method::POST,
             "/api/runs/:id/retry",
-            "Retry a failed, rejected or cancelled workflow run (`rupu workflow resume`).\n\n`id` is the run id; `restart_interrupted` starts interrupted steps and units over instead of continuing them; `mode` (ask|bypass|readonly) overrides the run's own launch mode, which it keeps otherwise. A run left running by a dead runner is marked failed first and retried. Answers 202 `{run_id, retrying, restart_interrupted, host_id}` once the resume is spawned: watch the run's status. 409 for a running, paused (use runs.resume), awaiting-approval or completed run; local-only (a remote `host` is a 501).",
+            "Retry a failed, rejected or cancelled workflow run (`rupu workflow resume`).\n\n`id` is the run id; `restart_interrupted` starts interrupted steps and units over instead of continuing them; `mode` (ask|bypass|readonly) overrides the run's own launch mode, which it keeps otherwise. A run left running by a dead runner is marked failed first and retried. Answers 202 `{run_id, retrying, restart_interrupted, host_id}` once the resume is spawned: watch the run's status. 409 for a running, paused (use runs.resume), awaiting-approval or completed run, and for a standalone agent run (use agent_runs.continue); local-only (a remote `host` is a 501).",
         )
         .query::<runs::RunControlQuery>()
         .body::<runs::RetryBody>()

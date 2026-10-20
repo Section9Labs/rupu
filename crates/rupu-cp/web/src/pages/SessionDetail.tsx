@@ -585,6 +585,8 @@ export default function SessionDetailPage() {
             <div className="text-ui text-ink-dim">
               {stopped ? (
                 <span>Session is stopped — sending is disabled.</span>
+              ) : compacting ? (
+                <span>Compacting — sending is disabled until it ends.</span>
               ) : sendOk ? (
                 <span className="text-ok">Sent — turn queued.</span>
               ) : (

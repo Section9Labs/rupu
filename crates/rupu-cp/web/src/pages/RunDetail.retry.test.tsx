@@ -16,7 +16,10 @@ vi.mock('../components/RunGraph', () => ({ __esModule: true, default: () => <div
 vi.mock('../components/TranscriptPanel', () => ({ __esModule: true, default: () => <div /> }));
 vi.mock('../components/run/StepTranscriptBrowser', () => ({ __esModule: true, default: () => <div /> }));
 vi.mock('../components/RunEventFeed', () => ({ __esModule: true, default: () => <div /> }));
-vi.mock('../components/charts/RunUsageTimeline', () => ({ __esModule: true, default: () => <div /> }));
+vi.mock('../components/charts/RunUsageTimeline', () => ({
+  __esModule: true,
+  default: ({ series }: { series: unknown[] }) => <div data-testid="usage-timeline">{series.length} points</div>,
+}));
 
 import RunDetail from './RunDetail';
 
@@ -88,6 +91,13 @@ describe('RunDetail retry', () => {
     expect(screen.queryByRole('button', { name: /^retry/i })).not.toBeInTheDocument();
   });
 
+  it('offers no Retry on a standalone agent run\'s record', async () => {
+    stubBase(graphFor({ workflow_name: 'agent:code-reviewer' }));
+    renderAt();
+    await screen.findByRole('button', { name: /archive/i });
+    expect(screen.queryByRole('button', { name: /^retry/i })).not.toBeInTheDocument();
+  });
+
   it('defaults the mode to the recorded one and retries without overriding it', async () => {
     stubBase(graphFor({ permission_mode: 'readonly' }));
     const retry = vi
@@ -125,8 +135,10 @@ describe('RunDetail retry', () => {
     await waitFor(() => expect(retry).toHaveBeenCalledWith('run_01X', { mode: 'bypass', restartInterrupted: true }));
   });
 
-  it('turns live once the run record says the retry took it', async () => {
+  it('turns live once the run record says the retry took it, and re-reads the run', async () => {
     stubBase(graphFor({}));
+    const graph = api.getRunGraph as unknown as ReturnType<typeof vi.fn>;
+    const subscribe = api.subscribeRunLog as unknown as ReturnType<typeof vi.fn>;
     vi.spyOn(runsApi, 'retryRun').mockResolvedValue({
       run_id: 'run_01X',
       retrying: true,
@@ -141,9 +153,70 @@ describe('RunDetail retry', () => {
     renderAt();
     fireEvent.click(within(await openRetry()).getByRole('button', { name: 'Retry' }));
     await screen.findByText('retry requested');
-    // The poll sees `running`: the chip goes and the live header (Cancel) shows.
+    graph.mockResolvedValue(graphFor({ status: 'running', finished_at: null, error_message: null }));
+    // The poll sees `running`: the graph and the event stream are read
+    // afresh, the chip goes and the live header (Cancel) shows.
     expect(await screen.findByRole('button', { name: 'Cancel run' }, { timeout: 4000 })).toBeInTheDocument();
     expect(screen.queryByText('retry requested')).not.toBeInTheDocument();
+    expect(subscribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-reads the run when the retried run settles, dropping the old failure', async () => {
+    stubBase(graphFor({ error_message: 'step scan failed: provider returned 529' }));
+    const graph = api.getRunGraph as unknown as ReturnType<typeof vi.fn>;
+    vi.spyOn(runsApi, 'retryRun').mockResolvedValue({
+      run_id: 'run_01X',
+      retrying: true,
+      restart_interrupted: false,
+      host_id: 'local',
+    });
+    const getRun = vi.spyOn(api, 'getRun').mockResolvedValue({
+      run: graphFor({ status: 'running', finished_at: null }).run,
+      steps: [],
+      usage: undefined as never,
+    });
+    // The live usage poll caught the retried run before it had spent anything.
+    const zero = { input_tokens: 0, output_tokens: 0, cached_tokens: 0, cache_write_tokens: 0, total_tokens: 0, cost_usd: 0, priced: true, partial: false };
+    vi.spyOn(api, 'getRunUsage').mockResolvedValue({
+      summary: zero as RunGraphResponse['usage'] & object,
+      steps: {},
+      turns: 0,
+      partial: false,
+      epoch: '1',
+      points_from: 0,
+      points: [],
+    } as never);
+    renderAt();
+    expect(await screen.findByText('step scan failed: provider returned 529')).toBeInTheDocument();
+    fireEvent.click(within(await openRetry()).getByRole('button', { name: 'Retry' }));
+    graph.mockResolvedValue(graphFor({ status: 'running', finished_at: null, error_message: null }));
+    await screen.findByRole('button', { name: 'Cancel run' }, { timeout: 4000 });
+    // It ends: the page follows it to the end and reads the finished run.
+    getRun.mockResolvedValue({ run: graphFor({ status: 'completed', error_message: null }).run, steps: [], usage: undefined as never });
+    (api.getRunUsageTimeline as unknown as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { label: 'scan', turn: 1, tokens_in: 2600, tokens_out: 80, tokens_cached: 0, tokens_cache_write: 0 },
+      { label: 'triage', turn: 2, tokens_in: 2600, tokens_out: 80, tokens_cached: 0, tokens_cache_write: 0 },
+    ] as never);
+    graph.mockResolvedValue({
+      ...graphFor({ status: 'completed', error_message: null }),
+      usage: {
+        input_tokens: 5200,
+        output_tokens: 160,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+        total_tokens: 5360,
+        cost_usd: 0.024,
+        priced: true,
+        partial: false,
+      } as RunGraphResponse['usage'],
+    });
+    expect(await screen.findByRole('button', { name: /archive/i }, { timeout: 4000 })).toBeInTheDocument();
+    expect(screen.queryByText('step scan failed: provider returned 529')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^retry/i })).not.toBeInTheDocument();
+    // The header's usage and the per-turn chart are the finished run's.
+    expect(screen.getByText('$0.0240')).toBeInTheDocument();
+    expect((api.getRunUsageTimeline as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+    await waitFor(() => expect(screen.getByTestId('usage-timeline')).toHaveTextContent('2 points'));
   });
 
   it('shows a 409 inline under the actions and keeps Retry', async () => {

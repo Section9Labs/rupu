@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 // Continue on a standalone agent run's transcript page (operator MCP Plan 3b,
-// UI-1, mock §2): a run that isn't running gets Continue, which opens a
+// UI-1, mock §2): a run that stopped short (failed, cancelled, interrupted)
+// gets Continue, which opens a
 // composer under the transcript with a "Model & provider" disclosure showing
 // the original values. The CP's continue takes no prompt (Plan 3a, package
 // B): it restores every flag of the original launch, and only a different
@@ -36,7 +37,7 @@ function agentRow(over: Partial<AgentRunRow> = {}): AgentRunRow {
     agent: 'code-reviewer',
     provider: 'anthropic',
     model: 'claude-opus-5-5',
-    status: 'completed',
+    status: 'cancelled',
     transcript_path: PATH,
     turns: 14,
     usage: undefined as never,
@@ -137,6 +138,13 @@ describe('RunTranscript continue', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
     fireEvent.click(screen.getByRole('button', { name: 'Continue run' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('run run_01JD2K is still running');
+  });
+
+  it('offers no Continue on a completed run (a continue would only print its answer)', async () => {
+    stub(agentRow({ status: 'completed' }));
+    renderAt();
+    await screen.findByRole('heading', { name: /code-reviewer/ });
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
   });
 
   it('offers no Continue while the run is running', async () => {

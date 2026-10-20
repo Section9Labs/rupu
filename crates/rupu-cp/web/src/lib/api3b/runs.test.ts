@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ApiError } from '../api';
-import { compactionLine, isRetryable, modeLabel, runsApi } from './runs';
+import { compactionLine, isAgentRunRecord, isRetryable, modeLabel, runsApi } from './runs';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -130,5 +130,12 @@ describe('compactionLine', () => {
     expect(compactionLine({ ...base, outcome: 'failed', detail: 'provider anthropic returned 529' })).toBe(
       'Compaction failed: provider anthropic returned 529',
     );
+  });
+});
+
+describe('isAgentRunRecord', () => {
+  it('names the run store records of standalone agent runs', () => {
+    expect(isAgentRunRecord('agent:code-reviewer')).toBe(true);
+    expect(isAgentRunRecord('security-review')).toBe(false);
   });
 });

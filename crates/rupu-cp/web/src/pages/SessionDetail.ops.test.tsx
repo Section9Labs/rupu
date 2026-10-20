@@ -126,6 +126,7 @@ describe('SessionDetail compact', () => {
     expect(box).toBeDisabled();
     expect(box.placeholder).toBe("The session is compacting; you can send again when it's done.");
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(screen.getByText('Compacting — sending is disabled until it ends.')).toBeInTheDocument();
   });
 
   it('shows the finished compaction as a line in the conversation', async () => {

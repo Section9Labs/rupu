@@ -19,6 +19,7 @@
 - **`rupu mcp serve` is deprecated.** It prints a notice and runs `rupu cp serve --no-web` on 127.0.0.1:7878; the stdio transport is gone (`--transport` and `--mode` are ignored).
 
 ### Fixed
+- **`POST /api/runs/:id/retry` refuses a standalone agent run** (409, pointing at `agent_runs.continue`). Its `agent:<name>` record lists beside workflow runs, and a retry answered 202 while the `workflow resume` it spawned died on the missing workflow, leaving a stale retry marker.
 - **`rupu workflow resume` of a failed, rejected or cancelled run keeps its launch mode.** With no `--mode`, a retry ran `ask` (with no prompter, so its steps could write and call external tools) whatever the run was launched with; it now resumes in the run's recorded mode, so a `readonly` run stays `readonly`.
 - **`rupu run --continue` of a run that never started** (its provider didn't build, e.g. no credentials) now restores the run's flags: the unstarted run's transcript records its command (`RunStart.launch_args`) like any other. Before, a continue on another provider lost them, `--mode` included, so a detached continuation refused to start in `ask` mode.
 

@@ -34,6 +34,13 @@ export function isRetryable(status: RunStatusStr | string): boolean {
   return status === 'failed' || status === 'rejected' || status === 'cancelled';
 }
 
+/** A run store record of a standalone agent run (`rupu run` records
+ *  `agent:<name>`): it lists beside workflow runs but is continued, not
+ *  retried (the retry endpoint answers 409). */
+export function isAgentRunRecord(workflowName: string): boolean {
+  return workflowName.startsWith('agent:');
+}
+
 /** `POST /api/runs/:id/retry` → 202. */
 export interface RetryResponse {
   run_id: string;

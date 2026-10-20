@@ -31,7 +31,7 @@ import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/ui/Button';
 import { StatusChip } from '../components/ui/StatusChip';
 import { RetryControl, type RetryChoice } from '../components/runops/RetryControl';
-import { asPermissionMode, isRetryable, runsApi } from '../lib/api3b/runs';
+import { asPermissionMode, isAgentRunRecord, isRetryable, runsApi } from '../lib/api3b/runs';
 import { TabBar, TabButton } from '../components/TabBar';
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
@@ -296,9 +296,19 @@ export default function RunDetail() {
 
   // Retry (failed / rejected / cancelled runs). Pending, not optimistic: after
   // the 202, `retryRequestedAt` holds until the run record shows the resume
-  // took the run (its marker consumed, or a non-retryable status).
+  // took the run (its marker consumed, or a non-retryable status); then
+  // `retryFollowing` holds while the retried run is live, so the page reads
+  // it afresh when it ends.
   const [retryPending, setRetryPending] = useState(false);
   const [retryRequestedAt, setRetryRequestedAt] = useState<number | null>(null);
+  const [retryFollowing, setRetryFollowing] = useState(false);
+  // Bumped to re-read the run's event stream from the start (a retried run
+  // replays its new attempt's events after the old ones, as a page load does).
+  const [streamGen, setStreamGen] = useState(0);
+  // The retried run ended and the graph (and the per-turn series) were read
+  // after it: their usage is the run's, where the live usage poll may hold a
+  // reading from mid-run.
+  const [usageFromGraph, setUsageFromGraph] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [retryStalled, setRetryStalled] = useState(false);
 
@@ -332,6 +342,8 @@ export default function RunDetail() {
     setActionError(null);
     setRetryPending(false);
     setRetryRequestedAt(null);
+    setRetryFollowing(false);
+    setUsageFromGraph(false);
     setRetryError(null);
     setRetryStalled(false);
     seededSelRef.current = false;
@@ -371,7 +383,7 @@ export default function RunDetail() {
     return () => {
       cancelled = true;
     };
-  }, [id, host]);
+  }, [id, host, streamGen]);
 
   // Autoflow-history context — independent of ?host= (the endpoint is
   // global-history-only today; see api.ts's getRunAutoflow doc comment).
@@ -433,7 +445,7 @@ export default function RunDetail() {
       host ? { host } : undefined,
     );
     return unsubscribe;
-  }, [id, host]);
+  }, [id, host, streamGen]);
 
   // Plain RunEvent[] for the model builder (drop the seq wrapper).
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
@@ -617,24 +629,43 @@ export default function RunDetail() {
   const { usage: liveUsage } = useRunUsage(id, host, runKnown && isRunning, { runKnown });
 
   // A requested retry: poll the run record until the resume has taken the run
-  // (its flip to Running consumes the marker the retry recorded), then show
-  // the live run. A marker that outlives RETRY_STALL_MS is a retry that never
+  // (its flip to Running consumes the marker the retry recorded), then follow
+  // the retried run until it ends. At each of those two points the page reads
+  // the run afresh (graph + event stream), so nothing from the failed attempt
+  // lingers. A marker that outlives RETRY_STALL_MS is a retry that never
   // started: say so and offer Retry again.
   useEffect(() => {
-    if (retryRequestedAt === null) return;
+    if (retryRequestedAt === null && !retryFollowing) return;
     let cancelled = false;
+    const reread = async () => {
+      const g = await api.getRunGraph(id);
+      if (cancelled) return;
+      setGraph(g);
+      setStreamGen((n) => n + 1);
+    };
     const tick = async () => {
       try {
         const { run: rec } = await api.getRun(id);
         if (cancelled) return;
-        if (!isRetryable(rec.status) || !rec.resume_requested_at) {
-          setRetryRequestedAt(null);
-          setLiveRunStatus(rec.status);
-          const g = await api.getRunGraph(id);
-          if (!cancelled) setGraph(g);
-        } else if (Date.now() - retryRequestedAt > RETRY_STALL_MS) {
-          setRetryRequestedAt(null);
-          setRetryStalled(true);
+        const live = rec.status === 'running' || rec.status === 'pending';
+        if (retryRequestedAt !== null) {
+          if (!isRetryable(rec.status) || !rec.resume_requested_at) {
+            // Re-read before moving the phase: the phase change re-runs this
+            // effect, whose cleanup would drop a read still in flight.
+            await reread();
+            if (cancelled) return;
+            setRetryRequestedAt(null);
+            setRetryFollowing(live);
+            setUsageFromGraph(!live);
+          } else if (Date.now() - retryRequestedAt > RETRY_STALL_MS) {
+            setRetryRequestedAt(null);
+            setRetryStalled(true);
+          }
+        } else if (!live) {
+          await reread();
+          if (cancelled) return;
+          setRetryFollowing(false);
+          setUsageFromGraph(true);
         }
       } catch {
         // A failed read keeps polling: the request is still recorded.
@@ -645,9 +676,9 @@ export default function RunDetail() {
       cancelled = true;
       window.clearInterval(t);
     };
-  }, [retryRequestedAt, id]);
+  }, [retryRequestedAt, retryFollowing, id]);
   // Usage for the header row: live summary, else the graph's one-shot numbers.
-  const displayUsage = liveUsage?.summary ?? graph?.usage;
+  const displayUsage = usageFromGraph ? (graph?.usage ?? liveUsage?.summary) : (liveUsage?.summary ?? graph?.usage);
   // Pause is only offered while the run is actively `running` (not merely
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
@@ -757,6 +788,7 @@ export default function RunDetail() {
     setRetryPending(true);
     setRetryError(null);
     setRetryStalled(false);
+    setUsageFromGraph(false);
     try {
       await runsApi.retryRun(run.id, choice);
       setRetryRequestedAt(Date.now());
@@ -990,6 +1022,7 @@ export default function RunDetail() {
             <div className="flex shrink-0 flex-col items-end gap-1">
               <div className="flex items-center gap-2">
                 {isRetryable(effectiveStatus) &&
+                  !isAgentRunRecord(run.workflow_name) &&
                   (retryRequestedAt !== null ? (
                     <StatusChip tone="running" dot className="mr-1">
                       retry requested
@@ -1384,7 +1417,7 @@ export default function RunDetail() {
           <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
             Token usage by turn
           </h2>
-          <RunUsageTimeline series={liveUsage?.points ?? series} separators />
+          <RunUsageTimeline series={(usageFromGraph ? null : liveUsage?.points) ?? series} separators />
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}

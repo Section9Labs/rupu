@@ -8,8 +8,11 @@
 // it (spec §3.3). Without it a sub-run opened from a remote run's panel 400s.
 //
 // A local standalone run's page also heads itself with the run (agent, status,
-// model, from its `/api/runs/agents` row) and, once the run isn't running,
-// offers Continue (operator MCP Plan 3b, UI-1, mock §2).
+// model, from its `/api/runs/agents` row) and, when the run stopped short of
+// finishing (failed, cancelled, interrupted), offers Continue (operator MCP
+// Plan 3b, UI-1, mock §2). A completed run has nothing to continue: the CP's
+// continue takes no prompt, and continuing a finished run only returns its
+// recorded answer.
 //
 // Route: /transcript (registered in App.tsx)
 
@@ -27,8 +30,9 @@ import { Button } from '../components/ui/Button';
 import { RunStatusChip } from '../components/ui/RunStatusChip';
 import { ContinueComposer } from '../components/runops/ContinueComposer';
 
-/** Statuses of a run that is still going: no Continue (the server 409s). */
-const LIVE_STATUSES = new Set(['running', 'pending', 'awaiting_approval']);
+/** Statuses with nothing to continue: still going (the server 409s) or
+ *  finished (a continue would only print the recorded answer). */
+const NOT_CONTINUABLE = new Set(['running', 'pending', 'awaiting_approval', 'completed', 'ok']);
 
 /** A standalone run's `/api/runs/agents` row (local only), re-read on demand. */
 function useAgentRunRow(runId: string | null): [AgentRunRow | null, () => void] {
@@ -94,7 +98,7 @@ export default function RunTranscript() {
   const label = path.split('/').filter(Boolean).pop() ?? 'Transcript';
   const childRunId = standaloneId;
   const status = row?.status ?? null;
-  const canContinue = !!row && !!childRunId && status !== null && !LIVE_STATUSES.has(status);
+  const canContinue = !!row && !!childRunId && status !== null && !NOT_CONTINUABLE.has(status);
 
   return (
     <div className="flex flex-col p-8 gap-4">
