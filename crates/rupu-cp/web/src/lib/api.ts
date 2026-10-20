@@ -104,6 +104,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await fetchJson<T>(path, init)).body;
 }
 
+/** The shared JSON request helper (auth, error mapping) for client modules
+ *  outside this file, e.g. `lib/api3b/*` (operator MCP Plan 3b). */
+export const apiRequest = request;
+
 /** The response header a customer-filtered fan-out (and a local listing that
  *  holds mirrored legacy runs) sets, naming — comma-separated host ids — the
  *  hosts it left out because it can't say whose some of their runs are

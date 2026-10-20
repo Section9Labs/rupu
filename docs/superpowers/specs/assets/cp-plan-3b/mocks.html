@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CP Plan 3b mocks</title>
+<style>
+  :root{
+    --bg:rgb(10 10 10); --panel:rgb(20 20 22); --surface:rgb(27 27 31);
+    --surface-hover:rgb(35 35 39); --surface-active:rgb(46 46 51);
+    --border:rgb(38 38 42); --border-strong:rgb(63 63 70);
+    --ink:rgb(245 245 245); --dim:rgb(161 161 170); --mute:rgb(113 113 122);
+    --brand:rgb(124 58 237); --brand-ink:rgb(167 139 250);
+    --run:rgb(96 165 250); --ok:rgb(74 222 128); --okbg:rgb(18 40 27);
+    --fail:rgb(248 113 113); --failbg:rgb(43 22 22); --warn:rgb(251 191 36); --warnbg:rgb(48 36 12);
+    --info:rgb(96 165 250); --infobg:rgb(20 32 54);
+    --sans:-apple-system,"system-ui",Inter,system-ui,sans-serif;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:13px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  main{padding:28px 36px 100px;max-width:1120px;margin:0 auto}
+  .doc-h{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--brand-ink);font-weight:700;margin-bottom:6px}
+  .doc-t{font-size:24px;font-weight:600;letter-spacing:-.01em;margin-bottom:8px}
+  .doc-s{color:var(--dim);font-size:14px;max-width:78ch;margin-bottom:8px}
+  .doc-s b{color:var(--ink)}
+  .sec{margin-top:44px}
+  .sec-label{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+  .sec-label h2{font-size:15px;font-weight:600}
+  .sec-label .n{font-size:11px;color:var(--mute);font-family:var(--mono)}
+  .cap{color:var(--dim);font-size:12.5px;margin-bottom:14px;max-width:80ch}
+  .cap b{color:var(--ink);font-weight:600}
+  .call{display:inline-block;font-size:10.5px;font-weight:700;color:var(--warn);background:var(--warnbg);border-radius:5px;padding:1px 6px;margin-left:6px;letter-spacing:.02em}
+
+  /* frame: a mini app window */
+  .frame{display:flex;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:var(--bg)}
+  .rail{width:150px;flex:0 0 150px;border-right:1px solid var(--border);background:var(--panel);padding:12px 8px;font-size:12px}
+  .rail .lg{display:flex;align-items:center;gap:7px;padding:2px 6px 12px;font-weight:600}
+  .rail .lg i{width:20px;height:20px;border-radius:6px;background:var(--brand);display:inline-block}
+  .ni{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;color:var(--dim)}
+  .ni.on{background:var(--surface);color:var(--ink);font-weight:500}
+  .ni .d{width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.5}
+  .pg{flex:1;min-width:0}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .pad{padding:16px 18px}
+  .ph{display:flex;align-items:flex-start;gap:14px;padding:16px 18px;border-bottom:1px solid var(--border);background:var(--panel)}
+  .ph .back{font-size:11.5px;color:var(--mute);margin-bottom:6px}
+  .ph h1{font-size:17px;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:10px}
+  .ph .sub{color:var(--dim);font-size:12.5px;margin-top:3px}
+  .ph .sub code,.mono{font-family:var(--mono);font-size:11.5px}
+  .spacer{flex:1}
+  .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+  .btn{font:inherit;font-size:12px;font-weight:500;border-radius:8px;padding:6px 12px;cursor:default;border:1px solid transparent;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .btn-primary{background:var(--ink);color:var(--bg);font-weight:600}
+  .btn-secondary{background:transparent;border-color:var(--border-strong);color:var(--dim)}
+  .btn-ghost{background:transparent;color:var(--dim);padding:6px 8px}
+  .btn-danger{background:transparent;border-color:rgb(248 113 113 / .4);color:var(--fail)}
+  .btn-danger-solid{background:var(--fail);color:#111;font-weight:600}
+  .btn-ring{background:transparent;border-color:var(--border-strong);color:var(--dim);padding:3px 9px;font-size:11px;border-radius:999px}
+  .btn[disabled]{opacity:.45}
+  .kbd{font-family:var(--mono);font-size:10px;color:var(--mute);border:1px solid var(--border-strong);border-radius:4px;padding:0 4px}
+
+  .seg{display:inline-flex;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:2px}
+  .seg span{font-size:11.5px;color:var(--dim);padding:4px 10px;border-radius:7px}
+  .seg span.on{background:var(--panel);color:var(--ink);font-weight:500}
+  .tabs{display:flex;gap:2px;padding:0 18px;border-bottom:1px solid var(--border);background:var(--panel)}
+  .tabs span{font-size:12px;color:var(--dim);padding:9px 10px;border-bottom:2px solid transparent}
+  .tabs span.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:500}
+  .tabs .div{width:1px;background:var(--border);margin:8px 6px}
+
+  .chip{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:999px;line-height:1.5;white-space:nowrap}
+  .chip .dot{width:6px;height:6px;border-radius:50%}
+  .chip.ok{background:var(--okbg);color:var(--ok)} .chip.ok .dot{background:var(--ok)}
+  .chip.run{background:rgb(96 165 250 /.14);color:var(--run)} .chip.run .dot{background:var(--run)}
+  .chip.fail{background:var(--failbg);color:var(--fail)} .chip.fail .dot{background:var(--fail)}
+  .chip.warn{background:var(--warnbg);color:var(--warn)} .chip.warn .dot{background:var(--warn)}
+  .chip.neutral{background:var(--surface);color:var(--dim)} .chip.neutral .dot{background:var(--mute)}
+  .chip.origin{background:rgb(124 58 237 /.16);color:var(--brand-ink)}
+
+  .box{border-radius:10px;padding:12px 14px;font-size:12.5px}
+  .box.err{background:var(--failbg);color:var(--fail);border:1px solid rgb(248 113 113 /.25)}
+  .box.warn{background:var(--warnbg);color:var(--warn);border:1px solid rgb(251 191 36 /.25)}
+  .box.info{background:var(--infobg);color:var(--info);border:1px solid rgb(96 165 250 /.25)}
+  .box.ok{background:var(--okbg);color:var(--ok);border:1px solid rgb(74 222 128 /.25)}
+  .box b{font-weight:600}
+  .box .mono{color:inherit;opacity:.9}
+
+  .list .row{display:flex;align-items:center;gap:12px;padding:10px 16px;border-top:1px solid var(--border)}
+  .list .row:first-child{border-top:0}
+  .list .row.hd{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);font-weight:600;padding:8px 16px;background:var(--surface)}
+  .code{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  .meta{color:var(--mute);font-size:11.5px}
+  .w1{width:140px;flex:0 0 140px}.w2{width:200px;flex:0 0 200px}.w3{width:110px;flex:0 0 110px}
+
+  .field{padding:10px 0}
+  .field .fl{font-size:12px;font-weight:600;margin-bottom:4px;display:flex;gap:8px;align-items:center}
+  .field .fh{font-size:11.5px;color:var(--mute);margin-top:4px}
+  .input{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 11px;color:var(--ink);font:inherit;font-size:12.5px;min-height:34px}
+  .input.mono{font-family:var(--mono);font-size:12px}
+  .input.ph{color:var(--mute)}
+  .input.area{min-height:72px}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+  .check{display:inline-flex;align-items:center;gap:7px;font-size:12px;color:var(--dim)}
+  .check i{width:14px;height:14px;border:1px solid var(--border-strong);border-radius:4px;display:inline-block}
+  .check i.on{background:var(--ink);border-color:var(--ink)}
+
+  .modalwrap{background:rgb(0 0 0 /.55);padding:28px;display:flex;justify-content:center}
+  .modal{width:560px;background:var(--panel);border:1px solid var(--border-strong);border-radius:14px;box-shadow:0 20px 60px rgb(0 0 0 /.5)}
+  .modal .mh{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center}
+  .modal .mh b{font-size:14px}
+  .modal .mb{padding:6px 18px 12px}
+  .modal .mf{padding:12px 18px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end;align-items:center}
+  .pop{background:var(--panel);border:1px solid var(--border-strong);border-radius:12px;box-shadow:0 12px 40px rgb(0 0 0 /.5);padding:12px 14px;width:320px}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .ann{font-size:11.5px;color:var(--mute);margin-top:8px;max-width:84ch}
+  .ann b{color:var(--dim)}
+
+  table.place{width:100%;border-collapse:collapse;font-size:12px}
+  table.place th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);font-weight:600;padding:8px 12px;background:var(--surface);border-bottom:1px solid var(--border)}
+  table.place td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top;color:var(--dim)}
+  table.place td:first-child{color:var(--ink);font-weight:500;width:26%}
+  table.place td code{font-family:var(--mono);font-size:11px;color:var(--brand-ink)}
+  .composer{border:1px solid var(--border-strong);border-radius:10px;background:var(--surface);padding:10px 12px}
+  .composer .ta{min-height:46px;color:var(--mute);font-size:12.5px}
+  .composer .bar{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .disc{font-size:11.5px;color:var(--dim);display:inline-flex;gap:6px;align-items:center}
+  .turn{padding:12px 16px;border-top:1px solid var(--border)}
+  .turn .who{font-size:11px;color:var(--mute);margin-bottom:4px}
+  .pre{font-family:var(--mono);font-size:11.5px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--dim);white-space:pre;overflow:hidden}
+</style>
+</head>
+<body>
+<main>
+  <div class="doc-h">Operator MCP · Plan 3b</div>
+  <div class="doc-t">Web UI for the Plan 3a capabilities: mocks for sign-off</div>
+  <p class="doc-s">Plan 3a gave the CP API and the MCP about 47 operations that until now only the CLI had (agentiflow launch, retry, continue, session stop and compact, skill installs, imports, cron, prune, accounts…). The spec says <b>every one also gets web UI</b>, designed for the human's task rather than mirroring the tool list, and <b>every new or changed page is mocked and approved before it is built</b>.</p>
+  <p class="doc-s">Every action goes on the page where its object already lives. Nothing gets a new top-level page; the only new places are a Library tab and two Settings tabs. Every destructive action previews or confirms first, and every write shows a <b>pending</b> state until the record actually changes, because a 202 means recorded, not done. The pieces marked <span class="call">MY CALL</span> are placement choices I made; tell me which to change.</p>
+
+  <!-- ============ placement table ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>Where each capability goes</h2><span class="n">47 tools → 12 surfaces</span></div>
+    <div class="card">
+      <table class="place">
+        <tr><th>Capability</th><th>Where</th><th>How</th></tr>
+        <tr><td>Retry a failed / rejected / cancelled workflow run</td><td>Run page header (§1), and the Inbox's "Recent failures" rows</td><td>Primary <b>Retry</b> opens a small popover: the mode (defaulting to the run's recorded mode) and "Restart interrupted steps". <code>runs.retry</code></td></tr>
+        <tr><td>Continue a standalone agent run</td><td>Agent run transcript page (§2)</td><td><b>Continue</b> opens a composer under the transcript: an optional prompt, plus Model / Provider under a disclosure. <code>agent_runs.continue</code></td></tr>
+        <tr><td>Stop / compact a session</td><td>Session page header (§3)</td><td><b>Compact</b> opens a small popover with a window field. <b>Stop</b> confirms. A "compacting" chip shows while it runs, and the composer is locked. <code>sessions.stop</code>, <code>sessions.compact</code></td></tr>
+        <tr><td>Launch / hard-stop an agentiflow</td><td>Agentiflows list header, Agentiflow page header (§4)</td><td><b>New agentiflow</b> opens the launcher sheet with a definition picker. On a running flow, <b>Stop</b> (at the round boundary) sits next to a danger <b>Stop now</b>. <code>agentiflows.run</code>, <code>agentiflows.stop</code></td></tr>
+        <tr><td>Agentiflow definitions: list, create, save, delete, validate</td><td>New <b>Library → Agentiflows</b> tab and a definition page <span class="call">MY CALL</span></td><td>Mirrors Library → Workflows: list, New, a YAML editor with a live server validity badge, and Save / Revert / Delete / Launch. <code>agentiflow_defs.*</code></td></tr>
+        <tr><td>Launch: model, provider, engagement profiles; YAML launch</td><td>The two existing launcher sheets (§5)</td><td>A "Model &amp; provider" disclosure on agent launches, and an "Engagement profiles" picker (each profile shows its bundle and asset kinds) on both. The New workflow modal gains a <b>Run without saving</b> button. <code>agents.run</code>, <code>workflows.run</code>, <code>workflows.run_yaml</code>, <code>engagement_profiles.*</code></td></tr>
+        <tr><td>Agent validation</td><td>Agent builder; Library → Agents</td><td>The builder's validity badge switches from its browser-only check to the server's (debounced, as workflows already do). Library → Agents gains <b>Validate all</b>, which opens a results drawer. <code>agents.validate</code>, <code>agents.validate_all</code></td></tr>
+        <tr><td>Install / update / validate skills</td><td>Library → Skills header, Skill page (§6)</td><td><b>Install skills</b> dialog (a preview of the skills found, then install). <b>Update</b> and <b>Validate</b> on each skill. <code>skills.install</code>, <code>skills.update</code>, <code>skills.validate</code></td></tr>
+        <tr><td>Stock fleet; project init</td><td>Library → Agents header; Projects header <span class="call">MY CALL</span></td><td><b>Install stock fleet</b> opens a dialog that lists every file with its status (installed, missing, edited), with a force toggle. <b>Initialize project</b> asks for a path and whether to add samples. <code>fleet.*</code>, <code>projects.init</code></td></tr>
+        <tr><td>Import findings; finding schema</td><td>Findings explorer, next to Export (§7)</td><td><b>Import</b> asks for paths, runs a dry run first and shows what would attach, skip or fail, then imports. The dialog has a "Report schema" link that opens a read-only schema viewer. <code>findings.import</code>, <code>findings.schema</code></td></tr>
+        <tr><td>Coverage gap / rerun</td><td>Coverage page: the Gap tab (exists) and the header</td><td>The Gap tab reads <code>coverage.gap</code>. <b>Rerun…</b> in the header picks a recorded run, then confirms. <code>coverage.rerun</code></td></tr>
+        <tr><td>Query-language help</td><td>Every list's query bar (§8)</td><td>A <b>?</b> button at the end of the bar opens a fields popover (each key, its kind, its values, an example). It is built from <code>query.fields</code>, so it can't drift from the server.</td></tr>
+        <tr><td>Autoflow run / explain / doctor / wakes / claims repair</td><td>Library → Autoflows rows; Activity → Autoflows header (§9)</td><td>Row actions <b>Run now</b> (takes an issue ref) and <b>Explain</b> (opens a drawer). <b>Doctor</b> and <b>Repair claims</b> go in the Activity header, each a preview then apply. Wakes appear as a strip above the runs table. <code>autoflows.*</code>, <code>claims.repair</code></td></tr>
+        <tr><td>Cron; prune</td><td>New <b>Settings → Automation</b> and <b>Settings → Maintenance</b> tabs (§10) <span class="call">MY CALL</span></td><td>Automation lists the cron schedules and the event log, with <b>Tick now</b> and a dry-run option. Maintenance shows each prune kind with the dry run first, then <b>Prune N</b>. <code>cron.*</code>, <code>maintenance.prune</code></td></tr>
+        <tr><td>Auth status, SCM accounts and rules</td><td>New <b>Settings → Accounts</b> tab (§11) <span class="call">MY CALL</span></td><td>One table of providers and SCM accounts with their state (ok, refreshes itself, needs login), plus the CLI command to fix each one. No secrets anywhere. Binding rules sit below, with <b>Add rule</b>. <code>auth.status</code>, <code>scm_accounts.list</code>, <code>scm_rules.*</code></td></tr>
+        <tr><td>Tracked repos</td><td>Project page → Config tab <span class="call">MY CALL</span></td><td>A "Repositories" section listing the tracked checkouts, with <b>Attach</b>, <b>Prefer</b> and <b>Forget</b>. <code>repos.*</code></td></tr>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============ 1. RunDetail retry ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>1 · Retry on a failed workflow run</h2><span class="n">/runs/:id</span></div>
+    <p class="cap">On a terminal run, the header gains <b>Retry</b> as the primary action, before Archive and Delete. It opens a small popover with the two choices a retry has. Retry resumes the run, so the mode defaults to the <b>recorded</b> one: a read-only run retries read-only, as on the CLI since #909. Afterwards the button turns into "Retry requested…" until the run's status flips to running.</p>
+    <div class="frame">
+      <div class="rail"><div class="lg"><i></i>rupu</div><div class="ni"><span class="d"></span>Overview</div><div class="ni on"><span class="d"></span>Activity</div><div class="ni"><span class="d"></span>Projects</div><div class="ni"><span class="d"></span>Security</div><div class="ni"><span class="d"></span>Library</div><div class="ni"><span class="d"></span>Fleet</div></div>
+      <div class="pg">
+        <div class="ph">
+          <div><div class="back">← Workflow runs</div><h1>security-review <span class="chip fail"><span class="dot"></span>failed</span></h1><div class="sub"><code>run_01JD3X…</code> · cobalt-harbor · started 14:02 · failed at step <b>triage</b> after 6m</div></div>
+          <div class="spacer"></div>
+          <div class="actions">
+            <span class="btn btn-primary">↻ Retry ▾</span>
+            <span class="btn btn-secondary">Archive</span>
+            <span class="btn btn-danger">Delete</span>
+          </div>
+        </div>
+        <div class="tabs"><span class="on">Graph</span><span>Transcript</span><span>Events</span><span>Findings</span><span>Messages</span><span>Children</span></div>
+        <div class="pad" style="display:flex;justify-content:flex-end;padding-bottom:0"><div class="pop" style="width:300px">
+          <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">Retry security-review</div>
+          <div class="field" style="padding:2px 0"><div class="fl">Mode</div><div class="input" style="min-height:0;padding:6px 10px">Read-only <span class="meta">(as launched)</span> ▾</div></div>
+          <div class="field" style="padding:6px 0"><span class="check"><i></i>Restart interrupted steps from scratch</span><div class="fh">Off: steps cut off mid-turn continue where they stopped.</div></div>
+          <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:4px"><span class="btn btn-ghost">Cancel</span><span class="btn btn-primary">Retry</span></div></div></div>
+        <div class="pad"><div class="box err"><b>Step triage failed:</b> provider anthropic returned 529 overloaded after 3 retries. <span class="mono">fallbacks exhausted</span></div>
+        <div class="ann">After clicking: <span class="chip run"><span class="dot"></span>retry requested</span> replaces the button (pending, not optimistic). Once the run reads <i>running</i>, the header becomes the normal live header (Pause / Cancel). A 409 (someone already retried it) shows the server's message inline, under the actions.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 2. Continue agent run ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>2 · Continue a standalone agent run</h2><span class="n">/transcript?run=…</span></div>
+    <p class="cap">A finished or failed standalone run gets <b>Continue</b>. It opens the same composer the session page uses. The continuation keeps every flag of the original launch, so the composer only asks for what you'd change: a prompt (optional) and, under a disclosure, a different model or provider. It starts a new run and links to it.</p>
+    <div class="card">
+      <div class="ph"><div><div class="back">← Agent runs</div><h1>code-reviewer <span class="chip fail"><span class="dot"></span>failed</span></h1><div class="sub"><code>run_01JD2K…</code> · lynx · claude-opus-5-5 · stopped: output limit</div></div><div class="spacer"></div><div class="actions"><span class="btn btn-primary">Continue</span><span class="btn btn-secondary">Archive</span></div></div>
+      <div class="turn"><div class="who">assistant · turn 14</div><div style="color:var(--dim)">…the remaining three handlers follow the same pattern; reviewing <span class="mono">api/sessions.rs</span> next.</div></div>
+      <div class="pad" style="border-top:1px solid var(--border)">
+        <div class="composer"><div class="ta">Add an instruction for the continuation (optional): it picks up where the run stopped…</div>
+          <div class="bar"><span class="disc">▸ Model &amp; provider <span class="meta">(same as the original: anthropic · claude-opus-5-5)</span></span><span class="spacer"></span><span class="kbd">⌘↵</span><span class="btn btn-secondary">Cancel</span><span class="btn btn-primary">Continue run</span></div></div>
+        <div class="ann">After clicking: "Continued as <span class="mono">run_01JD4Q…</span> →" (a link). A run that is still running gets a 409, shown inline.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 3. Session stop / compact ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>3 · Stop and compact a session</h2><span class="n">/sessions/:id</span></div>
+    <p class="cap">Both go in the session header, next to Archive. <b>Compact</b> opens a small popover (window, defaulting to the session's own). While it runs, a <b>compacting</b> chip shows and the composer is locked with the reason, since the server answers 409 to sends then. <b>Stop</b> ends the worker and confirms first.</p>
+    <div class="grid2">
+      <div class="card">
+        <div class="ph"><div><h1>refactor-loop <span class="chip ok"><span class="dot"></span>idle</span></h1><div class="sub"><code>ses_01JC…</code> · 23 turns · 412k tokens in context</div></div><div class="spacer"></div><div class="actions"><span class="btn btn-secondary">Compact</span><span class="btn btn-danger">Stop</span><span class="btn btn-ghost">⋯</span></div></div>
+        <div class="pad" style="display:flex;justify-content:flex-end">
+          <div class="pop"><div style="font-weight:600;font-size:12.5px;margin-bottom:6px">Compact this session</div>
+            <div style="font-size:11.5px;color:var(--dim);margin-bottom:8px">Summarizes the older turns into one, keeping the recent ones and the loaded skills. Uses one model call.</div>
+            <div class="field" style="padding:4px 0"><div class="fl">Keep the last</div><div class="input" style="min-height:0;padding:6px 10px">8 turns <span class="meta">(session default)</span></div></div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><span class="btn btn-ghost">Cancel</span><span class="btn btn-primary">Compact</span></div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="ph"><div><h1>refactor-loop <span class="chip run"><span class="dot"></span>compacting</span></h1><div class="sub">started 14:31 · 0:42 elapsed</div></div><div class="spacer"></div><div class="actions"><span class="btn btn-secondary" disabled>Compact</span><span class="btn btn-danger" disabled>Stop</span></div></div>
+        <div class="tabs"><span class="on">Conversation</span><span>Messages</span></div>
+        <div class="pad"><div class="composer" style="opacity:.6"><div class="ta">The session is compacting; you can send again when it's done.</div><div class="bar"><span class="spacer"></span><span class="btn btn-primary" disabled>Send</span></div></div>
+        <div class="ann">When it finishes, a line in the conversation says "Compacted 15 turns into 1". If the session changed meanwhile, it says "Compaction discarded: the session changed while it ran".</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 4. Agentiflows ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>4 · Agentiflows: launch, stop, definitions</h2><span class="n">/runs/agentiflows · /agentiflows/:id · /library?tab=agentiflows</span></div>
+    <p class="cap">The flow page gets the two stops the API has. <b>Stop</b> winds down at the next round boundary. <b>Stop now</b> kills the coordinator and its units (danger, confirmed). Definitions get a Library tab of their own, built exactly like Library → Workflows, with a YAML editor validated live by the server.</p>
+    <div class="grid2">
+      <div class="card">
+        <div class="ph"><div><div class="back">← Agentiflows</div><h1>assess-cellgw <span class="chip run"><span class="dot"></span>round 4</span></h1><div class="sub"><code>af_01JD…</code> · lead heron · 6 units live · $3.20 of $10</div></div><div class="spacer"></div><div class="actions"><span class="btn btn-secondary">Stop</span><span class="btn btn-danger">Stop now</span></div></div>
+        <div class="pad"><div class="box warn"><b>Stop now?</b> The coordinator and its 6 running units are killed at once, so the current round's work is lost. Use <b>Stop</b> to finish the round first.<div style="display:flex;gap:8px;margin-top:10px;justify-content:flex-end"><span class="btn btn-secondary">Keep running</span><span class="btn btn-danger-solid">Stop now</span></div></div></div>
+      </div>
+      <div class="card">
+        <div class="ph"><div><h1>Library</h1><div class="sub">Agents, workflows, agentiflows, autoflows and skills</div></div><div class="spacer"></div><div class="actions"><span class="btn btn-primary">New agentiflow</span></div></div>
+        <div style="padding:10px 18px;border-bottom:1px solid var(--border)"><div class="seg"><span>Agents</span><span>Workflows</span><span class="on">Agentiflows</span><span>Autoflows</span><span>Skills</span></div></div>
+        <div class="list">
+          <div class="row hd"><span class="w2">Definition</span><span class="w3">Layer</span><span class="spacer">Lead · profiles</span><span>Actions</span></div>
+          <div class="row"><span class="w2 code">assess-cellgw</span><span class="w3"><span class="chip neutral">global</span></span><span class="spacer meta">heron · network, web</span><span class="btn btn-ring">Launch</span></div>
+          <div class="row"><span class="w2 code">rupu-self-review</span><span class="w3"><span class="chip origin">project</span></span><span class="spacer meta">reviewer-lead · code</span><span class="btn btn-ring">Launch</span></div>
+          <div class="row"><span class="w2 code">dispatch-kinds-flow</span><span class="w3"><span class="chip origin">project</span></span><span class="spacer meta">dispatch-kinds-lead · code</span><span class="btn btn-ring">Launch</span></div>
+        </div>
+      </div>
+    </div>
+    <p class="ann"><b>New agentiflow</b> on the Agentiflows list opens the launcher sheet: the definition, the project or directory, and Launch. A flow is local-only, so there is no host picker. The definition page is the workflow editor's layout, a YAML pane with the server's validity badge, plus Save / Revert / Delete / Launch.</p>
+  </div>
+
+  <!-- ============ 5. Launcher fields ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>5 · Launcher: model, provider, engagement profiles</h2><span class="n">AgentLauncherSheet · LauncherSheet</span></div>
+    <p class="cap">The rarely changed knobs stay collapsed. A profile chip shows what it brings, its bundle and asset kinds, so you can pick one without reading TOML. A remote host that can't take a field greys it out and says why, matching the API's refusal.</p>
+    <div class="modalwrap"><div class="modal">
+      <div class="mh"><b>Run code-reviewer</b><span class="spacer"></span><div class="seg"><span class="on">Run</span><span>Session</span></div></div>
+      <div class="mb">
+        <div class="field"><div class="fl">Prompt</div><div class="input area ph">Review the open PR for correctness…</div></div>
+        <div class="row2"><div class="field"><div class="fl">Mode</div><div class="input">Ask ▾</div></div><div class="field"><div class="fl">Host</div><div class="input">local ▾</div></div></div>
+        <div class="field"><div class="fl">▾ Model &amp; provider</div><div class="row2"><div class="input">anthropic ▾ <span class="meta">(agent default)</span></div><div class="input">claude-opus-5-5 ▾</div></div></div>
+        <div class="field"><div class="fl">▾ Engagement profiles</div><div class="input" style="display:flex;gap:6px;align-items:center"><span class="chip origin">network ×</span><span class="meta">add a profile…</span></div>
+          <div class="fh">network: recon, service-analyst, exploit-verifier · asset kinds host, port, service</div></div>
+        <div class="field"><div class="fl">▸ Skills</div></div>
+      </div>
+      <div class="mf"><span class="meta" style="margin-right:auto">Bills to customer acme · anthropic (sso)</span><span class="btn btn-secondary">Cancel</span><span class="btn btn-primary">Launch</span></div>
+    </div></div>
+  </div>
+
+  <!-- ============ 6. Skills install ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>6 · Install skills</h2><span class="n">/library?tab=skills</span></div>
+    <p class="cap">Library → Skills gets <b>Install skills</b>. The dialog takes a source (a directory, <span class="mono">owner/repo</span> or an https git URL), finds the skills in it, and lets you tick which ones to install, to the global or a project layer. Replacing an edited copy needs the force check, which is styled as danger. Each skill page gains <b>Update</b> and <b>Validate</b>.</p>
+    <div class="modalwrap"><div class="modal">
+      <div class="mh"><b>Install skills</b></div>
+      <div class="mb">
+        <div class="field"><div class="fl">Source</div><div class="input mono">Section9Labs/rupu-skills</div><div class="fh">A local directory (absolute), owner/repo, or an https git URL. Pick a branch, tag or commit under Ref.</div></div>
+        <div class="row2"><div class="field"><div class="fl">Ref</div><div class="input mono ph">main</div></div><div class="field"><div class="fl">Install to</div><div class="input">Global (~/.rupu/skills) ▾</div></div></div>
+        <div class="card" style="margin-top:6px"><div class="list">
+          <div class="row hd"><span class="w2">Found in source</span><span class="spacer">Description</span><span>Status</span></div>
+          <div class="row"><span class="check"><i class="on"></i></span><span class="w2 code">nmap</span><span class="spacer meta">Port and service discovery with nmap…</span><span class="chip neutral">new</span></div>
+          <div class="row"><span class="check"><i class="on"></i></span><span class="w2 code">ffuf</span><span class="spacer meta">Web content discovery…</span><span class="chip ok">up to date</span></div>
+          <div class="row"><span class="check"><i></i></span><span class="w2 code">nuclei</span><span class="spacer meta">Template-based scanning…</span><span class="chip warn">edited locally</span></div>
+        </div></div>
+        <div class="field"><span class="check" style="color:var(--fail)"><i></i>Replace locally edited copies</span></div>
+      </div>
+      <div class="mf"><span class="btn btn-secondary">Cancel</span><span class="btn btn-primary">Install 1 skill</span></div>
+    </div></div>
+  </div>
+
+  <!-- ============ 7. Findings import ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>7 · Import findings</h2><span class="n">/security?tab=findings</span></div>
+    <p class="cap">Next to <b>Export</b>, an <b>Import</b> button attaches reports written before the full profile. It always does a dry run first and shows each file's outcome. Only then is the import button enabled, labelled with how many reports it will attach. The schema link opens a read-only viewer of the report format.</p>
+    <div class="modalwrap"><div class="modal" style="width:640px">
+      <div class="mh"><b>Import finding reports</b><span class="spacer"></span><span class="btn btn-ghost">Report schema ↗</span></div>
+      <div class="mb">
+        <div class="field"><div class="fl">Files or directories on this machine</div><div class="input mono">/Users/matt/Security/engagements/acme/reports</div><div class="fh">Absolute paths. A directory is searched for Markdown reports. The ledger is backed up before anything is rewritten.</div></div>
+        <div class="box info" style="margin:6px 0 10px">Dry run: <b>3 attach</b> · 1 skipped · 1 failed. Nothing has been written yet.</div>
+        <div class="card"><div class="list">
+          <div class="row"><span class="chip ok">attach</span><span class="code">FND-004-auth-bypass.md</span><span class="spacer"></span><span class="meta">→ fnd_01HZ… high</span></div>
+          <div class="row"><span class="chip ok">attach</span><span class="code">FND-007-idor.md</span><span class="spacer"></span><span class="meta">→ fnd_01J0… medium</span></div>
+          <div class="row"><span class="chip ok">attach</span><span class="code">FND-011-ssrf.md</span><span class="spacer"></span><span class="meta">→ fnd_01J2… high</span></div>
+          <div class="row"><span class="chip neutral">skip</span><span class="code">README.md</span><span class="spacer"></span><span class="meta">not a finding report</span></div>
+          <div class="row"><span class="chip fail">fail</span><span class="code">FND-012-xss.md</span><span class="spacer"></span><span class="meta">no finding with id FND-012 in this project</span></div>
+        </div></div>
+      </div>
+      <div class="mf"><span class="btn btn-secondary">Cancel</span><span class="btn btn-primary">Import 3 reports</span></div>
+    </div></div>
+  </div>
+
+  <!-- ============ 8. Query help ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>8 · Query-language help</h2><span class="n">every ListQueryBar</span></div>
+    <p class="cap">A <b>?</b> at the end of every query line opens the list's fields: key, kind and allowed values, with one example each. It is built from the same registry the server filters with, so a list can't advertise a field it doesn't take.</p>
+    <div class="card pad" style="background:var(--bg)">
+      <div style="display:flex;gap:8px;align-items:center"><div class="input mono" style="flex:1">severity&gt;=high tag:auth -status:fixed</div><span class="btn btn-secondary" style="padding:6px 10px">?</span></div>
+      <div style="display:flex;justify-content:flex-end;margin-top:8px"><div class="pop" style="width:420px">
+        <div style="font-weight:600;font-size:12.5px;margin-bottom:8px">Findings query fields</div>
+        <div class="list" style="font-size:12px">
+          <div class="row" style="padding:6px 0"><span class="w1 code">severity</span><span class="spacer meta">ordered · critical high medium low info · supports &gt;= &lt;=</span></div>
+          <div class="row" style="padding:6px 0"><span class="w1 code">status</span><span class="spacer meta">open · verified · fixed · false_positive</span></div>
+          <div class="row" style="padding:6px 0"><span class="w1 code">tag</span><span class="spacer meta">text · <span class="mono">tag:auth</span></span></div>
+          <div class="row" style="padding:6px 0"><span class="w1 code">since</span><span class="spacer meta">time · <span class="mono">since:7d</span>, a date, or RFC 3339</span></div>
+        </div>
+        <div class="meta" style="margin-top:8px">Bare words search the text. <span class="mono">-</span> negates. Values OR, terms AND.</div>
+      </div></div>
+    </div>
+  </div>
+
+  <!-- ============ 9. Autoflows ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>9 · Autoflows: run now, explain, doctor, repair</h2><span class="n">/library?tab=autoflows · /activity?tab=autoflows</span></div>
+    <p class="cap">On a definition row, <b>Run now</b> asks for an issue ref, which must be fully qualified; a bare <span class="mono">42</span> is refused as on the API. <b>Explain</b> opens a drawer that says why this autoflow would or wouldn't fire for that issue. The Activity → Autoflows header gains <b>Doctor</b> and <b>Repair claims</b>, both dry-run first.</p>
+    <div class="grid2">
+      <div class="card">
+        <div class="list">
+          <div class="row hd"><span class="w2">Autoflow</span><span class="w3">Trigger</span><span class="spacer"></span><span>Actions</span></div>
+          <div class="row"><span class="w2 code">issue-triage</span><span class="w3"><span class="chip neutral">issue opened</span></span><span class="spacer"></span><span class="btn btn-ring">Run now</span><span class="btn btn-ring">Explain</span><span class="btn btn-ring">Disable</span></div>
+          <div class="row"><span class="w2 code">nightly-audit</span><span class="w3"><span class="chip neutral">cron 0 3 * * *</span></span><span class="spacer"></span><span class="btn btn-ring">Run now</span><span class="btn btn-ring">Explain</span><span class="btn btn-ring">Disable</span></div>
+        </div>
+        <div class="pad" style="border-top:1px solid var(--border)"><div class="field" style="padding:0"><div class="fl">Run issue-triage for</div><div style="display:flex;gap:8px"><div class="input mono" style="flex:1">github:Section9Labs/rupu/issues/912</div><span class="btn btn-primary">Run</span></div><div class="fh">A full issue ref: <span class="mono">platform:owner/repo/issues/N</span>.</div></div></div>
+      </div>
+      <div class="card">
+        <div class="ph"><div><h1 style="font-size:15px">Repair claims</h1><div class="sub">Dry run: 2 claims would be released</div></div></div>
+        <div class="list">
+          <div class="row"><span class="chip warn">stale</span><span class="code">rupu#871</span><span class="spacer meta">issue-triage · claimed 3d ago by a dead runner</span></div>
+          <div class="row"><span class="chip warn">orphaned</span><span class="code">rupu#880</span><span class="spacer meta">no run recorded for the claim</span></div>
+        </div>
+        <div class="pad" style="display:flex;justify-content:flex-end;gap:8px;border-top:1px solid var(--border)"><span class="btn btn-secondary">Close</span><span class="btn btn-danger-solid">Release 2 claims</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 10. Settings: Automation + Maintenance ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>10 · Settings → Automation and Maintenance</h2><span class="n">/settings?tab=automation · maintenance</span> <span class="call">MY CALL</span></div>
+    <p class="cap">Cron and prune have no natural home on an object page, so they become two Settings tabs instead of new top-level pages, as the spec prefers. Automation lists the schedules and recent firings, with <b>Tick now</b>; a dry run shows what would fire without firing it. Maintenance always previews: each kind shows what it would remove, then <b>Prune N</b>.</p>
+    <div class="grid2">
+      <div class="card">
+        <div class="tabs"><span>General</span><span>Providers</span><span>SCM / Issues</span><span class="on">Automation</span><span>Maintenance</span><span>Accounts</span></div>
+        <div class="list">
+          <div class="row hd"><span class="w2">Schedule</span><span class="w3">Cron</span><span class="spacer">Last fired</span><span>Next</span></div>
+          <div class="row"><span class="w2 code">nightly-audit</span><span class="w3 code">0 3 * * *</span><span class="spacer meta">today 03:00 · run_01JD…</span><span class="meta">03:00</span></div>
+          <div class="row"><span class="w2 code">weekly-deps</span><span class="w3 code">0 9 * * 1</span><span class="spacer meta">Mon 09:00</span><span class="meta">Mon</span></div>
+        </div>
+        <div class="pad" style="display:flex;gap:8px;align-items:center;border-top:1px solid var(--border)"><span class="meta">The cp loop ticks every 60 s.</span><span class="spacer"></span><span class="btn btn-secondary">Dry run</span><span class="btn btn-primary">Tick now</span></div>
+      </div>
+      <div class="card">
+        <div class="tabs"><span>General</span><span>Providers</span><span>SCM / Issues</span><span>Automation</span><span class="on">Maintenance</span><span>Accounts</span></div>
+        <div class="list">
+          <div class="row hd"><span class="w2">What</span><span class="w3">Older than</span><span class="spacer">Would remove</span><span></span></div>
+          <div class="row"><span class="w2">Archived transcripts</span><span class="w3"><span class="input" style="min-height:0;padding:3px 8px;font-size:11.5px">30d</span></span><span class="spacer meta num">412 files · 1.8 GB</span><span class="btn btn-ring">Prune 412</span></div>
+          <div class="row"><span class="w2">Archived sessions</span><span class="w3"><span class="input" style="min-height:0;padding:3px 8px;font-size:11.5px">30d</span></span><span class="spacer meta">23 sessions</span><span class="btn btn-ring">Prune 23</span></div>
+          <div class="row"><span class="w2">Netflow ledgers</span><span class="w3"><span class="input" style="min-height:0;padding:3px 8px;font-size:11.5px">14d</span></span><span class="spacer meta">nothing</span><span class="btn btn-ring" disabled>Prune</span></div>
+          <div class="row"><span class="w2">Cleanup (temp clones, stale locks)</span><span class="w3 meta">—</span><span class="spacer meta">7 items</span><span class="btn btn-ring">Clean 7</span></div>
+        </div>
+        <div class="pad meta" style="border-top:1px solid var(--border)">Every Prune asks once: "Delete 412 archived transcripts? This can't be undone."</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 11. Settings: Accounts ============ -->
+  <div class="sec">
+    <div class="sec-label"><h2>11 · Settings → Accounts</h2><span class="n">/settings?tab=accounts</span> <span class="call">MY CALL</span></div>
+    <p class="cap">One table answers "will my runs authenticate?" for every provider and SCM account. It shows the state and expiry, never a secret. An account that refreshes itself reads as <b>ok</b>. A <b>needs login</b> row shows the exact CLI command, because login stays human-only and out of the web and MCP (spec non-goal). Binding rules sit below, with <b>Add rule</b>.</p>
+    <div class="card">
+      <div class="tabs"><span>General</span><span>Providers</span><span>SCM / Issues</span><span>Automation</span><span>Maintenance</span><span class="on">Accounts</span></div>
+      <div class="list">
+        <div class="row hd"><span class="w2">Account</span><span class="w3">Kind</span><span class="w1">Mode</span><span class="spacer">State</span></div>
+        <div class="row"><span class="w2 code">anthropic</span><span class="w3 meta">provider</span><span class="w1 meta">sso</span><span class="spacer"><span class="chip ok"><span class="dot"></span>ok · refreshes itself</span></span></div>
+        <div class="row"><span class="w2 code">openai</span><span class="w3 meta">provider</span><span class="w1 meta">api-key</span><span class="spacer"><span class="chip ok"><span class="dot"></span>ok</span></span></div>
+        <div class="row"><span class="w2 code">github</span><span class="w3 meta">scm · github.com</span><span class="w1 meta">sso</span><span class="spacer"><span class="chip ok"><span class="dot"></span>ok</span></span></div>
+        <div class="row"><span class="w2 code">gl.work</span><span class="w3 meta">scm · gitlab.corp</span><span class="w1 meta">sso</span><span class="spacer" style="display:flex;gap:10px;align-items:center"><span class="chip warn"><span class="dot"></span>needs login</span><span class="mono meta">rupu auth login --account gl.work --mode sso</span></span></div>
+      </div>
+      <div class="pad" style="border-top:1px solid var(--border)">
+        <div style="display:flex;align-items:center;margin-bottom:8px"><b style="font-size:12.5px">Binding rules</b><span class="spacer"></span><span class="btn btn-secondary">Add rule</span></div>
+        <div class="pre">gitlab.corp/acme/*   →  gl.work
+github.com/Section9Labs/*  →  github</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sec">
+    <div class="sec-label"><h2>Not mocked here</h2></div>
+    <p class="cap">These follow existing patterns exactly, so a mock would add nothing beyond the table:
+      <ul style="margin:6px 0 0 18px;line-height:1.7">
+        <li>the agentiflow definition page (the workflow editor's layout);</li>
+        <li>Validate all (a results drawer like the warnings strip);</li>
+        <li>Install stock fleet and Initialize project (two dialogs shaped like Install skills);</li>
+        <li>Coverage rerun (a run picker, then a confirm);</li>
+        <li>the Explain and Doctor drawers (text reports);</li>
+        <li>the Repositories section on a project's Config tab (a list with row actions).</li>
+      </ul>
+      Say so if you want any of them mocked before it's built.</p>
+  </div>
+</main>
+</body>
+</html>
