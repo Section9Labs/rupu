@@ -10,28 +10,28 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "netflow.run",
             Method::GET,
             "/api/runs/:id/netflow",
-            "List the network flows one run made, sub-agents included.\n\n`id` is the run id; `from` and `to` (RFC 3339, both inclusive) bound the window. `workflow`, `origin`, `org` and `host` keep the flows whose key is in the comma-separated list, `not_*` leave them out; here `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, exclusions_applied}`; `HTTP 404` for an unknown run.",
+            "List the network flows one run made, sub-agents included.\n\n`id` is the run id; `from` and `to` (RFC 3339, both inclusive) bound the window. `workflow`, `origin`, `org` and `host` keep the flows whose key is in the comma-separated list, `not_*` leave them out; here `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, capture?}`; `capture` (`{state, reason, notes}`) appears for run scope only, when the run's ledger has a capture line, and explains an empty bash-flow list; `HTTP 404` for an unknown run.",
         )
         .query::<netflow::TimeRangeQuery>(),
         op(
             "netflow.agentiflow",
             Method::GET,
             "/api/agentiflows/:id/netflow",
-            "List the network flows of a whole agentiflow: its lead and every run beneath it.\n\n`id` is the agentiflow id; `from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, exclusions_applied}`; `HTTP 404` for an unknown agentiflow.",
+            "List the network flows of a whole agentiflow: its lead and every run beneath it.\n\n`id` is the agentiflow id; `from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, capture?}`; `HTTP 404` for an unknown agentiflow.",
         )
         .query::<netflow::TimeRangeQuery>(),
         op(
             "netflow.project",
             Method::GET,
             "/api/projects/:id/netflow",
-            "List the network flows attributable to one project.\n\n`id` is the project id; `from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, exclusions_applied}`.",
+            "List the network flows attributable to one project.\n\n`id` is the project id; `from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, capture?}`.",
         )
         .query::<netflow::TimeRangeQuery>(),
         op(
             "netflow.global",
             Method::GET,
             "/api/netflow",
-            "List the network flows across every registered workspace.\n\n`from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, exclusions_applied}`.",
+            "List the network flows across every registered workspace.\n\n`from`, `to` and the comma-separated `workflow`, `origin`, `org`, `host` and `not_*` filters work as for netflow.run, and `host` is a flow filter on `host:port`, not a rupu host. Returns `{flows, hosts, window, dropped_total, asn_loaded, incomplete, capture?}`.",
         )
         .query::<netflow::TimeRangeQuery>(),
         op(
@@ -93,7 +93,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "dashboard.get",
             Method::GET,
             "/api/dashboard",
-            "Read the overview dashboard: activity, throughput, cycles, findings and fleet counts.\n\n`range` is 7d, 30d or all; `host` picks one rupu host, absent merges all; `customer` is a slug or `none`. Returns an object with `hosts` (per-host freshness), the `*_partial` flags, `active`, `terminal_buckets`, `throughput_buckets`, `cycles`, `findings_open` and `fleet`.",
+            "Read the overview dashboard: activity, throughput, cycles, findings and fleet counts.\n\n`range` is 7d, 30d or all; `host` picks one rupu host, absent merges all; `customer` is a slug or `none`. Returns an object with `hosts` (per-host freshness), the `*_partial` flags, `active`, `active_longest`, `terminal_buckets`, `throughput_buckets`, `cycles`, `findings_open`, `fleet`, `captured_at` and `inventory_captured_at`, plus `hosts_without_customer` (the hosts a customer filter left out because they can't report a customer), present only then.",
         )
         .query::<dashboard::DashboardQuery>(),
     ]
