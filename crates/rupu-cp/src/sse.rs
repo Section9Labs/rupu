@@ -49,6 +49,183 @@ impl RunFrame {
     }
 }
 
+/// The most a run event stream may hold without completing a frame — the
+/// fields read so far plus the line being completed: past it,
+/// [`parse_run_frames`] yields an error and stops. (It then holds at most
+/// this plus one chunk.)
+pub const MAX_FRAME_BUFFER: usize = 16 * 1024 * 1024;
+
+/// The frames of a run event stream as [`RunFrame::to_sse_bytes`] writes them
+/// (and axum's `Sse` sends them: keep-alive comments between frames).
+/// Partial frames across chunks are buffered; a line ends at `\n`, `\r\n` or
+/// a bare `\r`. An unknown event name is skipped, as is an event frame
+/// without a numeric `id`. A byte-stream error is yielded, and ends the
+/// stream, as does holding more than [`MAX_FRAME_BUFFER`] of a frame not yet
+/// complete; the end of the bytes ends it too, dropping a frame left
+/// incomplete.
+pub fn parse_run_frames(
+    bytes: crate::host::connector::EventByteStream,
+) -> impl Stream<Item = std::io::Result<RunFrame>> + Send {
+    let st = FrameReader {
+        bytes,
+        buf: Vec::new(),
+        pos: 0,
+        scan: 0,
+        eof: false,
+        event: String::new(),
+        id: None,
+        data: None,
+        done: false,
+    };
+    futures_util::stream::unfold(st, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            while let Some(frame) = st.line() {
+                if let Some(frame) = frame {
+                    return Some((Ok(frame), st));
+                }
+                // A field line: the frame's fields grew.
+                if st.fields() > MAX_FRAME_BUFFER {
+                    return Some((st.over_cap(), st));
+                }
+            }
+            if st.eof {
+                return None;
+            }
+            // Every complete line is read: what is left is one line still
+            // being completed.
+            if st.fields() + (st.buf.len() - st.pos) > MAX_FRAME_BUFFER {
+                return Some((st.over_cap(), st));
+            }
+            match st.bytes.next().await {
+                Some(Ok(chunk)) => {
+                    // Once per chunk: drop what was read, so the buffer
+                    // holds only the line being completed.
+                    st.buf.drain(..st.pos);
+                    st.scan -= st.pos;
+                    st.pos = 0;
+                    st.buf.extend_from_slice(&chunk);
+                }
+                Some(Err(e)) => {
+                    st.done = true;
+                    return Some((Err(e), st));
+                }
+                // A last bare `\r` ends its line now.
+                None => st.eof = true,
+            }
+        }
+    })
+}
+
+/// [`parse_run_frames`]' state.
+struct FrameReader {
+    bytes: crate::host::connector::EventByteStream,
+    buf: Vec<u8>,
+    /// Where the unread bytes start.
+    pos: usize,
+    /// Where the search for the next line ending resumes: no line ending
+    /// lies in `pos..scan`.
+    scan: usize,
+    /// The bytes ended.
+    eof: bool,
+    /// The fields of the frame being read.
+    event: String,
+    id: Option<String>,
+    data: Option<String>,
+    done: bool,
+}
+
+impl FrameReader {
+    /// The size of the fields of the frame being read.
+    fn fields(&self) -> usize {
+        self.event.len()
+            + self.id.as_ref().map_or(0, String::len)
+            + self.data.as_ref().map_or(0, String::len)
+    }
+
+    /// The error that ends a stream past [`MAX_FRAME_BUFFER`].
+    fn over_cap(&mut self) -> std::io::Result<RunFrame> {
+        self.done = true;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the event stream sent a frame of over {MAX_FRAME_BUFFER} bytes"),
+        ))
+    }
+
+    /// The frame a blank line completes, if it is one we serve.
+    fn dispatch(&mut self) -> Option<RunFrame> {
+        let event = std::mem::take(&mut self.event);
+        let (id, data) = (self.id.take(), self.data.take());
+        match event.as_str() {
+            "end" => Some(RunFrame::End),
+            "" | "message" => Some(RunFrame::Event {
+                id: id?.trim().parse().ok()?,
+                json: data?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Read one complete line out of the buffer: `Some(frame it completes)`,
+    /// `None` when no complete line is buffered.
+    fn line(&mut self) -> Option<Option<RunFrame>> {
+        let Some(off) = self.buf[self.scan..]
+            .iter()
+            .position(|b| matches!(b, b'\n' | b'\r'))
+        else {
+            self.scan = self.buf.len();
+            return None;
+        };
+        let at = self.scan + off;
+        let ending = match self.buf[at] {
+            b'\r' => match self.buf.get(at + 1) {
+                Some(b'\n') => 2,
+                Some(_) => 1,
+                // A `\r` last in the buffer may be half of a `\r\n`.
+                None if !self.eof => {
+                    self.scan = at;
+                    return None;
+                }
+                None => 1,
+            },
+            _ => 1,
+        };
+        let line = String::from_utf8_lossy(&self.buf[self.pos..at]).into_owned();
+        self.pos = at + ending;
+        self.scan = self.pos;
+        Some(self.field(&line))
+    }
+
+    /// Take one line of a frame.
+    fn field(&mut self, line: &str) -> Option<RunFrame> {
+        if line.is_empty() {
+            return self.dispatch();
+        }
+        if line.starts_with(':') {
+            return None;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+        match field {
+            "event" => self.event = value.to_string(),
+            "id" => self.id = Some(value.to_string()),
+            "data" => match &mut self.data {
+                Some(d) => {
+                    d.push('\n');
+                    d.push_str(value);
+                }
+                None => self.data = Some(value.to_string()),
+            },
+            _ => {}
+        }
+        None
+    }
+}
+
 /// The `Last-Event-ID` a reconnecting client sent: the id of the last event
 /// it saw, so the stream resumes after it. `0` (replay from the start) when
 /// absent or not a number.
@@ -591,6 +768,144 @@ mod tests {
         store.update(&record).expect("update status");
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(namers.lock().unwrap().cached_runs(), 0);
+    }
+
+    #[tokio::test]
+    async fn sse_frames_parse_across_chunk_boundaries() {
+        // A keep-alive comment first (as axum sends it), then three chunks
+        // that each end mid-line.
+        let wire = format!(
+            ": keep-alive\n\n{}{}{}",
+            RunFrame::Event {
+                id: 1,
+                json: r#"{"type":"a"}"#.into()
+            }
+            .to_sse_bytes(),
+            RunFrame::Event {
+                id: 2,
+                json: r#"{"type":"b"}"#.into()
+            }
+            .to_sse_bytes(),
+            RunFrame::End.to_sse_bytes(),
+        );
+        let (a, rest) = wire.split_at(wire.find("data").unwrap() + 3);
+        let (b, c) = rest.split_at(rest.find("id: 2").unwrap() + 2);
+        let chunks: Vec<std::io::Result<bytes::Bytes>> = [a, b, c]
+            .into_iter()
+            .map(|s| Ok(bytes::Bytes::from(s.to_string())))
+            .collect();
+        let frames: Vec<RunFrame> = parse_run_frames(Box::pin(futures_util::stream::iter(chunks)))
+            .map(|f| f.unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            frames,
+            vec![
+                RunFrame::Event {
+                    id: 1,
+                    json: r#"{"type":"a"}"#.into()
+                },
+                RunFrame::Event {
+                    id: 2,
+                    json: r#"{"type":"b"}"#.into()
+                },
+                RunFrame::End,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_event_name_is_skipped_and_a_partial_tail_dropped() {
+        let wire = "event: progress\nid: 9\ndata: {}\n\nid: 3\ndata: {\"x\":1}\n\nid: 4\ndata: {";
+        let frames: Vec<RunFrame> = parse_run_frames(Box::pin(futures_util::stream::iter([Ok(
+            bytes::Bytes::from_static(wire.as_bytes()),
+        )])))
+        .map(|f| f.unwrap())
+        .collect()
+        .await;
+        assert_eq!(
+            frames,
+            vec![RunFrame::Event {
+                id: 3,
+                json: r#"{"x":1}"#.into()
+            }]
+        );
+    }
+
+    /// `chunks` through [`parse_run_frames`]: the frames, then the error
+    /// that ended it, if one did.
+    async fn frames_of(chunks: Vec<Vec<u8>>) -> (Vec<RunFrame>, Option<std::io::Error>) {
+        let chunks: Vec<std::io::Result<bytes::Bytes>> = chunks
+            .into_iter()
+            .map(|c| Ok(bytes::Bytes::from(c)))
+            .collect();
+        let mut out = Vec::new();
+        let mut frames = std::pin::pin!(parse_run_frames(Box::pin(futures_util::stream::iter(
+            chunks
+        ))));
+        while let Some(f) = frames.next().await {
+            match f {
+                Ok(f) => out.push(f),
+                Err(e) => return (out, Some(e)),
+            }
+        }
+        (out, None)
+    }
+
+    fn ev(id: u64, json: &str) -> RunFrame {
+        RunFrame::Event {
+            id,
+            json: json.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn data_lines_past_the_cap_without_a_blank_line_are_an_error() {
+        let line = format!("data: {}\n", "x".repeat(1024 * 1024));
+        let mut chunk = b"id: 1\ndata: {}\n\nid: 2\n".to_vec();
+        for _ in 0..(MAX_FRAME_BUFFER / (1024 * 1024) + 1) {
+            chunk.extend_from_slice(line.as_bytes());
+        }
+        let (frames, err) = frames_of(vec![chunk, b"\n".to_vec()]).await;
+        assert_eq!(frames, vec![ev(1, "{}")]);
+        let err = err.expect("the cap ends the stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn crlf_line_endings_parse() {
+        let (frames, err) = frames_of(vec![
+            b"id: 1\r\ndata: {}\r\n\r\nevent: end\r\ndata: {}\r".to_vec(),
+            // The `\r\n` split across chunks is one line ending.
+            b"\n\r\n".to_vec(),
+        ])
+        .await;
+        assert!(err.is_none());
+        assert_eq!(frames, vec![ev(1, "{}"), RunFrame::End]);
+    }
+
+    #[tokio::test]
+    async fn bare_cr_line_endings_parse() {
+        let (frames, err) =
+            frames_of(vec![b"id: 1\rdata: {}\r\rid: 2\rdata: [1]\r\r".to_vec()]).await;
+        assert!(err.is_none());
+        assert_eq!(frames, vec![ev(1, "{}"), ev(2, "[1]")]);
+    }
+
+    #[tokio::test]
+    async fn multi_line_data_is_joined_with_newlines() {
+        let (frames, _) = frames_of(vec![b"id: 7\ndata: {\"a\":\ndata:1}\n\n".to_vec()]).await;
+        assert_eq!(frames, vec![ev(7, "{\"a\":\n1}")]);
+    }
+
+    #[tokio::test]
+    async fn an_unterminated_line_past_the_cap_is_an_error() {
+        let mut head = b"id: 1\ndata: {}\n\n".to_vec();
+        head.extend(std::iter::repeat_n(b'x', MAX_FRAME_BUFFER + 1));
+        let (frames, err) = frames_of(vec![head, b"\n\n".to_vec()]).await;
+        assert_eq!(frames, vec![ev(1, "{}")]);
+        let err = err.expect("the cap ends the stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     /// Dropping the receiving side stops the coordinator: its task exits

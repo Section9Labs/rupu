@@ -204,3 +204,28 @@ async fn mcp_serve_alias_prints_the_deprecation_and_serves_http() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn catalog_search_is_served() {
+    let home = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_rupu"))
+        .args([
+            "cp",
+            "serve",
+            "--no-web",
+            "--bind",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .env("RUPU_HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rupu cp serve");
+    let mut guard = Guard(child);
+    let base = format!("http://127.0.0.1:{port}");
+    wait_healthy(&base, &mut guard.0).await;
+    let names = tool_names(&base).await;
+    assert!(names.iter().any(|n| n == "catalog.search"), "{names:?}");
+}

@@ -391,7 +391,7 @@ async fn serve_on_refuses_nothing_to_serve() {
 
 // ---- operator tools (in-process calls over the CP API) ----
 
-struct NoopLauncher;
+pub(super) struct NoopLauncher;
 
 #[async_trait]
 impl rupu_cp::launcher::RunLauncher for NoopLauncher {
@@ -403,8 +403,8 @@ impl rupu_cp::launcher::RunLauncher for NoopLauncher {
     }
 }
 
-const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
-const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+pub(super) const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+pub(super) const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
 
 /// A writable CP with one run and one live session, serving `/mcp`.
 async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
@@ -413,7 +413,7 @@ async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
 
 /// [`spawn_operator`] with `seed` run over its global dir first, and
 /// `catalog` as the catalog source.
-async fn spawn_operator_with(
+pub(super) async fn spawn_operator_with(
     seed: impl FnOnce(&std::path::Path),
     catalog: Option<Arc<dyn ToolSource>>,
 ) -> (std::net::SocketAddr, tempfile::TempDir) {
@@ -479,31 +479,16 @@ pub(super) fn text_of(result: &Value) -> String {
         .to_string()
 }
 
-const OPERATOR_TOOLS: [&str; 13] = [
-    "runs.list",
-    "runs.get",
-    "runs.approve",
-    "runs.reject",
-    "runs.cancel",
-    "workflows.list",
-    "workflows.run",
-    "agents.list",
-    "agents.run",
-    "sessions.start",
-    "sessions.send",
-    "messages.list",
-    "messages.send",
-];
-
 #[tokio::test]
-async fn tools_list_has_the_13_operator_tools_with_schemas() {
+async fn tools_list_matches_the_pinned_names() {
     let (addr, _tmp) = spawn_operator().await;
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     names.sort();
     // The operator tools plus `wait` (its own source).
-    let mut want = OPERATOR_TOOLS.to_vec();
+    let pinned = super::mcp_routes::pinned_tool_names();
+    let mut want: Vec<&str> = pinned.iter().map(String::as_str).collect();
     want.push("wait");
     want.sort();
     assert_eq!(names, want);
@@ -763,7 +748,8 @@ async fn run_control_through_mcp_records_actor_mcp_and_plain_http_web() {
         assert_ne!(r["isError"], json!(true), "{verb}: {r}");
     }
     // Plain HTTP, with and without the header the operator source once
-    // sent: never `mcp`. `resume` is no MCP tool yet; its HTTP side the same.
+    // sent: never `mcp`, `resume` included (its MCP side is
+    // `mcp_ops_runs::runs_pause_resume_record_through_mcp`).
     for verb in VERBS.iter().copied().chain(["resume"]) {
         for (how, header) in [("http", false), ("spoof", true)] {
             let mut req = c.post(format!("http://{addr}/api/runs/{}/{verb}", id(verb, how)));
@@ -846,12 +832,12 @@ async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     let named = |n: &str| tools.iter().filter(|t| t["name"] == n).collect::<Vec<_>>();
-    // Served once each: the operator's `agents.list`, `wait`'s own `wait`,
-    // the catalog's `agents.get` and `findings.query`.
+    // Served once each: the operator's `agents.list` and `agents.get`,
+    // `wait`'s own `wait`, the catalog's `findings.query`.
     for (name, from_catalog) in [
         ("agents.list", false),
         ("wait", false),
-        ("agents.get", true),
+        ("agents.get", false),
         ("findings.query", true),
     ] {
         let t = named(name);
@@ -862,12 +848,155 @@ async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name
             "{name}: {t:?}"
         );
     }
-    let r = call_tool(addr, "agents.get", json!({})).await;
-    assert_eq!(text_of(&r), "catalog agents.get", "{r}");
+    let r = call_tool(addr, "findings.query", json!({})).await;
+    assert_eq!(text_of(&r), "catalog findings.query", "{r}");
     let r = call_tool(addr, "agents.list", json!({})).await;
     assert!(text_of(&r).starts_with('['), "{r}");
     // `--tools` checks names the same way.
     rupu_cp::mcp::validate_tools(&["agents.get".into()], Some(&catalog)).unwrap();
     rupu_cp::mcp::validate_tools(&["agents.list".into(), "wait".into()], Some(&catalog)).unwrap();
     assert!(rupu_cp::mcp::validate_tools(&["nope.x".into()], Some(&catalog)).is_err());
+}
+
+/// Reports progress twice, then returns.
+struct Ticker;
+
+#[async_trait]
+impl ToolSource for Ticker {
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![ToolDef {
+            name: "tick".into(),
+            description: "ticks".into(),
+            input_schema: json!({"type": "object"}),
+            hints: ToolHints::default(),
+        }]
+    }
+    async fn call(&self, name: &str, _args: Value, cx: &CallCx) -> Option<ToolResult> {
+        if name != "tick" {
+            return None;
+        }
+        if let Some(p) = &cx.progress {
+            p.report(1.0, Some(2.0), Some("one"));
+            p.report(2.0, Some(2.0), None);
+        }
+        Some(ToolResult::Text("ticked".into()))
+    }
+}
+
+async fn tick_post(accept: &str) -> reqwest::Response {
+    let (addr, _tmp) = spawn_with(
+        None,
+        true,
+        Some(McpOpts {
+            catalog: Some(Arc::new(Ticker)),
+            tools: vec![],
+        }),
+    )
+    .await;
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", accept)
+        .json(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "tick", "arguments": {},
+                       "_meta": {"progressToken": "p9"}}}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_progress_call_is_answered_as_sse() {
+    let resp = tick_post("application/json, text/event-stream").await;
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/event-stream"), "{ct}");
+    let body = resp.text().await.unwrap();
+    let frames: Vec<Value> = body
+        .split("\n\n")
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| {
+            assert!(f.contains("event: message"), "{f}");
+            let data = f.lines().find_map(|l| l.strip_prefix("data:")).unwrap();
+            serde_json::from_str(data.trim()).unwrap()
+        })
+        .collect();
+    assert_eq!(frames.len(), 3, "{body}");
+    for (i, f) in frames[..2].iter().enumerate() {
+        assert_eq!(f["method"], "notifications/progress");
+        assert_eq!(f["params"]["progressToken"], "p9");
+        assert_eq!(f["params"]["progress"], (i + 1) as f64);
+    }
+    assert_eq!(frames[2]["id"], 4);
+    assert_eq!(frames[2]["result"]["content"][0]["text"], "ticked");
+}
+
+#[tokio::test]
+async fn without_sse_in_accept_the_reply_is_json() {
+    let resp = tick_post("application/json").await;
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("application/json"), "{ct}");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["result"]["content"][0]["text"], "ticked");
+}
+
+/// Serves `agents.list` (an operator tool also) and `stub.only`.
+struct Overlapping;
+
+#[async_trait]
+impl ToolSource for Overlapping {
+    fn tools(&self) -> Vec<ToolDef> {
+        ["agents.list", "stub.only"]
+            .into_iter()
+            .map(|n| ToolDef {
+                name: n.into(),
+                description: format!("catalog {n}"),
+                input_schema: json!({"type": "object"}),
+                hints: ToolHints::default(),
+            })
+            .collect()
+    }
+    async fn call(&self, name: &str, _args: Value, _cx: &CallCx) -> Option<ToolResult> {
+        Some(ToolResult::Text(format!("catalog {name}")))
+    }
+}
+
+#[test]
+fn served_names_counts_a_shadowed_catalog_tool_once() {
+    let catalog: Arc<dyn ToolSource> = Arc::new(Overlapping);
+    let with = rupu_cp::mcp::served_names(Some(&catalog));
+    let without = rupu_cp::mcp::served_names(None);
+    assert!(with.contains("agents.list") && with.contains("stub.only"));
+    assert!(without.contains("agents.list") && without.contains("wait"));
+    assert!(!without.contains("stub.only"));
+    assert_eq!(with.len(), without.len() + 1, "{with:?}");
+}
+
+/// An MCP result's JSON: `structuredContent`, else the parsed text.
+pub(super) fn json_of(result: &Value) -> Value {
+    result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| serde_json::from_str(&text_of(result)).unwrap_or(Value::Null))
+}
+
+/// Assert `tools/list` carries each `(name, required args)` of `table`.
+pub(super) async fn assert_required_args(addr: std::net::SocketAddr, table: &[(&str, &[&str])]) {
+    let list = rpc(addr, "tools/list", json!({})).await["result"]["tools"].clone();
+    for (name, required) in table {
+        let tool = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == *name)
+            .unwrap_or_else(|| panic!("{name} is not listed"));
+        let mut got: Vec<String> = tool["inputSchema"]["required"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default();
+        got.sort();
+        let mut want: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "{name}");
+    }
 }

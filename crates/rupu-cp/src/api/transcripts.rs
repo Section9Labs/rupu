@@ -31,8 +31,8 @@ pub fn routes() -> Router<AppState> {
 /// Optional `?host=<id>` query param, same shape as `sessions.rs`'s
 /// `SessionHostQuery`, plus `?ignore_liveness=true` — the PID-reuse escape
 /// hatch. Defaults to `false`: unchanged behavior unless the caller opts in.
-#[derive(Deserialize, Default)]
-struct TranscriptHostQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct TranscriptHostQuery {
     #[serde(default)]
     host: Option<String>,
     #[serde(default)]

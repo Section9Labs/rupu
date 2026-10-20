@@ -245,8 +245,8 @@ async fn list_hosts(State(s): State<AppState>) -> ApiResult<Json<Vec<HostView>>>
     Ok(Json(views))
 }
 
-#[derive(Deserialize)]
-struct AddHostBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AddHostBody {
     name: String,
     base_url: String,
     /// Bearer token for the remote CP (optional; stored in keychain when present).
@@ -291,8 +291,8 @@ async fn add_host(
 
 // ── Enroll-node types + handler ───────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct EnrollNodeBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct EnrollNodeBody {
     name: String,
 }
 
@@ -461,8 +461,8 @@ async fn enroll_node_handler(
 
 // ── SSH host ──────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct AddSshHostBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AddSshHostBody {
     name: String,
     host: String,
     port: Option<u16>,
@@ -511,8 +511,8 @@ async fn add_ssh_host_handler(
 
 // ── Bucket host ───────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct AddBucketHostBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AddBucketHostBody {
     name: String,
     url: String,
     prefix: Option<String>,

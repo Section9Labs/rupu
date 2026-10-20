@@ -56,7 +56,7 @@ async fn a_malformed_line_is_answered_and_the_server_keeps_serving() {
     client.send_raw("").unwrap();
     client.send_raw("   ").unwrap();
     let list = request(&client, 1, "tools/list", Value::Null).await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
     // JSON that is no JSON-RPC message is an invalid request.
     client.send(json!(42)).await.unwrap();
     assert_eq!(next(&client).await["error"]["code"], -32600);

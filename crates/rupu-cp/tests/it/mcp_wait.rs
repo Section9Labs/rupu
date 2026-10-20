@@ -20,8 +20,15 @@ const RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1WAT";
 
 /// A CP over `global` serving `/mcp` (no catalog).
 async fn spawn(global: &Path) -> SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+    serve(state_of(global)).await
+}
+
+fn state_of(global: &Path) -> rupu_cp::state::AppState {
+    rupu_cp::state::AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default())
+}
+
+/// `state` served with `/mcp` (no catalog).
+async fn serve(state: rupu_cp::state::AppState) -> SocketAddr {
     let server = rupu_cp::mcp::build_server(
         &state,
         &McpOpts {
@@ -371,6 +378,48 @@ async fn an_unknown_run_is_an_error_not_a_hang() {
 }
 
 #[tokio::test]
+async fn a_project_local_run_is_found() {
+    let global = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let ws_store = rupu_workspace::WorkspaceStore {
+        root: global.path().join("workspaces"),
+    };
+    rupu_workspace::upsert(&ws_store, project.path()).unwrap();
+    RunStore::new(project.path().join(".rupu").join("runs"))
+        .create(
+            super::sse::seed_run(RUN, RunStatus::Completed),
+            "name: test\nsteps: []\n",
+        )
+        .unwrap();
+    let addr = spawn(global.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+}
+
+#[tokio::test]
+async fn a_string_cursor_on_a_local_source_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let key = format!("run:{RUN}");
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN}],
+               "cursor": {key.clone(): "msg_01"}, "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains(&format!("cursor.{key}")), "{r}");
+}
+
+#[tokio::test]
 async fn bad_arguments_are_refused() {
     let tmp = tempfile::tempdir().unwrap();
     seed(tmp.path(), RunStatus::Running);
@@ -378,7 +427,7 @@ async fn bad_arguments_are_refused() {
     let cases = [
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN, "host": "mini"}]}),
-            "watch[0] (`run_settled`): wait on a remote host is not supported yet",
+            "unknown host `mini`",
         ),
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN}], "follow": true}),
@@ -472,4 +521,1451 @@ async fn cancelling_a_wait_stops_it() {
     assert_eq!(resp.status(), 202);
     assert!(resp.text().await.unwrap().is_empty());
     assert!(t.elapsed() < Duration::from_secs(10));
+}
+
+// ---- agentiflow, agent_run_end, session_turn ------------------------------
+
+const FLOW: &str = "af_01J9ZQ3K4M5N6P7Q8R9S0T1WAT";
+
+fn transcript(global: &Path, run: &str, answer: &str, status: &str) -> std::path::PathBuf {
+    let dir = global.join("transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{run}.jsonl"));
+    let a = json!({"type": "assistant_message", "data": {"content": answer}});
+    let c = json!({"type": "run_complete", "data": {"run_id": run, "status": status,
+        "total_tokens": 12, "duration_ms": 5}});
+    std::fs::write(&path, format!("{a}\n{c}\n")).unwrap();
+    path
+}
+
+fn session(global: &Path, id: &str, status: &str, active: Option<&str>, runs: Value) {
+    let dir = global.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let v = json!({"session_id": id, "agent_name": "triage", "status": status,
+        "active_run_id": active, "runs": runs});
+    std::fs::write(dir.join("session.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn agentiflow_lines_are_returned_and_filtered_by_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = rupu_agentiflow::agentiflow_dir(tmp.path()).join(FLOW);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("events.jsonl"),
+        "{\"kind\":\"round\",\"n\":1}\n{\"kind\":\"run_stopped\",\"why\":\"done\"}\n",
+    )
+    .unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agentiflow", "id": FLOW, "types": ["run_stopped"]}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["events"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(s["events"][0]["event"]["why"], "done", "{r}");
+    assert_eq!(s["fired"][0]["detail"]["count"], 1, "{r}");
+    assert_eq!(
+        s["cursor"],
+        json!({ format!("agentiflow:{FLOW}"): 2 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn an_ended_agent_run_fires_with_its_final_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    transcript(tmp.path(), "run_a", "done.", "ok");
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_a"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["final_answer"], "done.", "{r}");
+    assert_eq!(d["total_tokens"], 12, "{r}");
+    assert_eq!(d["status"], "ok", "{r}");
+}
+
+#[tokio::test]
+async fn an_agent_run_that_appears_late_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        transcript(&g, "run_late", "late.", "ok");
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_late"}], "timeout_ms": 20000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["detail"]["final_answer"], "late.",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_run_that_never_appears_is_an_error_after_the_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_none"}], "timeout_ms": 30000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(12), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert_eq!(
+        text_of(&r),
+        "no agent run `run_none` (a launch that failed before writing its transcript, \
+         e.g. missing provider credentials, leaves none)",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_session_turn_fires_with_the_turns_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = transcript(tmp.path(), "run_t", "the answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_A",
+        "running",
+        Some("run_t"),
+        json!([{"run_id": "run_t", "transcript_path": path.to_str().unwrap()}]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_A"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_t", "{r}");
+    assert_eq!(d["final_answer"], "the answer.", "{r}");
+}
+
+#[tokio::test]
+async fn a_session_that_stopped_fires_without_a_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    session(tmp.path(), "ses_B", "stopped", None, json!([]));
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_B"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], Value::Null, "{r}");
+    assert_eq!(d["final_answer"], Value::Null, "{r}");
+    assert_eq!(d["status"], "stopped", "{r}");
+}
+
+#[tokio::test]
+async fn a_host_on_these_conditions_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    for c in [
+        json!({"kind": "agentiflow", "id": FLOW, "host": "local"}),
+        json!({"kind": "agent_run_end", "run": "run_a", "host": "local"}),
+        json!({"kind": "session_turn", "session": "ses_A", "host": "other"}),
+    ] {
+        let r = wait(addr, json!({ "watch": [c] })).await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert!(text_of(&r).contains("host"), "{r}");
+    }
+}
+
+#[tokio::test]
+async fn an_idle_session_without_run_does_not_fire_on_an_old_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_I",
+        "idle",
+        None,
+        json!([{"run_id": "run_old", "transcript_path": path.to_str().unwrap()}]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_I"}], "timeout_ms": 1500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+}
+
+#[tokio::test]
+async fn session_turn_with_an_explicit_run_fires_on_that_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    let new = transcript(tmp.path(), "run_new", "new answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_E",
+        "idle",
+        None,
+        json!([
+            {"run_id": "run_old", "transcript_path": old.to_str().unwrap()},
+            {"run_id": "run_new", "transcript_path": new.to_str().unwrap()}
+        ]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_E", "run": "run_old"}]}),
+    )
+    .await;
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_old", "{r}");
+    assert_eq!(d["final_answer"], "old answer.", "{r}");
+}
+
+#[tokio::test]
+async fn an_unknown_run_on_a_session_is_an_error_after_the_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    session(tmp.path(), "ses_U", "idle", None, json!([]));
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_U", "run": "run_nope"}],
+            "timeout_ms": 30000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(12), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains("run_nope"), "{r}");
+}
+
+#[tokio::test]
+async fn a_timeout_shorter_than_the_grace_times_out_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_none"}], "timeout_ms": 1500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+}
+
+#[tokio::test]
+async fn a_fast_turn_between_rechecks_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    let old_entry = json!({"run_id": "run_old", "transcript_path": old.to_str().unwrap()});
+    session(
+        tmp.path(),
+        "ses_F",
+        "idle",
+        None,
+        json!([old_entry.clone()]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let new = transcript(&g, "run_fast", "fast answer.", "ok");
+        session(
+            &g,
+            "ses_F",
+            "idle",
+            None,
+            json!([old_entry, {"run_id": "run_fast", "transcript_path": new.to_str().unwrap()}]),
+        );
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_F"}], "timeout_ms": 10000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_fast", "{r}");
+    assert_eq!(d["final_answer"], "fast answer.", "{r}");
+}
+
+#[tokio::test]
+async fn an_active_turn_that_finishes_and_clears_active_run_id_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tpath = dir.join("run_R.jsonl");
+    let entry = json!({"run_id": "run_R", "transcript_path": tpath.to_str().unwrap()});
+    session(
+        tmp.path(),
+        "ses_R",
+        "running",
+        Some("run_R"),
+        json!([entry.clone()]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        transcript(&g, "run_R", "R answer.", "ok");
+        session(&g, "ses_R", "idle", None, json!([entry]));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_R"}], "timeout_ms": 10000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_R", "{r}");
+    assert_eq!(d["final_answer"], "R answer.", "{r}");
+}
+
+// ---- findings ----
+
+fn register(global: &Path, ws: &str) -> std::path::PathBuf {
+    let repo = global.join(format!("{ws}-repo"));
+    std::fs::create_dir_all(&repo).unwrap();
+    let dir = global.join("workspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{ws}.toml")),
+        format!(
+            "id = \"{ws}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    repo
+}
+
+fn finding(id: &str, run: &str, severity: rupu_coverage::Severity) -> rupu_coverage::FindingRecord {
+    use rupu_coverage::{Attribution, FindingEvidence, FindingProfile, FindingScope, Surface};
+    rupu_coverage::FindingRecord {
+        id: id.into(),
+        file_path: None,
+        line_range: None,
+        target_ref: None,
+        scope: FindingScope::File,
+        summary: "s".into(),
+        severity,
+        concern_id: None,
+        evidence: FindingEvidence {
+            code_excerpt: None,
+            rationale: "r".into(),
+            references: vec![],
+        },
+        declared_by: Attribution {
+            run_id: run.into(),
+            model: "m".into(),
+            surface: Surface::Agent,
+            codename: None,
+            agent: None,
+            provider: None,
+        },
+        declared_at: chrono::Utc::now(),
+        profile: FindingProfile::Summary,
+        report: None,
+        tags: Vec::new(),
+    }
+}
+
+fn record(repo: &Path, target: &str, rec: rupu_coverage::FindingRecord) {
+    let paths = rupu_coverage::CoveragePaths::new(repo, target);
+    paths.ensure_dir().unwrap();
+    rupu_coverage::append_record(&paths, rupu_coverage::Ledger::Findings, &rec).unwrap();
+}
+
+use rupu_coverage::Severity;
+
+#[tokio::test]
+async fn no_cursor_returns_only_findings_recorded_after_the_call_began() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    for i in 0..3 {
+        record(
+            &repo,
+            "t1",
+            finding(&format!("fnd_old{i}"), "run_a", Severity::Low),
+        );
+    }
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "ws1"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![4], "{r}");
+    let e = &r["structuredContent"]["events"][0];
+    assert_eq!(e["source"], "findings:ws1/t1", "{r}");
+    assert_eq!(e["event"]["id"], "fnd_new", "{r}");
+    assert_eq!(e["event"]["ws_id"], "ws1", "{r}");
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["detail"]["count"], 1,
+        "{r}"
+    );
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({"findings:ws1/t1": 4}),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_scope_reads_the_runs_findings_from_the_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_a1", "run_a", Severity::Low));
+    record(&repo, "t1", finding("fnd_b1", "run_b", Severity::Low));
+    record(&repo, "t1", finding("fnd_a2", "run_a", Severity::High));
+    let addr = spawn(tmp.path()).await;
+    let started = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "run": "run_a"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 3], "{r}");
+    assert!(started.elapsed() < Duration::from_millis(250), "{r}");
+}
+
+#[tokio::test]
+async fn q_filters_new_findings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(
+        &repo,
+        "t1",
+        finding("fnd_seed", "run_a", Severity::Critical),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_low", "run_a", Severity::Low));
+        record(&r2, "t1", finding("fnd_high", "run_a", Severity::High));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "q": "severity>=high"}], "timeout_ms": 3000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["event"]["id"], "fnd_high",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_q_is_an_error_with_its_token_and_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "q": "severity>>high"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let body: Value = serde_json::from_str(&text_of(&r)).unwrap();
+    assert!(body["code"].is_string(), "{body}");
+    assert!(body["token"].is_number(), "{body}");
+    assert!(
+        body["start"].is_number() && body["end"].is_number(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_project_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "nope"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+}
+
+#[tokio::test]
+async fn a_ledger_created_mid_wait_is_read_from_its_first_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t2", finding("fnd_n1", "run_a", Severity::Low));
+        record(&r2, "t2", finding("fnd_n2", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "ws1"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["source"], "findings:ws1/t2",
+        "{r}"
+    );
+}
+
+/// A first workspace listing that fails finds nothing, and the listing that
+/// first succeeds counts as the call's start: its old findings don't fire,
+/// a new one does.
+#[tokio::test]
+async fn workspaces_first_listed_after_a_failed_listing_start_at_their_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    // The workspace store's dir is a file: listing it fails.
+    let dir = tmp.path().join("workspaces");
+    let aside = tmp.path().join("workspaces.aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    std::fs::write(&dir, b"not a dir").unwrap();
+    let addr = spawn(tmp.path()).await;
+    let (d, a, r2) = (dir.clone(), aside.clone(), repo.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::remove_file(&d).unwrap();
+        std::fs::rename(&a, &d).unwrap();
+        // Past the next re-check (1 s), which lists the workspace.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings"}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![2], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["event"]["id"], "fnd_new",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn the_cursor_resumes_per_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_a", "run_a", Severity::Low));
+    record(&repo, "t1", finding("fnd_b", "run_a", Severity::Low));
+    record(&repo, "t2", finding("fnd_c", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let watch = json!([{"kind": "findings", "project": "ws1"}]);
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 300})).await;
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+    let cursor = r["structuredContent"]["cursor"].clone();
+    assert_eq!(
+        cursor,
+        json!({"findings:ws1/t1": 2, "findings:ws1/t2": 1}),
+        "{r}"
+    );
+
+    record(&repo, "t1", finding("fnd_d", "run_a", Severity::Low));
+    record(&repo, "t2", finding("fnd_e", "run_a", Severity::Low));
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": cursor, "timeout_ms": 3000}),
+    )
+    .await;
+    let got: Vec<(String, u64)> = r["structuredContent"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["source"].as_str().unwrap().to_string(),
+                e["id"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![("findings:ws1/t1".into(), 3), ("findings:ws1/t2".into(), 2)],
+        "{r}"
+    );
+    let cursor = r["structuredContent"]["cursor"].clone();
+
+    record(&repo, "t1", finding("fnd_f", "run_a", Severity::Low));
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": cursor, "timeout_ms": 3000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![4], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["source"], "findings:ws1/t1",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_row_matches_the_list_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    let store = rupu_workspace::CustomerStore::new(tmp.path());
+    store
+        .create(
+            "acme",
+            &rupu_workspace::NewCustomer {
+                name: "ACME".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .assign("acme", rupu_workspace::ProjectRef::Id("ws1"))
+        .unwrap();
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::High));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let row = r["structuredContent"]["events"][0]["event"].clone();
+    assert_eq!(row["customer"], "acme", "{r}");
+    let list: Value = reqwest::get(format!("http://{addr}/api/findings"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = list["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "fnd_new")
+        .unwrap();
+    assert_eq!(&row, listed);
+}
+
+// ---- remote hosts ---------------------------------------------------------
+
+/// A peer CP over `global` on its own runtime and thread, so stopping it
+/// closes every connection it holds (an aborted `axum::serve` task leaves its
+/// connections' tasks running).
+struct Peer {
+    url: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Peer {
+    fn start(global: &Path) -> Self {
+        let global = global.to_path_buf();
+        let (url_tx, url_rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = rupu_cp::server::router(state_of(&global), None);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                url_tx
+                    .send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let _ = stopped.await;
+            });
+            rt.shutdown_background();
+        });
+        Self {
+            url: url_rx.recv().unwrap(),
+            stop: Some(stop),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A coordinator over `global` with `peer` registered; its address and the
+/// peer's host id.
+async fn spawn_with_peer(global: &Path, peer: &Peer) -> (SocketAddr, String) {
+    let state = state_of(global);
+    let host = state.hosts.add_host("peer", &peer.url, None).unwrap();
+    (serve(state).await, host.id)
+}
+
+fn append_completed(global: &Path) {
+    let ev = Event::RunCompleted {
+        run_id: RUN.into(),
+        status: RunStatus::Completed,
+        finished_at: Utc::now(),
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store(global).events_path(RUN))
+        .unwrap();
+    writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn remote_run_events_resume_with_the_cursor() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    append_step(remote.path(), "two");
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let watch = json!([{"kind": "run_events", "run": RUN, "host": host}]);
+    let source = format!("run:{RUN}@{host}");
+
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 5000})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["events"][0]["source"], source.as_str(), "{r}");
+    assert_eq!(s["events"][1]["event"]["step_id"], "two", "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 2 }), "{r}");
+    assert_eq!(s["fired"][0]["kind"], "run_events", "{r}");
+    assert!(s.get("warnings").is_none(), "{r}");
+
+    append_step(remote.path(), "three");
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": s["cursor"], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ &source: 3 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_settled_run_fires() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Completed);
+    append_step(remote.path(), "one");
+    append_completed(remote.path());
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN, "host": host}],
+               "timeout_ms": 10_000}),
+    )
+    .await;
+    // The peer's stream ends 2 s after its last terminal event.
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(s["fired"][0]["detail"]["status"], "completed", "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+    // Watched for its state only: no cursor, no events.
+    assert_eq!(s["events"], json!([]), "{r}");
+    assert_eq!(s["cursor"], json!({}), "{r}");
+}
+
+#[tokio::test]
+async fn a_remote_parked_gate_fires() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut rec = super::sse::seed_run(RUN, RunStatus::AwaitingApproval);
+    rec.awaiting = vec![AwaitingGate {
+        step_id: "review".into(),
+        prompt: Some("ship it?".into()),
+        since: Utc::now(),
+        expires_at: None,
+    }];
+    store(remote.path())
+        .create(rec, "name: test\nsteps: []\n")
+        .unwrap();
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": RUN, "host": host}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let fired = &r["structuredContent"]["fired"][0];
+    assert_eq!(fired["kind"], "run_gate", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["prompt"], "ship it?", "{r}");
+
+    // `timeout_ms: 0` still peeks: the first answer gets its own budget.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": RUN, "host": host}], "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["kind"], "run_gate",
+        "{r}"
+    );
+}
+
+/// A run id that resolves to a host is watched there, as if `host` named it.
+#[tokio::test]
+async fn a_run_found_on_a_host_is_watched_there() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ format!("run:{RUN}@{host}"): 1 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn remote_messages_poll_with_a_string_cursor() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let bus = super::messages::workflow_run(remote.path(), RUN, RunStatus::Running);
+    let op = bus
+        .operator_send(OperatorMessage {
+            to: Address::Broadcast,
+            body: "focus".into(),
+            urgent: false,
+            via: OperatorVia::Cli,
+            viewer: None,
+            client: None,
+        })
+        .unwrap();
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let watch = json!([{"kind": "messages", "root": RUN, "host": host}]);
+    let source = format!("messages:{RUN}@{host}");
+
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 5000})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    let events = s["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{r}");
+    assert_eq!(events[0]["source"], source.as_str(), "{r}");
+    assert_eq!(events[0]["id"], op.id(), "{r}");
+    assert_eq!(events[0]["event"]["body"], "focus", "{r}");
+    assert_eq!(s["fired"][0]["kind"], "messages", "{r}");
+    assert_eq!(s["cursor"], json!({ &source: op.id() }), "{r}");
+    // The event is the local shape (its log line), plus its receipts.
+    let local = wait(
+        spawn(remote.path()).await,
+        json!({"watch": [{"kind": "messages", "root": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    let mut remote_event = events[0]["event"].clone();
+    assert_eq!(remote_event["t"], "msg", "{r}");
+    assert_eq!(remote_event["seen"], json!([]), "{r}");
+    remote_event.as_object_mut().unwrap().remove("seen");
+    assert_eq!(
+        remote_event, local["structuredContent"]["events"][0]["event"],
+        "{local}"
+    );
+
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": s["cursor"], "timeout_ms": 300}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert_eq!(s["events"], json!([]), "{r}");
+    assert_eq!(s["cursor"], json!({ &source: op.id() }), "{r}");
+
+    // An integer is a line number: not a remote message space's cursor.
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": {&source: 3}, "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains(&format!("cursor.{source}")), "{r}");
+}
+
+#[tokio::test]
+async fn an_unknown_host_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    for watch in [
+        json!({"kind": "run_events", "run": RUN, "host": "host_nope"}),
+        json!({"kind": "messages", "root": RUN, "host": "host_nope"}),
+    ] {
+        let t = Instant::now();
+        let r = wait(addr, json!({"watch": [watch], "timeout_ms": 5000})).await;
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert_eq!(text_of(&r), "unknown host `host_nope`", "{r}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_run_on_a_host_is_an_error() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    for (kind, timeout) in [("run_events", 5000), ("run_gate", 5000), ("run_gate", 0)] {
+        let r = wait(
+            addr,
+            json!({"watch": [{"kind": kind, "run": "run_nope", "host": host}], "timeout_ms": timeout}),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert_eq!(
+            text_of(&r),
+            format!("no run `run_nope` on host `{host}`"),
+            "{r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_host_that_goes_away_mid_wait_returns_by_the_timeout_with_a_warning() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    let mut peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let pending = tokio::spawn(wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 3000}),
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    peer.stop();
+    let r = pending.await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    let warnings = s["warnings"].as_array().unwrap_or_else(|| panic!("{r}"));
+    assert!(!warnings.is_empty(), "{r}");
+    let source = format!("run:{RUN}@{host}: ");
+    assert!(warnings[0].as_str().unwrap().starts_with(&source), "{r}");
+}
+
+/// What a [`fake_peer`] does with one request (one per connection).
+enum Reply {
+    /// Send it and close.
+    Close(String),
+    /// Send it and keep the connection open.
+    Hold(String),
+    /// Send it, then drop the connection mid-body (a chunked body never
+    /// ended).
+    Cut(String),
+}
+
+/// A bare HTTP peer answering each request with `answer(path, n)`, `n`
+/// counting that path's earlier requests; the counts, by path.
+async fn fake_peer(
+    answer: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let answer = std::sync::Arc::new(answer);
+    let seen = counts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let (answer, seen) = (answer.clone(), seen.clone());
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    let n = seen.entry(path.clone()).or_insert(0);
+                    *n += 1;
+                    *n - 1
+                };
+                match answer(&path, n) {
+                    Reply::Close(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                    Reply::Hold(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Reply::Cut(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+    (url, counts)
+}
+
+fn json_reply(status: &str, body: &Value) -> String {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// An event-stream response head, then `frames` as one chunk.
+fn sse_reply(frames: &str) -> String {
+    let mut r = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        .to_string();
+    if !frames.is_empty() {
+        r.push_str(&format!("{:x}\r\n{frames}\r\n", frames.len()));
+    }
+    r
+}
+
+fn not_found() -> Reply {
+    Reply::Close(json_reply("404 Not Found", &json!({"error": "not found"})))
+}
+
+/// A coordinator with a [`fake_peer`] registered; its address and the peer's
+/// host id.
+async fn spawn_with_fake_peer(global: &Path, url: &str) -> (SocketAddr, String) {
+    let state = state_of(global);
+    let host = state.hosts.add_host("fake", url, None).unwrap();
+    (serve(state).await, host.id)
+}
+
+/// A stream cut short (no `end`) whose reopen succeeds is a silent
+/// reconnect: the reopened stream's events come back, with no warning.
+#[tokio::test]
+async fn a_stream_cut_then_reopened_is_not_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, counts) = fake_peer(|path, n| match (path, n) {
+        ("/api/events/stream", 0) => Reply::Cut(sse_reply("")),
+        ("/api/events/stream", _) => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\",\"step_id\":\"one\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+    assert!(r["structuredContent"].get("warnings").is_none(), "{r}");
+    // Reopened at the next round, not at once.
+    assert!(
+        t.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(counts.lock().unwrap()["/api/events/stream"], 2);
+}
+
+/// A `timeout_ms: 0` peek at a remote run's events returns what the host has,
+/// as a local peek returns what is on disk.
+#[tokio::test]
+async fn a_remote_peek_returns_the_events_the_host_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/events/stream" => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 2\ndata: {\"type\":\"step_started\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 0}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], false, "{r}");
+    assert_eq!(
+        s["cursor"],
+        json!({ format!("run:{RUN}@{host}"): 2 }),
+        "{r}"
+    );
+    assert!(s.get("warnings").is_none(), "{r}");
+}
+
+/// A healthy host's later round that the call's timeout cuts short (it went
+/// out just before it) is not named in `warnings`.
+#[tokio::test]
+async fn a_round_cut_short_by_the_timeout_is_not_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote_run = "run_01J9ZQ3K4M5N6P7Q8R9S0T1REM";
+    let (url, _) = fake_peer(move |path, n| {
+        if path == format!("/api/runs/{remote_run}") && n == 0 {
+            Reply::Close(json_reply(
+                "200 OK",
+                &json!({"run": {"id": remote_run, "status": "running", "awaiting": []}}),
+            ))
+        } else if path.starts_with("/api/runs/") {
+            // Slow, not dead: the timeout lands while it answers.
+            Reply::Hold(String::new())
+        } else {
+            not_found()
+        }
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    // The second round goes out at 2 s, 500 ms before the timeout.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": remote_run, "host": host}],
+               "timeout_ms": 2500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert!(s.get("warnings").is_none(), "{r}");
+}
+
+/// A host that replays from the start despite the cursor: frames at or
+/// before it are dropped.
+#[tokio::test]
+async fn replayed_frames_at_or_before_the_cursor_are_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/events/stream" => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 2\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 3\ndata: {\"type\":\"step_started\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let source = format!("run:{RUN}@{host}");
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}],
+               "cursor": {&source: 2}, "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ &source: 3 }),
+        "{r}"
+    );
+}
+
+/// A peer whose `/api/host/info` doesn't list `run.messages` can't serve a
+/// message space: an error naming the host.
+#[tokio::test]
+async fn a_peer_without_run_messages_is_an_error_naming_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/host/info" => Reply::Close(json_reply(
+            "200 OK",
+            &json!({"version": "0.70.0", "features": []}),
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "messages", "root": RUN, "host": host}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let text = text_of(&r);
+    assert!(
+        text.starts_with(&format!("host `{host}` can't read messages (")),
+        "{text}"
+    );
+    assert!(text.contains("run.messages"), "{text}");
+}
+
+/// A remote round that hangs holds up nothing else: a local line written
+/// while it is in flight returns at once.
+#[tokio::test]
+async fn a_slow_host_round_does_not_hold_up_local_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let remote_run = "run_01J9ZQ3K4M5N6P7Q8R9S0T1REM";
+    let (url, counts) = fake_peer(move |path, n| {
+        if path == format!("/api/runs/{remote_run}") && n == 0 {
+            // The first poll answers (no gate); every later one hangs.
+            Reply::Close(json_reply(
+                "200 OK",
+                &json!({"run": {"id": remote_run, "status": "running", "awaiting": []}}),
+            ))
+        } else if path.starts_with("/api/runs/") {
+            Reply::Hold(String::new())
+        } else {
+            not_found()
+        }
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let pending = tokio::spawn(wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN},
+                         {"kind": "run_gate", "run": remote_run, "host": host}],
+               "timeout_ms": 20_000}),
+    ));
+    // Past the second round (2 s), which hangs.
+    while counts
+        .lock()
+        .unwrap()
+        .get(&format!("/api/runs/{remote_run}"))
+        .copied()
+        .unwrap_or(0)
+        < 2
+    {
+        assert!(t.elapsed() < Duration::from_secs(10), "no second poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let written = Instant::now();
+    append_step(tmp.path(), "one");
+    let r = pending.await.unwrap();
+    assert!(
+        written.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        written.elapsed()
+    );
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+}
+
+/// A first round that hangs, once a local condition fired, holds the result
+/// back by at most 5 s and is named in `warnings`.
+#[tokio::test]
+async fn a_hung_first_round_holds_a_fired_result_back_at_most_5s() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Completed);
+    let (url, _) = fake_peer(|path, _| match path {
+        p if p.starts_with("/api/runs/") => Reply::Hold(String::new()),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN},
+                         {"kind": "run_gate", "run": "run_other", "host": host}],
+               "timeout_ms": 20_000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(7), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(
+        s["warnings"],
+        json!([format!("run:run_other@{host}: no first answer within 5 s")]),
+        "{r}"
+    );
+
+    // Past the call's own timeout, the warning says so.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN},
+                         {"kind": "run_gate", "run": "run_other", "host": host}],
+               "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(
+        r["structuredContent"]["warnings"],
+        json!([format!(
+            "run:run_other@{host}: no answer before the call's timeout"
+        )]),
+        "{r}"
+    );
+}
+
+/// A coordinator with a healthy peer and a hung one (accepts, never
+/// answers) registered; its address and the two host ids.
+async fn spawn_with_healthy_and_hung(
+    global: &Path,
+    healthy: &Peer,
+) -> (SocketAddr, String, String) {
+    let (hung_url, _) = fake_peer(|_, _| Reply::Hold(String::new())).await;
+    let state = state_of(global);
+    let ok = state.hosts.add_host("healthy", &healthy.url, None).unwrap();
+    let hung = state.hosts.add_host("hung", &hung_url, None).unwrap();
+    (serve(state).await, ok.id, hung.id)
+}
+
+/// Hosts' rounds are independent: a hung host holds up neither another
+/// host's events nor its own warning's accuracy (only the hung host is
+/// named).
+#[tokio::test]
+async fn a_hung_host_does_not_hold_up_another_host() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    append_step(remote.path(), "two");
+    let peer = Peer::start(remote.path());
+    let (addr, ok, hung) = spawn_with_healthy_and_hung(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": ok},
+                         {"kind": "run_gate", "run": "run_other", "host": hung}],
+               "timeout_ms": 15_000}),
+    )
+    .await;
+    // Held back by the hung host's first round for at most 5 s.
+    assert!(t.elapsed() < Duration::from_secs(7), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["cursor"], json!({ format!("run:{RUN}@{ok}"): 2 }), "{r}");
+    assert_eq!(
+        s["warnings"],
+        json!([format!("run:run_other@{hung}: no first answer within 5 s")]),
+        "{r}"
+    );
+}
+
+/// A healthy host's first-round failure is still the call's error while
+/// another host hangs.
+#[tokio::test]
+async fn a_hosts_first_round_error_is_not_lost_beside_a_hung_host() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let peer = Peer::start(remote.path());
+    let (addr, ok, hung) = spawn_with_healthy_and_hung(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": "run_nope", "host": ok},
+                         {"kind": "run_gate", "run": "run_other", "host": hung}],
+               "timeout_ms": 15_000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert_eq!(
+        text_of(&r),
+        format!("no run `run_nope` on host `{ok}`"),
+        "{r}"
+    );
+}
+
+/// A wait that was given a progress token reports while it waits, with
+/// `progress` growing, then answers.
+#[tokio::test]
+async fn a_wait_with_a_progress_token_reports_while_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let body = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "wait",
+                       "arguments": {"watch": [{"kind": "run_events", "run": RUN}],
+                                     "timeout_ms": 11000},
+                       "_meta": {"progressToken": "w1"}}}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let frames: Vec<Value> = body
+        .split("\n\n")
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| {
+            let data = f.lines().find_map(|l| l.strip_prefix("data:")).unwrap();
+            serde_json::from_str(data.trim()).unwrap()
+        })
+        .collect();
+    let (last, progress) = frames.split_last().unwrap();
+    assert!(progress.len() >= 2, "{body}");
+    let mut prev = -1.0;
+    for f in progress {
+        assert_eq!(f["method"], "notifications/progress", "{body}");
+        assert_eq!(f["params"]["progressToken"], "w1");
+        assert_eq!(f["params"]["total"], 11000.0);
+        assert_eq!(f["params"]["message"], "waiting: run_events");
+        let p = f["params"]["progress"].as_f64().unwrap();
+        assert!(p > prev, "{body}");
+        prev = p;
+    }
+    assert_eq!(last["id"], 7);
+    assert_eq!(
+        last["result"]["structuredContent"]["timed_out"], true,
+        "{body}"
+    );
 }

@@ -30,7 +30,7 @@ pub fn routes() -> Router<AppState> {
 /// parse failures as the schema evolves. The `message_history` field
 /// is deliberately excluded — it can be very large.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionDto {
+pub(crate) struct SessionDto {
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -85,6 +85,32 @@ struct SessionDto {
     runs: Vec<SessionRunEntry>,
 }
 
+impl SessionDto {
+    /// The session's status when it is a plain word (`running`, `stopped`, …).
+    pub(crate) fn status_word(&self) -> String {
+        match &self.status {
+            serde_json::Value::String(s) => s.to_lowercase(),
+            other => other.to_string().to_lowercase(),
+        }
+    }
+
+    pub(crate) fn active_run_id(&self) -> Option<&str> {
+        self.active_run_id.as_deref().filter(|r| !r.is_empty())
+    }
+
+    pub(crate) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// The recorded turns, oldest first: `(run_id, transcript_path)`.
+    pub(crate) fn turns(&self) -> Vec<(String, Option<String>)> {
+        self.runs
+            .iter()
+            .map(|r| (r.run_id.clone(), r.transcript_path.clone()))
+            .collect()
+    }
+}
+
 /// `runs` as recorded turns, or none when it has any other shape — usage
 /// accounting must never turn a readable session into a parse error.
 fn lenient_runs<'de, D>(d: D) -> Result<Vec<SessionRunEntry>, D::Error>
@@ -101,7 +127,7 @@ where
 /// - `Ok(None)`  — file does not exist (caller should treat as 404)
 /// - `Ok(Some)`  — file exists and parsed successfully
 /// - `Err(_)`    — file exists but could not be read or parsed (→ 500)
-fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionDto>, ApiError> {
+pub(crate) fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionDto>, ApiError> {
     let path = dir.join("session.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -633,8 +659,8 @@ pub(crate) fn collect_sessions(
     Ok(rows)
 }
 
-#[derive(Deserialize, Default)]
-struct SessionsQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SessionsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -675,8 +701,8 @@ impl SessionsQuery {
 
 /// Optional `?host=<id>` query param for single-session detail/runs/usage
 /// endpoints.
-#[derive(Deserialize, Default)]
-struct SessionHostQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SessionHostQuery {
     #[serde(default)]
     host: Option<String>,
 }

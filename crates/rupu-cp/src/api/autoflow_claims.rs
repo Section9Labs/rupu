@@ -178,8 +178,8 @@ async fn list_claims(State(s): State<AppState>) -> ApiResult<Json<Vec<ClaimRow>>
     Ok(Json(rows))
 }
 
-#[derive(Deserialize)]
-struct ReleaseBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReleaseBody {
     issue_ref: String,
 }
 
@@ -197,8 +197,8 @@ async fn release_claim(
     Ok(Json(json!({ "released": released })))
 }
 
-#[derive(Deserialize)]
-struct RequeueBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct RequeueBody {
     issue_ref: String,
     #[serde(default)]
     not_before: Option<String>,

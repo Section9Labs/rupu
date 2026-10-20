@@ -472,6 +472,15 @@ pub trait HostConnector: Send + Sync {
         false
     }
 
+    /// Whether every request to this host opens a connection of its own (SSH:
+    /// a fresh `ssh` process per command, no ControlMaster), so a caller that
+    /// polls it must poll slowly: a burst of connections can get the
+    /// coordinator blocked by the host. `false` — the default — for the
+    /// transports that hold a connection or read the coordinator's own mirror.
+    fn connects_per_request(&self) -> bool {
+        false
+    }
+
     /// Whether this transport executes an [`AgentLaunchRequest`] under the
     /// `run_id` the CALLER supplied, rather than minting its own.
     ///
@@ -1465,6 +1474,15 @@ pub(crate) mod testing {
         /// `Some` → `launch_agent` records each request here and answers
         /// `run_STUB`. `None` → not configured.
         pub launched: Option<std::sync::Mutex<Vec<crate::agent_launcher::AgentLaunchRequest>>>,
+        /// What `connects_per_request` answers (an SSH-like host).
+        pub connects_per_request: bool,
+        /// Canned `get_run` reply. `None` → not configured.
+        pub get_run: Option<Result<serde_json::Value, HostConnectorError>>,
+        /// How many times `get_run` was called.
+        pub get_run_calls: std::sync::atomic::AtomicUsize,
+        /// Canned `stream_run_events` body (SSE text), sent at once and then
+        /// held open like a live stream. `None` → not configured.
+        pub events: Option<&'static str>,
     }
 
     /// An `AppState` whose host registry resolves `host_id` to `conn`. A
@@ -1500,6 +1518,10 @@ pub(crate) mod testing {
 
     #[async_trait::async_trait]
     impl HostConnector for StubConnector {
+        fn connects_per_request(&self) -> bool {
+            self.connects_per_request
+        }
+
         async fn ship_skills(
             &self,
             _: &crate::host::skill_ship::SkillBundle,
@@ -1560,7 +1582,11 @@ pub(crate) mod testing {
             unimplemented!("StubConnector: list_runs not configured")
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-            unimplemented!("StubConnector: get_run not configured")
+            self.get_run_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.get_run
+                .clone()
+                .expect("StubConnector: get_run not configured")
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!("StubConnector: approve_run not configured")
@@ -1579,7 +1605,11 @@ pub(crate) mod testing {
             &self,
             _run_id: &str,
         ) -> Result<EventByteStream, HostConnectorError> {
-            unimplemented!("StubConnector: stream_run_events not configured")
+            let body = self
+                .events
+                .expect("StubConnector: stream_run_events not configured");
+            let first = futures_util::stream::iter([Ok(Bytes::from_static(body.as_bytes()))]);
+            Ok(Box::pin(first.chain(futures_util::stream::pending())))
         }
         async fn get_transcript(
             &self,

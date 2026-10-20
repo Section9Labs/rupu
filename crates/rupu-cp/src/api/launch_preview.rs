@@ -32,7 +32,7 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/launch/preview", post(preview))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PreviewBody {
     /// Exactly one of `workflow` / `agent`.
     #[serde(default)]

@@ -61,7 +61,14 @@ pub fn validate_tools(
     tools: &[String],
     catalog: Option<&Arc<dyn ToolSource>>,
 ) -> Result<(), ServeError> {
-    let names: Vec<String> = sources(
+    let names: Vec<String> = served_names(catalog).into_iter().collect();
+    ToolFilter::parse(tools).apply(&names).map(|_| ())
+}
+
+/// The tool names the server serves, after shadowing (each once), built
+/// without an `AppState` as [`validate_tools`] does.
+pub fn served_names(catalog: Option<&Arc<dyn ToolSource>>) -> BTreeSet<String> {
+    sources(
         Arc::new(operator_source::OperatorSource::new(axum::Router::new())),
         Arc::new(Listed(vec![wait::tool_def()])),
         catalog,
@@ -69,8 +76,7 @@ pub fn validate_tools(
     .iter()
     .flat_map(|s| s.tools())
     .map(|t| t.name)
-    .collect();
-    ToolFilter::parse(tools).apply(&names).map(|_| ())
+    .collect()
 }
 
 /// What `/mcp` serves, in precedence order: the operator tools, `wait`,
@@ -141,14 +147,50 @@ impl ToolSource for Listed {
     }
 }
 
-/// `api_routes().with_state(state)` with the unsafe-segment guard applied
-/// (no token layer): what in-process calls go through.
+/// `api_routes().with_state(state)` with the route guard ([`guarded`]) and
+/// the unsafe-segment guard applied (no token layer): what in-process calls
+/// go through.
 pub(crate) fn inner_api(state: &AppState) -> axum::Router {
-    crate::server::api_routes()
-        .with_state(state.clone())
-        .layer(axum::middleware::from_fn(
-            crate::path_guard::reject_unsafe_segments,
-        ))
+    guarded(crate::server::api_routes().with_state(state.clone())).layer(axum::middleware::from_fn(
+        crate::path_guard::reject_unsafe_segments,
+    ))
+}
+
+/// The route template an operator tool's request is meant for (as the
+/// router registers it, `{root}` expanded): set by the operator source as a
+/// request extension, checked by [`guarded`]'s layer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpectedRoute(pub(crate) &'static str);
+
+/// `router` with a route layer that refuses, before the handler runs, a
+/// request whose [`ExpectedRoute`] is not the route it matched: an argument
+/// that spells a sibling route's literal segment (`/api/runs/workflows` for
+/// `/api/runs/:id`) never reaches that sibling's handler. A request without
+/// the extension passes.
+pub(crate) fn guarded(router: axum::Router) -> axum::Router {
+    router.route_layer(axum::middleware::from_fn(check_expected_route))
+}
+
+async fn check_expected_route(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let expected = req.extensions().get::<ExpectedRoute>().map(|e| e.0);
+    let matched = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str());
+    if let (Some(expected), Some(matched)) = (expected, matched) {
+        if expected != matched {
+            return crate::error::ApiError::bad_request(format!(
+                "`{}` routes to `{matched}`, not `{expected}`",
+                req.uri()
+            ))
+            .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -167,6 +209,38 @@ mod tests {
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn inner_api_refuses_a_request_that_matched_another_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(dir.path().to_path_buf(), Default::default());
+        let request = |expected| {
+            let mut r = http::Request::builder()
+                .uri("/api/runs/workflows")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            r.extensions_mut().insert(ExpectedRoute(expected));
+            r
+        };
+        let resp = inner_api(&state)
+            .oneshot(request("/api/runs/:id"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["error"],
+            "`/api/runs/workflows` routes to `/api/runs/workflows`, not `/api/runs/:id`"
+        );
+        let resp = inner_api(&state)
+            .oneshot(request("/api/runs/workflows"))
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);

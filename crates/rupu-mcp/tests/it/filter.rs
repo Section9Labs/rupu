@@ -83,3 +83,28 @@ fn server_new_reports_unknown_entry_across_sources() {
         matches!(r, Err(ServeError::Filter(m)) if m.contains("`nope.*`") && m.contains("stub"))
     );
 }
+
+fn error_for(entry: &str, all: &[&str]) -> String {
+    ToolFilter::parse(&names(&[entry]))
+        .apply(&names(all))
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn a_near_miss_suggests_the_name() {
+    let err = error_for("runs.lsit", &["runs.list", "runs.get"]);
+    assert!(err.contains("did you mean `runs.list`?"), "{err}");
+}
+
+#[test]
+fn a_namespace_typo_suggests_the_wildcard() {
+    let err = error_for("run.*", &["runs.list", "runs.get"]);
+    assert!(err.contains("did you mean `runs.*`?"), "{err}");
+}
+
+#[test]
+fn a_far_miss_has_no_suggestion() {
+    let err = error_for("zzzz", &["runs.list", "runs.get"]);
+    assert!(!err.contains("did you mean"), "{err}");
+}

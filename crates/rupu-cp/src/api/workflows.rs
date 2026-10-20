@@ -456,8 +456,8 @@ async fn get_workflow(
 
 /// Request body for `PUT /api/workflows/:name` and `POST /api/workflows`: the
 /// full raw `.yaml` to validate and persist.
-#[derive(Deserialize)]
-struct WorkflowWriteBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct WorkflowWriteBody {
     raw: String,
 }
 
@@ -783,8 +783,8 @@ async fn launch_run(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct GenerateWorkflowBody {
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct GenerateWorkflowBody {
     description: String,
     #[serde(default)]
     provider: Option<String>,

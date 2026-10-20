@@ -347,6 +347,37 @@ fn lookup_session_agent_name(
     agent
 }
 
+/// The transcript of standalone agent run `run`: `<global>/transcripts/<run>.jsonl`,
+/// else `<project>/.rupu/transcripts/<run>.jsonl` of a registered workspace.
+/// `run` must be a safe path segment.
+pub(crate) fn agent_run_transcript(
+    global: &std::path::Path,
+    run: &str,
+) -> Option<std::path::PathBuf> {
+    if crate::path_guard::unsafe_segment(run).is_some() {
+        return None;
+    }
+    let file = format!("{run}.jsonl");
+    let at = global.join("transcripts").join(&file);
+    if at.is_file() {
+        return Some(at);
+    }
+    let workspaces = rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    }
+    .list()
+    .unwrap_or_default();
+    workspaces
+        .into_iter()
+        .map(|w| {
+            std::path::PathBuf::from(&w.path)
+                .join(".rupu")
+                .join("transcripts")
+                .join(&file)
+        })
+        .find(|p| p.is_file())
+}
+
 /// Load all `*.meta.json` files from `<global>/transcripts/` and convert to
 /// `AgentRunRow`s with `source = "standalone"`.
 ///
@@ -800,8 +831,8 @@ fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentR
     local_rows
 }
 
-#[derive(Deserialize, Default)]
-struct AgentRunsQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct AgentRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -1089,8 +1120,8 @@ async fn list_agent_runs(
 // Autoflow runs — /api/runs/autoflows
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct AutoflowRunsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -1278,8 +1309,8 @@ async fn list_autoflow_runs(
 // Autoflow events — /api/runs/autoflows/events
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct AutoflowEventsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowEventsQuery {
     // Flat fields — same serde_urlencoded reason as above.
     offset: Option<usize>,
     limit: Option<usize>,

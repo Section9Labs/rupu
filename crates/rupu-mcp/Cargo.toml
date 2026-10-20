@@ -16,6 +16,8 @@ anyhow.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros", "sync"] }
 async-trait.workspace = true
+bytes.workspace = true
+base64.workspace = true
 
 # In-workspace
 rupu-tools = { path = "../rupu-tools" }

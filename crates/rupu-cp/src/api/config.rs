@@ -51,8 +51,8 @@ pub fn routes() -> Router<AppState> {
 
 /// `?project=<ws_id>` and `?customer=<slug>` select what is layered over
 /// global; they are mutually exclusive.
-#[derive(Deserialize, Default)]
-struct ConfigQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ConfigQuery {
     project: Option<String>,
     customer: Option<String>,
 }
@@ -174,14 +174,14 @@ async fn get_config(
     }))
 }
 
-#[derive(Deserialize)]
-struct ConfigWriteBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct ConfigWriteBody {
     raw: Option<String>,
     patch: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-struct PolicyBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct PolicyBody {
     lock: Vec<String>,
 }
 

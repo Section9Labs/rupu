@@ -183,8 +183,8 @@ pub(crate) fn apply_rollup(row: &mut ProjectRow, roll: &crate::usage::EntityRoll
 }
 
 /// `?customer=<slug>|none` on `GET /api/projects`.
-#[derive(serde::Deserialize, Default)]
-struct ProjectsQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ProjectsQuery {
     customer: Option<String>,
 }
 
@@ -407,8 +407,8 @@ fn session_is_active(v: &Value) -> bool {
 }
 
 /// `?offset=&limit=&q=&facets=` on a project's run and session lists.
-#[derive(serde::Deserialize, Default)]
-struct ProjectListQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ProjectListQuery {
     offset: Option<usize>,
     limit: Option<usize>,
     /// `?q=` — the list query (the workflow-run registry for runs, the

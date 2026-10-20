@@ -132,6 +132,42 @@ const DEFAULT_RECENT_EVENTS_LIMIT: usize = 200;
 /// best-effort "recent" page rather than a complete one.
 const MAX_RUNS_SCANNED: usize = 20;
 
+/// The query keys of `GET /api/events`. A number that doesn't parse is
+/// ignored, as it always was (the endpoint read a string map); only the
+/// last-named key of a repeated one used to count, and now a repeat is a 400.
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct RecentEventsQuery {
+    /// Page size; absent, `0` or not a number → the default.
+    #[serde(default, deserialize_with = "lenient")]
+    #[schemars(with = "Option<usize>")]
+    limit: Option<usize>,
+    /// Unix-ms cursor: only events strictly older (or, with `before_run` and
+    /// `before_pos`, strictly after that row in newest-first order).
+    #[serde(default, deserialize_with = "lenient")]
+    #[schemars(with = "Option<i64>")]
+    before_ts: Option<i64>,
+    /// Run id of the last row of the previous page.
+    #[serde(default)]
+    before_run: Option<String>,
+    /// Line index within `before_run`'s events of the last row of the previous page.
+    #[serde(default, deserialize_with = "lenient")]
+    #[schemars(with = "Option<usize>")]
+    before_pos: Option<usize>,
+    /// The list query line (`crate::query::events::FIELDS`).
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// A value that parses, else `None` (the string-map reader's `.parse().ok()`).
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: std::str::FromStr,
+{
+    let o: Option<String> = serde::Deserialize::deserialize(d)?;
+    Ok(o.and_then(|v| v.parse::<T>().ok()))
+}
+
 /// `GET /api/events?limit=<n>&before_ts=<unix-ms>&before_run=<id>&before_pos=<n>`
 /// — recent events aggregated from recent runs' `events.jsonl`, returned
 /// newest-first and cursor-paginated. This is the "load history" counterpart
@@ -159,23 +195,17 @@ const MAX_RUNS_SCANNED: usize = 20;
 /// query that doesn't parse is a 400 `{error, token, code, start, end}`.
 async fn recent_events(
     State(s): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
+    Query(params): Query<RecentEventsQuery>,
 ) -> Result<Json<Vec<serde_json::Value>>, crate::query::ListError> {
     let limit = params
-        .get("limit")
-        .and_then(|v| v.parse::<usize>().ok())
+        .limit
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT);
-    let before_ts = params.get("before_ts").and_then(|v| v.parse::<i64>().ok());
-    let before_run = params.get("before_run").cloned();
-    let before_pos = params
-        .get("before_pos")
-        .and_then(|v| v.parse::<usize>().ok());
+    let before_ts = params.before_ts;
+    let before_run = params.before_run;
+    let before_pos = params.before_pos;
     let cursor = EventsCursor::from_parts(before_ts, before_run, before_pos);
-    let query = crate::query::ListQuery::parse(
-        params.get("q").map(String::as_str),
-        crate::query::events::FIELDS,
-    )?;
+    let query = crate::query::ListQuery::parse(params.q.as_deref(), crate::query::events::FIELDS)?;
 
     let rows = collect_recent_events(&s.run_store, limit, cursor, query.as_ref())
         .map_err(|e| ApiError::internal(e.to_string()))?;

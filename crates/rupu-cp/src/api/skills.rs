@@ -137,8 +137,8 @@ pub struct SkillDetail {
     pub source_error: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct SkillsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct SkillsQuery {
     ws_id: Option<String>,
 }
 
