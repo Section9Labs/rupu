@@ -38,7 +38,10 @@ pub mod state;
 pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
-pub mod usage_index;
+/// The usage index moved to `rupu_orchestrator` (a run's usage is one
+/// definition for the control plane and the CLI); re-exported at its old
+/// path.
+pub use rupu_orchestrator::usage_index;
 pub mod usage_sources;
 
 use anyhow::Context as _;

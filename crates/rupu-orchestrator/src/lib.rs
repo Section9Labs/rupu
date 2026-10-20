@@ -25,9 +25,12 @@ pub mod runner;
 pub mod runs;
 pub mod step_factory;
 pub mod templates;
+pub mod transcript_paths;
 #[doc(hidden)]
 pub mod testing;
+pub mod usage_index;
 pub mod usage_ledger;
+pub mod usage_summary;
 pub mod workflow;
 pub mod workflow_runtime;
 

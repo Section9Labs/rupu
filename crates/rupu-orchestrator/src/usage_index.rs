@@ -1,6 +1,6 @@
 //! Incremental, process-cached usage fold — the ONE definition of "a run's
 //! usage" (spec 2026-09-29 §4). Every CP endpoint and the CLI go through here
-//! (via `crate::usage::{run_usage, transcripts_usage}`).
+//! (via `crate::usage_summary::{run_usage, transcripts_usage}`).
 //!
 //! A run's usage is the sum of its usage-ledger rows (`usage.jsonl`) plus, for
 //! every *known* transcript (step results ∪ live events ∪ the dispatched
@@ -21,13 +21,13 @@
 //! Usage accounting never fails a caller: unreadable or garbled input
 //! degrades to "partial" or zero, never an error or a panic.
 
-use crate::host::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
-use crate::usage::TurnPoint;
-use rupu_orchestrator::runs::{
+use crate::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
+use crate::usage_summary::TurnPoint;
+use crate::runs::{
     known_transcript_from_event_line, known_transcripts_from_step_result_line,
     placed_step_from_event_line, KnownTranscript, RunRecord, RunStore,
 };
-use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow};
+use crate::usage_ledger::{LedgerKind, LedgerRow};
 use rupu_transcript::{transcript_key, Event, JsonlCursor, UsageRow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -68,7 +68,7 @@ impl Tokens {
 }
 
 /// One run's (or one transcript set's) usage. Pricing is applied by
-/// consumers (`crate::usage::summarize_run_usage`), never stored here.
+/// consumers (`crate::usage_summary::summarize_run_usage`), never stored here.
 #[derive(Debug, Clone, Default)]
 pub struct RunUsage {
     /// Keyed by `(provider, model, agent)`; `runs` = contributing transcripts.
@@ -855,14 +855,16 @@ impl UsageIndex {
     }
 
     /// Whether the index has been asked for `run_id`'s usage in `store`.
-    #[cfg(test)]
-    pub(crate) fn has_run(&self, store: &RunStore, run_id: &str) -> bool {
+    /// A probe for tests (here and in the control plane's).
+    #[doc(hidden)]
+    pub fn has_run(&self, store: &RunStore, run_id: &str) -> bool {
         lock(&self.runs).contains_key(&(store.root.clone(), run_id.to_string()))
     }
 
-    /// Whether the index has folded the transcript at `path`.
-    #[cfg(test)]
-    pub(crate) fn has_file(&self, path: &Path) -> bool {
+    /// Whether the index has folded the transcript at `path`. A probe for
+    /// tests (here and in the control plane's).
+    #[doc(hidden)]
+    pub fn has_file(&self, path: &Path) -> bool {
         lock(&self.files).contains_key(path)
     }
 
@@ -896,7 +898,7 @@ impl UsageIndex {
 
     /// [`Self::run_usage`] plus the run record's wall-clock duration once it
     /// has finished, from the same record load (none at all while sealed).
-    pub(crate) fn run_usage_and_wall_clock(
+    pub fn run_usage_and_wall_clock(
         &self,
         store: &RunStore,
         run_id: &str,
@@ -1240,9 +1242,9 @@ impl UsageIndex {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use rupu_orchestrator::executor::Event as RunEvent;
-    use rupu_orchestrator::runs::{RunRecord, RunStatus, StepResultRecord};
-    use rupu_orchestrator::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    use crate::executor::Event as RunEvent;
+    use crate::runs::{RunRecord, RunStatus, StepResultRecord};
+    use crate::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
     use rupu_transcript::Event;
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
@@ -1307,6 +1309,21 @@ mod tests {
 
     fn create_run(store: &RunStore, id: &str, status: RunStatus) {
         store.create(record(id, status, None), "").unwrap();
+    }
+
+    /// A mirrored run as the control plane's `NodeMirror` records one: it
+    /// ran on worker `host_abc`, and its one step's transcript was recorded
+    /// at a path on that host.
+    fn seed_remote_run(tmp: &Path) -> (RunStore, PathBuf) {
+        let store = run_store(tmp);
+        store
+            .create(record("run_01USAGE", RunStatus::Running, Some("host_abc")), "")
+            .unwrap();
+        let recorded = PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl");
+        store
+            .append_step_result("run_01USAGE", &step_result("a", &recorded))
+            .unwrap();
+        (store, recorded)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2064,7 +2081,7 @@ mod tests {
                 codename: None,
                 run_id: "run_PLACEDSTEP".into(),
                 step_id: "fan".into(),
-                kind: rupu_orchestrator::runs::StepKind::Linear,
+                kind: crate::runs::StepKind::Linear,
                 agent: Some("fanner".into()),
                 host: Some("mini".into()),
             },
@@ -2123,7 +2140,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_partial_mirrored_run_unseals_when_the_cache_fills() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, _recorded) = crate::usage::tests::seed_remote_run(tmp.path()).await;
+        let (store, _recorded) = seed_remote_run(tmp.path());
         let mut rec = store.load("run_01USAGE").unwrap();
         rec.status = RunStatus::Completed;
         store.update(&rec).unwrap();
@@ -2723,7 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn remote_worker_run_resolves_mirror_cache() {
         let tmp = tempfile::tempdir().unwrap();
-        let (store, recorded) = crate::usage::tests::seed_remote_run(tmp.path()).await;
+        let (store, recorded) = seed_remote_run(tmp.path());
         assert!(!recorded.exists());
         let cache = tmp
             .path()
@@ -2854,7 +2871,7 @@ mod tests {
         store
             .append_step_result("run_WALLA", &step_result("s", &f))
             .unwrap();
-        let m = crate::usage::run_metrics(&store, "run_WALLA", &pricing);
+        let m = crate::usage_summary::run_metrics(&store, "run_WALLA", &pricing);
         assert_eq!(m.duration_ms, Some(4200));
         assert_eq!(m.turns, 1);
 
@@ -2866,7 +2883,7 @@ mod tests {
             .append_step_result("run_WALLB", &step_result("s", &f))
             .unwrap();
         for _ in 0..2 {
-            let m = crate::usage::run_metrics(&store, "run_WALLB", &pricing);
+            let m = crate::usage_summary::run_metrics(&store, "run_WALLB", &pricing);
             assert_eq!(m.duration_ms, Some(90_000));
             assert_eq!(m.usage.total_tokens, 2);
         }
