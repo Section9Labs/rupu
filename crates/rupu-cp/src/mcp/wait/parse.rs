@@ -13,11 +13,25 @@ use super::clamp_timeout;
 pub(super) enum Kind {
     Settled,
     Gate,
-    Events { types: Option<Vec<String>> },
-    Messages { kinds: Option<Vec<MessageKind>> },
-    Agentiflow { types: Option<Vec<String>> },
+    Events {
+        types: Option<Vec<String>>,
+    },
+    Messages {
+        kinds: Option<Vec<MessageKind>>,
+    },
+    Agentiflow {
+        types: Option<Vec<String>>,
+    },
     AgentRunEnd,
-    SessionTurn { run: Option<String> },
+    SessionTurn {
+        run: Option<String>,
+    },
+    /// New finding records in the coverage ledgers of the scoped workspaces.
+    Findings {
+        project: Option<String>,
+        run: Option<String>,
+        q: Option<String>,
+    },
 }
 
 impl Kind {
@@ -30,6 +44,7 @@ impl Kind {
             Kind::Agentiflow { .. } => "agentiflow",
             Kind::AgentRunEnd => "agent_run_end",
             Kind::SessionTurn { .. } => "session_turn",
+            Kind::Findings { .. } => "findings",
         }
     }
 
@@ -143,6 +158,18 @@ pub(super) fn input_schema() -> Value {
                     {
                         "type": "object",
                         "additionalProperties": false,
+                        "required": ["kind"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["findings"],
+                                "description": "New finding records in the coverage ledgers (local only). A tag change on an older finding fires nothing."},
+                            "project": {"type": "string", "description": "A project (workspace) id; default: every registered project."},
+                            "run": {"type": "string", "description": "Only findings declared by this run or anything that ran under it; its findings already recorded are returned too."},
+                            "q": {"type": "string", "description": "A findings query (`severity>=high tag:x`), as `findings.list` takes."}
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
                         "required": ["kind", "session"],
                         "properties": {
                             "kind": {"type": "string", "enum": ["session_turn"],
@@ -241,7 +268,7 @@ pub(super) fn parse(args: Value) -> Result<Request, String> {
 }
 
 const KINDS: &str =
-    "run_settled, run_gate, run_events, messages, agentiflow, agent_run_end, session_turn";
+    "run_settled, run_gate, run_events, messages, agentiflow, agent_run_end, session_turn, findings";
 
 fn condition(i: usize, c: Value) -> Result<Condition, String> {
     let at = format!("watch[{i}]");
@@ -257,6 +284,7 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         "agentiflow" => &["kind", "id", "types"],
         "agent_run_end" => &["kind", "run"],
         "session_turn" => &["kind", "session", "run"],
+        "findings" => &["kind", "project", "run", "q"],
         other => return Err(format!("{at}: unknown kind `{other}` ({KINDS})")),
     };
     let what = format!("{at} (`{kind}`)");
@@ -272,6 +300,9 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
             ));
         }
         Some(_) => return Err(format!("{what}: `host` must be a string")),
+    }
+    if kind == "findings" {
+        return findings_condition(o, &what);
     }
     let target_key = match kind.as_str() {
         "messages" => "root",
@@ -346,6 +377,39 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         kind,
         target,
         source,
+    })
+}
+
+/// A `findings` condition. Its `q` is checked here, so a bad one fails the
+/// call before any wait, with the body `GET /api/findings` answers a 400 with.
+fn findings_condition(mut o: Map<String, Value>, what: &str) -> Result<Condition, String> {
+    let mut id = |key: &str| -> Result<Option<String>, String> {
+        match o.remove(key) {
+            None => Ok(None),
+            Some(Value::String(s)) if !s.is_empty() => {
+                if let Some(why) = crate::path_guard::unsafe_segment(&s) {
+                    return Err(format!("{what}: `{s}` is not a valid id ({why})"));
+                }
+                Ok(Some(s))
+            }
+            Some(_) => Err(format!("{what}: `{key}` must be a non-empty string")),
+        }
+    };
+    let (project, run) = (id("project")?, id("run")?);
+    let q = match o.remove("q") {
+        None => None,
+        Some(Value::String(q)) => {
+            if let Err(e) = rupu_coverage::parse_query(&q) {
+                return Err(crate::api::findings::query_error_body(&e).to_string());
+            }
+            Some(q)
+        }
+        Some(_) => return Err(format!("{what}: `q` must be a string")),
+    };
+    Ok(Condition {
+        source: format!("findings:{}", project.as_deref().unwrap_or("*")),
+        target: project.clone().unwrap_or_default(),
+        kind: Kind::Findings { project, run, q },
     })
 }
 

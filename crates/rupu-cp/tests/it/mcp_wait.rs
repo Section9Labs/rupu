@@ -819,3 +819,259 @@ async fn an_active_turn_that_finishes_and_clears_active_run_id_still_fires() {
     assert_eq!(d["run_id"], "run_R", "{r}");
     assert_eq!(d["final_answer"], "R answer.", "{r}");
 }
+
+// ---- findings ----
+
+fn register(global: &Path, ws: &str) -> std::path::PathBuf {
+    let repo = global.join(format!("{ws}-repo"));
+    std::fs::create_dir_all(&repo).unwrap();
+    let dir = global.join("workspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{ws}.toml")),
+        format!(
+            "id = \"{ws}\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    repo
+}
+
+fn finding(id: &str, run: &str, severity: rupu_coverage::Severity) -> rupu_coverage::FindingRecord {
+    use rupu_coverage::{Attribution, FindingEvidence, FindingProfile, FindingScope, Surface};
+    rupu_coverage::FindingRecord {
+        id: id.into(),
+        file_path: None,
+        line_range: None,
+        target_ref: None,
+        scope: FindingScope::File,
+        summary: "s".into(),
+        severity,
+        concern_id: None,
+        evidence: FindingEvidence {
+            code_excerpt: None,
+            rationale: "r".into(),
+            references: vec![],
+        },
+        declared_by: Attribution {
+            run_id: run.into(),
+            model: "m".into(),
+            surface: Surface::Agent,
+            codename: None,
+            agent: None,
+            provider: None,
+        },
+        declared_at: chrono::Utc::now(),
+        profile: FindingProfile::Summary,
+        report: None,
+        tags: Vec::new(),
+    }
+}
+
+fn record(repo: &Path, target: &str, rec: rupu_coverage::FindingRecord) {
+    let paths = rupu_coverage::CoveragePaths::new(repo, target);
+    paths.ensure_dir().unwrap();
+    rupu_coverage::append_record(&paths, rupu_coverage::Ledger::Findings, &rec).unwrap();
+}
+
+use rupu_coverage::Severity;
+
+#[tokio::test]
+async fn no_cursor_returns_only_findings_recorded_after_the_call_began() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    for i in 0..3 {
+        record(
+            &repo,
+            "t1",
+            finding(&format!("fnd_old{i}"), "run_a", Severity::Low),
+        );
+    }
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "ws1"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![4], "{r}");
+    let e = &r["structuredContent"]["events"][0];
+    assert_eq!(e["source"], "findings:ws1/t1", "{r}");
+    assert_eq!(e["event"]["id"], "fnd_new", "{r}");
+    assert_eq!(e["event"]["ws_id"], "ws1", "{r}");
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["detail"]["count"], 1,
+        "{r}"
+    );
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({"findings:ws1/t1": 4}),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_run_scope_reads_the_runs_findings_from_the_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_a1", "run_a", Severity::Low));
+    record(&repo, "t1", finding("fnd_b1", "run_b", Severity::Low));
+    record(&repo, "t1", finding("fnd_a2", "run_a", Severity::High));
+    let addr = spawn(tmp.path()).await;
+    let started = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "run": "run_a"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 3], "{r}");
+    assert!(started.elapsed() < Duration::from_millis(250), "{r}");
+}
+
+#[tokio::test]
+async fn q_filters_new_findings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(
+        &repo,
+        "t1",
+        finding("fnd_seed", "run_a", Severity::Critical),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_low", "run_a", Severity::Low));
+        record(&r2, "t1", finding("fnd_high", "run_a", Severity::High));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "q": "severity>=high"}], "timeout_ms": 3000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["event"]["id"], "fnd_high",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_q_is_an_error_with_its_token_and_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "q": "severity>>high"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let body: Value = serde_json::from_str(&text_of(&r)).unwrap();
+    assert!(body["code"].is_string(), "{body}");
+    assert!(body["token"].is_number(), "{body}");
+    assert!(
+        body["start"].is_number() && body["end"].is_number(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_project_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "nope"}], "timeout_ms": 300}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+}
+
+#[tokio::test]
+async fn a_ledger_created_mid_wait_is_read_from_its_first_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t2", finding("fnd_n1", "run_a", Severity::Low));
+        record(&r2, "t2", finding("fnd_n2", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings", "project": "ws1"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["source"], "findings:ws1/t2",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn the_cursor_resumes_per_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_a", "run_a", Severity::Low));
+    record(&repo, "t1", finding("fnd_b", "run_a", Severity::Low));
+    record(&repo, "t2", finding("fnd_c", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let watch = json!([{"kind": "findings", "project": "ws1"}]);
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 300})).await;
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+    let cursor = r["structuredContent"]["cursor"].clone();
+    assert_eq!(
+        cursor,
+        json!({"findings:ws1/t1": 2, "findings:ws1/t2": 1}),
+        "{r}"
+    );
+
+    record(&repo, "t1", finding("fnd_d", "run_a", Severity::Low));
+    record(&repo, "t2", finding("fnd_e", "run_a", Severity::Low));
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": cursor, "timeout_ms": 3000}),
+    )
+    .await;
+    let got: Vec<(String, u64)> = r["structuredContent"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["source"].as_str().unwrap().to_string(),
+                e["id"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![("findings:ws1/t1".into(), 3), ("findings:ws1/t2".into(), 2)],
+        "{r}"
+    );
+    let cursor = r["structuredContent"]["cursor"].clone();
+
+    record(&repo, "t1", finding("fnd_f", "run_a", Severity::Low));
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": cursor, "timeout_ms": 3000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![4], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["source"], "findings:ws1/t1",
+        "{r}"
+    );
+}

@@ -8,6 +8,7 @@
 //! ([`NumberedTail`]), so an agent mixing `wait` with the streams never sees a
 //! gap or a repeat.
 
+mod findings;
 mod local;
 mod parse;
 mod turns;
@@ -79,7 +80,8 @@ impl WaitSource {
 
 const DESCRIPTION: &str =
     "Wait for a run to settle, a gate to park, new run, agentiflow or message \
-lines, a standalone agent run to finish or a session turn to end. Returns at once when a watched \
+lines, a standalone agent run to finish, a session turn to end or new finding records to be recorded \
+(a tag change on an older finding is not one). Returns at once when a watched \
 state already holds; otherwise when a condition fires, a watched stream has new lines, or the \
 timeout. For `session_turn` pass the `run` id `sessions.send` returned; without it the call waits \
 for the session's active turn, or the next one if it is idle. An error in any one condition (a \
@@ -105,6 +107,9 @@ impl ToolSource for WaitSource {
 
 impl WaitSource {
     async fn wait(&self, req: Request) -> ToolResult {
+        if let Err(e) = findings::validate(&self.state, &req.watch).await {
+            return ToolResult::Error(e);
+        }
         // Every run condition's run exists, wherever it lives.
         let located = match locate(&self.state, &req.watch).await {
             Ok(l) => l,
@@ -153,7 +158,7 @@ impl WaitSource {
                     Feed::Flow(dir.join("events.jsonl"))
                 }
                 // Watched by re-checking their state; nothing to tail.
-                Kind::AgentRunEnd | Kind::SessionTurn { .. } => continue,
+                Kind::AgentRunEnd | Kind::SessionTurn { .. } | Kind::Findings { .. } => continue,
                 _ => match located.get(&c.target) {
                     Some(Located::Store(store)) => Feed::Run(store.events_path(&c.target)),
                     // Nothing was ever written: only `run_settled` can be
@@ -195,8 +200,9 @@ impl WaitSource {
         // seen settled has written its last line, so the catch-up after it
         // has every event. Either returns at once.
         let mut started = turns::Turns::new();
+        let mut ledgers = findings::Findings::default();
         if let Err(e) = self
-            .check_state(&req.watch, &located, &mut started, &mut got.fired)
+            .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
             .await
         {
             return ToolResult::Error(e);
@@ -265,12 +271,12 @@ impl WaitSource {
                     if has_state && last_check.elapsed() >= RECHECK_MIN_GAP {
                         last_check = Instant::now();
                         if let Err(e) = self
-                            .check_state(&req.watch, &located, &mut started, &mut got.fired)
+                            .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
                             .await
                         {
                             return ToolResult::Error(e);
                         }
-                        if !got.fired.is_empty() {
+                        if got.any() {
                             break;
                         }
                     }
@@ -282,12 +288,12 @@ impl WaitSource {
                     if has_state {
                         last_check = Instant::now();
                         if let Err(e) = self
-                            .check_state(&req.watch, &located, &mut started, &mut got.fired)
+                            .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
                             .await
                         {
                             return ToolResult::Error(e);
                         }
-                        if !got.fired.is_empty() {
+                        if got.any() {
                             break;
                         }
                     }
@@ -305,6 +311,21 @@ impl WaitSource {
             }
         }
         got.finish(&req.watch)
+    }
+}
+
+impl WaitSource {
+    /// The state conditions, then the `findings` ledgers.
+    async fn check(
+        &self,
+        watch: &[Condition],
+        located: &HashMap<String, Located>,
+        (turns, ledgers): (&mut turns::Turns, &mut findings::Findings),
+        got: &mut Got,
+    ) -> Result<(), String> {
+        self.check_state(watch, located, turns, &mut got.fired)
+            .await?;
+        findings::poll(&self.state, watch, ledgers, got).await
     }
 }
 

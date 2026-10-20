@@ -313,10 +313,67 @@ pub(crate) fn build_response(mut findings: Vec<FindingOut>) -> FindingsResponse 
     }
 }
 
-fn store_for(global_dir: &std::path::Path) -> WorkspaceStore {
+pub(crate) fn store_for(global_dir: &std::path::Path) -> WorkspaceStore {
     WorkspaceStore {
         root: global_dir.join("workspaces"),
     }
+}
+
+/// One ledger record as a [`FindingOut`]: tagged with its workspace, project
+/// and target, with its permalink and codename, and without the `RunStore`
+/// `workflow_name` join or a customer (callers add those). The one rule
+/// `GET /api/findings` and `wait`'s `findings` condition build rows with.
+pub(crate) fn finding_out(
+    w: &rupu_workspace::Workspace,
+    target_id: &str,
+    record: FindingRecord,
+    web_hosts: &rupu_scm::weburl::WebHosts,
+) -> FindingOut {
+    let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
+        (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink_with(
+            remote,
+            w.initial_branch.as_deref(),
+            path,
+            record.line_range,
+            web_hosts,
+        ),
+        _ => None,
+    };
+    let (codename, codename_derived) = crate::codename::named(
+        record.declared_by.codename.as_deref(),
+        &record.declared_by.run_id,
+        None,
+    );
+    FindingOut {
+        codename,
+        codename_derived,
+        ws_id: w.id.clone(),
+        project: project_name(&w.path),
+        target_id: target_id.to_string(),
+        workflow_name: None,
+        permalink,
+        report_summary: None,
+        customer: None,
+        record,
+    }
+}
+
+/// A finding as the list endpoint serves it: summary fields in, report body
+/// out ([`FindingOut::into_list_row`]), as JSON.
+pub(crate) fn list_row(f: &FindingOut) -> serde_json::Value {
+    serde_json::to_value(f.clone().into_list_row()).unwrap_or(serde_json::Value::Null)
+}
+
+/// The body of the 400 a bad `q` is answered with (and the text of `wait`'s
+/// error for one).
+pub(crate) fn query_error_body(e: &rupu_coverage::QueryParseError) -> serde_json::Value {
+    serde_json::json!({
+        "error": e.message,
+        "token": e.token,
+        "code": e.code,
+        "start": e.start,
+        "end": e.end,
+    })
 }
 
 /// Workspace path basename, falling back to the full path.
@@ -436,7 +493,7 @@ pub fn collect_all_findings(global_dir: &std::path::Path) -> Vec<FindingOut> {
 /// `[scm.<account>].base_url`s (permalinks for GitHub Enterprise /
 /// self-managed GitLab remotes). A missing or unreadable config yields none
 /// — permalinks are best-effort, so a bad config only costs those links.
-fn scm_web_hosts(global_dir: &std::path::Path) -> rupu_scm::weburl::WebHosts {
+pub(crate) fn scm_web_hosts(global_dir: &std::path::Path) -> rupu_scm::weburl::WebHosts {
     let config_path = global_dir.join("config.toml");
     if !config_path.exists() {
         return rupu_scm::weburl::WebHosts::default();
@@ -461,39 +518,14 @@ pub fn collect_all_findings_reporting(
     each_ledger(
         global_dir,
         |w, target_id, _paths, records| {
-            let project = project_name(&w.path);
-            for record in records {
-                // `w` (the owning workspace) is already in hand for every
-                // finding in this target — no separate lookup/memoization is
-                // needed, unlike a flat finding list without provenance.
-                let permalink = match (w.repo_remote.as_deref(), record.file_path.as_deref()) {
-                    (Some(remote), Some(path)) => rupu_scm::weburl::repo_permalink_with(
-                        remote,
-                        w.initial_branch.as_deref(),
-                        path,
-                        record.line_range,
-                        &web_hosts,
-                    ),
-                    _ => None,
-                };
-                let (codename, codename_derived) = crate::codename::named(
-                    record.declared_by.codename.as_deref(),
-                    &record.declared_by.run_id,
-                    None,
-                );
-                out.push(FindingOut {
-                    codename,
-                    codename_derived,
-                    ws_id: w.id.clone(),
-                    project: project.clone(),
-                    target_id: target_id.to_string(),
-                    workflow_name: None,
-                    permalink,
-                    report_summary: None,
-                    customer: None,
-                    record,
-                });
-            }
+            // `w` (the owning workspace) is already in hand for every
+            // finding in this target — no separate lookup/memoization is
+            // needed, unlike a flat finding list without provenance.
+            out.extend(
+                records
+                    .into_iter()
+                    .map(|record| finding_out(w, target_id, record, &web_hosts)),
+            );
         },
         &mut tags_unavailable,
     );
@@ -836,13 +868,7 @@ async fn list_findings(
     let parsed = rupu_coverage::parse_query(q.q.as_deref().unwrap_or("")).map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": e.message,
-                "token": e.token,
-                "code": e.code,
-                "start": e.start,
-                "end": e.end,
-            })),
+            Json(query_error_body(&e)),
         )
             .into_response()
     })?;
