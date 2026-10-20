@@ -118,13 +118,22 @@ async fn cp_serve_no_web_serves_mcp_tools() {
     wait_healthy(&base, &mut guard.0).await;
 
     let names = tool_names(&base).await;
-    for want in ["runs.approve", "wait", "scm.repos.list", "read_file"] {
-        assert!(names.iter().any(|n| n == want), "missing {want}: {names:?}");
+    // Each name served once: an operator tool wins its name over the
+    // catalog's (`agents.list`, `workflows.list`), and a catalog tool no
+    // operator tool covers is served (`findings.query`, `findings.tag`).
+    for want in [
+        "runs.approve",
+        "wait",
+        "scm.repos.list",
+        "read_file",
+        "agents.list",
+        "workflows.list",
+        "findings.query",
+        "findings.tag",
+    ] {
+        let n = names.iter().filter(|n| *n == want).count();
+        assert_eq!(n, 1, "{want} served {n} times: {names:?}");
     }
-    assert!(
-        !names.iter().any(|n| n == "findings.query"),
-        "findings.query is the operator's: {names:?}"
-    );
     let (status, _) = http("GET", &base, "/", None).unwrap();
     assert_eq!(status, 404, "--no-web serves no page");
 }

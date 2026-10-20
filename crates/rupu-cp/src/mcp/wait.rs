@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use tokio::time::Instant;
 
 use crate::state::AppState;
-use crate::transcript_tail::{read_numbered, NumberedLine, NumberedTail};
+use crate::transcript_tail::{count_numbered, read_numbered, NumberedLine, NumberedTail};
 
 /// The timeout when a call names none.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30_000);
@@ -44,6 +44,21 @@ pub fn clamp_timeout(ms: Option<u64>) -> Duration {
     ms.map_or(DEFAULT_TIMEOUT, |ms| {
         Duration::from_millis(ms).min(MAX_TIMEOUT)
     })
+}
+
+/// The `wait` tool's definition (what [`WaitSource`] lists).
+pub fn tool_def() -> ToolDef {
+    ToolDef {
+        name: "wait".into(),
+        description: DESCRIPTION.into(),
+        input_schema: input_schema(),
+        hints: ToolHints {
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        },
+    }
 }
 
 pub struct WaitSource {
@@ -171,17 +186,7 @@ resume where the last call left off.";
 #[async_trait]
 impl ToolSource for WaitSource {
     fn tools(&self) -> Vec<ToolDef> {
-        vec![ToolDef {
-            name: "wait".into(),
-            description: DESCRIPTION.into(),
-            input_schema: input_schema(),
-            hints: ToolHints {
-                read_only: true,
-                destructive: false,
-                idempotent: true,
-                open_world: false,
-            },
-        }]
+        vec![tool_def()]
     }
 
     async fn call(&self, name: &str, args: Value, _cx: &CallCx) -> Option<ToolResult> {
@@ -289,7 +294,9 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         None => {}
         Some(Value::String(h)) if h == "local" => {}
         Some(Value::String(_)) => {
-            return Err("wait on a remote host is not built yet (Plan 2)".into());
+            return Err(format!(
+                "{what}: wait on a remote host is not supported yet"
+            ));
         }
         Some(_) => return Err(format!("{what}: `host` must be a string")),
     }
@@ -382,6 +389,14 @@ enum Feed {
     Log(PathBuf),
 }
 
+impl Feed {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Feed::Run(p) | Feed::Log(p) => p,
+        }
+    }
+}
+
 impl WaitSource {
     async fn wait(&self, req: Request) -> ToolResult {
         let store = Arc::clone(&self.state.run_store);
@@ -456,7 +471,18 @@ impl WaitSource {
 
         let mut tails: Vec<Tail> = Vec::new();
         for (i, (source, feed)) in feeds.iter().enumerate() {
-            let after = got.cursor.get(source).copied().unwrap_or(0);
+            let after = if collects[i] {
+                got.cursor.get(source).copied().unwrap_or(0)
+            } else {
+                // Watched for run state only: a line just prompts a
+                // re-check, so the tail starts past what is there now.
+                let p = feed.path().to_path_buf();
+                match tokio::task::spawn_blocking(move || count_numbered(&p)).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => return ToolResult::Error(format!("reading {source}: {e}")),
+                    Err(e) => return ToolResult::Error(format!("reading {source}: {e}")),
+                }
+            };
             tails.push(match feed {
                 Feed::Run(p) => {
                     Box::pin(NumberedTail::<Event>::open(p, after).map(move |l| (i, Line::Run(l))))
@@ -538,9 +564,11 @@ impl WaitSource {
                 Kind::Gate => {
                     let store = Arc::clone(&self.state.run_store);
                     if let Some(rec) = load(store, &c.target).await {
-                        if !rec.awaiting.is_empty() {
-                            let gates: Vec<Value> = rec
-                                .awaiting
+                        // `awaiting_gates`: a legacy record names its one
+                        // gate in `awaiting_step_id` only.
+                        let awaiting = rec.awaiting_gates();
+                        if !awaiting.is_empty() {
+                            let gates: Vec<Value> = awaiting
                                 .iter()
                                 .map(|g| {
                                     json!({

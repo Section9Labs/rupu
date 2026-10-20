@@ -24,7 +24,7 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
 }
 
 /// Every `/api/*` route, no auth layer: the in-process MCP caller's router.
-pub fn api_routes() -> Router<AppState> {
+pub(crate) fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::api::agentiflows::routes())
         .merge(crate::api::messages::routes())

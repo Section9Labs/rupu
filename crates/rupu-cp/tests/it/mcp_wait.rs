@@ -131,6 +131,31 @@ async fn a_parked_gate_fires_at_once_with_its_gates() {
 }
 
 #[tokio::test]
+async fn a_legacy_record_s_gate_fires_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut rec = super::sse::seed_run(RUN, RunStatus::AwaitingApproval);
+    // A record from before `awaiting`: its one gate is the legacy fields.
+    rec.awaiting = vec![];
+    rec.awaiting_step_id = Some("review".into());
+    rec.approval_prompt = Some("ship it?".into());
+    store(tmp.path())
+        .create(rec, "name: test\nsteps: []\n")
+        .unwrap();
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let fired = &r["structuredContent"]["fired"][0];
+    assert_eq!(fired["kind"], "run_gate", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["prompt"], "ship it?", "{r}");
+}
+
+#[tokio::test]
 async fn new_events_are_returned_with_their_line_ids_and_the_cursor_resumes() {
     let tmp = tempfile::tempdir().unwrap();
     seed(tmp.path(), RunStatus::Running);
@@ -353,7 +378,7 @@ async fn bad_arguments_are_refused() {
     let cases = [
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN, "host": "mini"}]}),
-            "wait on a remote host is not built yet (Plan 2)",
+            "watch[0] (`run_settled`): wait on a remote host is not supported yet",
         ),
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN}], "follow": true}),

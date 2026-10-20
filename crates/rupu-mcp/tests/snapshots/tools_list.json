@@ -1063,6 +1063,79 @@
   },
   {
     "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "all": {
+          "description": "Return every match in one answer, unpaged (no `limit`/`cursor`) and unbounded. For a workflow `for_each` over the rows; to read findings into a conversation, page instead.",
+          "type": "boolean"
+        },
+        "cursor": {
+          "description": "`next_cursor` from the previous page.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Rows per page (default 50).",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "q": {
+          "description": "Findings query, e.g. `severity>=high tag:class:sqli -tag:false-positive -has:poc \"sql injection\"`. Tokens AND; `key:a,b` is any-of; `-` negates; keys: severity (>=,>,<=,<), tag, has (tags|report|poc|cwe), cwe, owner, product, verified, profile, scope, concern, agent, file (path prefix), run, id; bare words search title/summary/id/file. Empty matches everything.",
+          "type": "string"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "findings.query"
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "add": {
+          "description": "Tags to add.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "finding_ids": {
+          "description": "Finding ids (fnd_…) from findings.query or findings.report.",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "remove": {
+          "description": "Tags to remove.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspace": {
+          "description": "Project id, or the absolute path of a registered project, the tool acts on.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "finding_ids",
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "name": "findings.tag"
+  },
+  {
+    "inputSchema": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
         "account": {

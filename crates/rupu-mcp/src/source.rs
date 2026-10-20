@@ -37,8 +37,8 @@ pub struct ToolDef {
 /// What a tool call produced.
 #[derive(Debug, Clone)]
 pub enum ToolResult {
-    /// `structuredContent` = the value; `content` = one text block with the
-    /// same JSON.
+    /// `content` = one text block with the JSON; `structuredContent` = the
+    /// value too when it is an object (the protocol allows nothing else).
     Json(Value),
     /// Plain text content.
     Text(String),

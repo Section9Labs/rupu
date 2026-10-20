@@ -72,6 +72,26 @@ async fn json_results_carry_structured_content() {
     );
 }
 
+#[tokio::test]
+async fn a_non_object_json_result_has_no_structured_content() {
+    let server = stub_server();
+    for value in [json!([1, 2, 3]), json!("s"), json!(7)] {
+        let resp = server
+            .handle(
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                        "params": { "name": "stub.echo", "arguments": value.clone() } }),
+                None,
+            )
+            .await
+            .unwrap();
+        let result = &resp["result"];
+        assert!(result.get("structuredContent").is_none(), "{resp}");
+        assert_ne!(result["isError"], json!(true), "{resp}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), value);
+    }
+}
+
 fn call(id: u64, name: &str, args: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": { "name": name, "arguments": args } })

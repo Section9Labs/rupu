@@ -222,6 +222,15 @@ pub fn read_numbered<E: serde::de::DeserializeOwned>(
     Ok((out, last))
 }
 
+/// The id of the last line of the JSONL file at `path`, numbered as
+/// [`NumberedTail`] and [`read_numbered`] number it (0 for a missing or
+/// empty file): where a tail that wants only new lines starts. Blocking.
+pub fn count_numbered(path: &Path) -> std::io::Result<u64> {
+    let mut seq = 0u64;
+    JsonlCursor::new().drain_with(path, || {}, |_| seq += 1)?;
+    Ok(seq)
+}
+
 /// One item of a resumable transcript stream ([`sequenced`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptFrame {
@@ -302,6 +311,10 @@ mod numbered_tests {
         let (rest, last) = read_numbered::<u32>(&p, last, 2).unwrap();
         assert_eq!(ids(&rest), vec![(4, Some(4))]);
         assert_eq!(last, 4);
+        // The count ends where the numbering does (the partial line is not
+        // a line yet); a missing file has none.
+        assert_eq!(count_numbered(&p).unwrap(), 4);
+        assert_eq!(count_numbered(&dir.path().join("nope.jsonl")).unwrap(), 0);
         let (none, last) = read_numbered::<u32>(&p, 9, 2).unwrap();
         assert!(none.is_empty());
         assert_eq!(last, 9);

@@ -201,6 +201,12 @@ impl OperatorSource {
                 return ToolResult::Error(format!("argument `{p}` must be a string"));
             };
             if p == "id" {
+                // A run id is `run_` + word characters: anything else (a
+                // sibling route's literal segment such as `workflows`) would
+                // reach another handler.
+                if op.name.starts_with("runs.") && !crate::host::connector::valid_run_id(&val) {
+                    return ToolResult::Error(format!("`{val}` is not a run id"));
+                }
                 id_for_root = Some(val.clone());
             }
             path = path.replace(&format!(":{p}"), &encode_segment(&val));
@@ -244,16 +250,17 @@ impl OperatorSource {
         } else {
             axum::body::Body::empty()
         };
-        let request = match http::Request::builder()
+        let mut request = match http::Request::builder()
             .method(op.method.clone())
             .uri(uri)
             .header("content-type", "application/json")
-            .header("x-rupu-client", "mcp")
             .body(body)
         {
             Ok(r) => r,
             Err(e) => return ToolResult::Error(format!("bad request: {e}")),
         };
+        // How the handlers know the call came through `/mcp` (attribution).
+        request.extensions_mut().insert(super::McpClient);
 
         let resp = match self.inner.clone().oneshot(request).await {
             Ok(r) => r,

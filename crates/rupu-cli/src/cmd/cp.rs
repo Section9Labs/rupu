@@ -85,7 +85,46 @@ struct CliContextFactory {
     run_id: String,
     global_assembler: Arc<rupu_runtime::assembly::RunAssembler>,
     /// Per project id.
-    projects: std::sync::Mutex<HashMap<String, Arc<rupu_runtime::assembly::RunAssembler>>>,
+    projects: BuildCache<rupu_runtime::assembly::RunAssembler>,
+}
+
+/// Values kept per key, each built OUTSIDE the lock: a slow build (a
+/// project's SCM discovery) never holds up a caller whose value is cached,
+/// or the build of another key. Two first callers of one key may both
+/// build; the first to finish is kept.
+struct BuildCache<V> {
+    map: std::sync::Mutex<HashMap<String, Arc<V>>>,
+}
+
+impl<V> BuildCache<V> {
+    fn new() -> Self {
+        Self {
+            map: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<V>>> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_or_build<E>(
+        &self,
+        key: &str,
+        build: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        if let Some(v) = self.lock().get(key) {
+            return Ok(Arc::clone(v));
+        }
+        let built = Arc::new(build()?);
+        Ok(Arc::clone(
+            self.lock().entry(key.to_string()).or_insert(built),
+        ))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
 }
 
 impl CliContextFactory {
@@ -108,7 +147,7 @@ impl CliContextFactory {
             global,
             run_id: format!("mcp_{}", ulid::Ulid::new()),
             global_assembler,
-            projects: std::sync::Mutex::new(HashMap::new()),
+            projects: BuildCache::new(),
         }
     }
 
@@ -139,41 +178,31 @@ impl CliContextFactory {
         }
     }
 
-    /// `block_on` for the registry discovery a sync `context` call needs.
+    /// The registry discovery a `context` call needs, blocking on the
+    /// runtime: `context` runs on the blocking pool (`CatalogSource::call`).
     fn discover(
         resolver: &rupu_auth::KeychainResolver,
         cfg: &rupu_config::Config,
     ) -> rupu_scm::Registry {
-        let fut = rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink));
-        let handle = tokio::runtime::Handle::current();
-        match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| handle.block_on(fut))
-            }
-            // No other worker to hand the runtime to: discover on a thread
-            // of its own.
-            _ => std::thread::scope(|s| {
-                s.spawn(|| {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("discovery runtime")
-                        .block_on(fut)
-                })
-                .join()
-                .expect("discovery thread")
-            }),
-        }
+        tokio::runtime::Handle::current().block_on(rupu_scm::Registry::discover(
+            resolver,
+            cfg,
+            Arc::new(rupu_netflow::NullSink),
+        ))
     }
 
     fn assembler_for(
         &self,
         w: &rupu_workspace::Workspace,
     ) -> Result<Arc<rupu_runtime::assembly::RunAssembler>, String> {
-        let mut cache = self.projects.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(a) = cache.get(&w.id) {
-            return Ok(Arc::clone(a));
-        }
+        self.projects
+            .get_or_build(&w.id, || self.build_assembler(w))
+    }
+
+    fn build_assembler(
+        &self,
+        w: &rupu_workspace::Workspace,
+    ) -> Result<rupu_runtime::assembly::RunAssembler, String> {
         let path = std::path::PathBuf::from(&w.path);
         let project_root =
             paths::project_root_for(&path).map_err(|e| format!("project `{}`: {e:#}", w.id))?;
@@ -185,7 +214,7 @@ impl CliContextFactory {
         let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
         let registry = Arc::new(Self::discover(&resolver, &cfg));
         let findings = crate::findings_opts::base_options(&self.global, &cfg.findings);
-        let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+        Ok(rupu_runtime::assembly::RunAssembler::new(
             rupu_runtime::assembly::AssemblyContext {
                 project_root,
                 customer: cfg_paths.customer_slug.clone(),
@@ -195,9 +224,7 @@ impl CliContextFactory {
                 findings,
                 ..rupu_runtime::assembly::AssemblyContext::minimal(self.global.clone())
             },
-        ));
-        cache.insert(w.id.clone(), Arc::clone(&assembler));
-        Ok(assembler)
+        ))
     }
 }
 
@@ -5041,6 +5068,61 @@ mod tests {
 }
 
 #[cfg(test)]
+mod build_cache_tests {
+    use super::BuildCache;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A build in progress holds the lock of nobody: a cached key answers
+    /// at once, and another key's build runs alongside it.
+    #[test]
+    fn a_slow_build_holds_up_neither_a_cached_key_nor_another_build() {
+        let cache = std::sync::Arc::new(BuildCache::<u32>::new());
+        cache.get_or_build("cached", || Ok::<_, ()>(1)).unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let slow = {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache
+                    .get_or_build("slow", || {
+                        entered_tx.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(30)).unwrap();
+                        Ok::<_, ()>(2)
+                    })
+                    .unwrap()
+            })
+        };
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // While "slow" builds: the cached key, and another key's build,
+        // finish (each would deadlock if the build held the lock).
+        let (done_tx, done) = mpsc::channel();
+        {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let a = *cache.get_or_build("cached", || Ok::<_, ()>(9)).unwrap();
+                let b = *cache.get_or_build("other", || Ok::<_, ()>(3)).unwrap();
+                done_tx.send((a, b)).unwrap();
+            });
+        }
+        assert_eq!(done.recv_timeout(Duration::from_secs(10)).unwrap(), (1, 3));
+        release_tx.send(()).unwrap();
+        assert_eq!(*slow.join().unwrap(), 2);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn a_failed_build_is_not_kept() {
+        let cache = BuildCache::<u32>::new();
+        assert_eq!(cache.get_or_build("k", || Err("no")), Err("no"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(*cache.get_or_build("k", || Ok::<_, &str>(4)).unwrap(), 4);
+        // Built once: a later build closure is never run.
+        assert_eq!(*cache.get_or_build("k", || Ok::<_, &str>(5)).unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
 mod catalog_context_tests {
     use super::CliContextFactory;
     use rupu_mcp::ContextFactory;
@@ -5089,25 +5171,54 @@ mod catalog_context_tests {
         std::fs::write(customers.config_path("acme"), "[bash]\ntimeout_secs = 7\n").unwrap();
         customers.assign("acme", ProjectRef::Id(&wa.id)).unwrap();
 
-        let f = factory(global.path());
-        let ca = f.context(Some(&wa.id)).unwrap();
+        let f = Arc::new(factory(global.path()));
+        let ca = on_pool(&f, Some(&wa.id)).await.unwrap();
         assert_eq!(ca.services.customer.as_deref(), Some("acme"));
         assert_eq!(ca.workspace.bash.timeout_secs, 7);
         assert_eq!(ca.workspace.id, wa.id);
         // Another project, no customer: neither the slug nor the value.
-        let cb = f.context(Some(&wb.id)).unwrap();
+        let cb = on_pool(&f, Some(&wb.id)).await.unwrap();
         assert_eq!(cb.services.customer, None);
         assert_ne!(cb.workspace.bash.timeout_secs, 7);
         // By path, the same project as by id; no workspace = the global layer.
-        let by_path = f.context(Some(a.path().to_str().unwrap())).unwrap();
+        let by_path = on_pool(&f, Some(a.path().to_str().unwrap())).await.unwrap();
         assert_eq!(by_path.services.customer.as_deref(), Some("acme"));
-        let none = f.context(None).unwrap();
+        let none = on_pool(&f, None).await.unwrap();
         assert_eq!(none.services.customer, None);
-        assert_eq!(
-            f.projects.lock().unwrap().len(),
-            2,
-            "one assembler per project"
-        );
+        assert_eq!(f.projects.len(), 2, "one assembler per project");
+    }
+
+    /// `context` as `CatalogSource::call` runs it: on the blocking pool.
+    async fn on_pool(
+        f: &Arc<CliContextFactory>,
+        ws: Option<&str>,
+    ) -> Result<rupu_tools::ToolContext, String> {
+        let (f, ws) = (Arc::clone(f), ws.map(str::to_string));
+        tokio::task::spawn_blocking(move || f.context(ws.as_deref()))
+            .await
+            .unwrap()
+    }
+
+    /// Two projects' first contexts at once both complete (discovery runs
+    /// on the blocking pool, blocking on the runtime), each its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_first_contexts_for_two_projects_both_complete() {
+        crate::test_support::ensure_crypto_provider();
+        let global = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let wa = register(global.path(), a.path());
+        let wb = register(global.path(), b.path());
+        let f = Arc::new(factory(global.path()));
+        let (ca, cb) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            futures_util::future::join(on_pool(&f, Some(&wa.id)), on_pool(&f, Some(&wb.id))),
+        )
+        .await
+        .expect("both contexts complete");
+        assert_eq!(ca.unwrap().workspace.id, wa.id);
+        assert_eq!(cb.unwrap().workspace.id, wb.id);
+        assert_eq!(f.projects.len(), 2);
     }
 
     #[tokio::test]

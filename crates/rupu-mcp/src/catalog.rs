@@ -14,17 +14,6 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-/// Tools the operator surface serves itself, so the catalog's versions are
-/// not listed.
-pub const HIDDEN_BY_OPERATOR_TOOLS: &[&str] = &[
-    "agents.list",
-    "agents.get",
-    "workflows.list",
-    "workflows.get",
-    "findings.query",
-    "findings.tag",
-];
-
 const WORKSPACE_DESCRIPTION: &str =
     "Project id, or the absolute path of a registered project, the tool acts on.";
 
@@ -32,7 +21,8 @@ pub trait ContextFactory: Send + Sync {
     /// A tool context for one call. `workspace` is a project id or the
     /// absolute path of a registered project; `None` for tools that act on
     /// no workspace (connectors). `Err` text is returned to the caller as
-    /// the tool's error.
+    /// the tool's error. Blocking: [`CatalogSource`] calls it on the
+    /// blocking pool, where it may block on the runtime (`Handle::block_on`).
     fn context(&self, workspace: Option<&str>) -> Result<ToolContext, String>;
 }
 
@@ -97,8 +87,8 @@ fn with_workspace(mut schema: Value) -> Value {
 
 impl CatalogSource {
     /// Every catalog tool the factory's base context can serve
-    /// (`ctx.services.provided(false)`, grant `*`), minus
-    /// [`HIDDEN_BY_OPERATOR_TOOLS`].
+    /// (`ctx.services.provided(false)`, grant `*`). A server that also has
+    /// its own tool by one of these names leaves the catalog's out.
     pub fn new(factory: Arc<dyn ContextFactory>) -> Result<Self, ServeError> {
         let base = factory
             .context(None)
@@ -114,7 +104,7 @@ impl CatalogSource {
         let mut served = BTreeMap::new();
         let mut defs = Vec::new();
         for d in ToolCatalog::all() {
-            if !grant.entries.contains_key(d.name) || HIDDEN_BY_OPERATOR_TOOLS.contains(&d.name) {
+            if !grant.entries.contains_key(d.name) {
                 continue;
             }
             let body = rupu_tools::bodies::body(d.name, &base)
@@ -133,12 +123,11 @@ impl CatalogSource {
             served.insert(d.name, *d);
         }
         // Under grant `*` a tool whose service is missing is `skipped`;
-        // `unavailable` holds exact names. Report both, minus hidden tools.
+        // `unavailable` holds exact names. Report both.
         let unavailable = grant
             .unavailable
             .iter()
             .chain(grant.skipped.iter())
-            .filter(|u| !HIDDEN_BY_OPERATOR_TOOLS.contains(&u.tool))
             .cloned()
             .collect();
         Ok(Self {
@@ -186,9 +175,19 @@ impl ToolSource for CatalogSource {
         } else {
             None
         };
-        let ctx = match self.factory.context(workspace.as_deref()) {
-            Ok(c) => c,
-            Err(e) => return Some(ToolResult::Error(e)),
+        // Building a context reads config and may discover SCM accounts:
+        // blocking work, kept off the runtime.
+        let factory = Arc::clone(&self.factory);
+        let ctx = match tokio::task::spawn_blocking(move || factory.context(workspace.as_deref()))
+            .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Some(ToolResult::Error(e)),
+            Err(e) => {
+                return Some(ToolResult::Error(format!(
+                    "building the tool context failed: {e}"
+                )))
+            }
         };
         let Some(tool) = rupu_tools::bodies::body(d.name, &ctx) else {
             return Some(ToolResult::Error(format!(

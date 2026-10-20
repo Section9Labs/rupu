@@ -325,9 +325,14 @@ impl Core {
             None => None,
         };
         match result {
-            Some(ToolResult::Json(v)) => json!({
+            // `structuredContent` must be an object (clients reject anything
+            // else); any other JSON value goes as the text block only.
+            Some(ToolResult::Json(v)) if v.is_object() => json!({
                 "content": [{"type": "text", "text": v.to_string()}],
                 "structuredContent": v,
+            }),
+            Some(ToolResult::Json(v)) => json!({
+                "content": [{"type": "text", "text": v.to_string()}],
             }),
             Some(ToolResult::Text(t)) => json!({ "content": [{"type": "text", "text": t}] }),
             Some(ToolResult::Error(t)) => {

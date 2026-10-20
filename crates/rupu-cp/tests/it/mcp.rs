@@ -37,9 +37,15 @@ fn serve_opts(dir: &std::path::Path) -> rupu_cp::ServeOpts {
     }
 }
 
-async fn spawn_with(token: Option<&str>, web: bool, mcp: Option<McpOpts>) -> std::net::SocketAddr {
-    let dir = tempfile::tempdir().unwrap().keep();
-    let state = rupu_cp::build_state(&serve_opts(&dir));
+/// The CP serving over a fresh global dir, held for the test's lifetime by
+/// the returned `TempDir`.
+async fn spawn_with(
+    token: Option<&str>,
+    web: bool,
+    mcp: Option<McpOpts>,
+) -> (std::net::SocketAddr, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = rupu_cp::build_state(&serve_opts(dir.path()));
     let server = mcp.map(|o| rupu_cp::mcp::build_server(&state, &o).unwrap());
     let app = router_with(
         state,
@@ -51,7 +57,7 @@ async fn spawn_with(token: Option<&str>, web: bool, mcp: Option<McpOpts>) -> std
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    addr
+    (addr, dir)
 }
 
 fn plain_mcp() -> Option<McpOpts> {
@@ -63,7 +69,7 @@ fn plain_mcp() -> Option<McpOpts> {
 
 #[tokio::test]
 async fn initialize_returns_a_session_header_and_tools_capability() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/mcp"))
         .json(&init_body())
@@ -85,14 +91,14 @@ async fn initialize_returns_a_session_header_and_tools_capability() {
 
 #[tokio::test]
 async fn get_on_mcp_is_405() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let resp = reqwest::get(format!("http://{addr}/mcp")).await.unwrap();
     assert_eq!(resp.status(), 405);
 }
 
 #[tokio::test]
 async fn notification_only_post_is_202() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/mcp"))
         .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
@@ -105,7 +111,7 @@ async fn notification_only_post_is_202() {
 
 #[tokio::test]
 async fn unparseable_body_is_400_with_a_parse_error() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/mcp"))
         .body("{nope")
@@ -119,7 +125,7 @@ async fn unparseable_body_is_400_with_a_parse_error() {
 
 #[tokio::test]
 async fn cross_origin_is_refused() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let c = reqwest::Client::new();
     let url = format!("http://{addr}/mcp");
     let evil = c
@@ -144,7 +150,7 @@ async fn cross_origin_is_refused() {
 
 #[tokio::test]
 async fn bearer_required_when_token_set() {
-    let addr = spawn_with(Some("t"), true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(Some("t"), true, plain_mcp()).await;
     let c = reqwest::Client::new();
     let url = format!("http://{addr}/mcp");
     let no = c.post(&url).json(&init_body()).send().await.unwrap();
@@ -186,7 +192,7 @@ impl ToolSource for Sleeper {
 #[tokio::test]
 async fn cancel_is_scoped_to_the_session() {
     let started = Arc::new(tokio::sync::Semaphore::new(0));
-    let addr = spawn_with(
+    let (addr, _tmp) = spawn_with(
         None,
         true,
         Some(McpOpts {
@@ -229,7 +235,7 @@ async fn cancel_is_scoped_to_the_session() {
 
 #[tokio::test]
 async fn no_web_serves_api_and_mcp_but_not_the_spa() {
-    let addr = spawn_with(None, false, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, false, plain_mcp()).await;
     let c = reqwest::Client::new();
     assert_eq!(
         c.get(format!("http://{addr}/"))
@@ -260,7 +266,7 @@ async fn no_web_serves_api_and_mcp_but_not_the_spa() {
 
 #[tokio::test]
 async fn web_only_has_no_mcp() {
-    let addr = spawn_with(None, true, None).await;
+    let (addr, _tmp) = spawn_with(None, true, None).await;
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/mcp"))
         .json(&init_body())
@@ -291,7 +297,7 @@ async fn init_with_headers(
 
 #[tokio::test]
 async fn rebinding_host_is_refused_on_a_loopback_bind() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let host = format!("evil.example:{}", addr.port());
     assert_eq!(init_with_headers(addr, Some(host.clone()), None).await, 403);
     // Origin == Host is not enough on its own.
@@ -303,7 +309,7 @@ async fn rebinding_host_is_refused_on_a_loopback_bind() {
 
 #[tokio::test]
 async fn localhost_host_is_served_on_a_loopback_bind() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     for host in ["localhost", "LOCALHOST:7878", "127.0.0.1:9", "[::1]:80"] {
         assert_eq!(
             init_with_headers(addr, Some(host.into()), None).await,
@@ -335,7 +341,7 @@ async fn localhost_host_is_served_on_a_loopback_bind() {
 
 #[tokio::test]
 async fn null_origin_is_refused() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     assert_eq!(
         init_with_headers(addr, None, Some("null".into())).await,
         403
@@ -344,7 +350,7 @@ async fn null_origin_is_refused() {
 
 #[tokio::test]
 async fn delete_on_mcp_is_405() {
-    let addr = spawn_with(None, true, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, true, plain_mcp()).await;
     let resp = reqwest::Client::new()
         .delete(format!("http://{addr}/mcp"))
         .send()
@@ -355,7 +361,7 @@ async fn delete_on_mcp_is_405() {
 
 #[tokio::test]
 async fn no_web_keeps_the_json_404_for_api_paths() {
-    let addr = spawn_with(None, false, plain_mcp()).await;
+    let (addr, _tmp) = spawn_with(None, false, plain_mcp()).await;
     let c = reqwest::Client::new();
     let resp = c
         .get(format!("http://{addr}/api/nope"))
@@ -402,8 +408,18 @@ const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
 
 /// A writable CP with one run and one live session, serving `/mcp`.
 async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
+    spawn_operator_with(|_| {}, None).await
+}
+
+/// [`spawn_operator`] with `seed` run over its global dir first, and
+/// `catalog` as the catalog source.
+async fn spawn_operator_with(
+    seed: impl FnOnce(&std::path::Path),
+    catalog: Option<Arc<dyn ToolSource>>,
+) -> (std::net::SocketAddr, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_path_buf();
+    seed(&dir);
     let store = rupu_orchestrator::runs::RunStore::new(dir.join("runs"));
     store
         .create(
@@ -419,7 +435,7 @@ async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
     let server = rupu_cp::mcp::build_server(
         &state,
         &McpOpts {
-            catalog: None,
+            catalog,
             tools: vec![],
         },
     )
@@ -523,8 +539,20 @@ async fn a_traversal_id_never_reaches_another_route() {
     let r = call_tool(addr, "runs.get", json!({"id": "../../config"})).await;
     assert_eq!(r["isError"], json!(true), "{r}");
     let t = text_of(&r);
-    assert!(t.contains("HTTP 4"), "{t}");
+    assert!(t.contains("is not a run id"), "{t}");
     assert!(!t.contains("\"providers\""), "{t}");
+}
+
+#[tokio::test]
+async fn a_sibling_route_s_segment_is_not_a_run_id() {
+    let (addr, _tmp) = spawn_operator().await;
+    for id in ["workflows", "archived", "agents", "autoflows"] {
+        for tool in ["runs.get", "runs.cancel"] {
+            let r = call_tool(addr, tool, json!({ "id": id })).await;
+            assert_eq!(r["isError"], json!(true), "{tool} {id}: {r}");
+            assert_eq!(text_of(&r), format!("`{id}` is not a run id"), "{r}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -565,6 +593,7 @@ async fn reject_and_cancel_are_marked_destructive() {
     }
     let get = tools.iter().find(|t| t["name"] == "runs.get").unwrap();
     assert_eq!(get["annotations"]["readOnlyHint"], json!(true), "{get}");
+    assert_eq!(get["annotations"]["idempotentHint"], json!(true), "{get}");
 }
 
 #[tokio::test]
@@ -654,4 +683,191 @@ async fn messages_sent_through_mcp_record_client_mcp_and_keep_via_cp() {
     let http = find("plain http");
     assert_eq!(http["via"], "cp", "{http}");
     assert!(http.get("client").is_none(), "{http}");
+}
+
+#[tokio::test]
+async fn an_x_rupu_client_header_is_not_mcp_attribution() {
+    let (addr, tmp) = spawn_operator().await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/sessions/{OP_SESSION}/messages"))
+        .header("x-rupu-client", "mcp")
+        .json(&json!({"body": "spoofed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let lines = log_lines(tmp.path());
+    let line = lines.iter().find(|l| l["body"] == "spoofed").unwrap();
+    assert!(line.get("client").is_none(), "{line}");
+}
+
+/// Parks `id` at its one gate `gate` in `dir`'s run store.
+fn seed_parked(dir: &std::path::Path, id: &str) {
+    let mut rec = super::sse::seed_run(id, rupu_orchestrator::runs::RunStatus::AwaitingApproval);
+    rec.awaiting = vec![rupu_orchestrator::runs::AwaitingGate {
+        step_id: "gate".into(),
+        prompt: None,
+        since: chrono::Utc::now(),
+        expires_at: None,
+    }];
+    rec.sync_awaiting_compat();
+    rupu_orchestrator::runs::RunStore::new(dir.join("runs"))
+        .create(rec, "name: test\nsteps: []\n")
+        .unwrap();
+}
+
+/// Who `verb` on `id` was recorded as decided by.
+fn decided_by(dir: &std::path::Path, verb: &str, id: &str) -> Option<String> {
+    let rec = rupu_orchestrator::runs::RunStore::new(dir.join("runs"))
+        .load(id)
+        .unwrap();
+    match verb {
+        "approve" => rec.gate_decisions.first().and_then(|d| d.approver.clone()),
+        "resume" => rec.resume_approver,
+        _ => rec.reject_cleanup_pending.and_then(|m| m.approver),
+    }
+}
+
+#[tokio::test]
+async fn run_control_through_mcp_records_actor_mcp_and_plain_http_web() {
+    const VERBS: [&str; 3] = ["approve", "reject", "cancel"];
+    let id = |verb: &str, how: &str| format!("run_{verb}_{how}");
+    let (addr, tmp) = spawn_operator_with(
+        |dir| {
+            for verb in VERBS {
+                for how in ["mcp", "http", "spoof"] {
+                    seed_parked(dir, &id(verb, how));
+                }
+            }
+            for how in ["http", "spoof"] {
+                let rec = super::sse::seed_run(
+                    &id("resume", how),
+                    rupu_orchestrator::runs::RunStatus::Paused,
+                );
+                rupu_orchestrator::runs::RunStore::new(dir.join("runs"))
+                    .create(rec, "name: test\nsteps: []\n")
+                    .unwrap();
+            }
+        },
+        None,
+    )
+    .await;
+    let c = reqwest::Client::new();
+    for verb in VERBS {
+        let r = call_tool(
+            addr,
+            &format!("runs.{verb}"),
+            json!({"id": id(verb, "mcp")}),
+        )
+        .await;
+        assert_ne!(r["isError"], json!(true), "{verb}: {r}");
+    }
+    // Plain HTTP, with and without the header the operator source once
+    // sent: never `mcp`. `resume` is no MCP tool yet; its HTTP side the same.
+    for verb in VERBS.iter().copied().chain(["resume"]) {
+        for (how, header) in [("http", false), ("spoof", true)] {
+            let mut req = c.post(format!("http://{addr}/api/runs/{}/{verb}", id(verb, how)));
+            if header {
+                req = req.header("x-rupu-client", "mcp");
+            }
+            let resp = req.send().await.unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "{verb} {how}: {}",
+                resp.text().await.unwrap()
+            );
+        }
+    }
+    for verb in VERBS {
+        assert_eq!(
+            decided_by(tmp.path(), verb, &id(verb, "mcp")).as_deref(),
+            Some("mcp"),
+            "{verb}"
+        );
+    }
+    for verb in VERBS.iter().copied().chain(["resume"]) {
+        for how in ["http", "spoof"] {
+            assert_eq!(
+                decided_by(tmp.path(), verb, &id(verb, how)).as_deref(),
+                Some("web"),
+                "{verb} {how}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tools_answer_arrays_as_text_without_structured_content() {
+    let (addr, _tmp) = spawn_operator().await;
+    for tool in ["runs.list", "workflows.list", "agents.list"] {
+        let r = call_tool(addr, tool, json!({})).await;
+        assert_ne!(r["isError"], json!(true), "{tool}: {r}");
+        // The protocol allows only an object here.
+        assert!(
+            r.get("structuredContent").is_none_or(Value::is_object),
+            "{tool}: {r}"
+        );
+        let text: Value = serde_json::from_str(&text_of(&r)).unwrap();
+        assert!(text.is_array(), "{tool}: {r}");
+        assert!(r.get("structuredContent").is_none(), "{tool}: {r}");
+    }
+    // With `facets`, `runs.list` answers an object: structured content.
+    let r = call_tool(addr, "runs.list", json!({"facets": "1"})).await;
+    assert!(r["structuredContent"].is_object(), "{r}");
+}
+
+/// A catalog with tools named like operator tools and one no operator tool
+/// covers; each answers with its own name.
+struct NamedLikeOperator;
+
+#[async_trait]
+impl ToolSource for NamedLikeOperator {
+    fn tools(&self) -> Vec<ToolDef> {
+        ["agents.list", "agents.get", "wait", "findings.query"]
+            .into_iter()
+            .map(|n| ToolDef {
+                name: n.into(),
+                description: format!("catalog {n}"),
+                input_schema: json!({"type": "object"}),
+                hints: ToolHints::default(),
+            })
+            .collect()
+    }
+    async fn call(&self, name: &str, _args: Value, _cx: &CallCx) -> Option<ToolResult> {
+        Some(ToolResult::Text(format!("catalog {name}")))
+    }
+}
+
+#[tokio::test]
+async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name() {
+    let catalog: Arc<dyn ToolSource> = Arc::new(NamedLikeOperator);
+    let (addr, _tmp) = spawn_operator_with(|_| {}, Some(Arc::clone(&catalog))).await;
+    let v = rpc(addr, "tools/list", json!({})).await;
+    let tools = v["result"]["tools"].as_array().unwrap();
+    let named = |n: &str| tools.iter().filter(|t| t["name"] == n).collect::<Vec<_>>();
+    // Served once each: the operator's `agents.list`, `wait`'s own `wait`,
+    // the catalog's `agents.get` and `findings.query`.
+    for (name, from_catalog) in [
+        ("agents.list", false),
+        ("wait", false),
+        ("agents.get", true),
+        ("findings.query", true),
+    ] {
+        let t = named(name);
+        assert_eq!(t.len(), 1, "{name}: {t:?}");
+        assert_eq!(
+            t[0]["description"] == json!(format!("catalog {name}")),
+            from_catalog,
+            "{name}: {t:?}"
+        );
+    }
+    let r = call_tool(addr, "agents.get", json!({})).await;
+    assert_eq!(text_of(&r), "catalog agents.get", "{r}");
+    let r = call_tool(addr, "agents.list", json!({})).await;
+    assert!(text_of(&r).starts_with('['), "{r}");
+    // `--tools` checks names the same way.
+    rupu_cp::mcp::validate_tools(&["agents.get".into()], Some(&catalog)).unwrap();
+    rupu_cp::mcp::validate_tools(&["agents.list".into(), "wait".into()], Some(&catalog)).unwrap();
+    assert!(rupu_cp::mcp::validate_tools(&["nope.x".into()], Some(&catalog)).is_err());
 }

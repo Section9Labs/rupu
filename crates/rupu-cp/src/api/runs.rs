@@ -213,6 +213,7 @@ async fn approve_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
+    via: crate::mcp::ViaMcp,
     OptionalJson(body): OptionalJson<ApproveBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
@@ -229,10 +230,10 @@ async fn approve_run(
     let now = chrono::Utc::now();
     let mode = body.and_then(|b| b.mode);
     // On the blocking pool: the gate methods take the run lock.
-    let (rid, gate) = (id.clone(), q.gate.clone());
+    let (rid, gate, actor) = (id.clone(), q.gate.clone(), crate::mcp::actor(&via));
     s.run_store
         .blocking(move |store| {
-            store.request_resume_approval(&rid, "web", mode.as_deref(), now, gate.as_deref())
+            store.request_resume_approval(&rid, actor, mode.as_deref(), now, gate.as_deref())
         })
         .await
         .map_err(|e| map_approval_err(&id, e))?;
@@ -271,6 +272,7 @@ async fn reject_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
+    via: crate::mcp::ViaMcp,
     OptionalJson(body): OptionalJson<RejectBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
@@ -289,10 +291,10 @@ async fn reject_run(
     let now = chrono::Utc::now();
     let reason = reason.unwrap_or_default();
     // On the blocking pool: the gate methods take the run lock.
-    let (rid, gate) = (id.clone(), q.gate.clone());
+    let (rid, gate, actor) = (id.clone(), q.gate.clone(), crate::mcp::actor(&via));
     s.run_store
         .blocking(move |store| {
-            store.request_resume_rejection(&rid, "web", &reason, now, gate.as_deref())
+            store.request_resume_rejection(&rid, actor, &reason, now, gate.as_deref())
         })
         .await
         .map_err(|e| map_approval_err(&id, e))?;
@@ -362,6 +364,7 @@ async fn cancel_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
+    via: crate::mcp::ViaMcp,
     OptionalJson(body): OptionalJson<CancelBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
@@ -378,9 +381,9 @@ async fn cancel_run(
         .unwrap_or_else(|| "Cancelled from control plane".to_string());
     // On the blocking pool: `cancel` waits (bounded) for the run lock.
     let _outcome: CancelOutcome = {
-        let (run_id, reason) = (id.clone(), reason.clone());
+        let (run_id, reason, actor) = (id.clone(), reason.clone(), crate::mcp::actor(&via));
         s.run_store
-            .blocking(move |store| store.cancel(&run_id, "web", &reason, now))
+            .blocking(move |store| store.cancel(&run_id, actor, &reason, now))
             .await
             .map_err(|e| map_cancel_err(&id, e))?
     };
@@ -476,6 +479,7 @@ async fn resume_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
+    via: crate::mcp::ViaMcp,
 ) -> ApiResult<Json<serde_json::Value>> {
     validate_id(&id)?;
     s.launcher
@@ -508,9 +512,9 @@ async fn resume_run(
     }
     let now = chrono::Utc::now();
     // On the blocking pool: the gate methods take the run lock.
-    let rid = id.clone();
+    let (rid, actor) = (id.clone(), crate::mcp::actor(&via));
     s.run_store
-        .blocking(move |store| store.request_resume_approval(&rid, "web", None, now, None))
+        .blocking(move |store| store.request_resume_approval(&rid, actor, None, now, None))
         .await
         .map_err(|e| map_approval_err(&id, e))?;
     let mut resp = run_response(&s, &id).await?;
@@ -2835,6 +2839,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -2876,6 +2881,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(Some(body)),
         )
         .await
@@ -2905,6 +2911,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -2923,6 +2930,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(Some(RejectBody { reason: None })),
         )
         .await
@@ -2948,6 +2956,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(Some(body)),
         )
         .await
@@ -2974,6 +2983,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3029,6 +3039,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_b".into()),
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3070,6 +3081,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3104,6 +3116,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("does_not_exist".into()),
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3132,6 +3145,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
+            None,
             OptionalJson(Some(RejectBody {
                 reason: Some("gate_a looks bad".into()),
             })),
@@ -3168,6 +3182,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_a".into()),
             }),
+            None,
             OptionalJson(Some(RejectBody { reason: None })),
         )
         .await
@@ -3185,6 +3200,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate_b".into()),
             }),
+            None,
             OptionalJson(Some(RejectBody {
                 reason: Some("gate_b too".into()),
             })),
@@ -3215,6 +3231,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: Some("gate".into()),
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3246,6 +3263,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3281,6 +3299,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(Some(body)),
         )
         .await
@@ -3299,6 +3318,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
             OptionalJson(None),
         )
         .await
@@ -3412,6 +3432,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
         )
         .await
         .expect_err("resume without a launcher should be unavailable");
@@ -3433,10 +3454,77 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
         )
         .await
         .expect_err("resuming a running (non-paused) run should conflict");
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
+    }
+
+    /// A local decision made through `/mcp` (the operator source's request
+    /// extension) records the actor `mcp`; without it, `web`.
+    #[tokio::test]
+    async fn local_run_control_through_mcp_records_actor_mcp() {
+        use crate::mcp::McpClient;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let s = writable_state(&tmp);
+        let q = || {
+            Query(RunControlQuery {
+                host: None,
+                gate: None,
+            })
+        };
+        for (via, actor) in [(Some(axum::Extension(McpClient)), "mcp"), (None, "web")] {
+            let id = |verb: &str| format!("run_{verb}_{actor}");
+            for verb in ["approve", "reject", "cancel"] {
+                s.run_store
+                    .create(awaiting_record(&id(verb), "gate"), "name: x\n")
+                    .unwrap();
+            }
+            s.run_store
+                .create(paused_record(&id("resume"), "gate"), "name: x\n")
+                .unwrap();
+            let _ = approve_run(
+                State(s.clone()),
+                Path(id("approve")),
+                q(),
+                via,
+                OptionalJson(None),
+            )
+            .await
+            .unwrap();
+            let _ = reject_run(
+                State(s.clone()),
+                Path(id("reject")),
+                q(),
+                via,
+                OptionalJson(None),
+            )
+            .await
+            .unwrap();
+            let _ = cancel_run(
+                State(s.clone()),
+                Path(id("cancel")),
+                q(),
+                via,
+                OptionalJson(None),
+            )
+            .await
+            .unwrap();
+            let _ = resume_run(State(s.clone()), Path(id("resume")), q(), via)
+                .await
+                .unwrap();
+            let load = |verb: &str| s.run_store.load(&id(verb)).unwrap();
+            assert_eq!(
+                load("approve").gate_decisions[0].approver.as_deref(),
+                Some(actor)
+            );
+            for verb in ["reject", "cancel"] {
+                let marker = load(verb).reject_cleanup_pending.expect("rejected");
+                assert_eq!(marker.approver.as_deref(), Some(actor), "{verb}");
+            }
+            assert_eq!(load("resume").resume_approver.as_deref(), Some(actor));
+        }
     }
 
     #[tokio::test]
@@ -3460,6 +3548,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
         )
         .await
         .expect("resume should succeed");
@@ -3489,6 +3578,7 @@ pub(crate) mod tests {
                 host: None,
                 gate: None,
             }),
+            None,
         )
         .await
         .expect_err("resume on missing run should 404");
@@ -3669,6 +3759,7 @@ pub(crate) mod tests {
                 host: Some("host_remote".into()),
                 gate: None,
             }),
+            None,
         )
         .await
     }

@@ -1114,7 +1114,7 @@ fn steerable(id: &str, record: &AgentiflowRecord) -> ApiResult<()> {
 async fn steer_agentiflow(
     State(s): State<AppState>,
     Path(id): Path<String>,
-    headers: axum::http::HeaderMap,
+    via: crate::mcp::ViaMcp,
     Json(req): Json<SteerRequest>,
 ) -> ApiResult<Response> {
     if !valid_run_id(&id) {
@@ -1126,15 +1126,8 @@ async fn steer_agentiflow(
             body: req.message,
             urgent: req.now,
         };
-        return crate::api::messages::post(
-            MessageRoute::Agentiflows,
-            &s,
-            &id,
-            None,
-            &headers,
-            body,
-        )
-        .await;
+        return crate::api::messages::post(MessageRoute::Agentiflows, &s, &id, None, &via, body)
+            .await;
     }
     if req.message.trim().is_empty() {
         return Err(ApiError::bad_request("steering message is empty"));

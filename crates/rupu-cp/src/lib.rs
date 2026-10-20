@@ -337,6 +337,21 @@ pub fn spawn_prewarm(app_state: &state::AppState) {
 /// Serve the control plane on an already-bound listener (see [`bind`]).
 /// `opts.bind` is informational here (`GET /api/config`'s `status.bind`);
 /// the listener's own address is what gets printed and served.
+/// The startup warning for `/mcp` served on a non-loopback address with no
+/// token: anyone who can reach it has full operator access. Visibility
+/// only; nothing is refused.
+pub(crate) fn open_mcp_warning(
+    serves_mcp: bool,
+    addr: std::net::SocketAddr,
+    has_token: bool,
+) -> Option<String> {
+    (serves_mcp && !has_token && !addr.ip().is_loopback()).then(|| {
+        format!(
+            "warning: /mcp is served on {addr} without --token; anyone who can reach this address has full operator access"
+        )
+    })
+}
+
 pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> anyhow::Result<()> {
     if !opts.web && opts.mcp.is_none() {
         anyhow::bail!("nothing to serve: --no-web and --no-mcp together");
@@ -382,6 +397,10 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         }
     }
     println!();
+    if let Some(warning) = open_mcp_warning(serves_mcp, addr, token.is_some()) {
+        eprintln!("{warning}");
+        tracing::warn!("{warning}");
+    }
     // The log gets the URL without the token: tracing sinks outlive the
     // terminal.
     info!("rupu cp serving on {}", click_url(addr));
@@ -410,6 +429,23 @@ mod tests {
         assert_eq!(p("127.0.0.1:7878"), "http://127.0.0.1:7878");
         assert_eq!(p("192.168.1.5:9000"), "http://192.168.1.5:9000");
         assert_eq!(p("[::]:7878"), "http://[::1]:7878");
+    }
+
+    #[test]
+    fn open_mcp_warning_only_for_an_untokened_non_loopback_mcp() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let w = open_mcp_warning(true, a("0.0.0.0:7879"), false).expect("warns");
+        assert_eq!(
+            w,
+            "warning: /mcp is served on 0.0.0.0:7879 without --token; anyone who can reach this address has full operator access"
+        );
+        assert!(open_mcp_warning(true, a("192.168.1.5:9000"), false).is_some());
+        assert!(open_mcp_warning(true, a("[::]:9000"), false).is_some());
+        // A token, a loopback bind, or no MCP: no warning.
+        assert!(open_mcp_warning(true, a("0.0.0.0:7879"), true).is_none());
+        assert!(open_mcp_warning(true, a("127.0.0.1:7879"), false).is_none());
+        assert!(open_mcp_warning(true, a("[::1]:7879"), false).is_none());
+        assert!(open_mcp_warning(false, a("0.0.0.0:7879"), false).is_none());
     }
 
     /// Regression for the 2026-09-04 linger: a bind failure must surface as

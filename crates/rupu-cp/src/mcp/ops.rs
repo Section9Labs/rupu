@@ -34,7 +34,7 @@ fn schema<T: schemars::JsonSchema>() -> Option<schemars::schema::RootSchema> {
 const READ: ToolHints = ToolHints {
     read_only: true,
     destructive: false,
-    idempotent: false,
+    idempotent: true,
     open_world: false,
 };
 const DESTRUCTIVE: ToolHints = ToolHints {
@@ -69,7 +69,7 @@ fn build() -> Vec<OpSpec> {
             name: "runs.list",
             method: http::Method::GET,
             path: "/api/runs/workflows",
-            description: "List workflow runs, newest first.\n\nFilter with `q` (the query line, e.g. `status:running`), `lifecycle` (active|completed|failed), `since`/`until`, and page with `offset`/`limit`. Returns a JSON array of run rows.",
+            description: "List workflow runs started by hand (not standalone agent runs, not event- or cron-started ones), newest first.\n\nFilter with `q` (the query line, e.g. `status:running`), `lifecycle` (active|completed|failed), `since`/`until`, `host`, and page with `offset`/`limit`. Returns a JSON array of run rows; with `facets` set, an object `{rows, facets, facets_partial}`.",
             query: schema::<runs::WorkflowRunsQuery>,
             body: none,
             hints: READ,

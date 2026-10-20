@@ -1,6 +1,6 @@
 //! The catalog as a tool source: workspace-scoped contexts per call.
 
-use rupu_mcp::catalog::{CatalogSource, ContextFactory, HIDDEN_BY_OPERATOR_TOOLS};
+use rupu_mcp::catalog::{CatalogSource, ContextFactory};
 use rupu_mcp::{CallCx, ToolResult, ToolSource};
 use rupu_tools::ToolContext;
 use serde_json::{json, Value};
@@ -45,18 +45,19 @@ fn required(def: &rupu_mcp::ToolDef) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The source hides nothing itself: a server with its own tool by a
+/// catalog name leaves the catalog's out (rupu-cp's `mcp::sources`).
 #[test]
-fn operator_named_tools_are_not_listed() {
+fn every_servable_catalog_tool_is_listed() {
     let tmp = tempfile::TempDir::new().unwrap();
     let names: Vec<String> = source(tmp.path())
         .tools()
         .into_iter()
         .map(|t| t.name)
         .collect();
-    for hidden in HIDDEN_BY_OPERATOR_TOOLS {
-        assert!(!names.iter().any(|n| n == hidden), "{hidden} listed");
+    for name in ["read_file", "findings.query", "findings.tag"] {
+        assert!(names.iter().any(|n| n == name), "{name} not listed");
     }
-    assert!(names.iter().any(|n| n == "read_file"));
 }
 
 #[test]
@@ -127,12 +128,10 @@ async fn an_unserved_name_is_none() {
         .call("nope", json!({}), &CallCx::default())
         .await
         .is_none());
+    // A catalog tool whose service the base context lacks (no catalog
+    // port here) is not served.
     assert!(s
-        .call(
-            "findings.query",
-            json!({"workspace": "p"}),
-            &CallCx::default()
-        )
+        .call("agents.list", json!({}), &CallCx::default())
         .await
         .is_none());
 }
