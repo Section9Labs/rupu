@@ -32,6 +32,17 @@ pub fn builtin_profiles() -> BTreeMap<String, EngagementProfile> {
     raw
 }
 
+/// Every built-in profile's TOML source as shipped, keyed by id.
+pub fn builtin_profile_sources() -> BTreeMap<String, &'static str> {
+    BUILTIN_TOMLS
+        .iter()
+        .map(|src| {
+            let p = parse_profile(src).expect("embedded builtin profile parses");
+            (p.id, *src)
+        })
+        .collect()
+}
+
 /// The embedded built-in profile packages. Add a new built-in by dropping its
 /// `.toml` beside the others and listing it here. Composites (`mobile`,
 /// `pentest`) must appear with the profiles they include.

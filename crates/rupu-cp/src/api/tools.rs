@@ -31,11 +31,17 @@ struct ToolDto {
 }
 
 #[derive(Serialize)]
-struct ToolsResponse {
+pub(crate) struct ToolsResponse {
     tools: Vec<ToolDto>,
 }
 
 async fn get_tools() -> Json<ToolsResponse> {
+    Json(catalog())
+}
+
+/// The whole catalog as `GET /api/tools` serves it (also the MCP's
+/// `rupu://tools` resource).
+pub(crate) fn catalog() -> ToolsResponse {
     let tools = ToolCatalog::all()
         .iter()
         .map(|d| ToolDto {
@@ -49,7 +55,7 @@ async fn get_tools() -> Json<ToolsResponse> {
             action_eligible: d.is_action_eligible(),
         })
         .collect();
-    Json(ToolsResponse { tools })
+    ToolsResponse { tools }
 }
 
 #[cfg(test)]
