@@ -239,8 +239,8 @@ describe('Sessions — canonical run-table column order', () => {
   });
 });
 
-describe('Sessions — status cell uses the shared SessionStatusPill', () => {
-  it('a "running"-like status renders the shared pill with the motion marker', async () => {
+describe('Sessions — status cell uses the shared status chip', () => {
+  it('a "running"-like status renders the running chip with a live dot', async () => {
     stubDeps();
     // rupu-cli's raw session status ("active") is not one of the four
     // canonical values (idle|running|failed|stopped) — this also exercises
@@ -251,7 +251,8 @@ describe('Sessions — status cell uses the shared SessionStatusPill', () => {
     await waitFor(() => expect(screen.getByText(/fix-bug/)).toBeInTheDocument());
 
     const pill = screen.getByText('Running');
-    expect(pill).toHaveAttribute('data-motion', 'rg-pulse-run');
+    // The one status chip: a leading dot marks the live (running) state.
+    expect(pill.querySelector('[aria-hidden="true"]')).not.toBeNull();
   });
 
   it('an unknown/garbage status value renders the RAW label, not a fabricated real state', async () => {

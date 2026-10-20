@@ -196,14 +196,15 @@ describe('AgentRuns — agent subject cell', () => {
 });
 
 describe('AgentRuns — status column', () => {
-  it('renders a single-line status pill for a known status', async () => {
+  it('renders the status as the shared pill-shaped chip for a known status', async () => {
     stubDeps();
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([REMOTE_ROW]);
 
     renderPage();
 
     const status = await screen.findByText('Completed');
-    expect(status.className).toMatch(/whitespace-nowrap/);
+    // The one status chip of the visual language: a fully-rounded pill.
+    expect(status.className).toMatch(/rounded-full/);
   });
 
   it('renders an em-dash when status is absent', async () => {
@@ -216,7 +217,7 @@ describe('AgentRuns — status column', () => {
     await waitFor(() => expect(screen.getAllByText('—').length).toBeGreaterThan(0));
   });
 
-  it('normalizes a session-branch "ok" wire status to the green Completed pill (no AlertCircle fallback)', async () => {
+  it('normalizes a session-branch "ok" wire status to the green Completed chip (no unknown-status fallback)', async () => {
     stubDeps();
     const okRow: AgentRunRow = { ...SESSION_ROW, status: 'ok' };
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([okRow]);
@@ -224,14 +225,12 @@ describe('AgentRuns — status column', () => {
     renderPage();
 
     const status = await screen.findByText('Completed');
+    // The green completed tone — proves the wire "ok" hit the real descriptor,
+    // not an unknown-status neutral fallback.
     expect(status).toHaveClass('bg-status-done/10');
-    // CheckCircle2 (the completed icon), never AlertCircle (the
-    // unknown-status fallback) — proves the wire "ok" hit the real
-    // descriptor, not StatusPill's fallback branch.
-    expect(status.querySelector('svg')).toHaveClass('lucide-circle-check');
   });
 
-  it('normalizes a session-branch "error" wire status to the Failed pill', async () => {
+  it('normalizes a session-branch "error" wire status to the Failed chip', async () => {
     stubDeps();
     const errorRow: AgentRunRow = { ...SESSION_ROW, status: 'error' };
     vi.spyOn(api, 'getAgentRuns').mockResolvedValue([errorRow]);
@@ -239,8 +238,7 @@ describe('AgentRuns — status column', () => {
     renderPage();
 
     const status = await screen.findByText('Failed');
-    expect(status.closest('span')).toHaveClass('bg-status-failed/10');
-    expect(status.closest('span')?.querySelector('svg')).toHaveClass('lucide-circle-x');
+    expect(status).toHaveClass('bg-status-failed/10');
   });
 });
 

@@ -24,9 +24,10 @@ import SortableTable, { type Column } from '../../components/lists/SortableTable
 import { WORKFLOW_RUN_COLUMNS } from '../../components/runs/workflowRunColumns';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
+import { PageHeader } from '../../components/ui/PageHeader';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
-import { Spinner } from '../../components/ui/Spinner';
+import { ListSkeleton } from '../../components/lists/ListSkeleton';
 import { ListQueryBar, NoMatches, useListQuery } from '../../components/query/ListQueryBar';
 import { hostAlerts } from '../../components/query/hostAlerts';
 import { ListFooter } from '../../components/lists/ListFooter';
@@ -170,20 +171,25 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
   // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
 
+  const refreshButton = (
+    <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+      <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+      Refresh
+    </Button>
+  );
+
   return (
     <div className={embedded ? undefined : 'p-8'}>
-      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
-        {!embedded && (
-          <div>
-            <h1 className="text-2xl font-semibold text-ink">Workflow Runs</h1>
-            <p className="mt-1 text-sm text-ink-dim">Workflow executions across this control plane.</p>
-          </div>
-        )}
-        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </Button>
-      </header>
+      {embedded ? (
+        <div className="mb-3 flex justify-end">{refreshButton}</div>
+      ) : (
+        <PageHeader
+          className="mb-6"
+          title="Workflow Runs"
+          subtitle="Workflow executions across this control plane."
+          actions={refreshButton}
+        />
+      )}
 
       <ListQueryBar
         value={q}
@@ -199,13 +205,9 @@ export default function WorkflowRuns({ customer: fixedCustomer }: { customer?: s
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {loading && rows.length === 0 ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading runs…" />
-        </div>
+        <ListSkeleton label="Loading runs…" />
       ) : rows.length === 0 && waiting ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label={waiting} />
-        </div>
+        <ListSkeleton label={waiting} />
       ) : rows.length === 0 && noHostAnswered(slices) ? (
         <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (

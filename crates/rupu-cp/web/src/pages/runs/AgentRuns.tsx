@@ -28,11 +28,12 @@ import { api, ApiError, type AgentRunRow, type ListQueryOpts, type RunStatusStr 
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import UsageBarChart from '../../components/charts/UsageBarChart';
 import { Button } from '../../components/ui/Button';
+import { PageHeader } from '../../components/ui/PageHeader';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
-import { Spinner } from '../../components/ui/Spinner';
+import { ListSkeleton } from '../../components/lists/ListSkeleton';
 import { Badge } from '../../components/ui/Badge';
-import { StatusPill } from '../../components/StatusPill';
+import { RunStatusChip } from '../../components/ui/RunStatusChip';
 import { AgentName } from '../../components/codename/AgentName';
 import { memberLabel } from '../../lib/codename';
 import { cn } from '../../lib/cn';
@@ -263,20 +264,25 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
   // Never claim "nothing" while a host is still loading.
   const waiting = waitingLabel(slices);
 
+  const refreshButton = (
+    <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+      <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+      Refresh
+    </Button>
+  );
+
   return (
     <div className={embedded ? undefined : 'p-8'}>
-      <header className={cn('flex items-center justify-between', embedded ? 'mb-3 justify-end' : 'mb-6')}>
-        {!embedded && (
-          <div>
-            <h1 className="text-2xl font-semibold text-ink">Agent Runs</h1>
-            <p className="mt-1 text-sm text-ink-dim">Standalone and session-bound agent invocations.</p>
-          </div>
-        )}
-        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </Button>
-      </header>
+      {embedded ? (
+        <div className="mb-3 flex justify-end">{refreshButton}</div>
+      ) : (
+        <PageHeader
+          className="mb-6"
+          title="Agent Runs"
+          subtitle="Standalone and session-bound agent invocations."
+          actions={refreshButton}
+        />
+      )}
 
       <ListQueryBar
         value={q}
@@ -292,13 +298,9 @@ export default function AgentRuns({ customer: fixedCustomer }: { customer?: stri
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {loading && rows.length === 0 ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading agent runs…" />
-        </div>
+        <ListSkeleton label="Loading agent runs…" />
       ) : rows.length === 0 && waiting ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label={waiting} />
-        </div>
+        <ListSkeleton label={waiting} />
       ) : rows.length === 0 && noHostAnswered(slices) ? (
         <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (
@@ -418,7 +420,7 @@ const AGENT_RUN_COLUMNS: Column<AgentRunRow>[] = [
     sortValue: (r) => r.status ?? null,
     render: (r) =>
       r.status ? (
-        <StatusPill status={normalizeAgentRunStatus(r.status)} />
+        <RunStatusChip status={normalizeAgentRunStatus(r.status)} />
       ) : (
         <span className="text-ink-mute">—</span>
       ),

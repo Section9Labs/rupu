@@ -178,7 +178,7 @@ describe('WorkflowRuns — per-host empty states', () => {
 });
 
 describe('WorkflowRuns — table rules (fit columns)', () => {
-  it('the Status column is a fit (nowrap) column and renders via StatusPill', async () => {
+  it('the Status column is a fit (nowrap) column and renders the status chip', async () => {
     stubDeps();
     vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([makeRun({ id: 'r1' })]);
     const { container } = renderPage();

@@ -30,8 +30,9 @@ import UsageBarChart from '../components/charts/UsageBarChart';
 import { Button } from '../components/ui/Button';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
-import { SessionStatusPill } from '../components/StatusPill';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
+import { PageHeader } from '../components/ui/PageHeader';
+import { StatusChip, type ChipTone } from '../components/ui/StatusChip';
 import { AgentName } from '../components/codename/AgentName';
 import { memberLabel } from '../lib/codename';
 import type { PerHostFetchParams } from '../lib/perHost/usePerHostPagedList';
@@ -44,7 +45,7 @@ import { ListFooter } from '../components/lists/ListFooter';
 import { cn } from '../lib/cn';
 import { durationBetween, relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
-import { sessionStatusDisplayLabel } from '../lib/sessionStatus';
+import { sessionStatusDisplayLabel, sessionStatusTone, type SessionTone } from '../lib/sessionStatus';
 import { shortId } from '../lib/shortId';
 import { useScopedList } from '../lib/useScopedList';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
@@ -136,19 +137,17 @@ export default function Sessions() {
 
   return (
     <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Sessions</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Agent sessions tracked by this control plane — active conversations and their archived
-            history.
-          </p>
-        </div>
-        <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </Button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Sessions"
+        subtitle="Agent sessions tracked by this control plane — active conversations and their archived history."
+        actions={
+          <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+            Refresh
+          </Button>
+        }
+      />
 
       <ListQueryBar
         value={q}
@@ -164,13 +163,9 @@ export default function Sessions() {
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       {loading && rows.length === 0 ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading sessions…" />
-        </div>
+        <ListSkeleton label="Loading sessions…" />
       ) : rows.length === 0 && waiting ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label={waiting} />
-        </div>
+        <ListSkeleton label={waiting} />
       ) : rows.length === 0 && noHostAnswered(slices) ? (
         <EmptyState title="No hosts answered" hint="Every host is offline or can't serve this list; the line under the query says which." />
       ) : rows.length === 0 ? (
@@ -224,6 +219,27 @@ function sessionDurationMs(s: SessionSummary): number | null {
   return Math.max(0, end - start);
 }
 
+// Session status as the one status chip (spec §"Chips"): the session's own
+// 4-value vocabulary (running / idle / failed / stopped, plus a raw fallback)
+// mapped onto a chip tone, keeping the session label. A leading dot matches the
+// run-status chips; `running` is the live state. Replaces the icon-bearing
+// `SessionStatusPill` on the list.
+const SESSION_CHIP_TONE: Record<SessionTone, ChipTone> = {
+  running: 'running',
+  idle: 'pending',
+  failed: 'failed',
+  stopped: 'neutral',
+  neutral: 'neutral',
+};
+
+function SessionStatusChip({ status }: { status: unknown }) {
+  return (
+    <StatusChip tone={SESSION_CHIP_TONE[sessionStatusTone(status)]} dot>
+      {sessionStatusDisplayLabel(status)}
+    </StatusChip>
+  );
+}
+
 const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
   {
     key: 'status',
@@ -233,7 +249,7 @@ const SESSION_BASE_COLUMNS: Column<SessionSummary>[] = [
     // Sort on the label actually displayed (M3) — not the raw wire string —
     // so sorting groups rows by what the operator sees in the pill.
     sortValue: (s) => sessionStatusDisplayLabel(s.status),
-    render: (s) => <SessionStatusPill status={s.status} />,
+    render: (s) => <SessionStatusChip status={s.status} />,
   },
   {
     key: 'agent',
