@@ -596,6 +596,57 @@ mod tests {
         assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 3);
     }
 
+    /// A gate ask held back by the spacing holds up nothing else of its host:
+    /// the run's event stream, opened in the same round, is read at once,
+    /// and the stream's source gets no warning (only the gate's, naming its
+    /// turn).
+    #[tokio::test]
+    async fn a_held_back_gate_ask_does_not_hold_up_its_hosts_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stub = Arc::new(StubConnector {
+            connects_per_request: true,
+            get_run: Some(Ok(gate(true))),
+            events: Some(
+                "id: 1\ndata: {\"type\":\"step_started\"}\n\n\
+                 id: 2\ndata: {\"type\":\"step_started\"}\n\n",
+            ),
+            ..Default::default()
+        });
+        let source = WaitSource {
+            state: state_with_host(&tmp, "host_s", stub.clone()),
+            throttle: Arc::new(throttle::Throttle::with_spacing(Duration::from_secs(10))),
+        };
+        let gate_only = GATE.replace("run_r", "run_g");
+        let r = json_of(call(&source, &gate_only).await);
+        assert_eq!(r["fired"][0]["kind"], "run_gate", "{r}");
+        // The gate's next ask is 10 s away, within this call's 15 s.
+        let both = r#"{"watch": [{"kind": "run_events", "run": "run_r", "host": "host_s"},
+                                 {"kind": "run_gate", "run": "run_g", "host": "host_s"}],
+                       "timeout_ms": 15000}"#;
+        let t = Instant::now();
+        let r = json_of(call(&source, both).await);
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let ids: Vec<u64> = r["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ids, [1, 2], "{r}");
+        let warnings: Vec<&str> = r["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{r}"))
+            .iter()
+            .map(|w| w.as_str().unwrap())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{r}");
+        assert!(
+            warnings[0].starts_with("run:run_g@host_s: asked 0 s ago over SSH; next ask in "),
+            "{r}"
+        );
+        assert_eq!(stub.get_run_calls.load(Ordering::SeqCst), 1);
+    }
+
     /// A held-back ask that goes out and fails is the call's error, as the
     /// first round's ask it stands for would be.
     #[tokio::test]

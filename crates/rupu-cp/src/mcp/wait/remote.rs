@@ -13,18 +13,21 @@
 //! each applied as it lands, so a slow or hung host delays neither the local
 //! sources nor another host. A stream is its host's long-lived connection,
 //! not a poll; one that ends without its `end` frame is reopened from its
-//! cursor at that host's next round, silently when the reopen succeeds.
+//! cursor at that host's next round, silently when the reopen succeeds. On a
+//! host the [`Throttle`] spaces, a gate or message ask held back by another
+//! call's recent ask doesn't hold up its round: the round goes on without it,
+//! and the host's round at the ask's turn asks it.
 //!
-//! A failure in a host's first round fails the call; a later failure is
+//! A failure of a source's first answer fails the call; a later failure is
 //! retried at its next round and reported in the result's `warnings` (a later
 //! poll the call's timeout cut short is one only when it had at least
 //! [`FIRST_ROUND_BUDGET`] to answer: a healthy host's poll that went out just
 //! before the timeout is no news; a cut-short status always is). A first
-//! round may run up to [`FIRST_ROUND_BUDGET`] past a shorter timeout (a
+//! answer may come up to [`FIRST_ROUND_BUDGET`] past a shorter timeout (a
 //! `timeout_ms: 0` peek, which then reads what the streams it opened already
-//! have). Once something fired, a host whose first round is still out holds
-//! the result back by at most that much from the call's start; past it, only
-//! that host's sources are named in `warnings`.
+//! have). Once something fired, a source still without its first answer
+//! holds the result back by at most that much from the call's start; past
+//! it, that source is named in `warnings` (a held-back one with its turn).
 
 use std::future::Future;
 use std::io;
@@ -83,8 +86,6 @@ struct Host {
     conn: Arc<dyn HostConnector>,
     /// A round of its is in flight.
     busy: bool,
-    /// Its first round answered.
-    answered: bool,
     /// How often its poll rounds go out ([`poll_every`]).
     poll: Duration,
     /// Every request is a connection of its own: its gate and message asks
@@ -117,6 +118,8 @@ struct RunSrc {
     /// Its `end` arrived with `run_settled` conditions unfired: the next
     /// round asks for the run's status, which fires them.
     needs_status: bool,
+    /// Its first answer arrived (a failure or a warning included).
+    answered: bool,
 }
 
 /// A remote run whose gates are polled.
@@ -124,6 +127,7 @@ struct GateSrc {
     host: usize,
     run: String,
     source: String,
+    first: First,
 }
 
 /// A remote message space, polled.
@@ -133,6 +137,16 @@ struct MsgSrc {
     source: String,
     /// The kinds its conditions want; every kind when one wants all.
     kinds: Option<Vec<MessageKind>>,
+    first: First,
+}
+
+/// Where a polled source stands on its first answer.
+#[derive(Default)]
+struct First {
+    answered: bool,
+    /// Its first ask was held back by the [`Throttle`]: asked at `.0` by
+    /// another call, its turn at `.1`, within the first round's bound.
+    held: Option<(Instant, Instant)>,
 }
 
 /// The remote side of one call.
@@ -147,6 +161,9 @@ pub(super) struct Remote {
     inflight: FuturesUnordered<HostRound>,
     /// Shared by every call on the CP.
     throttle: Arc<Throttle>,
+    /// What bounds a first answer: the call's deadline, or
+    /// [`FIRST_ROUND_BUDGET`] from its start when that is later.
+    first_by: Instant,
 }
 
 /// One host's round in flight: the host, then what it brought.
@@ -205,11 +222,12 @@ pub(super) enum Fail {
     Late {
         had: Duration,
     },
-    /// Held back by the [`Throttle`]: asked `ago` by another call, and not
-    /// to be asked again for `next_in`, past what this call waits.
+    /// Held back by the [`Throttle`]: asked at `asked` by another call, its
+    /// turn at `due`. The round doesn't wait for it, so it holds up nothing
+    /// else of its host; the host's next round asks at `due`.
     Deferred {
-        ago: Duration,
-        next_in: Duration,
+        asked: Instant,
+        due: Instant,
     },
 }
 
@@ -236,6 +254,7 @@ impl Remote {
             turn: 0,
             inflight: FuturesUnordered::new(),
             throttle,
+            first_by: Instant::now() + FIRST_ROUND_BUDGET,
         };
         for c in watch {
             let Some(host_id) = &c.host else { continue };
@@ -255,7 +274,6 @@ impl Remote {
                         spaced: conn.connects_per_request(),
                         conn,
                         busy: false,
-                        answered: false,
                         next_poll: Instant::now(),
                     });
                     r.hosts.len() - 1
@@ -274,6 +292,7 @@ impl Remote {
                             stream: None,
                             ended: false,
                             needs_status: false,
+                            answered: false,
                         }),
                     }
                 }
@@ -283,6 +302,7 @@ impl Remote {
                             host,
                             run: c.target.clone(),
                             source: c.source.clone(),
+                            first: First::default(),
                         });
                     }
                 }
@@ -306,6 +326,7 @@ impl Remote {
                             root: c.target.clone(),
                             source: c.source.clone(),
                             kinds: kinds.clone(),
+                            first: First::default(),
                         }),
                     }
                 }
@@ -318,53 +339,67 @@ impl Remote {
 
     /// Every host's first round, each bounded by `first_by`.
     pub(super) fn start(&mut self, watch: &[Condition], got: &Got, first_by: Instant) {
+        self.first_by = first_by;
         for h in 0..self.hosts.len() {
             self.hosts[h].next_poll = Instant::now() + self.hosts[h].poll;
-            if !self.launch(h, watch, got, first_by, RoundKind::All) {
-                self.hosts[h].answered = true;
-            }
+            self.launch(h, watch, got, first_by, RoundKind::All);
         }
     }
 
     /// Start each idle host's round that is due: its poll round every
-    /// [`poll_every`], else the statuses its `end` frames owe.
+    /// [`poll_every`], else the statuses its `end` frames owe. A host whose
+    /// source still waits for its first answer is asked until `first_by`, the
+    /// others until `deadline`.
     pub(super) fn schedule(&mut self, watch: &[Condition], got: &Got, deadline: Instant) {
         let now = Instant::now();
-        // A hung host can keep the loop running to its first-round cut, past
-        // the deadline: a round started now would only be cut off and warn.
-        if now >= deadline {
-            return;
-        }
         for h in 0..self.hosts.len() {
-            if self.hosts[h].busy {
+            // A hung host can keep the loop running to its first-round cut,
+            // past the deadline: a round started then would only be cut off
+            // and warn, unless it brings a first answer.
+            let until = self.until(h, deadline);
+            if self.hosts[h].busy || now >= until {
                 continue;
             }
             if now >= self.hosts[h].next_poll {
                 self.hosts[h].next_poll = now + self.hosts[h].poll;
-                self.launch(h, watch, got, deadline, RoundKind::All);
+                self.launch(h, watch, got, until, RoundKind::All);
             } else if self.runs.iter().any(|s| s.host == h && s.needs_status) {
-                self.launch(h, watch, got, deadline, RoundKind::Status);
+                self.launch(h, watch, got, until, RoundKind::Status);
             }
         }
     }
 
-    /// When the next idle host's poll round is due; none once `deadline` has
-    /// passed, since `schedule` starts no round then and a due time already
-    /// behind us would wake the loop again at once.
-    pub(super) fn next_poll_at(&self, deadline: Instant) -> Option<Instant> {
-        if Instant::now() >= deadline {
-            return None;
+    /// Until when host `h` is asked: `first_by` while a source of its waits
+    /// for its first answer, else `deadline`.
+    fn until(&self, h: usize, deadline: Instant) -> Instant {
+        if self.host_first_pending(h) {
+            self.first_by.max(deadline)
+        } else {
+            deadline
         }
-        self.hosts
-            .iter()
-            .filter(|h| !h.busy)
-            .map(|h| h.next_poll)
+    }
+
+    /// When the next idle host's poll round is due; none for a host past what
+    /// it is asked until, since `schedule` starts no round for it then and a
+    /// due time already behind us would wake the loop again at once.
+    pub(super) fn next_poll_at(&self, deadline: Instant) -> Option<Instant> {
+        let now = Instant::now();
+        (0..self.hosts.len())
+            .filter(|&h| !self.hosts[h].busy && now < self.until(h, deadline))
+            .map(|h| self.hosts[h].next_poll)
             .min()
     }
 
-    /// A host's first round is still out.
+    /// A remote source still waits for its first answer.
     pub(super) fn first_pending(&self) -> bool {
-        self.hosts.iter().any(|h| !h.answered)
+        (0..self.hosts.len()).any(|h| self.host_first_pending(h))
+    }
+
+    /// A source of host `h` still waits for its first answer.
+    fn host_first_pending(&self, h: usize) -> bool {
+        self.runs.iter().any(|s| s.host == h && !s.answered)
+            || self.gates.iter().any(|s| s.host == h && !s.first.answered)
+            || self.msgs.iter().any(|s| s.host == h && !s.first.answered)
     }
 
     /// Host `h`'s round of `kind` in flight, its requests bounded by
@@ -443,8 +478,8 @@ impl Remote {
         asks
     }
 
-    /// Take host `h`'s round: on its first round any failure is the call's
-    /// error; later, a warning.
+    /// Take host `h`'s round: a failure of a source's first answer is the
+    /// call's error; later, a warning.
     pub(super) fn landed(
         &mut self,
         h: usize,
@@ -459,33 +494,38 @@ impl Remote {
         if let Some(due) = round.next_due {
             host.next_poll = due;
         }
-        let first = !std::mem::replace(&mut host.answered, true);
-        self.apply(round.answers, watch, got, first)
+        self.apply(round.answers, watch, got)
     }
 
-    /// Take a round's answers. On the `first` round any failure is the call's
-    /// error; later, a warning.
+    /// Take a round's answers. A failure of a source's first answer is the
+    /// call's error; later, a warning.
     fn apply(
         &mut self,
         answers: Vec<Answer>,
         watch: &[Condition],
         got: &mut Got,
-        first: bool,
     ) -> Result<(), String> {
-        let asked = if first { Asked::First } else { Asked::Poll };
+        let first_by = self.first_by;
         for answer in answers {
             match answer {
-                Answer::Open(i, r) => match r {
-                    Ok(bytes) => self.runs[i].stream = Some(Box::pin(parse_run_frames(bytes))),
-                    Err(f) => {
-                        let s = &self.runs[i];
-                        let host = &self.hosts[s.host].id;
-                        failed(got, asked, &s.source, f, |e| {
-                            describe(host, "stream run events", "run", &s.run, e)
-                        })?
+                Answer::Open(i, r) => {
+                    let asked = Asked::of(std::mem::replace(&mut self.runs[i].answered, true));
+                    match r {
+                        Ok(bytes) => self.runs[i].stream = Some(Box::pin(parse_run_frames(bytes))),
+                        Err(f) => {
+                            let s = &self.runs[i];
+                            let host = &self.hosts[s.host].id;
+                            failed(got, asked, &s.source, f, |e| {
+                                describe(host, "stream run events", "run", &s.run, e)
+                            })?
+                        }
                     }
-                },
+                }
                 Answer::Gate(i, r) => {
+                    let src = &mut self.gates[i];
+                    let Some(asked) = src.first.take(&r, first_by, got, &src.source) else {
+                        continue;
+                    };
                     let s = &self.gates[i];
                     match r {
                         Ok(v) => {
@@ -509,6 +549,10 @@ impl Remote {
                     }
                 }
                 Answer::Msgs(i, r) => {
+                    let src = &mut self.msgs[i];
+                    let Some(asked) = src.first.take(&r, first_by, got, &src.source) else {
+                        continue;
+                    };
                     let s = &self.msgs[i];
                     match r {
                         Ok(view) => take_messages(watch, &s.source, view, got),
@@ -549,9 +593,10 @@ impl Remote {
         Ok(())
     }
 
-    /// The hosts' first rounds still out, once something else fired: taken
-    /// as they land (a failure the call's error) until `cut`. A host that
-    /// hasn't answered by then has its sources named in `warnings`.
+    /// The first answers still out, once something else fired: taken as they
+    /// land (a failure the call's error) until `cut`, a held-back ask going
+    /// out at its turn when that comes first. A source without its first
+    /// answer by then is named in `warnings`.
     pub(super) async fn settle_first(
         &mut self,
         cut: Instant,
@@ -560,10 +605,29 @@ impl Remote {
         got: &mut Got,
     ) -> Result<(), String> {
         while self.first_pending() {
-            match tokio::time::timeout_at(cut, self.next()).await {
-                Ok(RemoteWake::Round(h, round)) => self.landed(h, round, watch, got)?,
-                Ok(RemoteWake::Frame(i, item)) => self.on_frame(i, item, watch, got),
-                Err(_) => break,
+            // Nothing out, and no held-back ask's turn before the cut: no
+            // answer can come.
+            let turn = self.held_turn();
+            if self.inflight.is_empty() && turn.is_none_or(|t| t > cut) {
+                break;
+            }
+            let wake = turn.map_or(cut, |t| t.min(cut));
+            tokio::select! {
+                w = self.next() => match w {
+                    RemoteWake::Round(h, round) => self.landed(h, round, watch, got)?,
+                    RemoteWake::Frame(i, item) => self.on_frame(i, item, watch, got),
+                },
+                _ = tokio::time::sleep_until(wake) => {
+                    if Instant::now() >= cut {
+                        break;
+                    }
+                    self.schedule(watch, got, deadline);
+                    // A turn that started no round would only wake this
+                    // again at once.
+                    if self.inflight.is_empty() {
+                        break;
+                    }
+                }
             }
         }
         let why = if cut >= deadline || Instant::now() >= deadline {
@@ -571,24 +635,39 @@ impl Remote {
         } else {
             format!("no first answer within {} s", FIRST_ROUND_BUDGET.as_secs())
         };
-        for (h, host) in self.hosts.iter().enumerate() {
-            if host.answered {
-                continue;
-            }
-            let sources = self
-                .runs
-                .iter()
-                .filter(|s| s.host == h)
-                .map(|s| &s.source)
-                .chain(self.gates.iter().filter(|s| s.host == h).map(|s| &s.source))
-                .chain(self.msgs.iter().filter(|s| s.host == h).map(|s| &s.source));
-            for source in sources {
-                got.warnings
-                    .entry(source.clone())
-                    .or_insert_with(|| why.clone());
-            }
+        let runs = self
+            .runs
+            .iter()
+            .filter(|s| !s.answered)
+            .map(|s| (&s.source, why.clone()));
+        let polled = self
+            .gates
+            .iter()
+            .map(|s| (&s.source, &s.first))
+            .chain(self.msgs.iter().map(|s| (&s.source, &s.first)))
+            .filter(|(_, f)| !f.answered)
+            .map(|(source, f)| {
+                (
+                    source,
+                    f.held
+                        .map_or_else(|| why.clone(), |(asked, due)| held_back(asked, due)),
+                )
+            });
+        for (source, msg) in runs.chain(polled) {
+            got.warnings.entry(source.clone()).or_insert(msg);
         }
         Ok(())
+    }
+
+    /// The earliest turn of a held-back first ask whose host is idle.
+    fn held_turn(&self) -> Option<Instant> {
+        self.gates
+            .iter()
+            .map(|s| (s.host, &s.first))
+            .chain(self.msgs.iter().map(|s| (s.host, &s.first)))
+            .filter(|(h, f)| !f.answered && !self.hosts[*h].busy)
+            .filter_map(|(_, f)| f.held.map(|(_, due)| due))
+            .min()
     }
 
     /// The next frame of any open stream, or the next host round to land.
@@ -715,8 +794,8 @@ impl Remote {
             .map(|(h, asks)| ask_host(Arc::clone(&self.hosts[h].conn), asks, deadline, None))
             .collect();
         for round in futures_util::future::join_all(rounds).await {
-            // Never an error past the first round.
-            let _ = self.apply(round.answers, watch, got, false);
+            // Only statuses, never an error.
+            let _ = self.apply(round.answers, watch, got);
         }
     }
 }
@@ -724,8 +803,8 @@ impl Remote {
 /// `asks` against one host, one after another, each bounded by `deadline`.
 /// With `memo` (a host the [`Throttle`] spaces), a gate or message ask goes
 /// out only as the spacing allows: it takes another call's recent answer
-/// when that answer stands in, else waits for its turn within `deadline`
-/// ([`Fail::Deferred`] past it), and its answer is recorded for the next.
+/// when that answer stands in, else is [`Fail::Deferred`] to its turn (the
+/// round doesn't wait for it), and its answer is recorded for the next.
 async fn ask_host(
     conn: Arc<dyn HostConnector>,
     asks: Vec<Ask>,
@@ -745,26 +824,22 @@ async fn ask_host(
                 src,
                 match &memo {
                     None => bounded(deadline, conn.get_run(&run)).await,
-                    Some((t, host)) => loop {
-                        match t.claim_gate(host, &run) {
-                            Claim::Ask { asked } => {
-                                note(asked + t.spacing());
-                                let r = bounded(deadline, conn.get_run(&run)).await;
-                                if let Ok(v) = &r {
-                                    t.gate_answered(host, &run, asked, v);
-                                }
-                                break r;
+                    Some((t, host)) => match t.claim_gate(host, &run) {
+                        Claim::Ask { asked } => {
+                            note(asked + t.spacing());
+                            let r = bounded(deadline, conn.get_run(&run)).await;
+                            if let Ok(v) = &r {
+                                t.gate_answered(host, &run, asked, v);
                             }
-                            Claim::Reuse { answer, due } => {
-                                note(due);
-                                break Ok(answer);
-                            }
-                            Claim::Wait { asked, due } => {
-                                if let Err(f) = wait_turn(asked, due, deadline).await {
-                                    note(due);
-                                    break Err(f);
-                                }
-                            }
+                            r
+                        }
+                        Claim::Reuse { answer, due } => {
+                            note(due);
+                            Ok(answer)
+                        }
+                        Claim::Wait { asked, due } => {
+                            note(due);
+                            Err(Fail::Deferred { asked, due })
                         }
                     },
                 },
@@ -773,27 +848,22 @@ async fn ask_host(
                 src,
                 match &memo {
                     None => bounded(deadline, conn.list_messages(&root, q)).await,
-                    Some((t, host)) => loop {
-                        match t.claim_msgs(host, &root, &q) {
-                            Claim::Ask { asked } => {
-                                note(asked + t.spacing());
-                                let r =
-                                    bounded(deadline, conn.list_messages(&root, q.clone())).await;
-                                if let Ok(view) = &r {
-                                    t.msgs_answered(host, &root, asked, q, view);
-                                }
-                                break r;
+                    Some((t, host)) => match t.claim_msgs(host, &root, &q) {
+                        Claim::Ask { asked } => {
+                            note(asked + t.spacing());
+                            let r = bounded(deadline, conn.list_messages(&root, q.clone())).await;
+                            if let Ok(view) = &r {
+                                t.msgs_answered(host, &root, asked, q, view);
                             }
-                            Claim::Reuse { answer, due } => {
-                                note(due);
-                                break Ok(answer);
-                            }
-                            Claim::Wait { asked, due } => {
-                                if let Err(f) = wait_turn(asked, due, deadline).await {
-                                    note(due);
-                                    break Err(f);
-                                }
-                            }
+                            r
+                        }
+                        Claim::Reuse { answer, due } => {
+                            note(due);
+                            Ok(answer)
+                        }
+                        Claim::Wait { asked, due } => {
+                            note(due);
+                            Err(Fail::Deferred { asked, due })
                         }
                     },
                 },
@@ -806,18 +876,15 @@ async fn ask_host(
     Round { answers, next_due }
 }
 
-/// Wait for a spaced ask's turn at `due` (the last ask was at `asked`); a
-/// turn past `deadline` is [`Fail::Deferred`] at once.
-async fn wait_turn(asked: Instant, due: Instant, deadline: Instant) -> Result<(), Fail> {
+/// A held-back first ask as a warning: asked at `asked` by another call,
+/// its turn at `due`.
+fn held_back(asked: Instant, due: Instant) -> String {
     let now = Instant::now();
-    if due > deadline {
-        return Err(Fail::Deferred {
-            ago: now.saturating_duration_since(asked),
-            next_in: due.saturating_duration_since(now),
-        });
-    }
-    tokio::time::sleep_until(due).await;
-    Ok(())
+    format!(
+        "asked {} s ago over SSH; next ask in {} s",
+        now.saturating_duration_since(asked).as_secs(),
+        due.saturating_duration_since(now).as_secs_f64().ceil() as u64
+    )
 }
 
 async fn bounded<T>(
@@ -837,7 +904,7 @@ async fn bounded<T>(
 /// Which request gave no answer.
 #[derive(Clone, Copy, PartialEq)]
 enum Asked {
-    /// One of a host's first round.
+    /// A source's first.
     First,
     /// A later poll (a gate, a space, a stream reopen).
     Poll,
@@ -845,14 +912,57 @@ enum Asked {
     Status,
 }
 
+impl Asked {
+    /// A source's ask, by whether it had `answered` before.
+    fn of(answered: bool) -> Self {
+        if answered {
+            Asked::Poll
+        } else {
+            Asked::First
+        }
+    }
+}
+
+impl First {
+    /// Take the answer `r` to this source's ask (`source`'s): how to report
+    /// a failure of it, or `None` when there is nothing more to do with it.
+    /// A first ask held back within `first_by` keeps the source waiting for
+    /// its first answer (its host's next round asks at its turn); one held
+    /// back past it is named in `warnings`; a later one is no news.
+    fn take<T>(
+        &mut self,
+        r: &Result<T, Fail>,
+        first_by: Instant,
+        got: &mut Got,
+        source: &str,
+    ) -> Option<Asked> {
+        let asked = Asked::of(self.answered);
+        if let Err(Fail::Deferred { asked: at, due }) = r {
+            if !self.answered {
+                if *due <= first_by {
+                    self.held = Some((*at, *due));
+                } else {
+                    self.answered = true;
+                    self.held = None;
+                    got.warnings
+                        .insert(source.to_string(), held_back(*at, *due));
+                }
+            }
+            return None;
+        }
+        self.answered = true;
+        self.held = None;
+        Some(asked)
+    }
+}
+
 /// A request for `source` that gave no answer: the call's error on the first
 /// round, else a warning. A request the call's timeout cut short is only a
 /// warning. A later poll's is one only when it had [`FIRST_ROUND_BUDGET`] (the
 /// time a host is given to answer): a poll that went out just before the
 /// timeout says nothing about the host, and the next poll asks again. A
-/// status's always is, since its `run_settled` fires without one. An ask the
-/// [`Throttle`] held back past the call is named on the first round (its
-/// source has no answer yet), and is no news on a later one.
+/// status's always is, since its `run_settled` fires without one. (An ask the
+/// [`Throttle`] held back is taken by [`First::take`].)
 fn failed(
     got: &mut Got,
     asked: Asked,
@@ -865,13 +975,7 @@ fn failed(
             "no answer before the call's timeout".to_string()
         }
         Fail::Late { .. } => return Ok(()),
-        // A first round's source would otherwise give nothing, unexplained;
-        // a later poll's had its answer, and its next poll asks.
-        Fail::Deferred { ago, next_in } if asked == Asked::First => format!(
-            "asked {} s ago over SSH; next ask in {} s",
-            ago.as_secs(),
-            next_in.as_secs_f64().ceil() as u64
-        ),
+        // Taken by `First::take` before it gets here.
         Fail::Deferred { .. } => return Ok(()),
         Fail::Conn(e) if asked == Asked::First => return Err(describe(e)),
         Fail::Conn(e) => describe(e),
@@ -966,7 +1070,6 @@ mod tests {
                 id: "h".into(),
                 conn: Arc::new(StubConnector::default()),
                 busy: false,
-                answered: true,
                 poll: REMOTE_POLL,
                 spaced: false,
                 next_poll: now - Duration::from_secs(1),
@@ -977,6 +1080,7 @@ mod tests {
             turn: 0,
             inflight: FuturesUnordered::new(),
             throttle: Arc::default(),
+            first_by: Instant::now(),
         };
         // Before the deadline the due poll is the wake target.
         assert!(r.next_poll_at(now + Duration::from_secs(5)).is_some());
@@ -1007,7 +1111,6 @@ mod tests {
                 spaced: true,
                 conn: Arc::new(ssh),
                 busy: false,
-                answered: false,
                 next_poll: Instant::now(),
             }],
             runs: Vec::new(),
@@ -1016,6 +1119,7 @@ mod tests {
             turn: 0,
             inflight: FuturesUnordered::new(),
             throttle: Arc::default(),
+            first_by: Instant::now(),
         };
         let before = Instant::now();
         let far = before + Duration::from_secs(60);

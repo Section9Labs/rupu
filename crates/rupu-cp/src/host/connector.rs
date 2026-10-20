@@ -1480,6 +1480,9 @@ pub(crate) mod testing {
         pub get_run: Option<Result<serde_json::Value, HostConnectorError>>,
         /// How many times `get_run` was called.
         pub get_run_calls: std::sync::atomic::AtomicUsize,
+        /// Canned `stream_run_events` body (SSE text), sent at once and then
+        /// held open like a live stream. `None` → not configured.
+        pub events: Option<&'static str>,
     }
 
     /// An `AppState` whose host registry resolves `host_id` to `conn`. A
@@ -1602,7 +1605,11 @@ pub(crate) mod testing {
             &self,
             _run_id: &str,
         ) -> Result<EventByteStream, HostConnectorError> {
-            unimplemented!("StubConnector: stream_run_events not configured")
+            let body = self
+                .events
+                .expect("StubConnector: stream_run_events not configured");
+            let first = futures_util::stream::iter([Ok(Bytes::from_static(body.as_bytes()))]);
+            Ok(Box::pin(first.chain(futures_util::stream::pending())))
         }
         async fn get_transcript(
             &self,
