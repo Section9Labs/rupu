@@ -6,6 +6,13 @@
 //! the run had finished (its answer is recovered without a model call), it
 //! failed (not an interruption — the caller starts fresh), or it can be
 //! resumed from the conversation `replay` rebuilds.
+//!
+//! An operator who gives the continuation a prompt
+//! ([`prepare_prompted_continuation`] / [`apply_prompted_continuation`],
+//! `rupu run --continue <id> <prompt>`) continues ANY ended run: a finished
+//! one gets the prompt as a new user turn (a real model call), a failed one
+//! continues on the same model, and an interrupted one gets the
+//! continuation note followed by the prompt.
 
 use crate::replay::{reconstruct_transcript, ReplayError};
 use rupu_providers::types::{ContentBlock, Message, Role};
@@ -225,6 +232,129 @@ fn prepare(transcript: &Path, recovery: bool) -> Result<Continuation, Continuati
     }
 }
 
+/// How the run a prompted continuation picks up had ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PriorEnd {
+    /// Paused, signalled or crashed before it recorded an end.
+    Interrupted,
+    /// It finished: `RunComplete { status: ok }`, or its final answer's turn
+    /// completed before the process died.
+    Finished,
+    /// It ended in failure. `outcome` is the provider-side outcome it failed
+    /// on (a refusal, say), when it names one.
+    Failed {
+        error: Option<String>,
+        outcome: Option<OutcomeRecord>,
+    },
+}
+
+/// What [`prepare_prompted_continuation`] rebuilt: the conversation, by
+/// reference to `seed_source`, how its run ended and the skills it had
+/// loaded.
+#[derive(Debug)]
+pub struct PromptedContinuation {
+    pub messages: Vec<Message>,
+    pub seed_source: PathBuf,
+    pub ended: PriorEnd,
+    pub loaded_skills: Vec<crate::LoadedSkill>,
+}
+
+/// Rebuild `transcript`'s conversation for a continuation the operator gives
+/// a prompt (`rupu run --continue <id> <prompt>`). A prompt is new input, so
+/// every ended run can take one: unlike [`prepare_continuation`], a finished
+/// run is rebuilt rather than answered from its record, and a failed run is
+/// rebuilt whether or not it names an outcome. The conversation must still
+/// replay and must not end on a tool call with no result.
+pub fn prepare_prompted_continuation(
+    transcript: &Path,
+) -> Result<PromptedContinuation, ContinuationError> {
+    let path = transcript.display().to_string();
+    let events = read_events(transcript)?;
+    if !events.iter().any(|e| matches!(e, Event::RunStart { .. })) {
+        return Err(ContinuationError::NotAnAgentRun { path });
+    }
+    let ended = match events.iter().rev().find_map(|e| match e {
+        Event::RunComplete {
+            status,
+            error,
+            outcome,
+            ..
+        } => Some((*status, error.clone(), outcome.clone())),
+        _ => None,
+    }) {
+        Some((RunStatus::Ok, _, _)) => PriorEnd::Finished,
+        Some((RunStatus::Error, error, outcome)) => PriorEnd::Failed { error, outcome },
+        Some((RunStatus::Aborted, _, _)) | None => PriorEnd::Interrupted,
+    };
+    let messages =
+        reconstruct_transcript(transcript).map_err(|source| ContinuationError::Replay {
+            path: path.clone(),
+            source,
+        })?;
+    let ended = match messages.last() {
+        None => return Err(ContinuationError::NotAnAgentRun { path }),
+        Some(last)
+            if last.role == Role::Assistant
+                && last
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse { .. })) =>
+        {
+            return Err(ContinuationError::DanglingToolCall { path })
+        }
+        // The final answer's turn completed before `RunComplete` landed: it
+        // finished, as `prepare_continuation` reads it.
+        Some(last) if last.role == Role::Assistant && ended == PriorEnd::Interrupted => {
+            PriorEnd::Finished
+        }
+        Some(_) => ended,
+    };
+    Ok(PromptedContinuation {
+        messages,
+        seed_source: transcript.to_path_buf(),
+        ended,
+        loaded_skills: crate::replay::loaded_skills(&events),
+    })
+}
+
+/// Seed `turn` — whose `message` is the operator's prompt, its invoked
+/// skills' bodies included (their `operator_loads` stay with it) — with a
+/// [`PromptedContinuation`]. The prompt moves to `continue_prompt` and
+/// `message` becomes the note that goes ahead of it in the same user turn:
+///
+/// | the run                          | note                                  |
+/// |----------------------------------|---------------------------------------|
+/// | interrupted                      | [`CONTINUATION_NOTE`] (none when its trailing user turn already holds it) |
+/// | finished                         | none: the prompt is a new user turn    |
+/// | failed on an outcome             | [`crate::recovery::recovery_retry_note`] on `provider`/`model` |
+/// | failed with no outcome           | none                                   |
+///
+/// The runner writes the note and the prompt as two `user_message` events
+/// joined by [`crate::runner::push_user_turn`], the rule replay applies, so
+/// a continuation of this run rebuilds them and never sends the prompt
+/// again.
+pub fn apply_prompted_continuation(
+    turn: &mut crate::runner::UserTurn,
+    prepared: PromptedContinuation,
+    provider: &str,
+    model: &str,
+) {
+    let note = match &prepared.ended {
+        PriorEnd::Interrupted if ends_with_note(&prepared.messages) => String::new(),
+        PriorEnd::Interrupted => CONTINUATION_NOTE.to_string(),
+        PriorEnd::Finished | PriorEnd::Failed { outcome: None, .. } => String::new(),
+        PriorEnd::Failed {
+            outcome: Some(outcome),
+            ..
+        } => crate::recovery::recovery_retry_note(&outcome.title, provider, model),
+    };
+    let prompt = std::mem::replace(&mut turn.message, note);
+    turn.continue_prompt = Some(prompt);
+    turn.initial_messages = prepared.messages;
+    turn.seed_source = Some(prepared.seed_source);
+    turn.loaded_skills = prepared.loaded_skills;
+}
+
 /// The transcript this run was seeded from by reference, if any.
 fn seeded_from(events: &[Event]) -> Option<PathBuf> {
     events.iter().find_map(|e| match e {
@@ -274,6 +404,7 @@ impl ContinuationTarget for crate::runner::UserTurn {
         note: String,
     ) {
         self.message = note;
+        self.continue_prompt = None;
         self.operator_loads.clear();
         self.initial_messages = messages;
         self.seed_source = Some(seed_source);
@@ -320,26 +451,28 @@ pub fn apply_continuation_with(
 
 /// Does `messages` already end in a user turn carrying [`CONTINUATION_NOTE`]?
 /// True of the rebuilt conversation of a continuation that died before its
-/// first turn finished: its note was recorded, so it replays into the history.
+/// first turn finished: its note was recorded, so it replays into the history
+/// — followed by the operator's prompt, when the continuation was given one.
 fn ends_with_note(messages: &[Message]) -> bool {
     messages.last().is_some_and(|m| {
         m.role == Role::User
-            && matches!(
-                m.content.last(),
-                Some(ContentBlock::Text { text }) if text == CONTINUATION_NOTE
-            )
+            && m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if text == CONTINUATION_NOTE))
     })
 }
 
 /// The transcript `turn` continues, when it describes a continuation: a run
 /// seeded by reference whose conversation ends with [`CONTINUATION_NOTE`]
-/// (sent as its message, or already in the seed), or that is sent a
-/// recovery retry note (a failed run continued on another model). `run_agent` records
-/// it on the run's coverage manifest.
+/// (sent as its message, or already in the seed), that is sent a
+/// recovery retry note (a failed run continued on another model), or that
+/// carries an operator's continuation prompt ([`apply_prompted_continuation`]).
+/// `run_agent` records it on the run's coverage manifest.
 pub(crate) fn continued_from(turn: &crate::runner::UserTurn) -> Option<&Path> {
     let source = turn.seed_source.as_deref()?;
     let carries_note = turn.message == CONTINUATION_NOTE
         || crate::recovery::is_recovery_retry_note(&turn.message)
+        || turn.continue_prompt.is_some()
         || (turn.message.is_empty() && ends_with_note(&turn.initial_messages));
     carries_note.then_some(source)
 }
@@ -1190,5 +1323,255 @@ mod tests {
             Continuation::Failed { seeded_from, .. } => assert_eq!(seeded_from, Some(a)),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // ── prompted continuations (`rupu run --continue <id> <prompt>`) ──────
+
+    /// Continue `prev` into `dest` with `prompt`, the way the CLI does,
+    /// answering `answer`. Returns the conversation the provider was sent.
+    async fn continue_with_prompt(
+        prev: &Path,
+        dest: &Path,
+        prompt: &str,
+        answer: &str,
+    ) -> Vec<Message> {
+        let prepared = prepare_prompted_continuation(prev).unwrap();
+        let provider =
+            crate::runner::CapturingMockProvider::new(vec![ScriptedTurn::AssistantText {
+                text: answer.into(),
+                stop: StopReason::EndTurn,
+                input_tokens: 1,
+                output_tokens: 1,
+            }]);
+        let captured = provider.captured.clone();
+        let mut opts = opts_for(
+            Box::new(provider),
+            dest.parent().unwrap(),
+            dest.to_path_buf(),
+        );
+        opts.prompt.message = prompt.into();
+        apply_prompted_continuation(&mut opts.prompt, prepared, "anthropic", "mock-1");
+        run_agent(opts).await.unwrap();
+        let sent = captured.lock().unwrap()[0].messages.clone();
+        sent
+    }
+
+    fn json<T: serde::Serialize>(v: &T) -> serde_json::Value {
+        serde_json::to_value(v).unwrap()
+    }
+
+    fn user_messages(t: &Path) -> Vec<String> {
+        lines(t)
+            .into_iter()
+            .filter(|v| kind(v) == "user_message")
+            .map(|v| v["data"]["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text { text: t.into() }
+    }
+
+    /// Replay of the continuation rebuilds exactly what its provider was
+    /// sent, plus its answer: the runner and replay merge the note and the
+    /// prompt by the same rule.
+    fn assert_replays_as_sent(dest: &Path, sent: &[Message], answer: &str) {
+        let mut expected = sent.to_vec();
+        expected.push(Message::assistant(answer));
+        assert_eq!(
+            json(&reconstruct_transcript(dest).unwrap()),
+            json(&expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_continued_with_a_prompt_takes_it_as_a_new_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        let prepared = prepare_prompted_continuation(&first).unwrap();
+        assert_eq!(prepared.ended, PriorEnd::Finished);
+        let rebuilt = prepared.messages.clone();
+        assert_eq!(rebuilt.last().unwrap().role, Role::Assistant);
+
+        let second = tmp.path().join("second.jsonl");
+        let sent = continue_with_prompt(&first, &second, "now list them", "alpha, beta").await;
+        let mut expected = rebuilt;
+        expected.push(Message::user("now list them"));
+        assert_eq!(json(&sent), json(&expected), "no note: the prompt alone");
+        assert_eq!(user_messages(&second), ["now list them"]);
+        assert_replays_as_sent(&second, &sent, "alpha, beta");
+
+        // Continuing THAT run with no prompt finds it finished: the prompt is
+        // in its conversation and is never sent again.
+        match prepare_continuation(&second).unwrap() {
+            Continuation::Finished { output } => assert_eq!(output, "alpha, beta"),
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_continued_with_a_prompt_gets_the_note_then_the_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        write_lines(&first, &through_first_turn_end(&lines(&first)));
+        let prepared = prepare_prompted_continuation(&first).unwrap();
+        assert_eq!(prepared.ended, PriorEnd::Interrupted);
+        let rebuilt = prepared.messages.clone();
+
+        let second = tmp.path().join("second.jsonl");
+        let sent = continue_with_prompt(&first, &second, "skip beta", "done").await;
+        let mut expected = rebuilt;
+        expected[2].content.push(text(CONTINUATION_NOTE));
+        expected[2].content.push(text("skip beta"));
+        assert_eq!(
+            json(&sent),
+            json(&expected),
+            "both join the trailing user turn"
+        );
+        assert_eq!(user_messages(&second), [CONTINUATION_NOTE, "skip beta"]);
+        assert_replays_as_sent(&second, &sent, "done");
+    }
+
+    /// A -> B (with a prompt) died before its first turn; C continues B. With
+    /// no prompt it sends exactly what B sent (the note and B's prompt once
+    /// each); with a prompt it adds only the new prompt.
+    #[tokio::test]
+    async fn re_continuing_a_prompted_continuation_never_resends_its_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = finished_transcript(tmp.path()).await;
+        write_lines(&a, &through_first_turn_end(&lines(&a)));
+        let b = tmp.path().join("b.jsonl");
+        let sent_b = continue_with_prompt(&a, &b, "skip beta", "from b").await;
+        die_before_first_turn(&b);
+
+        let c = tmp.path().join("c.jsonl");
+        let sent_c = continue_run(&b, &c, "from c").await;
+        assert_eq!(
+            json(&sent_c),
+            json(&sent_b),
+            "seed-only: nothing is sent again"
+        );
+        assert_eq!(user_messages(&c), Vec::<String>::new());
+
+        let d = tmp.path().join("d.jsonl");
+        let sent_d = continue_with_prompt(&b, &d, "and gamma", "from d").await;
+        assert_eq!(note_blocks(&sent_d), 1, "the note is already in the turn");
+        let mut expected = sent_b;
+        expected.last_mut().unwrap().content.push(text("and gamma"));
+        assert_eq!(json(&sent_d), json(&expected));
+        assert_replays_as_sent(&d, &sent_d, "from d");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_failed_on_an_outcome_continues_with_a_prompt_on_the_same_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = refused_transcript(tmp.path()).await;
+        let prepared = prepare_prompted_continuation(&first).unwrap();
+        let PriorEnd::Failed {
+            outcome: Some(outcome),
+            ..
+        } = &prepared.ended
+        else {
+            panic!("expected Failed with an outcome, got {:?}", prepared.ended);
+        };
+        let note = crate::recovery::recovery_retry_note(&outcome.title, "anthropic", "mock-1");
+
+        let second = tmp.path().join("second.jsonl");
+        let sent = continue_with_prompt(&first, &second, "it is authorised", "ok").await;
+        let mut turn = Message::user("do the thing");
+        turn.content.push(text(&note));
+        turn.content.push(text("it is authorised"));
+        assert_eq!(json(&sent), json(&vec![turn]));
+        assert_replays_as_sent(&second, &sent, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_failed_without_an_outcome_continues_with_a_prompt_and_no_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        let mut all = through_first_turn_end(&lines(&first));
+        all.push(serde_json::json!({ "type": "run_complete", "data": {
+            "run_id": "r", "status": "error", "total_tokens": 0, "duration_ms": 0,
+            "error": "max turns (1) reached",
+        } }));
+        write_lines(&first, &all);
+        assert!(matches!(
+            prepare_continuation(&first).unwrap(),
+            Continuation::Failed { .. }
+        ));
+        let prepared = prepare_prompted_continuation(&first).unwrap();
+        assert_eq!(
+            prepared.ended,
+            PriorEnd::Failed {
+                error: Some("max turns (1) reached".into()),
+                outcome: None
+            }
+        );
+        let rebuilt = prepared.messages.clone();
+
+        let second = tmp.path().join("second.jsonl");
+        let sent = continue_with_prompt(&first, &second, "wrap up now", "done").await;
+        let mut expected = rebuilt;
+        expected[2].content.push(text("wrap up now"));
+        assert_eq!(json(&sent), json(&expected));
+        assert_eq!(user_messages(&second), ["wrap up now"]);
+        assert_replays_as_sent(&second, &sent, "done");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_answered_before_run_complete_landed_is_finished_for_a_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript(tmp.path()).await;
+        let all: Vec<_> = lines(&t)
+            .into_iter()
+            .filter(|v| kind(v) != "run_complete")
+            .collect();
+        write_lines(&t, &all);
+        assert_eq!(
+            prepare_prompted_continuation(&t).unwrap().ended,
+            PriorEnd::Finished
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prompted_continuation_still_refuses_a_dangling_tool_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let t = finished_transcript(tmp.path()).await;
+        let cut: Vec<_> = through_first_turn_end(&lines(&t))
+            .into_iter()
+            .filter(|v| kind(v) != "tool_result")
+            .collect();
+        write_lines(&t, &cut);
+        assert!(matches!(
+            prepare_prompted_continuation(&t),
+            Err(ContinuationError::DanglingToolCall { .. })
+        ));
+    }
+
+    /// The prompt keeps the skills the operator invoked in it; a prompted
+    /// continuation is recorded as one on the coverage manifest.
+    #[tokio::test]
+    async fn a_prompted_continuation_keeps_the_prompts_operator_loads_and_is_a_continuation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = finished_transcript(tmp.path()).await;
+        let provider = MockProvider::new(vec![]);
+        let mut opts = opts_for(Box::new(provider), tmp.path(), tmp.path().join("t.jsonl"));
+        opts.prompt.message = "<skill name=\"pdf\">…</skill>\n\nsummarise".into();
+        let load = crate::OperatorLoad {
+            name: "pdf".into(),
+            layer: "global".into(),
+            content_hash: "0".repeat(64),
+            base_dir: "/skills/pdf".into(),
+        };
+        opts.prompt.operator_loads = vec![load.clone()];
+        let prepared = prepare_prompted_continuation(&first).unwrap();
+        apply_prompted_continuation(&mut opts.prompt, prepared, "anthropic", "mock-1");
+        assert_eq!(opts.prompt.message, "");
+        assert_eq!(
+            opts.prompt.continue_prompt.as_deref(),
+            Some("<skill name=\"pdf\">…</skill>\n\nsummarise")
+        );
+        assert_eq!(opts.prompt.operator_loads, vec![load]);
+        assert_eq!(continued_from(&opts.prompt), Some(first.as_path()));
     }
 }

@@ -124,12 +124,17 @@ export const runsApi = {
   },
 
   /** Continue a standalone agent run under a new run id, restoring every flag
-   *  of its launch; `model` / `provider` replace their own. The endpoint takes
-   *  no prompt. 409 while the run is still running; local only. */
-  continueAgentRun(id: string, opts: { model?: string; provider?: string }): Promise<ContinueResponse> {
-    const body: { model?: string; provider?: string } = {};
+   *  of its launch; `model` / `provider` replace their own. `prompt` is what
+   *  the run is told next: sent as typed when it isn't blank (with it, any
+   *  ended run carries on). 409 while the run is still running; local only. */
+  continueAgentRun(
+    id: string,
+    opts: { prompt?: string; model?: string; provider?: string },
+  ): Promise<ContinueResponse> {
+    const body: { prompt?: string; model?: string; provider?: string } = {};
     const model = blankToUndefined(opts.model);
     const provider = blankToUndefined(opts.provider);
+    if (opts.prompt && opts.prompt.trim() !== '') body.prompt = opts.prompt;
     if (model) body.model = model;
     if (provider) body.provider = provider;
     return post(`/api/runs/agents/${encodeURIComponent(id)}/continue`, body);

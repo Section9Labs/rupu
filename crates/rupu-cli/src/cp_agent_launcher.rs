@@ -201,6 +201,30 @@ mod tests {
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/p".as_ref()));
     }
 
+    /// A CP continue with a prompt: the prompt rides as ONE `--prompt=`
+    /// element next to `--continue`, so the child tells the continuation it.
+    #[test]
+    fn a_continue_with_a_prompt_carries_it() {
+        let mut r = req();
+        r.prompt = Some("-x and then?".into());
+        r.mode = None;
+        r.target = None;
+        r.continue_from = Some("run_01PREV".into());
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(
+            args(&spec),
+            [
+                "run",
+                "triage",
+                "--run-id",
+                &run_id,
+                "--prompt=-x and then?",
+                "--continue",
+                "run_01PREV",
+            ]
+        );
+    }
+
     #[test]
     fn a_malformed_run_id_or_mode_is_refused() {
         let mut bad_id = req();

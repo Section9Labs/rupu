@@ -220,7 +220,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "agent_runs.continue",
             Method::POST,
             "/api/runs/agents/:id/continue",
-            "Continue a standalone agent run, or a sub-agent's run, from its transcript (`rupu run --continue`).\n\n`id` is a `run_…` or `sub_…` id. The continuation restores every flag the run was launched with and runs in its directory; `model`, `provider` and `mode` replace the launch's own. It takes no prompt. A run that had finished answers with its recorded answer. Answers 202 `{run_id, continues, host_id}` with the new run's id. 409 while the run is still running; local-only (a remote `host` is a 501).",
+            "Continue a standalone agent run, or a sub-agent's run, from its transcript (`rupu run --continue`).\n\n`id` is a `run_…` or `sub_…` id. The continuation restores every flag the run was launched with and runs in its directory; `model`, `provider`, `mode`, `findings_profile`, `engagement_profiles`, `skills`, `preload_skills` and `messaging` replace the launch's own (an empty list keeps it). `prompt` (optional, not blank) is what the run is told next: with one, ANY ended run carries on — an interrupted run gets the interruption note then the prompt, a finished run gets the prompt as a new turn (a real model call), a failed run continues on the same model. Without one, an interrupted run carries on, a finished run answers with its recorded answer and calls no model, and a failed run continues only on a different `model`/`provider`. Answers 202 `{run_id, continues, host_id}` with the new run's id. 409 while the run is still running; local-only (a remote `host` is a 501).",
         )
         .query::<runs::RunControlQuery>()
         .body::<run_streams::ContinueAgentRunBody>()

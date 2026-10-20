@@ -96,7 +96,15 @@ impl RunTarget {
     }
 }
 
+/// Parse a run target. A target is one token: whitespace anywhere, or an
+/// empty path segment (`github:a//b`, `github: /b`), makes it not a target,
+/// so a prompt that merely starts with `github:` (`"github: compare foo/bar"`)
+/// stays a prompt.
 pub fn parse_run_target(s: &str) -> Result<RunTarget, RunTargetParseError> {
+    if s.chars().any(char::is_whitespace) {
+        return Err(RunTargetParseError::BadShape(s.into()));
+    }
+    let no_empty_segment = |path: &str| path.split('/').all(|seg| !seg.is_empty());
     let (platform_str, rest) = s
         .split_once(':')
         .ok_or_else(|| RunTargetParseError::BadShape(s.into()))?;
@@ -108,6 +116,9 @@ pub fn parse_run_target(s: &str) -> Result<RunTarget, RunTargetParseError> {
             .map_err(|_| RunTargetParseError::BadNumber(num_part.into()))?;
         let tracker = IssueTracker::from_str(platform_str)
             .map_err(|_| RunTargetParseError::UnknownPlatform(platform_str.into()))?;
+        if !no_empty_segment(project) {
+            return Err(RunTargetParseError::BadShape(s.into()));
+        }
         return Ok(RunTarget::Issue {
             tracker,
             project: project.to_string(),
@@ -143,7 +154,7 @@ pub fn parse_run_target(s: &str) -> Result<RunTarget, RunTargetParseError> {
     let (owner, repo) = path
         .rsplit_once('/')
         .ok_or_else(|| RunTargetParseError::BadShape(s.into()))?;
-    if owner.is_empty() || repo.is_empty() {
+    if !no_empty_segment(owner) || repo.is_empty() {
         return Err(RunTargetParseError::BadShape(s.into()));
     }
 

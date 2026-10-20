@@ -1238,12 +1238,12 @@ pub(crate) fn parse_engagement_profiles(raw: Vec<String>) -> Result<Vec<String>,
 /// A body's skill entries: well-formed (`name`, `global:name`,
 /// `project:name`, `*`) or a 400 naming the field. They land on the
 /// child's command line.
-fn parse_skill_entries(field: &str, raw: Vec<String>) -> Result<Vec<String>, ApiError> {
+pub(crate) fn parse_skill_entries(field: &str, raw: Vec<String>) -> Result<Vec<String>, ApiError> {
     rupu_skills::parse_grants(&raw).map_err(|e| ApiError::bad_request(format!("{field}: {e}")))?;
     Ok(raw)
 }
 
-fn parse_findings_profile(
+pub(crate) fn parse_findings_profile(
     raw: Option<&str>,
 ) -> Result<Option<rupu_coverage::FindingProfile>, ApiError> {
     raw.map(|s| s.parse().map_err(ApiError::bad_request))
@@ -1253,7 +1253,7 @@ fn parse_findings_profile(
 /// A body's `messaging`: its tool names are messaging tools this host
 /// knows, or a 400. They land on the child's command line, whose own check
 /// would otherwise fail the detached run.
-fn parse_messaging(raw: LaunchMessaging) -> Result<LaunchMessaging, ApiError> {
+pub(crate) fn parse_messaging(raw: LaunchMessaging) -> Result<LaunchMessaging, ApiError> {
     raw.resolve()
         .map_err(|e| ApiError::bad_request(format!("messaging: {e}")))?;
     Ok(raw)

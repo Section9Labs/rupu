@@ -8299,6 +8299,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 operator_loads,
                 missing_skills,
                 unseen_messages: session.unseen_messages.clone(),
+                continue_prompt: None,
             },
             workspace,
             mode,

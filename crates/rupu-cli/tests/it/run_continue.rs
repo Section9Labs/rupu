@@ -287,7 +287,9 @@ fn continue_on_a_failed_run_names_it_and_the_run_it_continued() {
         .stderr(predicate::str::contains(
             "run run_second ended in failure (max turns (5) reached)",
         ))
-        .stderr(predicate::str::contains("start a fresh run instead"))
+        .stderr(predicate::str::contains(
+            "give it a prompt to carry on, or start a fresh run instead",
+        ))
         .stderr(predicate::str::contains(
             "run run_first, which it continued, may still be continued with `--continue run_first`",
         ));
@@ -342,38 +344,240 @@ fn continue_refuses_an_unknown_run() {
         .stderr(predicate::str::contains("can't be read"));
 }
 
-/// `--continue` re-enters an existing run, whose conversation holds its
-/// prompt, so it takes no new one. The run being continued really exists
-/// here, so each case can only fail on the prompt.
+fn user_messages(dir: &Path, run_id: &str) -> Vec<String> {
+    events(dir, run_id)
+        .into_iter()
+        .filter(|v| v["type"] == "user_message")
+        .map(|v| v["data"]["content"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Replay of `run_id`'s transcript (through the run it was seeded from)
+/// rebuilds the conversation it ended with: the prompts its continuation
+/// sent sit in it once each, merged by the runner's rule.
+fn replayed(dir: &Path, run_id: &str) -> serde_json::Value {
+    serde_json::to_value(
+        rupu_agent::replay::reconstruct_transcript(&transcript(dir, run_id)).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A finished run continued with a prompt calls the model with it, as a new
+/// turn after the recorded answer. The prompt is not part of the recorded
+/// command, so continuing THAT run with no prompt re-sends nothing: it is
+/// finished, and prints its answer.
 #[test]
-fn continue_takes_no_prompt() {
+fn continue_with_a_prompt_carries_a_finished_run_on() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"second answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+        "and then?",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("second answer"));
+
+    assert_eq!(user_messages(dir.path(), "run_second"), ["and then?"]);
+    assert_eq!(
+        replayed(dir.path(), "run_second"),
+        serde_json::json!([
+            {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "first answer"}]},
+            {"role": "user", "content": [{"type": "text", "text": "and then?"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "second answer"}]},
+        ])
+    );
+    // The recorded command is the original's (its `--mode bypass`
+    // restored), under the new run id: no prompt in it.
+    assert_eq!(
+        run_start(dir.path(), "run_second")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_second", "--mode=bypass"])
+    );
+
+    // An empty script: any model call would fail the run.
+    rupu(dir.path(), "[]")
+        .args([
+            "run",
+            "hello",
+            "--run-id",
+            "run_third",
+            "--continue",
+            "run_second",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("second answer"));
+    assert!(!transcript(dir.path(), "run_third").exists());
+}
+
+/// An interrupted run continued with `--prompt`: the continuation note, then
+/// the prompt, in the trailing user turn.
+#[test]
+fn continue_with_a_prompt_flag_sends_the_note_then_the_prompt() {
     let dir = tempfile::tempdir().unwrap();
     make_agent(dir.path(), "hello");
     first_run(dir.path());
     interrupt_first_run(dir.path());
 
-    let cases: [(&[&str], &str); 2] = [
-        (&["another prompt"], "takes no prompt"),
-        (
-            &["--prompt", "x"],
-            "cannot be used with '--prompt <PROMPT_FLAG>'",
-        ),
-    ];
-    for (extra, refusal) in cases {
-        rupu(dir.path(), "[]")
-            .args([
-                "run",
-                "hello",
-                "--mode",
-                "bypass",
-                "--continue",
-                "run_first",
-            ])
-            .args(extra)
-            .assert()
-            .failure()
-            .stderr(predicate::str::contains(refusal));
-    }
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"continued answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+        "--prompt=keep it short",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("continued answer"));
+
+    let note = rupu_agent::continuation::CONTINUATION_NOTE;
+    assert_eq!(
+        user_messages(dir.path(), "run_second"),
+        [note, "keep it short"]
+    );
+    assert_eq!(
+        replayed(dir.path(), "run_second"),
+        serde_json::json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "say hi"},
+                {"type": "text", "text": note},
+                {"type": "text", "text": "keep it short"},
+            ]},
+            {"role": "assistant", "content": [{"type": "text", "text": "continued answer"}]},
+        ])
+    );
+}
+
+/// A failed run (no provider-side outcome) continues on its own model when
+/// it is given a prompt; without one it is still refused.
+#[test]
+fn continue_with_a_prompt_carries_a_failed_run_on_the_same_model() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+    fail_run(dir.path(), "run_first");
+
+    rupu(dir.path(), "[]")
+        .args(["run", "hello", "--continue", "run_first"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("give it a prompt to carry on"));
+
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"recovered","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+        "try again",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("recovered"));
+    assert_eq!(user_messages(dir.path(), "run_second"), ["try again"]);
+    assert_eq!(
+        run_start(dir.path(), "run_second")["model"],
+        run_start(dir.path(), "run_first")["model"]
+    );
+}
+
+/// A prompt that only starts like a run target (`github: …`) is a prompt, on
+/// a fresh run (nothing is cloned) and on a continue (the recorded command,
+/// here with no target, stays as it was).
+#[test]
+fn a_prompt_that_starts_like_a_target_is_a_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    let prompt = "github: compare foo/bar with baz/qux";
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"compared","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_first",
+        prompt,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("compared"));
+    assert_eq!(user_messages(dir.path(), "run_first"), [prompt]);
+    assert_eq!(
+        run_start(dir.path(), "run_first")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_first", "--mode=bypass"])
+    );
+
+    let again = "github: now compare foo/bar with main";
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"compared again","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+        again,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("compared again"));
+    assert_eq!(user_messages(dir.path(), "run_second"), [again]);
+    assert_eq!(
+        run_start(dir.path(), "run_second")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_second", "--mode=bypass"])
+    );
+}
+
+/// A blank prompt is no prompt: a finished run still just prints its answer.
+#[test]
+fn continue_with_a_blank_prompt_is_a_bare_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    first_run(dir.path());
+    rupu(dir.path(), "[]")
+        .args([
+            "run",
+            "hello",
+            "--run-id",
+            "run_second",
+            "--continue",
+            "run_first",
+            "--prompt=  ",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("first answer"));
+    assert!(!transcript(dir.path(), "run_second").exists());
 }
 
 fn run_start(dir: &Path, run_id: &str) -> serde_json::Value {

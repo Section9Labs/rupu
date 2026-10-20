@@ -53,14 +53,31 @@ async fn launch_tools_are_listed_with_their_required_arguments() {
         json!(true)
     );
     // The launch tools gained their new arguments; a continue's schema
-    // offers no prompt.
+    // offers an optional prompt and the launch flags it can replace.
     let props = |name: &str| tool(&list, name)["inputSchema"]["properties"].clone();
     for key in ["model", "provider", "engagement_profiles"] {
         assert!(props("agents.run").get(key).is_some(), "agents.run: {key}");
     }
     assert!(props("workflows.run").get("engagement_profiles").is_some());
     assert!(props("agent_runs.continue").get("model").is_some());
-    assert!(props("agent_runs.continue").get("prompt").is_none());
+    for key in [
+        "prompt",
+        "findings_profile",
+        "engagement_profiles",
+        "skills",
+        "preload_skills",
+        "messaging",
+    ] {
+        assert!(
+            props("agent_runs.continue").get(key).is_some(),
+            "agent_runs.continue: {key}"
+        );
+    }
+    assert_eq!(
+        tool(&list, "agent_runs.continue")["inputSchema"]["required"],
+        json!(["id"]),
+        "the prompt is optional"
+    );
     assert!(props("runs.retry").get("restart_interrupted").is_some());
 }
 
@@ -120,6 +137,25 @@ async fn retry_and_continue_record_through_mcp() {
     let agents = rec.agents.lock().unwrap().clone();
     assert_eq!(agents[0].continue_from.as_deref(), Some(AGENT_DONE));
     assert_eq!(agents[0].model.as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(agents[0].prompt, None);
+    // With a prompt, the continuation is told it next.
+    let r = call_tool(
+        addr,
+        "agent_runs.continue",
+        json!({"id": AGENT_DONE, "prompt": "now summarise"}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let agents = rec.agents.lock().unwrap().clone();
+    assert_eq!(agents[1].continue_from.as_deref(), Some(AGENT_DONE));
+    assert_eq!(agents[1].prompt.as_deref(), Some("now summarise"));
+    let blank = call_tool(
+        addr,
+        "agent_runs.continue",
+        json!({"id": AGENT_DONE, "prompt": " "}),
+    )
+    .await;
+    assert!(text_of(&blank).starts_with("HTTP 400"), "{blank}");
     let live = call_tool(addr, "agent_runs.continue", json!({"id": AGENT_LIVE})).await;
     assert!(text_of(&live).starts_with("HTTP 409"), "{live}");
     let remote = call_tool(

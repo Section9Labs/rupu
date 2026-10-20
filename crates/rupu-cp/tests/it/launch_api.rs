@@ -312,18 +312,82 @@ async fn a_sub_agent_run_continues_too() {
     }
 }
 
+/// A continue's prompt travels to the child as ONE `--prompt=` element next
+/// to `--continue`, with the other launch flags the body names; an empty
+/// list leaves the launch's own.
 #[tokio::test]
-async fn continue_refuses_a_running_run_an_unknown_one_a_prompt_and_a_remote_host() {
+async fn a_continue_passes_its_prompt_and_launch_flags_through() {
+    let (addr, _tmp, rec) = spawn_launch().await;
+    let (status, body) = post(
+        addr,
+        &format!("/api/runs/agents/{AGENT_DONE}/continue"),
+        json!({
+            "prompt": "--now list them, one per line",
+            "findings_profile": "summary",
+            "engagement_profiles": [" network "],
+            "skills": ["pdf", "project:notes"],
+            "preload_skills": [],
+            "messaging": {"tools": ["msg.send"]},
+        }),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let agents = rec.agents.lock().unwrap();
+    let [req] = agents.as_slice() else {
+        panic!("{agents:?}")
+    };
+    assert_eq!(req.continue_from.as_deref(), Some(AGENT_DONE));
+    assert_eq!(req.prompt.as_deref(), Some("--now list them, one per line"));
+    assert_eq!(req.engagement_profiles, ["network"]);
+    assert_eq!(req.skills, ["pdf", "project:notes"]);
+    assert!(req.preload_skills.is_empty());
+    let args: Vec<String> = rupu_runtime::argv::RunArgv::Agent(req.agent_run("run_01NEW").unwrap())
+        .to_args()
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "run",
+            "scout",
+            "--run-id",
+            "run_01NEW",
+            "--findings-profile",
+            "summary",
+            "--engagement-profile",
+            "network",
+            "--skill",
+            "pdf",
+            "--skill",
+            "project:notes",
+            "--prompt=--now list them, one per line",
+            "--messaging-tool",
+            "msg.send",
+            "--continue",
+            AGENT_DONE,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn continue_refuses_a_running_run_an_unknown_one_a_bad_body_and_a_remote_host() {
     let (addr, _tmp, rec) = spawn_launch().await;
     for (id, body, want) in [
         (AGENT_LIVE, json!({}), 409),
+        (AGENT_LIVE, json!({"prompt": "and then?"}), 409),
         (SUB_LIVE, json!({}), 409),
         ("run_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({}), 404),
-        ("sub_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({}), 404),
-        (AGENT_DONE, json!({"prompt": "and then?"}), 400),
+        ("sub_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({"prompt": "and then?"}), 404),
+        (AGENT_DONE, json!({"prompt": "  "}), 400),
+        (AGENT_DONE, json!({"prompt": ""}), 400),
         (AGENT_DONE, json!({"mode": "yolo"}), 400),
         (AGENT_DONE, json!({"model": " "}), 400),
         (AGENT_DONE, json!({"provider": ""}), 400),
+        (AGENT_DONE, json!({"findings_profile": "brief"}), 400),
+        (AGENT_DONE, json!({"engagement_profiles": [" "]}), 400),
+        (AGENT_DONE, json!({"skills": ["global:"]}), 400),
+        (AGENT_DONE, json!({"messaging": {"tools": ["read_file"]}}), 400),
         // Nothing names the directory it was launched from.
         (AGENT_LOST, json!({}), 409),
     ] {

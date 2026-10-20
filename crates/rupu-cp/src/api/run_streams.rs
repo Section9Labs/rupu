@@ -35,9 +35,20 @@ pub fn routes() -> Router<AppState> {
 
 /// Body of `POST /api/runs/agents/:id/continue`. Every field is optional:
 /// the continued run restores every flag the original was launched with
-/// (`RunStart.launch_args`), and a field set here replaces only its own.
+/// (`RunStart.launch_args`), and a field set here replaces only its own (an
+/// empty list leaves the original's).
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct ContinueAgentRunBody {
+    /// What to tell the run next (`rupu run --continue <id> --prompt=…`). With
+    /// a prompt any ended run carries on: an interrupted one is told it was
+    /// interrupted and then the prompt, a finished one gets the prompt as a
+    /// new turn (a real model call), and a failed one continues on the same
+    /// model. Without one, an interrupted run carries on, a finished run
+    /// answers with its recorded answer, and a failed run continues only on
+    /// another `model` / `provider`. Never carried into later continues: it
+    /// is in the new run's conversation. Must not be blank.
+    #[serde(default)]
+    prompt: Option<String>,
     /// Model to continue on, over the one the run was launched with. A run
     /// that failed on a provider-side outcome (a refusal, say) is continued
     /// on it too.
@@ -51,11 +62,29 @@ pub(crate) struct ContinueAgentRunBody {
     /// `ask`, which a detached continuation can't answer.
     #[serde(default)]
     mode: Option<String>,
-    /// Refused: `rupu run --continue` takes no prompt, since the continued
-    /// conversation already holds it. Read only to say so.
+    /// Findings contract (`full` | `summary`) to continue under, over the
+    /// launch's own (`rupu run --findings-profile`).
     #[serde(default)]
-    #[schemars(skip)]
-    prompt: Option<String>,
+    findings_profile: Option<String>,
+    /// Engagement profile ids to continue under, replacing the launch's
+    /// (`rupu run --engagement-profile`, one per id). Empty keeps the
+    /// launch's.
+    #[serde(default)]
+    engagement_profiles: Vec<String>,
+    /// Skills on top of the agent's own, replacing the launch's list
+    /// (`rupu run --skill`). Empty keeps the launch's.
+    #[serde(default)]
+    skills: Vec<String>,
+    /// Preloaded skills, replacing the launch's list (`rupu run
+    /// --preload-skill`). Empty keeps the launch's.
+    #[serde(default)]
+    preload_skills: Vec<String>,
+    /// The messaging switch, replacing the launch's: `"off"` (`rupu run
+    /// --no-messaging`) or `{"tools": [...]}` (`--messaging-tool`). Absent
+    /// keeps the launch's.
+    #[serde(default)]
+    #[schemars(with = "serde_json::Value")]
+    messaging: rupu_runtime::argv::LaunchMessaging,
 }
 
 /// What continuing an agent run needs from the run it continues.
@@ -196,16 +225,19 @@ fn continued_run(global: &std::path::Path, id: &str) -> ApiResult<ContinuedRun> 
 /// standalone `run_…` or a sub-agent's `sub_…`) from its transcript: a
 /// detached `rupu run <agent> --continue <id>` in the directory the run was
 /// launched from (its recorded workspace, never a repo target's clone, so
-/// the child reuses the original checkout), under a new run id. The child restores every flag the run
-/// was launched with; `model` / `provider` / `mode` replace their own. A run that had
-/// finished answers with its recorded answer and calls no model. 202 with
-/// the new run's id: the continuation is spawned, not done.
+/// the child reuses the original checkout), under a new run id. The child
+/// restores every flag the run was launched with; the body's fields replace
+/// their own. A `prompt` is what the run is told next (any ended run carries
+/// on with one); without one, a run that had finished answers with its
+/// recorded answer and calls no model. 202 with the new run's id: the
+/// continuation is spawned, not done.
 ///
 /// 409 while the run is still running (a sub-agent's record in its
 /// dispatcher's children ledger has no end and that process lives) or when
 /// the directory it was launched from is gone; 404 for an unknown run; 400
-/// for a `prompt`, a blank `model` / `provider` or a bad `mode`. Local-only:
-/// `?host=<remote>` is a 501.
+/// for a blank `prompt` / `model` / `provider`, a bad `mode` or
+/// `findings_profile`, a blank engagement id, a malformed skill entry or an
+/// unknown messaging tool. Local-only: `?host=<remote>` is a 501.
 async fn continue_agent_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -218,17 +250,24 @@ async fn continue_agent_run(
         )));
     }
     let b = body.map(|b| b.0).unwrap_or_default();
-    if b.prompt.is_some() {
-        return Err(ApiError::bad_request(
-            "a continue takes no prompt: the continued conversation already holds it",
-        ));
-    }
     crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
-    for (field, value) in [("model", &b.model), ("provider", &b.provider)] {
+    for (field, value) in [
+        ("prompt", &b.prompt),
+        ("model", &b.model),
+        ("provider", &b.provider),
+    ] {
         if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
             return Err(ApiError::bad_request(format!("{field}: must not be blank")));
         }
     }
+    use crate::api::agents::{
+        parse_engagement_profiles, parse_findings_profile, parse_messaging, parse_skill_entries,
+    };
+    let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
+    let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
+    let skills = parse_skill_entries("skills", b.skills)?;
+    let preload_skills = parse_skill_entries("preload_skills", b.preload_skills)?;
+    let messaging = parse_messaging(b.messaging)?;
     let launcher = s
         .agent_launcher
         .clone()
@@ -247,17 +286,17 @@ async fn continue_agent_run(
         provider: b.provider,
         continue_from: Some(id.clone()),
         agent: run.agent,
-        prompt: None,
+        prompt: b.prompt,
         mode: b.mode,
         target: None,
         working_dir: Some(run.working_dir.display().to_string()),
         run_id: None,
-        findings_profile: None,
-        engagement_profiles: Vec::new(),
-        skills: Vec::new(),
-        preload_skills: Vec::new(),
+        findings_profile,
+        engagement_profiles,
+        skills,
+        preload_skills,
         skill_bundle: None,
-        messaging: Default::default(),
+        messaging,
         codename: None,
     };
     let run_id = launcher.launch(req).await.map_err(|e| match e {

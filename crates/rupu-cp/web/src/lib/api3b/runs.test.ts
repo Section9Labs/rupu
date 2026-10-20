@@ -55,6 +55,14 @@ describe('runsApi.continueAgentRun', () => {
     await runsApi.continueAgentRun('run_1', { model: ' claude-sonnet-5-5 ', provider: '  ' });
     expect(f.mock.calls[0][1]?.body).toBe('{"model":"claude-sonnet-5-5"}');
   });
+
+  it('sends a non-blank prompt as typed and leaves a blank one out', async () => {
+    const f = stubFetch({ run_id: 'run_2', continues: 'run_1', host_id: 'local' });
+    await runsApi.continueAgentRun('run_1', { prompt: '  /pdf now the appendix\n' });
+    expect(f.mock.calls[0][1]?.body).toBe(JSON.stringify({ prompt: '  /pdf now the appendix\n' }));
+    await runsApi.continueAgentRun('run_1', { prompt: ' \n ' });
+    expect(f.mock.calls[1][1]?.body).toBe('{}');
+  });
 });
 
 describe('session ops', () => {
