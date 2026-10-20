@@ -23,7 +23,7 @@ use crate::usage_index::{RunUsage, UsageIndex};
 use rupu_config::PricingConfig;
 use rupu_transcript::UsageRow;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Token + cost summary for a run, or any rollup of runs.
@@ -213,4 +213,33 @@ pub struct TurnPoint {
     pub tokens_cached: u64,
     #[serde(default)]
     pub tokens_cache_write: u64,
+}
+
+/// A run id we are willing to join onto `<runs>/<id>/sub/` (no separators,
+/// no `..`).
+fn safe_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// `own` labelled `run_id`, plus every transcript of `run_id`'s recursive
+/// dispatch sub-run tree (`<runs>/<run_id>/sub/…`) that exists, labelled the
+/// same. The one definition of "an agent run's transcripts" for the agent
+/// runs list, session usage and the aggregates.
+pub fn with_dispatch_children(
+    run_store: &RunStore,
+    run_id: &str,
+    own: &Path,
+) -> Vec<(String, PathBuf)> {
+    let mut out = vec![(run_id.to_string(), own.to_path_buf())];
+    if safe_run_id(run_id) {
+        for kt in run_store.dispatched_transcripts([run_id]) {
+            if kt.path.is_file() {
+                out.push((run_id.to_string(), kt.path));
+            }
+        }
+    }
+    out
 }

@@ -56,14 +56,15 @@ pub fn repos_dir(global: &Path) -> PathBuf {
     global.join("repos")
 }
 
-/// Global session state root.
+/// Global session state root ([`rupu_runtime::sessions::sessions_dir`]).
 pub fn sessions_dir(global: &Path) -> PathBuf {
-    global.join("sessions")
+    rupu_runtime::sessions::sessions_dir(global)
 }
 
-/// Global archived session state root.
+/// Global archived session state root
+/// ([`rupu_runtime::sessions::archived_sessions_dir`]).
 pub fn archived_sessions_dir(global: &Path) -> PathBuf {
-    global.join("sessions-archive")
+    rupu_runtime::sessions::archived_sessions_dir(global)
 }
 
 /// Archive directory nested under a transcript root.

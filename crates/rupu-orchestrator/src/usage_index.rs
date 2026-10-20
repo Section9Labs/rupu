@@ -21,13 +21,13 @@
 //! Usage accounting never fails a caller: unreadable or garbled input
 //! degrades to "partial" or zero, never an error or a panic.
 
-use crate::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
-use crate::usage_summary::TurnPoint;
 use crate::runs::{
     known_transcript_from_event_line, known_transcripts_from_step_result_line,
     placed_step_from_event_line, KnownTranscript, RunRecord, RunStore,
 };
+use crate::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
 use crate::usage_ledger::{LedgerKind, LedgerRow};
+use crate::usage_summary::TurnPoint;
 use rupu_transcript::{transcript_key, Event, JsonlCursor, UsageRow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1241,10 +1241,10 @@ impl UsageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::executor::Event as RunEvent;
     use crate::runs::{RunRecord, RunStatus, StepResultRecord};
     use crate::usage_ledger::{LedgerKind, LedgerRow, LEDGER_VERSION};
+    use chrono::Utc;
     use rupu_transcript::Event;
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
@@ -1317,7 +1317,10 @@ mod tests {
     fn seed_remote_run(tmp: &Path) -> (RunStore, PathBuf) {
         let store = run_store(tmp);
         store
-            .create(record("run_01USAGE", RunStatus::Running, Some("host_abc")), "")
+            .create(
+                record("run_01USAGE", RunStatus::Running, Some("host_abc")),
+                "",
+            )
             .unwrap();
         let recorded = PathBuf::from("/remote/proj/.rupu/transcripts/run_01A.jsonl");
         store

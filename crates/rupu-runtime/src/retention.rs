@@ -6,6 +6,28 @@
 #[error("{0}")]
 pub struct RetentionError(String);
 
+/// Why a prune (archived transcripts, archived sessions, `rupu cleanup`)
+/// could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum PruneError {
+    /// The caller's `--older-than` / `older_than` is not a duration.
+    #[error(transparent)]
+    InvalidRetention(#[from] RetentionError),
+    /// The configured retention (`[storage]`) could not be read or is not a
+    /// duration: a configuration problem, not the caller's.
+    #[error("{0}")]
+    Config(String),
+    /// Reading or deleting failed.
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<std::io::Error> for PruneError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Failed(e.to_string())
+    }
+}
+
 /// Parse a retention cutoff like `30d` / `12h` / `1w` into a
 /// `chrono::Duration`.
 ///

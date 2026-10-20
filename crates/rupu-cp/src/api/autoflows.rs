@@ -70,6 +70,12 @@ pub(crate) struct AutoflowRunBody {
     pub(crate) mode: Option<String>,
 }
 
+/// The `RUPU_HOME` and the directory whose project layer the autoflow reads
+/// see: the one `cp serve` serves, as the CLI sees its working directory.
+fn visibility(s: &AppState) -> (std::path::PathBuf, std::path::PathBuf) {
+    (s.global_dir.clone(), s.workspace_dir.clone())
+}
+
 /// `GET /api/autoflows/:name` — `rupu autoflow show <name>`: the
 /// autoflow's resolved metadata (repo, entity, selector, workspace, claim
 /// TTL, ...) and its YAML `body`. 404 when no autoflow by that name is
@@ -78,25 +84,36 @@ async fn autoflow_show(
     State(s): State<AppState>,
     Path(name): Path<String>,
     Query(q): Query<AutoflowRepoQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<rupu_autoflow::AutoflowShowReport>> {
     admin_ops::local_only(q.host.as_deref(), "showing an autoflow")?;
     fs_safety::validate_name(&name)?;
-    let ops = admin_ops::ops(&s, "showing an autoflow")?;
-    Ok(Json(ops.autoflow_show(&name, q.repo.as_deref()).await?))
+    let (global, pwd) = visibility(&s);
+    let report = admin_ops::blocking(move || {
+        rupu_autoflow::show_report(&global, &pwd, &name, q.repo.as_deref())
+    })
+    .await?;
+    Ok(Json(report))
 }
 
 /// `GET /api/autoflows/explain?issue_ref=` — `rupu autoflow explain`: the
-/// issue's claim, last run, queued wakes and recent cycle events.
+/// issue's claim, last run, queued wakes and recent cycle events. The last
+/// run is priced as the CLI prices it from `cp serve`'s directory.
 async fn autoflow_explain(
     State(s): State<AppState>,
     Query(q): Query<ExplainQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<rupu_autoflow::AutoflowExplainReport>> {
     admin_ops::local_only(q.host.as_deref(), "explaining an autoflow issue")?;
-    let ops = admin_ops::ops(&s, "explaining an autoflow issue")?;
-    Ok(Json(
-        ops.autoflow_explain(&admin_ops::full_issue_ref(&q.issue_ref)?, q.repo.as_deref())
-            .await?,
-    ))
+    let issue_ref = admin_ops::full_issue_ref(&q.issue_ref)?;
+    let (global, pwd) = visibility(&s);
+    let report = admin_ops::blocking(move || {
+        let project_root = rupu_autoflow::paths::project_root_for(&pwd).ok().flatten();
+        let pricing =
+            rupu_workspace::load_config_for_display(&global, project_root.as_deref(), &pwd, true)
+                .pricing;
+        rupu_autoflow::explain_report(&global, &pwd, &issue_ref, q.repo.as_deref(), &pricing)
+    })
+    .await?;
+    Ok(Json(report))
 }
 
 /// `GET /api/autoflows/doctor` — `rupu autoflow doctor`: consistency
@@ -104,10 +121,13 @@ async fn autoflow_explain(
 async fn autoflow_doctor(
     State(s): State<AppState>,
     Query(q): Query<AutoflowRepoQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<rupu_autoflow::AutoflowDoctorReport>> {
     admin_ops::local_only(q.host.as_deref(), "the autoflow doctor")?;
-    let ops = admin_ops::ops(&s, "the autoflow doctor")?;
-    Ok(Json(ops.autoflow_doctor(q.repo.as_deref()).await?))
+    let global = s.global_dir.clone();
+    let report =
+        admin_ops::blocking(move || rupu_autoflow::doctor_report(&global, q.repo.as_deref()))
+            .await?;
+    Ok(Json(report))
 }
 
 /// `GET /api/autoflows/wakes` — `rupu autoflow wakes`: queued wakes and the
@@ -115,17 +135,21 @@ async fn autoflow_doctor(
 async fn autoflow_wakes(
     State(s): State<AppState>,
     Query(q): Query<AutoflowRepoQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<rupu_autoflow::AutoflowWakesReport>> {
     admin_ops::local_only(q.host.as_deref(), "listing autoflow wakes")?;
-    let ops = admin_ops::ops(&s, "listing autoflow wakes")?;
-    Ok(Json(ops.autoflow_wakes(q.repo.as_deref()).await?))
+    let global = s.global_dir.clone();
+    let report =
+        admin_ops::blocking(move || rupu_autoflow::wakes_report(&global, q.repo.as_deref()))
+            .await?;
+    Ok(Json(report))
 }
 
 /// `POST /api/autoflows/:name/run` — `rupu autoflow run <name> <issue>`,
-/// detached. Checked first (the autoflow resolves for the issue, no other
-/// cycle holds the issue's claim: 404 / 409), then spawned; 202 means the
-/// cycle's process started, not that it finished. Follow it with
-/// `GET /api/autoflows/explain`.
+/// detached. Checked first (`rupu_autoflow::run_precheck`: the autoflow
+/// resolves for the issue, the mode is one autoflows take, no other cycle
+/// holds the issue's claim: 400 / 404 / 409), then spawned through the
+/// `AdminOps` port; 202 means the cycle's process started, not that it
+/// finished. Follow it with `GET /api/autoflows/explain`.
 async fn autoflow_run(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -136,15 +160,26 @@ async fn autoflow_run(
     crate::api::config::require_writable_to(&s, "running an autoflow")?;
     fs_safety::validate_name(&name)?;
     let ops = admin_ops::ops(&s, "running an autoflow")?;
-    let issue = admin_ops::full_issue_ref(&body.issue)?;
-    let started = ops
-        .autoflow_run(admin_ops::AutoflowRunRequest {
-            name,
-            issue,
-            repo: body.repo,
-            mode: body.mode,
-        })
-        .await?;
+    let req = admin_ops::AutoflowRunRequest {
+        name,
+        issue: admin_ops::full_issue_ref(&body.issue)?,
+        repo: body.repo,
+        mode: body.mode,
+    };
+    let (global, pwd) = visibility(&s);
+    let check = req.clone();
+    admin_ops::blocking(move || {
+        rupu_autoflow::run_precheck(
+            &global,
+            &pwd,
+            &check.name,
+            &check.issue,
+            check.repo.as_deref(),
+            check.mode.as_deref(),
+        )
+    })
+    .await?;
+    let started = ops.autoflow_run(req).await?;
     Ok((StatusCode::ACCEPTED, Json(started)))
 }
 
@@ -313,7 +348,12 @@ async fn list_autoflow_defs(State(s): State<AppState>) -> ApiResult<Json<Vec<Aut
             .join(".rupu")
             .join("workflows");
         let scope_id = Some(r.workspace.id.clone());
-        project_rows.extend(scan_autoflow_defs(&dir, r.scope, ScopeKind::Project, scope_id));
+        project_rows.extend(scan_autoflow_defs(
+            &dir,
+            r.scope,
+            ScopeKind::Project,
+            scope_id,
+        ));
     }
 
     let project_names: std::collections::BTreeSet<&str> =
@@ -869,9 +909,13 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_TRUE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = disable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
-            .await
-            .expect("disable should succeed");
+        let resp = disable_autoflow(
+            State(s),
+            Path("nightly".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("disable should succeed");
         assert!(!resp.0.enabled);
         assert_eq!(resp.0.name, "nightly");
 
@@ -899,9 +943,13 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let resp = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
-            .await
-            .expect("enable should succeed");
+        let resp = enable_autoflow(
+            State(s),
+            Path("nightly".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("enable should succeed");
         assert!(resp.0.enabled);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
@@ -929,7 +977,11 @@ mod tests {
             let workflows = root.join(".rupu").join("workflows");
             std::fs::create_dir_all(&workflows).unwrap();
             let path = workflows.join("issue-triage.yaml");
-            std::fs::write(&path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage")).unwrap();
+            std::fs::write(
+                &path,
+                AUTOFLOW_ENABLED_TRUE.replace("nightly", "issue-triage"),
+            )
+            .unwrap();
             worktree_paths.insert(name.to_string(), path);
             register_workspace_with_remote(&tmp, &format!("ws_{name}"), &root, Some(remote));
         }
@@ -942,9 +994,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].scope, "worktree-a");
 
-        let resp = disable_autoflow(State(s), Path("issue-triage".into()), Query(ScopeQuery::default()))
-            .await
-            .expect("disable should succeed");
+        let resp = disable_autoflow(
+            State(s),
+            Path("issue-triage".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("disable should succeed");
         assert!(!resp.0.enabled);
 
         let a_disk = std::fs::read_to_string(&worktree_paths["worktree-a"]).unwrap();
@@ -980,7 +1036,11 @@ mod tests {
         let proj_workflows = proj.path().join(".rupu").join("workflows");
         std::fs::create_dir_all(&proj_workflows).unwrap();
         let proj_path = proj_workflows.join("shared-name.yaml");
-        std::fs::write(&proj_path, AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name")).unwrap();
+        std::fs::write(
+            &proj_path,
+            AUTOFLOW_ENABLED_TRUE.replace("nightly", "shared-name"),
+        )
+        .unwrap();
         register_workspace(&tmp, "ws_a", proj.path());
 
         let s = with_dummy_launcher(test_state(&tmp));
@@ -1049,7 +1109,10 @@ mod tests {
         assert!(!resp.0.enabled);
 
         let y_disk = std::fs::read_to_string(&path_y).unwrap();
-        assert!(y_disk.contains("enabled: false"), "repo Y's file must be flipped");
+        assert!(
+            y_disk.contains("enabled: false"),
+            "repo Y's file must be flipped"
+        );
         let x_disk = std::fs::read_to_string(&path_x).unwrap();
         assert!(
             x_disk.contains("enabled: true"),
@@ -1063,9 +1126,13 @@ mod tests {
         seed_global_autoflow(&tmp, "nightly.yaml", AUTOFLOW_ENABLED_FALSE);
         let s = test_state(&tmp); // no launcher installed — read-only deploy
 
-        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
-            .await
-            .expect_err("no launcher should be rejected");
+        let err = enable_autoflow(
+            State(s),
+            Path("nightly".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("no launcher should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::NOT_IMPLEMENTED);
     }
 
@@ -1075,9 +1142,13 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("does-not-exist".into()), Query(ScopeQuery::default()))
-            .await
-            .expect_err("unknown name should 404");
+        let err = enable_autoflow(
+            State(s),
+            Path("does-not-exist".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("unknown name should 404");
         assert_eq!(err.0, axum::http::StatusCode::NOT_FOUND);
     }
 
@@ -1092,9 +1163,13 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
-            .await
-            .expect_err("traversal name must be rejected");
+        let err = enable_autoflow(
+            State(s),
+            Path("../evil".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
         assert_eq!(
             err.0,
             axum::http::StatusCode::BAD_REQUEST,
@@ -1120,9 +1195,13 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("workflows")).unwrap();
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = disable_autoflow(State(s), Path("../evil".into()), Query(ScopeQuery::default()))
-            .await
-            .expect_err("traversal name must be rejected");
+        let err = disable_autoflow(
+            State(s),
+            Path("../evil".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("traversal name must be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
 
         let on_disk = std::fs::read_to_string(&outside_target).unwrap();
@@ -1141,9 +1220,13 @@ mod tests {
         let path = seed_global_autoflow(&tmp, "nightly.yaml", body);
         let s = with_dummy_launcher(test_state(&tmp));
 
-        let err = enable_autoflow(State(s), Path("nightly".into()), Query(ScopeQuery::default()))
-            .await
-            .expect_err("unsupported edit should be rejected");
+        let err = enable_autoflow(
+            State(s),
+            Path("nightly".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect_err("unsupported edit should be rejected");
         assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();

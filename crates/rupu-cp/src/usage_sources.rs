@@ -21,6 +21,7 @@ use crate::api::run_streams::{try_load_session_for_runs, StandaloneMetaDto};
 use crate::usage_index::UsageIndex;
 use chrono::{DateTime, Utc};
 use rupu_orchestrator::runs::RunStore;
+pub use rupu_orchestrator::usage_summary::with_dispatch_children;
 use rupu_orchestrator::RunRecord;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -109,15 +110,6 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// A run id we are willing to join onto `<runs>/<id>/sub/` (no separators,
-/// no `..`).
-fn safe_run_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
 /// A transcript's `RunStart` head. Found heads never change, so they are
 /// cached process-wide; a file with no `RunStart` yet is re-read next time.
 pub(crate) fn head_of(path: &Path) -> Head {
@@ -140,26 +132,6 @@ pub(crate) fn head_of(path: &Path) -> Head {
         .unwrap_or_else(|p| p.into_inner())
         .insert(path.to_path_buf(), head.clone());
     head
-}
-
-/// `own` labelled `run_id`, plus every transcript of `run_id`'s recursive
-/// dispatch sub-run tree (`<runs>/<run_id>/sub/…`) that exists, labelled the
-/// same. The one definition of "an agent run's transcripts" for the agent
-/// runs list, session usage and the aggregates.
-pub fn with_dispatch_children(
-    run_store: &RunStore,
-    run_id: &str,
-    own: &Path,
-) -> Vec<(String, PathBuf)> {
-    let mut out = vec![(run_id.to_string(), own.to_path_buf())];
-    if safe_run_id(run_id) {
-        for kt in run_store.dispatched_transcripts([run_id]) {
-            if kt.path.is_file() {
-                out.push((run_id.to_string(), kt.path));
-            }
-        }
-    }
-    out
 }
 
 /// Every transcript a workflow run claims — the resolved known set of each

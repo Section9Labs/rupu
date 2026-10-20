@@ -110,8 +110,8 @@ pub struct ServeOpts {
     /// `/api/skills/install|update`). rupu-cli's `cp serve` provides it;
     /// `None` → those endpoints return 501.
     pub skill_installer: Option<std::sync::Arc<crate::skill_installer::SkillInstaller>>,
-    /// Optional autoflow / cron / maintenance adapter. rupu-cli's `cp serve`
-    /// provides it; `None` → those endpoints return 501.
+    /// Optional cron-tick and autoflow-cycle adapter. rupu-cli's `cp serve`
+    /// provides it; `None` → those two endpoints return 501.
     pub admin_ops: Option<std::sync::Arc<dyn crate::admin_ops::AdminOps>>,
 }
 
