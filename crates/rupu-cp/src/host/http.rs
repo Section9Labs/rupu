@@ -51,9 +51,44 @@ const EVENT_STREAM_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// so a remote that accepts but never answers still fails fast.
 const EVENT_STREAM_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a run event stream may receive nothing, once its head arrived,
+/// before it ends with an error: the peer sends a keep-alive every 15 s
+/// (`tail_events_sse`), so a stream silent this long is a dead or half-open
+/// peer, and its reader (the web's proxied stream, a `wait`) reconnects
+/// rather than hang for the whole [`EVENT_STREAM_TIMEOUT`]. As
+/// [`ARTIFACT_PULL_IDLE_TIMEOUT`].
+const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Whole-transfer bound for one shipped skill's `PUT` (up to 32 MiB), in
 /// place of the client's 30 s total timeout.
 const SKILL_PUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// `stream`, ended with a `TimedOut` error once `idle` passes with no chunk.
+fn idle_bounded(
+    stream: impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    idle: Duration,
+    base_url: String,
+) -> EventByteStream {
+    let state = Some(Box::pin(stream));
+    Box::pin(futures_util::stream::unfold(state, move |state| {
+        let base_url = base_url.clone();
+        async move {
+            let mut stream = state?;
+            match tokio::time::timeout(idle, stream.next()).await {
+                Ok(Some(item)) => Some((item, Some(stream))),
+                Ok(None) => None,
+                // Said once; the stream ends after it.
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("no data from {base_url} for {} s", idle.as_secs()),
+                    )),
+                    None,
+                )),
+            }
+        }
+    }))
+}
 
 // ── Struct ────────────────────────────────────────────────────────────────────
 
@@ -65,6 +100,8 @@ pub struct HttpHostConnector {
     token: Option<String>,
     /// [`ARTIFACT_PULL_IDLE_TIMEOUT`]; a field so tests can shorten it.
     artifact_idle: Duration,
+    /// [`EVENT_STREAM_IDLE_TIMEOUT`]; a field so tests can shorten it.
+    event_idle: Duration,
     /// The `features` the remote's `/api/host/info` last listed (empty for a
     /// remote predating it); `None` until it was first read. What the
     /// synchronous [`HostConnector::honours_supplied_run_id`] answers from.
@@ -139,6 +176,7 @@ impl HttpHostConnector {
             base_url,
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
+            event_idle: EVENT_STREAM_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
             host_id: None,
@@ -184,6 +222,7 @@ impl HttpHostConnector {
             base_url,
             token,
             artifact_idle: ARTIFACT_PULL_IDLE_TIMEOUT,
+            event_idle: EVENT_STREAM_IDLE_TIMEOUT,
             features_seen: std::sync::Mutex::new(None),
             ship_memo: ShipMemo::default(),
             host_id: None,
@@ -831,7 +870,7 @@ impl HostConnector for HttpHostConnector {
             .bytes_stream()
             .map(|r| r.map_err(std::io::Error::other));
 
-        Ok(Box::pin(stream))
+        Ok(idle_bounded(stream, self.event_idle, self.base_url.clone()))
     }
 
     async fn get_transcript(&self, path: &str) -> Result<serde_json::Value, HostConnectorError> {
@@ -909,7 +948,9 @@ impl HostConnector for HttpHostConnector {
         let (runs_root, run_id, host) = (
             runs_root.to_path_buf(),
             run_id.to_string(),
-            self.host_id.clone().unwrap_or_else(|| self.base_url.clone()),
+            self.host_id
+                .clone()
+                .unwrap_or_else(|| self.base_url.clone()),
         );
         let rec = tokio::task::spawn_blocking(move || match fetched {
             Ok(bytes) => rupu_netflow::land::land_and_record(
@@ -1656,6 +1697,42 @@ mod tests {
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }
 
+    /// A run event stream that goes silent (a dead or half-open peer, which
+    /// would otherwise send a keep-alive every 15 s) ends with an error once
+    /// the idle bound passes, rather than hang for its 24 h whole-life bound.
+    #[tokio::test]
+    async fn an_event_stream_that_goes_silent_ends_on_the_idle_bound() {
+        let addr = artifact_remote(BlobPlan::Chunks {
+            chunks: vec![(0, b"ab")],
+            stall: true,
+        })
+        .await;
+        let conn = HttpHostConnector {
+            event_idle: Duration::from_secs(1),
+            ..HttpHostConnector::new(format!("http://{addr}"), None)
+        };
+        let t = std::time::Instant::now();
+        let mut stream = conn.stream_run_events_after("run_x", 0).await.unwrap();
+        let read = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut body = Vec::new();
+            let mut err = None;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(b) => body.extend_from_slice(&b),
+                    Err(e) => err = Some(e),
+                }
+            }
+            (body, err)
+        })
+        .await
+        .expect("the stream must end on its idle bound");
+        assert_eq!(read.0, b"ab");
+        let err = read.1.expect("an idle end is an error, not a clean end");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("no data from"), "{err}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+    }
+
     /// A run event stream is long-lived: its own per-request timeout
     /// overrides the client's total one, so a client built with a 1 s total
     /// timeout still reads a stream that trickles over ~2 s.
@@ -1678,7 +1755,11 @@ mod tests {
             body.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(body, b"abcdefgh");
-        assert!(t.elapsed() > Duration::from_millis(1500), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() > Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     /// The idle bound is per gap, not per transfer, and the pull's own
