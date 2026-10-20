@@ -633,8 +633,8 @@ pub(crate) fn collect_sessions(
     Ok(rows)
 }
 
-#[derive(Deserialize, Default)]
-struct SessionsQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SessionsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -675,8 +675,8 @@ impl SessionsQuery {
 
 /// Optional `?host=<id>` query param for single-session detail/runs/usage
 /// endpoints.
-#[derive(Deserialize, Default)]
-struct SessionHostQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SessionHostQuery {
     #[serde(default)]
     host: Option<String>,
 }

@@ -8,6 +8,55 @@ use http::Method;
 pub(super) fn ops() -> Vec<OpSpec> {
     vec![
         op(
+            "sessions.list",
+            Method::GET,
+            "/api/sessions",
+            "List interactive agent sessions, newest first.\n\nFilter with `q` (the query line, e.g. `is:active`), `scope`, `since`/`until`, `customer` and `host`, and page with `offset`/`limit`. Returns a JSON array of session rows; with `facets` set, an object `{rows, facets, facets_partial}`.",
+        )
+        .query::<sessions::SessionsQuery>(),
+        op(
+            "sessions.get",
+            Method::GET,
+            "/api/sessions/:id",
+            "Get one session's full record.\n\n`id` is the session id; `host` picks a remote host. Returns the session detail: status, agent, limits and totals.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
+            "sessions.turns",
+            Method::GET,
+            "/api/sessions/:id/runs",
+            "List the turns (runs) a session has taken.\n\n`id` is the session id; `host` picks a remote host. Returns a JSON array of the session's runs.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
+            "sessions.usage_timeline",
+            Method::GET,
+            "/api/sessions/:id/usage-timeline",
+            "Get a session's token and cost usage over time.\n\n`id` is the session id; `host` picks a remote host. Returns the usage timeline points.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
+            "sessions.archive",
+            Method::POST,
+            "/api/sessions/:id/archive",
+            "Archive a session so it leaves the active list.\n\n`id` is the session id; `host` picks a remote host. Returns the updated session.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
+            "sessions.restore",
+            Method::POST,
+            "/api/sessions/:id/restore",
+            "Restore an archived session to the active list.\n\n`id` is the session id; `host` picks a remote host. Returns the updated session.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
+            "sessions.delete",
+            Method::DELETE,
+            "/api/sessions/:id",
+            "Delete a session and its record permanently.\n\n`id` is the session id; `host` picks a remote host. Returns once the session is removed.",
+        )
+        .query::<sessions::SessionHostQuery>(),
+        op(
             "sessions.start",
             Method::POST,
             "/api/agents/:name/session",
