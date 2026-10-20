@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   areaPath,
+  bandCenters,
+  bandWidth,
   cumulativeTops,
   linePoints,
   niceScale,
   peakIndex,
+  roundedTopRect,
+  seriesMax,
   totals,
   xsFor,
   yOf,
@@ -12,6 +16,28 @@ import {
 } from './area';
 
 const P: Plot = { x0: 0, x1: 100, y0: 100, yTop: 0 };
+
+describe('unstacked + column geometry', () => {
+  it('seriesMax is the largest single value across series (never summed)', () => {
+    expect(seriesMax([[1, 5, 2], [3, 2, 4]])).toBe(5);
+    expect(seriesMax([])).toBe(0);
+  });
+  it('bandCenters centres n bars in n equal slots, inside the plot edges', () => {
+    // slot = 100/2 = 50 → centres at 25, 75 (not on the 0/100 edges)
+    expect(bandCenters(2, P)).toEqual([25, 75]);
+    expect(bandCenters(0, P)).toEqual([]);
+  });
+  it('bandWidth is a fraction of the slot, never below 2px', () => {
+    expect(bandWidth(2, P, 0.62)).toBeCloseTo(31);
+    expect(bandWidth(200, P)).toBe(2); // clamped
+  });
+  it('roundedTopRect is a rounded-top, square-bottom path', () => {
+    const d = roundedTopRect(0, 0, 10, 20, 3);
+    expect(d.startsWith('M')).toBe(true);
+    expect(d.trim().endsWith('Z')).toBe(true);
+    expect(d).toContain('Q'); // the two top corners
+  });
+});
 
 describe('niceScale', () => {
   it('rounds up to a nice max with ~3 intervals', () => {

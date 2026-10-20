@@ -65,4 +65,22 @@ describe('Chart', () => {
     expect(m.rows.map((r) => r.value)).toEqual([198, 16]);
     expect(m.total).toBe(214);
   });
+
+  it('kind="line" draws one overlaid line per series and no area fills', () => {
+    const { container } = wrap(<Chart dates={dates} series={series} kind="line" />);
+    expect(container.querySelectorAll('polyline').length).toBe(2);
+    // overlaid lines aren't clipped area paths
+    expect(container.querySelectorAll('[clip-path] path').length).toBe(0);
+    // the now-pulse still marks the latest point
+    expect(container.querySelector('.cp-chart-now')).not.toBeNull();
+  });
+
+  it('kind="column" draws stacked columns — no lines, no now-pulse', () => {
+    const { container } = wrap(<Chart dates={dates} series={series} kind="column" />);
+    expect(container.querySelectorAll('polyline').length).toBe(0);
+    // each column's cap is a rounded-top path inside the reveal clip
+    expect(container.querySelectorAll('[clip-path] path').length).toBeGreaterThan(0);
+    // columns don't carry the breathing now-dot (the rightmost bar is "now")
+    expect(container.querySelector('.cp-chart-now')).toBeNull();
+  });
 });

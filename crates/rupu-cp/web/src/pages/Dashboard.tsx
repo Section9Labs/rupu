@@ -227,6 +227,7 @@ export default function Dashboard() {
               peakSubLabel={(i) => `${data.terminal_buckets[i]?.failed ?? 0} failed`}
             />
             <Chart
+              kind="column"
               title="Throughput by trigger"
               subtitle="Runs per day · by what started them"
               dates={dayLabels(data.throughput_buckets)}
