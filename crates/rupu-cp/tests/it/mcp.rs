@@ -970,3 +970,32 @@ fn served_names_counts_a_shadowed_catalog_tool_once() {
     assert!(!without.contains("stub.only"));
     assert_eq!(with.len(), without.len() + 1, "{with:?}");
 }
+
+/// An MCP result's JSON: `structuredContent`, else the parsed text.
+pub(super) fn json_of(result: &Value) -> Value {
+    result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| serde_json::from_str(&text_of(result)).unwrap_or(Value::Null))
+}
+
+/// Assert `tools/list` carries each `(name, required args)` of `table`.
+pub(super) async fn assert_required_args(addr: std::net::SocketAddr, table: &[(&str, &[&str])]) {
+    let list = rpc(addr, "tools/list", json!({})).await["result"]["tools"].clone();
+    for (name, required) in table {
+        let tool = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == *name)
+            .unwrap_or_else(|| panic!("{name} is not listed"));
+        let mut got: Vec<String> = tool["inputSchema"]["required"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
+            .unwrap_or_default();
+        got.sort();
+        let mut want: Vec<String> = required.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want, "{name}");
+    }
+}

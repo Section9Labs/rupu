@@ -3,7 +3,7 @@
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
-use super::mcp::{call_tool, rpc, spawn_operator_with, text_of, OP_SESSION};
+use super::mcp::{assert_required_args, call_tool, json_of, rpc, spawn_operator_with, OP_SESSION};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
@@ -25,14 +25,6 @@ async fn http_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     (status, r.json().await.unwrap_or(Value::Null))
 }
 
-/// An MCP result's JSON: `structuredContent`, else the parsed text.
-fn json_of(result: &Value) -> Value {
-    result
-        .get("structuredContent")
-        .cloned()
-        .unwrap_or_else(|| serde_json::from_str(&text_of(result)).unwrap_or(Value::Null))
-}
-
 #[tokio::test]
 async fn sessions_tools_are_listed_with_their_required_arguments() {
     let (addr, _tmp) = spawn_operator_with(|_| {}, None).await;
@@ -46,22 +38,7 @@ async fn sessions_tools_are_listed_with_their_required_arguments() {
         ("sessions.restore", &["id"]),
         ("sessions.delete", &["id"]),
     ];
-    for (name, required) in table {
-        let tool = list
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == *name)
-            .unwrap_or_else(|| panic!("{name} is not listed"));
-        let mut got: Vec<String> = tool["inputSchema"]["required"]
-            .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
-            .unwrap_or_default();
-        got.sort();
-        let mut want: Vec<String> = required.iter().map(|s| s.to_string()).collect();
-        want.sort();
-        assert_eq!(got, want, "{name}");
-    }
+    assert_required_args(addr, table).await;
     let hint = |name: &str, key: &str| -> Value {
         list.as_array()
             .unwrap()

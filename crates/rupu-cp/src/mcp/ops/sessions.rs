@@ -25,35 +25,35 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "sessions.turns",
             Method::GET,
             "/api/sessions/:id/runs",
-            "List the turns (runs) a session has taken.\n\n`id` is the session id; `host` picks a remote host. Returns a JSON array of the session's runs.",
+            "List the turns (runs) a session has taken.\n\n`id` is the session id; `host` picks a remote host. Returns a JSON array of the session's runs, one per turn.",
         )
         .query::<sessions::SessionHostQuery>(),
         op(
             "sessions.usage_timeline",
             Method::GET,
             "/api/sessions/:id/usage-timeline",
-            "Get a session's token and cost usage over time.\n\n`id` is the session id; `host` picks a remote host. Returns the usage timeline points.",
+            "Get a session's token and cost usage over time.\n\n`id` is the session id; `host` picks a remote host. Returns a JSON array of usage points.",
         )
         .query::<sessions::SessionHostQuery>(),
         op(
             "sessions.archive",
             Method::POST,
             "/api/sessions/:id/archive",
-            "Archive a session so it leaves the active list.\n\n`id` is the session id; `host` picks a remote host. Returns the updated session.",
+            "Archive a session so it leaves the active list.\n\n`id` is the session id; `host` picks a remote host. Returns `{ok, id}` (plus `host_id` for a remote host).",
         )
         .query::<sessions::SessionHostQuery>(),
         op(
             "sessions.restore",
             Method::POST,
             "/api/sessions/:id/restore",
-            "Restore an archived session to the active list.\n\n`id` is the session id; `host` picks a remote host. Returns the updated session.",
+            "Restore an archived session to the active list.\n\n`id` is the session id; `host` picks a remote host. Returns `{ok, id}` (plus `host_id` for a remote host).",
         )
         .query::<sessions::SessionHostQuery>(),
         op(
             "sessions.delete",
             Method::DELETE,
             "/api/sessions/:id",
-            "Delete a session and its record permanently.\n\n`id` is the session id; `host` picks a remote host. Returns once the session is removed.",
+            "Delete a session and its record permanently.\n\n`id` is the session id; `host` picks a remote host. Returns `{ok, id}` (plus `host_id` for a remote host).",
         )
         .query::<sessions::SessionHostQuery>(),
         op(

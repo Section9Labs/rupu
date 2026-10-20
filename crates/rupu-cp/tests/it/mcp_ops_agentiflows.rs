@@ -4,7 +4,7 @@
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
-use super::mcp::{call_tool, rpc, spawn_operator_with, text_of};
+use super::mcp::{assert_required_args, call_tool, json_of, spawn_operator_with};
 use rupu_agentiflow::{agentiflow_dir, AgentiflowRecord};
 use rupu_fleet::{Bus, LogLine, Member};
 use serde_json::{json, Value};
@@ -49,17 +49,9 @@ async fn http_get(addr: SocketAddr, path: &str) -> (u16, Value) {
     (status, r.json().await.unwrap_or(Value::Null))
 }
 
-fn json_of(result: &Value) -> Value {
-    result
-        .get("structuredContent")
-        .cloned()
-        .unwrap_or_else(|| serde_json::from_str(&text_of(result)).unwrap_or(Value::Null))
-}
-
 #[tokio::test]
 async fn agentiflows_tools_are_listed_with_their_required_arguments() {
     let (addr, _tmp) = spawn_operator_with(|_| {}, None).await;
-    let list = rpc(addr, "tools/list", json!({})).await["result"]["tools"].clone();
     let table: &[(&str, &[&str])] = &[
         ("agentiflows.list", &[]),
         ("agentiflows.get", &["id"]),
@@ -68,22 +60,7 @@ async fn agentiflows_tools_are_listed_with_their_required_arguments() {
         ("agentiflows.unit_output", &["id", "unit_id"]),
         ("agentiflows.steer", &["id", "message"]),
     ];
-    for (name, required) in table {
-        let tool = list
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == *name)
-            .unwrap_or_else(|| panic!("{name} is not listed"));
-        let mut got: Vec<String> = tool["inputSchema"]["required"]
-            .as_array()
-            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_string()).collect())
-            .unwrap_or_default();
-        got.sort();
-        let mut want: Vec<String> = required.iter().map(|s| s.to_string()).collect();
-        want.sort();
-        assert_eq!(got, want, "{name}");
-    }
+    assert_required_args(addr, table).await;
 }
 
 #[tokio::test]
@@ -143,4 +120,17 @@ async fn steer_through_mcp_records_client_mcp() {
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     assert_eq!(msgs[0]["via"], json!("cp"), "{}", msgs[0]);
     assert_eq!(msgs[0]["client"], json!("mcp"), "{}", msgs[0]);
+}
+
+#[tokio::test]
+async fn steer_with_stop_queues_a_stop() {
+    let (addr, _tmp) = spawn_operator_with(seed_live_flow, None).await;
+    let r = call_tool(
+        addr,
+        "agentiflows.steer",
+        json!({"id": FLOW, "message": "wind down", "stop": true}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(json_of(&r), json!({"queued": true}), "{r}");
 }
