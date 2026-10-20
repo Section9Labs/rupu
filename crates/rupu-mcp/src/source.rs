@@ -102,9 +102,42 @@ fn is_textual(mime: &str) -> bool {
         || essence.ends_with("+xml")
 }
 
+/// A call's progress channel: present only when the request carried
+/// `params._meta.progressToken` and the transport can deliver notifications.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    token: Value,
+    tx: tokio::sync::mpsc::UnboundedSender<Value>,
+}
+
+impl Progress {
+    pub(crate) fn new(token: Value, tx: tokio::sync::mpsc::UnboundedSender<Value>) -> Self {
+        Self { token, tx }
+    }
+
+    /// Sends `notifications/progress {progressToken, progress, total?,
+    /// message?}`; a closed channel is ignored.
+    pub fn report(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
+        let mut params = json!({ "progressToken": self.token, "progress": progress });
+        if let Some(t) = total {
+            params["total"] = json!(t);
+        }
+        if let Some(m) = message {
+            params["message"] = json!(m);
+        }
+        let _ = self.tx.send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        }));
+    }
+}
+
 /// Per-call context.
 #[derive(Debug, Clone, Default)]
 pub struct CallCx {
+    /// Where the call reports progress, when the client asked for it.
+    pub progress: Option<Progress>,
     /// The MCP session the call arrived on, if the transport has sessions.
     pub session: Option<String>,
     /// The `Host` header of the request the call arrived on.

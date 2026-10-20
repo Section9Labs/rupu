@@ -249,3 +249,40 @@ async fn the_callers_host_reaches_the_source() {
         json!({"host": "127.0.0.1:7879"})
     );
 }
+
+#[tokio::test]
+async fn progress_notifications_precede_the_reply() {
+    use crate::stub::{next, serve_stub};
+    use rupu_mcp::Transport;
+    let (client, _server) = serve_stub();
+    client
+        .send(json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "stub.ticks", "arguments": {"n": 3},
+                        "_meta": { "progressToken": "t1" } } }))
+        .await
+        .unwrap();
+    for i in 1..=3 {
+        let n = next(&client).await;
+        assert_eq!(n["method"], "notifications/progress", "{n}");
+        assert_eq!(n["params"]["progressToken"], "t1");
+        assert_eq!(n["params"]["progress"], i as f64);
+        assert_eq!(n["params"]["total"], 3.0);
+    }
+    let reply = next(&client).await;
+    assert_eq!(reply["id"], 5);
+    assert_eq!(reply["result"]["content"][0]["text"], "ticked");
+}
+
+#[tokio::test]
+async fn no_token_no_progress() {
+    use crate::stub::{request, serve_stub};
+    let (client, _server) = serve_stub();
+    let reply = request(
+        &client,
+        6,
+        "tools/call",
+        json!({ "name": "stub.ticks", "arguments": {"n": 3} }),
+    )
+    .await;
+    assert_eq!(reply["result"]["content"][0]["text"], "ticked");
+}

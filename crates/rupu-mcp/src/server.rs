@@ -8,11 +8,12 @@
 
 use crate::error::{McpError, ServeError};
 use crate::filter::ToolFilter;
-use crate::source::{CallCx, ToolDef, ToolResult, ToolSource};
+use crate::source::{CallCx, Progress, ToolDef, ToolResult, ToolSource};
 use crate::transport::Transport;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, warn};
 
@@ -43,11 +44,15 @@ async fn send_logged<T: Transport>(transport: &T, msg: Value) {
 // ---------------------------------------------------------------------------
 
 /// What the transport knows about the request a message arrived on.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HandleCx<'a> {
     pub session: Option<&'a str>,
     /// The request's `Host` header.
     pub host: Option<&'a str>,
+    /// Where the transport takes server-to-client notifications. A
+    /// `tools/call` carrying `params._meta.progressToken` reports progress
+    /// here; with `None` no call gets a progress channel.
+    pub notify: Option<mpsc::UnboundedSender<Value>>,
 }
 
 /// JSON-RPC 2.0 over any transport, serving the tools of its
@@ -140,7 +145,7 @@ impl McpServer {
             msg,
             HandleCx {
                 session,
-                host: None,
+                ..HandleCx::default()
             },
         )
         .await
@@ -150,6 +155,7 @@ impl McpServer {
     pub async fn handle_with(&self, msg: Value, cx: HandleCx<'_>) -> Option<Value> {
         let session = cx.session.map(str::to_string);
         let host = cx.host.map(str::to_string);
+        let notify = cx.notify;
         match msg {
             Value::Array(batch) if batch.is_empty() => {
                 Some(McpError::InvalidRequest("empty batch".into()).to_jsonrpc(Value::Null))
@@ -163,7 +169,12 @@ impl McpServer {
                         let id = m.get("id").cloned();
                         (
                             id,
-                            tokio::spawn(self.core.clone().one(m, session.clone(), host.clone())),
+                            tokio::spawn(self.core.clone().one(
+                                m,
+                                session.clone(),
+                                host.clone(),
+                                notify.clone(),
+                            )),
                         )
                     })
                     .collect();
@@ -185,7 +196,7 @@ impl McpServer {
                 }
                 (!out.is_empty()).then_some(Value::Array(out))
             }
-            msg => self.core.clone().one(msg, session, host).await,
+            msg => self.core.clone().one(msg, session, host, notify).await,
         }
     }
 
@@ -205,7 +216,29 @@ impl McpServer {
                     let this = self.clone();
                     let t = transport.clone();
                     replies.spawn(async move {
-                        if let Some(v) = this.handle(msg, None).await {
+                        // Notifications reach the transport before the reply:
+                        // the forwarder ends once every sender is dropped,
+                        // which is when the call has ended.
+                        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+                        let fwd = tokio::spawn({
+                            let t = t.clone();
+                            async move {
+                                while let Some(n) = rx.recv().await {
+                                    send_logged(&*t, n).await;
+                                }
+                            }
+                        });
+                        let reply = this
+                            .handle_with(
+                                msg,
+                                HandleCx {
+                                    notify: Some(tx),
+                                    ..HandleCx::default()
+                                },
+                            )
+                            .await;
+                        let _ = fwd.await;
+                        if let Some(v) = reply {
                             send_logged(&*t, v).await;
                         }
                     });
@@ -235,6 +268,7 @@ impl Core {
         msg: Value,
         session: Option<String>,
         host: Option<String>,
+        notify: Option<mpsc::UnboundedSender<Value>>,
     ) -> Option<Value> {
         let Value::Object(msg) = msg else {
             let e = McpError::InvalidRequest("not a JSON-RPC object".into());
@@ -273,7 +307,7 @@ impl Core {
             }
             "ping" => ok(json!({})),
             "tools/list" => ok(json!({ "tools": self.list() })),
-            "tools/call" => self.tools_call(id, params, session, host).await,
+            "tools/call" => self.tools_call(id, params, session, host, notify).await,
             other => Some(McpError::UnknownMethod(other.to_string()).to_jsonrpc(id)),
         }
     }
@@ -300,7 +334,12 @@ impl Core {
         params: Value,
         session: Option<String>,
         host: Option<String>,
+        notify: Option<mpsc::UnboundedSender<Value>>,
     ) -> Option<Value> {
+        let progress = notify.and_then(|tx| {
+            let token = params.pointer("/_meta/progressToken")?.clone();
+            Some(Progress::new(token, tx))
+        });
         let key = (session.clone().unwrap_or_default(), id.to_string());
         let core = self.clone();
         let reply_id = id.clone();
@@ -319,7 +358,17 @@ impl Core {
                 let _guard = guard;
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let result = core.call(name, args, CallCx { session, host }).await;
+                let result = core
+                    .call(
+                        name,
+                        args,
+                        CallCx {
+                            progress,
+                            session,
+                            host,
+                        },
+                    )
+                    .await;
                 json!({ "jsonrpc": "2.0", "id": id, "result": result })
             });
             if flight

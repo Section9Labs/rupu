@@ -34,6 +34,7 @@ impl ToolSource for StubSource {
             def("stub.bin_file", ToolHints::default()),
             def("stub.annotated", ToolHints::default()),
             def("stub.host", ToolHints::default()),
+            def("stub.ticks", ToolHints::default()),
             def(
                 "stub.ro",
                 ToolHints {
@@ -78,6 +79,15 @@ impl ToolSource for StubSource {
                 meta: json!({"rupu/headers": {"x-rupu-hosts-unfilterable": "h:status"}}),
             }),
             "stub.host" => Some(ToolResult::Json(json!({ "host": cx.host }))),
+            "stub.ticks" => {
+                let n = args["n"].as_u64().unwrap_or(0);
+                if let Some(p) = &cx.progress {
+                    for i in 1..=n {
+                        p.report(i as f64, Some(n as f64), None);
+                    }
+                }
+                Some(ToolResult::Text("ticked".into()))
+            }
             "stub.ro" => Some(ToolResult::Text("ro".into())),
             _ => None,
         }

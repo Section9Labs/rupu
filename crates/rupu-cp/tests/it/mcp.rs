@@ -871,3 +871,85 @@ async fn a_catalog_tool_is_left_out_only_where_an_earlier_source_serves_its_name
     rupu_cp::mcp::validate_tools(&["agents.list".into(), "wait".into()], Some(&catalog)).unwrap();
     assert!(rupu_cp::mcp::validate_tools(&["nope.x".into()], Some(&catalog)).is_err());
 }
+
+/// Reports progress twice, then returns.
+struct Ticker;
+
+#[async_trait]
+impl ToolSource for Ticker {
+    fn tools(&self) -> Vec<ToolDef> {
+        vec![ToolDef {
+            name: "tick".into(),
+            description: "ticks".into(),
+            input_schema: json!({"type": "object"}),
+            hints: ToolHints::default(),
+        }]
+    }
+    async fn call(&self, name: &str, _args: Value, cx: &CallCx) -> Option<ToolResult> {
+        if name != "tick" {
+            return None;
+        }
+        if let Some(p) = &cx.progress {
+            p.report(1.0, Some(2.0), Some("one"));
+            p.report(2.0, Some(2.0), None);
+        }
+        Some(ToolResult::Text("ticked".into()))
+    }
+}
+
+async fn tick_post(accept: &str) -> reqwest::Response {
+    let (addr, _tmp) = spawn_with(
+        None,
+        true,
+        Some(McpOpts {
+            catalog: Some(Arc::new(Ticker)),
+            tools: vec![],
+        }),
+    )
+    .await;
+    reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", accept)
+        .json(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {"name": "tick", "arguments": {},
+                       "_meta": {"progressToken": "p9"}}}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_progress_call_is_answered_as_sse() {
+    let resp = tick_post("application/json, text/event-stream").await;
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/event-stream"), "{ct}");
+    let body = resp.text().await.unwrap();
+    let frames: Vec<Value> = body
+        .split("\n\n")
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| {
+            assert!(f.contains("event: message"), "{f}");
+            let data = f.lines().find_map(|l| l.strip_prefix("data:")).unwrap();
+            serde_json::from_str(data.trim()).unwrap()
+        })
+        .collect();
+    assert_eq!(frames.len(), 3, "{body}");
+    for (i, f) in frames[..2].iter().enumerate() {
+        assert_eq!(f["method"], "notifications/progress");
+        assert_eq!(f["params"]["progressToken"], "p9");
+        assert_eq!(f["params"]["progress"], (i + 1) as f64);
+    }
+    assert_eq!(frames[2]["id"], 4);
+    assert_eq!(frames[2]["result"]["content"][0]["text"], "ticked");
+}
+
+#[tokio::test]
+async fn without_sse_in_accept_the_reply_is_json() {
+    let resp = tick_post("application/json").await;
+    assert_eq!(resp.status(), 200);
+    let ct = resp.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("application/json"), "{ct}");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["result"]["content"][0]["text"], "ticked");
+}

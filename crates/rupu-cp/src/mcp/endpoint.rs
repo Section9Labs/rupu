@@ -1,15 +1,20 @@
-//! `POST /mcp`: MCP over HTTP (JSON replies, no server-initiated stream).
+//! `POST /mcp`: MCP over HTTP. Replies are JSON, or an SSE stream for a
+//! `tools/call` that asked for progress.
 
 use crate::state::AppState;
 use axum::{
     body::Bytes,
     extract::State,
     http::{header, HeaderMap, HeaderName, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::post,
     Json, Router,
 };
-use rupu_mcp::McpServer;
+use futures_util::StreamExt;
+use rupu_mcp::{HandleCx, McpServer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -74,6 +79,52 @@ fn is_initialize(msg: &Value) -> bool {
     }
 }
 
+/// The client accepts an event stream and the body is one `tools/call` that
+/// asked for progress.
+fn wants_progress_stream(headers: &HeaderMap, msg: &Value) -> bool {
+    let accepts = headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.to_ascii_lowercase().contains("text/event-stream"));
+    accepts
+        && msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && msg.pointer("/params/_meta/progressToken").is_some()
+}
+
+/// Answers as `text/event-stream`: each progress notification, then the
+/// reply, then the stream ends. The call runs in its own task, so a client
+/// that drops the stream leaves it running; what it sends after that is
+/// discarded.
+fn progress_stream(
+    server: Arc<McpServer>,
+    msg: Value,
+    session: Option<String>,
+    host: Option<String>,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let reply = server
+            .handle_with(
+                msg,
+                HandleCx {
+                    session: session.as_deref(),
+                    host: host.as_deref(),
+                    notify: Some(tx.clone()),
+                },
+            )
+            .await;
+        // Same channel as the notifications, so the reply comes last.
+        if let Some(v) = reply {
+            let _ = tx.send(v);
+        }
+    });
+    let events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|v| {
+        Ok::<_, std::convert::Infallible>(Event::default().event("message").data(v.to_string()))
+    });
+    Sse::new(events).into_response()
+}
+
 async fn handle(
     State(McpState {
         server,
@@ -108,7 +159,23 @@ async fn handle(
         .map(str::to_string);
     let minted = is_initialize(&msg).then(|| format!("mcp_{}", ulid::Ulid::new()));
     let session = minted.clone().or(supplied);
-    let reply = server.handle(msg, session.as_deref()).await;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if wants_progress_stream(&headers, &msg) {
+        return progress_stream(server, msg, session, host);
+    }
+    let reply = server
+        .handle_with(
+            msg,
+            HandleCx {
+                session: session.as_deref(),
+                host: host.as_deref(),
+                notify: None,
+            },
+        )
+        .await;
     let mut resp = match reply {
         Some(v) => Json(v).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
