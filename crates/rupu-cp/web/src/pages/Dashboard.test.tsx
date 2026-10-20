@@ -10,8 +10,9 @@ import { emptyFleet } from '../lib/dashboard/mergeSummaries';
 import { customerRow, scopedEntry, withCustomerScope, ACME } from '../lib/customerScopeTestUtils';
 
 beforeEach(() => {
-  // The Needs-you hero reads existing run-list endpoints per host; keep it empty
-  // and quiet here so these tests exercise the dashboard's own data path.
+  // The inbox pointer and the recent-activity feed read existing run-list
+  // endpoints per host; keep them empty and quiet here so these tests exercise
+  // the dashboard's own data path.
   vi.spyOn(api, 'getWorkflowRuns').mockResolvedValue([]);
 });
 afterEach(() => {
@@ -58,15 +59,18 @@ describe('Dashboard', () => {
     expect(screen.getByTestId('kpi-active')).toHaveTextContent('2'); // running
   });
 
-  it('leads with the Needs-you triage block', async () => {
+  it('points at the Inbox instead of carrying the action list', async () => {
     vi.spyOn(api, 'getRegisteredHosts').mockResolvedValue([LOCAL_HOST]);
     vi.spyOn(api, 'getDashboard').mockResolvedValue(summary());
     vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
 
     render(<MemoryRouter>{withCustomerScope(<Dashboard />)}</MemoryRouter>);
-    await waitFor(() => expect(screen.getByText('Needs you')).toBeInTheDocument());
-    // Nothing needs the operator (no awaiting/failed runs mocked) → empty state.
-    expect(screen.getByText('Nothing needs you')).toBeInTheDocument();
+    // Nothing is waiting (no awaiting/paused runs mocked) → the pointer says so
+    // and links to the Inbox; the action list itself is NOT on the overview.
+    await waitFor(() => expect(screen.getByText('Nothing waiting on you.')).toBeInTheDocument());
+    expect(screen.queryByText('Needs you')).not.toBeInTheDocument();
+    const inboxLinks = screen.getAllByRole('link', { name: /open inbox/i });
+    expect(inboxLinks[0]).toHaveAttribute('href', '/inbox');
   });
 
   it('renders a slow (still-loading) second host without blanking the page once local has data', async () => {

@@ -20,8 +20,8 @@ describe('Chart', () => {
     const { container } = wrap(<Chart dates={dates} series={series} title="Outcomes over time" />);
     // one polyline per series (the stacked line tops)
     expect(container.querySelectorAll('polyline').length).toBe(2);
-    // one filled area path per series
-    expect(container.querySelectorAll('.cp-chart-riser path').length).toBe(2);
+    // one filled area path per series, inside the reveal-clipped group
+    expect(container.querySelectorAll('[clip-path] path').length).toBe(2);
   });
 
   it('labels the title, legend and peak total', () => {

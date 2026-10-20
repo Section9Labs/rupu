@@ -1,0 +1,319 @@
+// useInbox — the Inbox board's data engine. It answers the screen's one
+// question, "what is waiting on me, and can I clear it?", by loading the fleet's
+// blocked work from EXISTING endpoints (no new API), then letting the operator
+// drive each item to zero: ACT on it (the real mutation), SNOOZE it (hide for a
+// while), or DISMISS it (clear from view). Snooze/dismiss are per-operator view
+// state in `localStorage` (inboxStore), never a server fact.
+//
+// Per registered host it runs two cheap list reads — the blocking set
+// (`status:awaiting_approval,paused`) and recent failures (`status:failed`) —
+// and merges them. The split the screen draws is honest about the backend:
+//   • ACTIONABLE (gates + paused) have a real mutation (approve/reject/resume);
+//   • FAILURES have none (no web retry endpoint), so they only link out or clear.
+//
+// The "stalled run time" headline (sum of how long each actionable item has
+// been waiting) is derived here from the same `since` timestamps, and only ever
+// falls when the operator acts — the number that makes the board a ledger, not
+// a list. A ticking `now` keeps ages, the stalled total and snooze expiry live.
+//
+// Mutations are pending-state, never optimistic: a 200 means recorded; the item
+// leaves only when a refetch no longer returns it. Snooze/dismiss ARE applied
+// immediately — they're a view preference, not a claim about the run.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  api,
+  apiErrorMessage,
+  type CustomerScope,
+  type RunListRow,
+  type RunStatusStr,
+} from '../api';
+import {
+  activeSnoozes,
+  addDismissed,
+  addSnooze,
+  readDismissed,
+  removeDismissed,
+  removeSnooze,
+  snoozeUntil,
+  type SnoozeDuration,
+} from './inboxStore';
+
+export type InboxKind = 'awaiting' | 'paused' | 'failed';
+export type InboxVerb = 'approve' | 'reject' | 'resume';
+
+/** A run that is blocked on, or recently failed under, the operator. */
+export interface InboxItem {
+  id: string;
+  host: string;
+  codename: string;
+  codenameDerived: boolean;
+  workflowName: string;
+  status: RunStatusStr;
+  kind: InboxKind;
+  /** RFC-3339 the wait/failure began (approx): started_at, or finished_at for failed. */
+  since: string | null;
+}
+
+export interface SnoozedEntry {
+  item: InboxItem;
+  until: number;
+}
+
+export interface UseInbox {
+  /** Gates + paused runs you can clear here, oldest wait first. */
+  actionable: InboxItem[];
+  /** Recent failures, most recent first. */
+  failures: InboxItem[];
+  /** Items currently snoozed that still match live data, soonest-return first. */
+  snoozed: SnoozedEntry[];
+  /** Dismissed items that still match live data (for "show dismissed"). */
+  dismissed: InboxItem[];
+  /** Visible counts by kind (snoozed/dismissed excluded). */
+  counts: { gates: number; paused: number; failed: number };
+  /** Total visible actionable wait time, ms (the stalled-run-time headline). */
+  stalledMs: number;
+  /** The oldest visible actionable item, or null. */
+  oldestActionable: InboxItem | null;
+  /** How many items this operator has cleared (acted or dismissed) this session. */
+  clearedThisSession: number;
+  loading: boolean;
+  error: string | null;
+  /** Per-run-id in-flight ACT (hides the row's act buttons while it settles). */
+  pending: Record<string, InboxVerb>;
+  /** Live clock the view reads for ages/the stalled total. */
+  now: number;
+  approve: (item: InboxItem) => void;
+  reject: (item: InboxItem) => void;
+  resume: (item: InboxItem) => void;
+  snooze: (item: InboxItem, dur: SnoozeDuration) => void;
+  dismiss: (item: InboxItem) => void;
+  unsnooze: (id: string) => void;
+  undismiss: (id: string) => void;
+  refresh: () => void;
+}
+
+const BLOCKING_LIMIT = 25;
+const FAILED_LIMIT = 10;
+const RECONCILE_MS = 60_000;
+const TICK_MS = 30_000;
+
+/** Mutation host arg: remote host id, or undefined for local. */
+function hostArg(host: string): string | undefined {
+  return host && host !== 'local' ? host : undefined;
+}
+
+function kindOf(status: RunStatusStr): InboxKind | null {
+  if (status === 'awaiting_approval') return 'awaiting';
+  if (status === 'paused') return 'paused';
+  if (status === 'failed') return 'failed';
+  return null;
+}
+
+function toItem(row: RunListRow, queriedHost: string): InboxItem | null {
+  const kind = kindOf(row.status);
+  if (!kind) return null;
+  return {
+    id: row.id,
+    host: row.host_id ?? queriedHost,
+    codename: row.codename,
+    codenameDerived: row.codename_derived,
+    workflowName: row.workflow_name,
+    status: row.status,
+    kind,
+    since: kind === 'failed' ? row.finished_at ?? row.started_at : row.started_at,
+  };
+}
+
+function sinceMs(item: InboxItem): number {
+  return item.since ? Date.parse(item.since) : 0;
+}
+
+export function useInbox(customer?: CustomerScope): UseInbox {
+  const [allItems, setAllItems] = useState<InboxItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<Record<string, InboxVerb>>({});
+  const [now, setNow] = useState(() => Date.now());
+  const [cleared, setCleared] = useState(0);
+
+  // View state (localStorage-backed). `now` at mount prunes lapsed snoozes.
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set(readDismissed()));
+  const [snoozeMap, setSnoozeMap] = useState<Record<string, number>>(() =>
+    activeSnoozes(Date.now()),
+  );
+
+  const customerRef = useRef(customer);
+  customerRef.current = customer;
+  const genRef = useRef(0);
+
+  const load = useCallback(() => {
+    const gen = ++genRef.current;
+    const scoped = customerRef.current;
+    setLoading(true);
+    api.getRegisteredHosts().then(
+      async (hosts) => {
+        if (genRef.current !== gen) return;
+        const reqs = hosts.flatMap((h) => {
+          const base = scoped ? { host: h.id, customer: scoped } : { host: h.id };
+          return [
+            api
+              .getWorkflowRuns({ ...base, q: 'status:awaiting_approval,paused', limit: BLOCKING_LIMIT })
+              .then((rows) => rows.map((r) => toItem(r, h.id)))
+              .catch(() => [] as (InboxItem | null)[]),
+            api
+              .getWorkflowRuns({ ...base, q: 'status:failed', limit: FAILED_LIMIT })
+              .then((rows) => rows.map((r) => toItem(r, h.id)))
+              .catch(() => [] as (InboxItem | null)[]),
+          ];
+        });
+        const settled = await Promise.all(reqs);
+        if (genRef.current !== gen) return;
+        const merged = settled
+          .flat()
+          .filter((x): x is InboxItem => x !== null)
+          .filter((it, i, arr) => arr.findIndex((o) => o.id === it.id && o.host === it.host) === i);
+        setAllItems(merged);
+        setError(null);
+        setLoading(false);
+      },
+      (e: unknown) => {
+        if (genRef.current !== gen) return;
+        setError(apiErrorMessage(e));
+        setLoading(false);
+      },
+    );
+  }, []);
+
+  useEffect(() => {
+    load();
+    const poll = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, RECONCILE_MS);
+    return () => clearInterval(poll);
+    // re-run when the customer scope changes
+  }, [load, customer]);
+
+  // Ticking clock: keeps ages, the stalled total and snooze expiry live, and
+  // re-prunes lapsed snoozes so a returning item reappears without a refetch.
+  useEffect(() => {
+    const t = setInterval(() => {
+      setNow(Date.now());
+      setSnoozeMap((prev) => {
+        const pruned = activeSnoozes(Date.now());
+        // keep identity stable when nothing lapsed
+        const sameSize = Object.keys(pruned).length === Object.keys(prev).length;
+        return sameSize ? prev : pruned;
+      });
+    }, TICK_MS);
+    return () => clearInterval(t);
+  }, []);
+
+  const act = useCallback(
+    (item: InboxItem, verb: InboxVerb, run: () => Promise<void>) => {
+      setPending((p) => ({ ...p, [item.id]: verb }));
+      run().then(
+        () => {
+          setPending((p) => {
+            const { [item.id]: _drop, ...rest } = p;
+            return rest;
+          });
+          setCleared((c) => c + 1);
+          load();
+        },
+        (e: unknown) => {
+          setPending((p) => {
+            const { [item.id]: _drop, ...rest } = p;
+            return rest;
+          });
+          setError(apiErrorMessage(e));
+        },
+      );
+    },
+    [load],
+  );
+
+  const approve = useCallback(
+    (item: InboxItem) => act(item, 'approve', () => api.approveRun(item.id, undefined, hostArg(item.host))),
+    [act],
+  );
+  const reject = useCallback(
+    (item: InboxItem) =>
+      act(item, 'reject', () => api.rejectRun(item.id, 'Rejected from inbox', hostArg(item.host))),
+    [act],
+  );
+  const resume = useCallback(
+    (item: InboxItem) => act(item, 'resume', () => api.resumeRun(item.id, hostArg(item.host))),
+    [act],
+  );
+
+  const snooze = useCallback((item: InboxItem, dur: SnoozeDuration) => {
+    const until = snoozeUntil(dur, Date.now());
+    setSnoozeMap(addSnooze(item.id, until));
+  }, []);
+  const unsnooze = useCallback((id: string) => {
+    setSnoozeMap(removeSnooze(id));
+  }, []);
+  const dismiss = useCallback((item: InboxItem) => {
+    setDismissedIds(new Set(addDismissed(item.id)));
+    setCleared((c) => c + 1);
+  }, []);
+  const undismiss = useCallback((id: string) => {
+    setDismissedIds(new Set(removeDismissed(id)));
+  }, []);
+
+  // Partition live items by view state. Snooze wins over dismiss (a snoozed
+  // item is coming back), and both hide an item from the working queue.
+  const view = useMemo(() => {
+    const isSnoozed = (id: string) => (snoozeMap[id] ?? 0) > now;
+    const isDismissed = (id: string) => dismissedIds.has(id);
+
+    const actionable = allItems
+      .filter((it) => it.kind !== 'failed' && !isSnoozed(it.id) && !isDismissed(it.id))
+      .sort((a, b) => sinceMs(a) - sinceMs(b)); // oldest wait first
+    const failures = allItems
+      .filter((it) => it.kind === 'failed' && !isSnoozed(it.id) && !isDismissed(it.id))
+      .sort((a, b) => sinceMs(b) - sinceMs(a)); // most recent first
+    const snoozed: SnoozedEntry[] = allItems
+      .filter((it) => isSnoozed(it.id))
+      .map((it) => ({ item: it, until: snoozeMap[it.id] }))
+      .sort((a, b) => a.until - b.until);
+    const dismissed = allItems.filter((it) => isDismissed(it.id) && !isSnoozed(it.id));
+
+    const stalledMs = actionable.reduce((s, it) => s + Math.max(0, now - sinceMs(it)), 0);
+    const counts = {
+      gates: actionable.filter((it) => it.kind === 'awaiting').length,
+      paused: actionable.filter((it) => it.kind === 'paused').length,
+      failed: failures.length,
+    };
+    return {
+      actionable,
+      failures,
+      snoozed,
+      dismissed,
+      stalledMs,
+      counts,
+      oldestActionable: actionable[0] ?? null,
+    };
+  }, [allItems, dismissedIds, snoozeMap, now]);
+
+  return useMemo(
+    () => ({
+      ...view,
+      clearedThisSession: cleared,
+      loading,
+      error,
+      pending,
+      now,
+      approve,
+      reject,
+      resume,
+      snooze,
+      dismiss,
+      unsnooze,
+      undismiss,
+      refresh: load,
+    }),
+    [view, cleared, loading, error, pending, now, approve, reject, resume, snooze, dismiss, unsnooze, undismiss, load],
+  );
+}

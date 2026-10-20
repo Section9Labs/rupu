@@ -7,6 +7,7 @@ import {
   Building2,
   DollarSign,
   FolderGit2,
+  Inbox,
   LayoutDashboard,
   MessageSquare,
   Network,
@@ -51,6 +52,7 @@ export type NavSection =
 
 export const sidebarNav: NavSection[] = [
   { kind: 'leaf', item: { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, enabled: true } },
+  { kind: 'leaf', item: { to: '/inbox', label: 'Inbox', icon: Inbox, enabled: true } },
   { kind: 'leaf', item: { to: '/projects', label: 'Projects', icon: FolderGit2, enabled: true } },
   { kind: 'leaf', item: { to: '/customers', label: 'Customers', icon: Building2, enabled: true } },
   { kind: 'leaf', item: { to: '/events', label: 'Live Events', icon: Radio, enabled: true } },

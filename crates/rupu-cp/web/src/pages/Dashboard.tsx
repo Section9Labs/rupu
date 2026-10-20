@@ -1,25 +1,25 @@
-// Dashboard — the top screen, rebuilt on the common visual language and
-// reorganised around the dashboard's real job: TRIAGE (spec
-// 2026-10-19-rupu-cp-visual-language-design.md + dashboard-redesign.html).
+// Dashboard — the Overview: the state of the system at a glance (health, pace,
+// and what's running), NOT a to-do list. The action list — parked gates, paused
+// runs, failures — moved to its own screen (the Inbox, `pages/Inbox.tsx`); the
+// Overview only POINTS at it (`InboxPointer`), so each screen does one job well.
 //
-// Composition: PageHeader (range + Usage →) → "Needs you" hero (parked gates /
-// paused / recent failures, with inline actions) → "Last 30 days" KPI strip
-// (type-first, attention in red) → "Fleet" host cards → "Trends" two living
-// charts → "Inventory" summary strip. This is rendering only — every data
-// source, the per-host async load, the customer scope, and the "not reported ≠
-// 0" partial rules are the SAME as before (`useDashboardData`, the scope
-// helpers). The Needs-you hero adds `useNeedsYou`, which reads existing run-list
-// + mutation endpoints (no new API).
+// Composition: PageHeader (range + Usage →) → inbox pointer (count + link, never
+// the list) → "Last 30 days" KPI strip (type-first, Active now leads, attention
+// in red) → "Fleet" host cards → "Trends" two living charts → "Recent activity"
+// read-only feed → "Inventory" summary strip. Rendering only — every data source,
+// the per-host async load, the customer scope, and the "not reported ≠ 0" partial
+// rules are the SAME as before (`useDashboardData`, the scope helpers). The
+// pointer and the recent feed read existing run-list endpoints (no new API).
 //
 // Components come from the shared language (`components/ui/*`): PageHeader,
-// KpiStrip, Chart, SummaryStrip, StatusChip, Button, Skeleton. The Needs-you
-// hero and fleet cards live in `components/dashboard/*`.
+// KpiStrip, Chart, SummaryStrip, Segmented, Skeleton. The pointer, fleet cards
+// and recent-activity feed live in `components/dashboard/*`.
 
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useDashboardData } from '../lib/dashboard/useDashboardData';
-import { useNeedsYou } from '../lib/dashboard/useNeedsYou';
-import { NeedsYou } from '../components/dashboard/NeedsYou';
+import { InboxPointer } from '../components/dashboard/InboxPointer';
+import { RecentActivity } from '../components/dashboard/RecentActivity';
 import { FleetHostCards } from '../components/dashboard/FleetHostCards';
 import { PageHeader } from '../components/ui/PageHeader';
 import { KpiStrip, type KpiItem } from '../components/ui/KpiStrip';
@@ -114,7 +114,6 @@ export default function Dashboard() {
   const [range, setRange] = useState<DashboardRange>('30d');
   const { customer, rejectIfScopeError } = useScopedList(undefined, []);
   const { data, hosts, error, hostsWithoutCustomer } = useDashboardData(range, customer, rejectIfScopeError);
-  const needsYou = useNeedsYou(customer);
 
   const now = Date.now();
 
@@ -154,6 +153,7 @@ export default function Dashboard() {
         ? `${data.fleet.workers} worker${data.fleet.workers === 1 ? '' : 's'}`
         : undefined;
     return [
+      { label: 'Active now', value: data.active.running.toLocaleString(), meta: activeMeta, testId: 'kpi-active' },
       { label: 'Failed', value: failed.toLocaleString(), attention: failed > 0, testId: 'kpi-failed' },
       { label: 'Success rate', value: rate, testId: 'kpi-success' },
       {
@@ -162,7 +162,6 @@ export default function Dashboard() {
         meta: data.cycles_partial ? 'partial window' : undefined,
         testId: 'kpi-cycles',
       },
-      { label: 'Active now', value: data.active.running.toLocaleString(), meta: activeMeta, testId: 'kpi-active' },
       {
         label: 'Open findings',
         value: data.findings_open === null ? '—' : `${data.findings_open.toLocaleString()}${data.findings_partial ? '+' : ''}`,
@@ -205,10 +204,8 @@ export default function Dashboard() {
         without={hostsWithoutCustomer}
       />
 
-      <SectionLabel count={needsYou.items.length > 0 ? needsYou.items.length : undefined}>
-        Needs you
-      </SectionLabel>
-      <NeedsYou data={needsYou} />
+      {/* The action list lives on the Inbox now; the Overview only points at it. */}
+      <InboxPointer customer={customer} />
 
       {data && kpis ? (
         <>
@@ -235,6 +232,14 @@ export default function Dashboard() {
               series={throughputSeries(data.throughput_buckets)}
             />
           </div>
+
+          <div className="flex items-baseline justify-between">
+            <SectionLabel>Recent activity</SectionLabel>
+            <Link to="/runs/workflows" className="text-note text-ink-dim hover:text-ink">
+              All runs →
+            </Link>
+          </div>
+          <RecentActivity customer={customer} />
 
           <SectionLabel>Inventory</SectionLabel>
           <UnscopedNote>Fleet counts aren’t per customer.</UnscopedNote>
