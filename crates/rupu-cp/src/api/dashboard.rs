@@ -130,8 +130,8 @@ struct DashboardResponse {
     summary: crate::host::dashboard_summary::DashboardSummary,
 }
 
-#[derive(serde::Deserialize)]
-struct DashboardQuery {
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct DashboardQuery {
     range: Option<String>,
     host: Option<String>,
     /// `?customer=<slug>|none` — see `get_dashboard`.

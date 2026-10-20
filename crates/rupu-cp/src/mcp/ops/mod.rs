@@ -194,7 +194,6 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
 
 /// Routes not yet operator tools; Plan 2 empties this list.
 pub const PENDING_PLAN_2: &[(&str, &str)] = &[
-    ("GET", "/api/agentiflows/:id/netflow"),
     ("GET", "/api/config"),
     ("PUT", "/api/config/customer/:slug"),
     ("PUT", "/api/config/global"),
@@ -209,7 +208,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("DELETE", "/api/customers/:slug/projects/:ws_id"),
     ("PUT", "/api/customers/:slug/projects/:ws_id"),
     ("POST", "/api/customers/:slug/unarchive"),
-    ("GET", "/api/dashboard"),
     ("GET", "/api/host/info"),
     ("GET", "/api/hosts"),
     ("POST", "/api/hosts"),
@@ -219,13 +217,7 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/hosts/registered"),
     ("POST", "/api/hosts/ssh"),
     ("POST", "/api/launch/preview"),
-    ("GET", "/api/netflow"),
-    ("GET", "/api/netflow/explorer"),
-    ("GET", "/api/netflow/graph"),
-    ("GET", "/api/netflow/index"),
-    ("GET", "/api/netflow/latest"),
     ("GET", "/api/projects"),
-    ("GET", "/api/projects/:id/netflow"),
     ("GET", "/api/projects/:ws_id"),
     ("GET", "/api/projects/:ws_id/agents"),
     ("GET", "/api/projects/:ws_id/autoflows"),
@@ -238,11 +230,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/projects/:ws_id/tree"),
     ("GET", "/api/projects/:ws_id/workflows"),
     ("GET", "/api/repos"),
-    ("GET", "/api/runs/:id/netflow"),
-    ("GET", "/api/usage"),
-    ("GET", "/api/usage/outliers"),
-    ("GET", "/api/usage/runs"),
-    ("GET", "/api/usage/timeline"),
     ("GET", "/api/workers"),
 ];
 

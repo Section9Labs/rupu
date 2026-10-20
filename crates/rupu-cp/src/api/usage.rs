@@ -33,8 +33,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/usage/runs", get(get_usage_runs))
 }
 
-#[derive(Debug, Deserialize)]
-struct UsageQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UsageQuery {
     since: Option<String>,
     until: Option<String>,
     group_by: Option<String>,
@@ -1026,8 +1026,8 @@ struct UsageTimelineBucket {
     pricing_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TimelineQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct TimelineQuery {
     since: Option<String>,
     until: Option<String>,
     bucket: Option<String>,
@@ -1221,8 +1221,8 @@ struct UsageRunRow {
     pricing_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct UsageRunsQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct UsageRunsQuery {
     since: Option<String>,
     until: Option<String>,
     workspace_id: Option<String>,

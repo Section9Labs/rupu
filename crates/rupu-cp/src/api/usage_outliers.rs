@@ -39,8 +39,8 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/usage/outliers", get(get_usage_outliers))
 }
 
-#[derive(Debug, Deserialize)]
-struct OutliersQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct OutliersQuery {
     since: Option<String>,
     until: Option<String>,
     /// `?customer=<slug>|none` — candidates and baselines from that

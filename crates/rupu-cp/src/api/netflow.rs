@@ -356,8 +356,8 @@ async fn get_netflow_index(
 
 /// `GET /api/netflow/latest?scope=` — scope is `project:<id>` or absent
 /// for global.
-#[derive(Debug, Deserialize)]
-pub struct LatestQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct LatestQuery {
     pub scope: Option<String>,
 }
 
@@ -2313,8 +2313,8 @@ async fn get_global_netflow(
     Ok(Json(resp))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GraphQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GraphQuery {
     /// `run:<id>`, `project:<id>`, or absent for global. An unrecognized
     /// prefix (or any other value that isn't `run:`/`project:`) is NOT a
     /// 400 — it falls through to the same global branch as an absent
@@ -2348,8 +2348,8 @@ pub struct GraphQuery {
 /// malformed value produces the NAMED 400 built by [`parse_time_range`]
 /// instead of Axum's generic query-deserialization-failure 400 (which would
 /// not name the accepted format or which parameter was at fault).
-#[derive(Debug, Default, Deserialize)]
-pub struct TimeRangeQuery {
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct TimeRangeQuery {
     pub from: Option<String>,
     pub to: Option<String>,
     /// Cross-filter params for the explorer's table (and the explorer
@@ -2563,8 +2563,8 @@ async fn get_netflow_graph(
 /// Same shape as [`GraphQuery`] plus the four cross-filter params — its
 /// own struct rather than `#[serde(flatten)]` composition for the same
 /// `serde_urlencoded` reason documented there.
-#[derive(Debug, Deserialize)]
-pub struct ExplorerQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ExplorerQuery {
     /// `run:<id>`, `project:<id>`, or absent for global — same permissive
     /// fallthrough as [`GraphQuery::scope`].
     pub scope: Option<String>,
