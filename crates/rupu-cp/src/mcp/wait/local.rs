@@ -66,18 +66,22 @@ pub(super) enum Located {
     Store(Arc<RunStore>),
     /// The autoflow history knows the run, but it never persisted anything.
     Unpersisted,
+    /// A registered remote host has it: it is watched there.
+    Host(String),
 }
 
-/// The run each run condition names, resolved through
-/// [`resolve_run_location`] (a project-local run answers like a global one).
-/// An error names the run that has none.
+/// The run each local run condition names, resolved through
+/// [`resolve_run_location`] (a project-local run answers like a global one;
+/// a run a registered host has is [`Located::Host`]). An error names the run
+/// that has none.
 pub(super) async fn locate(
     state: &AppState,
     watch: &[Condition],
 ) -> Result<HashMap<String, Located>, String> {
     let mut found: HashMap<String, Located> = HashMap::new();
     for c in watch {
-        if !matches!(c.kind, Kind::Settled | Kind::Gate | Kind::Events { .. }) {
+        let is_run = matches!(c.kind, Kind::Settled | Kind::Gate | Kind::Events { .. });
+        if !is_run || c.host.is_some() {
             continue;
         }
         let run = c.target.as_str();
@@ -87,11 +91,7 @@ pub(super) async fn locate(
             RunLocation::ProjectLocal { path } => {
                 Located::Store(Arc::new(RunStore::new(path.join(".rupu").join("runs"))))
             }
-            RunLocation::Host { host_id } => {
-                return Err(format!(
-                "run `{run}` lives on host `{host_id}`: wait on a remote host is not supported yet"
-            ))
-            }
+            RunLocation::Host { host_id } => Located::Host(host_id),
             RunLocation::Unpersisted { .. } if unpersisted_ok => Located::Unpersisted,
             RunLocation::Unpersisted { .. } => {
                 return Err(format!(
@@ -133,7 +133,7 @@ impl WaitSource {
     ) -> Result<(), String> {
         super::turns::check(&self.state, watch, memo, fired).await?;
         for (i, c) in watch.iter().enumerate() {
-            if fired.contains_key(&i) {
+            if fired.contains_key(&i) || c.host.is_some() {
                 continue;
             }
             let Some(at) = located.get(&c.target) else {

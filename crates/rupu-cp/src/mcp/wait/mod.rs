@@ -6,14 +6,16 @@
 //!
 //! Cursor ids are the line numbers the CP's SSE streams send as `id:`
 //! ([`NumberedTail`]), so an agent mixing `wait` with the streams never sees a
-//! gap or a repeat.
+//! gap or a repeat. A run on a registered host is read from the host's event
+//! stream, and its gates and a remote message space are polled ([`remote`]).
 
 mod findings;
 mod local;
 mod parse;
+mod remote;
 mod turns;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,6 +31,7 @@ use crate::transcript_tail::{count_numbered, NumberedTail};
 
 use local::{catch_up, locate, matching, Feed, Line, Located, Tail};
 use parse::{input_schema, parse, Condition, CursorValue, Kind, Request};
+use remote::{Remote, REMOTE_POLL};
 
 /// The timeout when a call names none.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30_000);
@@ -86,7 +89,9 @@ state already holds; otherwise when a condition fires, a watched stream has new 
 timeout. For `session_turn` pass the `run` id `sessions.send` returned; without it the call waits \
 for the session's active turn, or the next one if it is idle. An error in any one condition (a \
 run, session or turn that doesn't appear within 10 s) fails the whole call. Pass the returned \
-`cursor` back to resume where the last call left off.";
+`cursor` back to resume where the last call left off. With `host`, a run's events come from that \
+host's event stream and its gates and a message space are polled every 2 s; a host that stops \
+answering after its first answer is retried and named in `warnings`.";
 
 #[async_trait]
 impl ToolSource for WaitSource {
@@ -106,31 +111,58 @@ impl ToolSource for WaitSource {
 }
 
 impl WaitSource {
-    async fn wait(&self, req: Request) -> ToolResult {
+    async fn wait(&self, mut req: Request) -> ToolResult {
+        let deadline = Instant::now() + req.timeout;
         if let Err(e) = findings::validate(&self.state, &req.watch).await {
             return ToolResult::Error(e);
         }
-        // Every run condition's run exists, wherever it lives.
+        // Every local run condition's run exists, wherever it lives.
         let located = match locate(&self.state, &req.watch).await {
             Ok(l) => l,
             Err(e) => return ToolResult::Error(e),
         };
-        // A string cursor value names a remote message space; every source
-        // here is local.
-        if let Some((k, _)) = req
-            .cursor
-            .iter()
-            .find(|(_, v)| matches!(v, CursorValue::Id(_)))
-        {
-            return ToolResult::Error(format!(
-                "`cursor.{k}` must be a non-negative integer: a string cursor is only for a remote host's message space"
-            ));
+        // A run a registered host has is watched there, as if `host` named it.
+        for c in &mut req.watch {
+            if c.host.is_none()
+                && matches!(c.kind, Kind::Settled | Kind::Gate | Kind::Events { .. })
+            {
+                if let Some(Located::Host(h)) = located.get(&c.target) {
+                    c.on_host(h.clone());
+                }
+            }
         }
+        // A string cursor value names a remote message space, and a remote
+        // message space's cursor is a string.
+        let remote_spaces: HashSet<&str> = req
+            .watch
+            .iter()
+            .filter(|c| c.host.is_some() && matches!(c.kind, Kind::Messages { .. }))
+            .map(|c| c.source.as_str())
+            .collect();
+        for (k, v) in &req.cursor {
+            match (v, remote_spaces.contains(k.as_str())) {
+                (CursorValue::Id(_), false) => {
+                    return ToolResult::Error(format!(
+                        "`cursor.{k}` must be a non-negative integer: a string cursor is only for a remote host's message space"
+                    ))
+                }
+                (CursorValue::Line(_), true) => {
+                    return ToolResult::Error(format!(
+                        "`cursor.{k}` must be a string: a remote message space's cursor is the id of the last message seen"
+                    ))
+                }
+                _ => {}
+            }
+        }
+        let mut remote = match Remote::new(&self.state, &req.watch) {
+            Ok(r) => r,
+            Err(e) => return ToolResult::Error(e),
+        };
 
-        // Each source's feed.
+        // Each local source's feed.
         let mut feeds: Vec<(String, Feed)> = Vec::new();
         for c in &req.watch {
-            if feeds.iter().any(|(s, _)| *s == c.source) {
+            if c.host.is_some() || feeds.iter().any(|(s, _)| *s == c.source) {
                 continue;
             }
             let feed = match &c.kind {
@@ -184,17 +216,17 @@ impl WaitSource {
             .collect();
         let has_state = req.watch.iter().any(|c| !c.kind.collects());
 
-        let mut got = Got {
-            cursor: req
-                .cursor
-                .iter()
-                .filter_map(|(k, v)| match v {
-                    CursorValue::Line(n) => Some((k.clone(), *n)),
-                    CursorValue::Id(_) => None,
-                })
-                .collect(),
-            ..Got::default()
-        };
+        let mut got = Got::default();
+        for (k, v) in &req.cursor {
+            match v {
+                CursorValue::Line(n) => {
+                    got.cursor.insert(k.clone(), *n);
+                }
+                CursorValue::Id(id) => {
+                    got.ids.insert(k.clone(), id.clone());
+                }
+            }
+        }
 
         // State first, then what is already on disk past the cursor: a run
         // seen settled has written its last line, so the catch-up after it
@@ -210,7 +242,11 @@ impl WaitSource {
         if let Err(e) = catch_up(&req.watch, &feeds, &collects, &by_source, &mut got).await {
             return ToolResult::Error(e);
         }
+        if let Err(e) = remote.start(&req.watch, &mut got, deadline).await {
+            return ToolResult::Error(e);
+        }
         if got.any() {
+            remote.drain(&req.watch, &mut got, deadline).await;
             return got.finish(&req.watch);
         }
 
@@ -245,18 +281,28 @@ impl WaitSource {
         let tailing = !tails.is_empty();
         let mut lines = futures_util::stream::select_all(tails);
 
-        let deadline = Instant::now() + req.timeout;
         let mut next_check = Instant::now() + RECHECK_EVERY;
+        let mut next_poll = Instant::now() + REMOTE_POLL;
         let mut last_check = Instant::now();
         loop {
-            tokio::select! {
+            let wake_at = if remote.is_empty() {
+                next_check.min(deadline)
+            } else {
+                next_check.min(next_poll).min(deadline)
+            };
+            let wake = tokio::select! {
                 line = async {
                     if tailing {
                         lines.next().await
                     } else {
                         std::future::pending().await
                     }
-                } => {
+                } => Wake::Line(line),
+                (src, frame) = remote.next_frame() => Wake::Frame(src, frame),
+                _ = tokio::time::sleep_until(wake_at) => Wake::Tick,
+            };
+            match wake {
+                Wake::Line(line) => {
                     let Some((src, line)) = line else { break };
                     if !line.send() {
                         continue;
@@ -281,23 +327,40 @@ impl WaitSource {
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(next_check.min(deadline)) => {
+                Wake::Frame(src, frame) => {
+                    remote
+                        .on_frame(src, frame, &req.watch, &mut got, deadline)
+                        .await;
+                    if got.any() {
+                        break;
+                    }
+                }
+                Wake::Tick => {
                     if Instant::now() >= deadline {
                         break;
                     }
-                    if has_state {
-                        last_check = Instant::now();
-                        if let Err(e) = self
-                            .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
-                            .await
-                        {
-                            return ToolResult::Error(e);
-                        }
+                    if !remote.is_empty() && Instant::now() >= next_poll {
+                        remote.poll(&req.watch, &mut got, deadline).await;
+                        next_poll = Instant::now() + REMOTE_POLL;
                         if got.any() {
                             break;
                         }
                     }
-                    next_check = Instant::now() + RECHECK_EVERY;
+                    if Instant::now() >= next_check {
+                        if has_state {
+                            last_check = Instant::now();
+                            if let Err(e) = self
+                                .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
+                                .await
+                            {
+                                return ToolResult::Error(e);
+                            }
+                            if got.any() {
+                                break;
+                            }
+                        }
+                        next_check = Instant::now() + RECHECK_EVERY;
+                    }
                 }
             }
         }
@@ -309,9 +372,19 @@ impl WaitSource {
             if let Err(e) = catch_up(&req.watch, &feeds, &collects, &by_source, &mut got).await {
                 return ToolResult::Error(e);
             }
+            remote.drain(&req.watch, &mut got, deadline).await;
         }
         got.finish(&req.watch)
     }
+}
+
+/// What woke the wait loop.
+// Moved once per wake-up; boxing the line would allocate for every one.
+#[allow(clippy::large_enum_variant)]
+enum Wake {
+    Line(Option<(usize, Line)>),
+    Frame(usize, Option<std::io::Result<crate::sse::RunFrame>>),
+    Tick,
 }
 
 impl WaitSource {
@@ -338,7 +411,13 @@ struct Got {
     events: Vec<Value>,
     /// Lines taken per collecting condition.
     counts: BTreeMap<usize, u64>,
+    /// Per source: the last line id read.
     cursor: BTreeMap<String, u64>,
+    /// Per remote message space: the id of the last message read.
+    ids: BTreeMap<String, String>,
+    /// Per source: the last failure of a remote request after its first
+    /// answer.
+    warnings: BTreeMap<String, String>,
 }
 
 impl Got {
@@ -368,11 +447,26 @@ impl Got {
             .into_iter()
             .map(|(i, detail)| json!({"index": i, "kind": watch[i].kind.name(), "detail": detail}))
             .collect();
-        ToolResult::Json(json!({
+        let mut cursor: serde_json::Map<String, Value> = self
+            .cursor
+            .into_iter()
+            .map(|(k, n)| (k, json!(n)))
+            .collect();
+        cursor.extend(self.ids.into_iter().map(|(k, id)| (k, json!(id))));
+        let mut out = json!({
             "fired": fired,
             "events": self.events,
-            "cursor": self.cursor,
+            "cursor": cursor,
             "timed_out": timed_out,
-        }))
+        });
+        if !self.warnings.is_empty() {
+            let warnings: Vec<String> = self
+                .warnings
+                .into_iter()
+                .map(|(source, e)| format!("{source}: {e}"))
+                .collect();
+            out["warnings"] = json!(warnings);
+        }
+        ToolResult::Json(out)
     }
 }

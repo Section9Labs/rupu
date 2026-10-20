@@ -63,8 +63,19 @@ pub(super) struct Condition {
     /// The run id, message root id, agentiflow id or session id.
     pub(super) target: String,
     /// `run:<id>`, `messages:<root>` or `agentiflow:<id>`; `agent_run:<id>` and
-    /// `session:<id>` for the conditions that tail nothing.
+    /// `session:<id>` for the conditions that tail nothing. On a remote host:
+    /// `run:<id>@<host>` / `messages:<root>@<host>`.
     pub(super) source: String,
+    /// The remote host it is watched on; `None` for this one.
+    pub(super) host: Option<String>,
+}
+
+impl Condition {
+    /// Watch it on `host`: its source names the host.
+    pub(super) fn on_host(&mut self, host: String) {
+        self.source = format!("{}@{host}", self.source);
+        self.host = Some(host);
+    }
 }
 
 pub(super) struct Request {
@@ -74,7 +85,7 @@ pub(super) struct Request {
 }
 
 pub(super) fn input_schema() -> Value {
-    let host = json!({"type": "string", "description": "`local` (the default); remote hosts are not served yet."});
+    let host = json!({"type": "string", "description": "`local` (the default), or a registered host's id. On a remote host the run's events come from its event stream; its gates and a message space are polled every 2 s."});
     let run = json!({"type": "string", "description": "A workflow run id."});
     json!({
         "type": "object",
@@ -283,16 +294,17 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
     let mut o = entries(c, allowed, &what)?;
     // (The local-only kinds don't list `host` among their keys, so a `host`
     // on them is already an unknown argument.)
-    match o.remove("host") {
-        None => {}
-        Some(Value::String(h)) if h == "local" => {}
-        Some(Value::String(_)) => {
-            return Err(format!(
-                "{what}: wait on a remote host is not supported yet"
-            ));
+    let host = match o.remove("host") {
+        None => None,
+        Some(Value::String(h)) if h == "local" => None,
+        Some(Value::String(h)) if !h.is_empty() => {
+            if let Some(why) = crate::path_guard::unsafe_segment(&h) {
+                return Err(format!("{what}: `{h}` is not a valid host id ({why})"));
+            }
+            Some(h)
         }
-        Some(_) => return Err(format!("{what}: `host` must be a string")),
-    }
+        Some(_) => return Err(format!("{what}: `host` must be a non-empty string")),
+    };
     if kind == "findings" {
         return findings_condition(o, &what);
     }
@@ -365,11 +377,16 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         Kind::SessionTurn { .. } => format!("session:{target}"),
         _ => format!("run:{target}"),
     };
-    Ok(Condition {
+    let mut c = Condition {
         kind,
         target,
         source,
-    })
+        host: None,
+    };
+    if let Some(h) = host {
+        c.on_host(h);
+    }
+    Ok(c)
 }
 
 /// A `findings` condition. Its `q` is checked here, so a bad one fails the
@@ -402,6 +419,7 @@ fn findings_condition(mut o: Map<String, Value>, what: &str) -> Result<Condition
         source: format!("findings:{}", project.as_deref().unwrap_or("*")),
         target: project.clone().unwrap_or_default(),
         kind: Kind::Findings { project, run, q },
+        host: None,
     })
 }
 
@@ -429,6 +447,16 @@ mod tests {
         .unwrap();
         assert_eq!(r.watch[0].source, "run:run_a");
         assert_eq!(r.watch[1].source, "messages:ses_b");
+        assert_eq!(r.watch[1].host, None);
+        let remote = parse(json!({"watch": [
+            {"kind": "run_events", "run": "run_a", "host": "host_x"},
+            {"kind": "messages", "root": "ses_b", "host": "local"}
+        ]}))
+        .unwrap();
+        assert_eq!(remote.watch[0].source, "run:run_a@host_x");
+        assert_eq!(remote.watch[0].host.as_deref(), Some("host_x"));
+        assert_eq!(remote.watch[1].source, "messages:ses_b");
+        assert_eq!(remote.watch[1].host, None);
         assert_eq!(
             r.watch[1].kind,
             Kind::Messages {

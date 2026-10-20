@@ -49,6 +49,104 @@ impl RunFrame {
     }
 }
 
+/// The frames of a run event stream as [`RunFrame::to_sse_bytes`] writes them
+/// (and axum's `Sse` sends them: keep-alive comments between frames).
+/// Partial frames across chunks are buffered; an unknown event name is
+/// skipped, as is an event frame without a numeric `id`. A byte-stream error
+/// is yielded, and ends the stream; so does the end of the bytes, dropping a
+/// frame left incomplete.
+pub fn parse_run_frames(
+    bytes: crate::host::connector::EventByteStream,
+) -> impl Stream<Item = std::io::Result<RunFrame>> + Send {
+    struct St {
+        bytes: crate::host::connector::EventByteStream,
+        buf: Vec<u8>,
+        /// The fields of the frame being read.
+        event: String,
+        id: Option<String>,
+        data: Option<String>,
+        done: bool,
+    }
+    impl St {
+        /// The frame a blank line completes, if it is one we serve.
+        fn dispatch(&mut self) -> Option<RunFrame> {
+            let event = std::mem::take(&mut self.event);
+            let (id, data) = (self.id.take(), self.data.take());
+            match event.as_str() {
+                "end" => Some(RunFrame::End),
+                "" | "message" => Some(RunFrame::Event {
+                    id: id?.trim().parse().ok()?,
+                    json: data?,
+                }),
+                _ => None,
+            }
+        }
+
+        /// Read one complete line out of the buffer: the frame it completes.
+        /// `None` when no complete line is buffered.
+        fn line(&mut self) -> Option<Option<RunFrame>> {
+            let end = self.buf.iter().position(|b| *b == b'\n')?;
+            let mut line: Vec<u8> = self.buf.drain(..=end).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                return Some(self.dispatch());
+            }
+            let line = String::from_utf8_lossy(&line);
+            if line.starts_with(':') {
+                return Some(None);
+            }
+            let (field, value) = match line.split_once(':') {
+                Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+                None => (line.as_ref(), ""),
+            };
+            match field {
+                "event" => self.event = value.to_string(),
+                "id" => self.id = Some(value.to_string()),
+                "data" => match &mut self.data {
+                    Some(d) => {
+                        d.push('\n');
+                        d.push_str(value);
+                    }
+                    None => self.data = Some(value.to_string()),
+                },
+                _ => {}
+            }
+            Some(None)
+        }
+    }
+    let st = St {
+        bytes,
+        buf: Vec::new(),
+        event: String::new(),
+        id: None,
+        data: None,
+        done: false,
+    };
+    futures_util::stream::unfold(st, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            while let Some(frame) = st.line() {
+                if let Some(frame) = frame {
+                    return Some((Ok(frame), st));
+                }
+            }
+            match st.bytes.next().await {
+                Some(Ok(chunk)) => st.buf.extend_from_slice(&chunk),
+                Some(Err(e)) => {
+                    st.done = true;
+                    return Some((Err(e), st));
+                }
+                None => return None,
+            }
+        }
+    })
+}
+
 /// The `Last-Event-ID` a reconnecting client sent: the id of the last event
 /// it saw, so the stream resumes after it. `0` (replay from the start) when
 /// absent or not a number.
@@ -591,6 +689,68 @@ mod tests {
         store.update(&record).expect("update status");
         tokio::time::sleep(Duration::from_secs(10)).await;
         assert_eq!(namers.lock().unwrap().cached_runs(), 0);
+    }
+
+    #[tokio::test]
+    async fn sse_frames_parse_across_chunk_boundaries() {
+        // A keep-alive comment first (as axum sends it), then three chunks
+        // that each end mid-line.
+        let wire = format!(
+            ": keep-alive\n\n{}{}{}",
+            RunFrame::Event {
+                id: 1,
+                json: r#"{"type":"a"}"#.into()
+            }
+            .to_sse_bytes(),
+            RunFrame::Event {
+                id: 2,
+                json: r#"{"type":"b"}"#.into()
+            }
+            .to_sse_bytes(),
+            RunFrame::End.to_sse_bytes(),
+        );
+        let (a, rest) = wire.split_at(wire.find("data").unwrap() + 3);
+        let (b, c) = rest.split_at(rest.find("id: 2").unwrap() + 2);
+        let chunks: Vec<std::io::Result<bytes::Bytes>> = [a, b, c]
+            .into_iter()
+            .map(|s| Ok(bytes::Bytes::from(s.to_string())))
+            .collect();
+        let frames: Vec<RunFrame> = parse_run_frames(Box::pin(futures_util::stream::iter(chunks)))
+            .map(|f| f.unwrap())
+            .collect()
+            .await;
+        assert_eq!(
+            frames,
+            vec![
+                RunFrame::Event {
+                    id: 1,
+                    json: r#"{"type":"a"}"#.into()
+                },
+                RunFrame::Event {
+                    id: 2,
+                    json: r#"{"type":"b"}"#.into()
+                },
+                RunFrame::End,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_event_name_is_skipped_and_a_partial_tail_dropped() {
+        let wire = "event: progress\nid: 9\ndata: {}\n\nid: 3\ndata: {\"x\":1}\n\nid: 4\ndata: {";
+        let frames: Vec<RunFrame> = parse_run_frames(Box::pin(futures_util::stream::iter([Ok(
+            bytes::Bytes::from_static(wire.as_bytes()),
+        )])))
+        .map(|f| f.unwrap())
+        .collect()
+        .await;
+        assert_eq!(
+            frames,
+            vec![RunFrame::Event {
+                id: 3,
+                json: r#"{"x":1}"#.into()
+            }]
+        );
     }
 
     /// Dropping the receiving side stops the coordinator: its task exits

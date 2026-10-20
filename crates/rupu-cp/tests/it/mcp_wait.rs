@@ -20,8 +20,15 @@ const RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1WAT";
 
 /// A CP over `global` serving `/mcp` (no catalog).
 async fn spawn(global: &Path) -> SocketAddr {
-    let state =
-        rupu_cp::state::AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default());
+    serve(state_of(global)).await
+}
+
+fn state_of(global: &Path) -> rupu_cp::state::AppState {
+    rupu_cp::state::AppState::new(global.to_path_buf(), rupu_config::PricingConfig::default())
+}
+
+/// `state` served with `/mcp` (no catalog).
+async fn serve(state: rupu_cp::state::AppState) -> SocketAddr {
     let server = rupu_cp::mcp::build_server(
         &state,
         &McpOpts {
@@ -420,7 +427,7 @@ async fn bad_arguments_are_refused() {
     let cases = [
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN, "host": "mini"}]}),
-            "watch[0] (`run_settled`): wait on a remote host is not supported yet",
+            "unknown host `mini`",
         ),
         (
             json!({"watch": [{"kind": "run_settled", "run": RUN}], "follow": true}),
@@ -1121,4 +1128,303 @@ async fn a_wait_row_matches_the_list_row() {
         .find(|f| f["id"] == "fnd_new")
         .unwrap();
     assert_eq!(&row, listed);
+}
+
+// ---- remote hosts ---------------------------------------------------------
+
+/// A peer CP over `global` on its own runtime and thread, so stopping it
+/// closes every connection it holds (an aborted `axum::serve` task leaves its
+/// connections' tasks running).
+struct Peer {
+    url: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Peer {
+    fn start(global: &Path) -> Self {
+        let global = global.to_path_buf();
+        let (url_tx, url_rx) = std::sync::mpsc::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let app = rupu_cp::server::router(state_of(&global), None);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                url_tx
+                    .send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let _ = stopped.await;
+            });
+            rt.shutdown_background();
+        });
+        Self {
+            url: url_rx.recv().unwrap(),
+            stop: Some(stop),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A coordinator over `global` with `peer` registered; its address and the
+/// peer's host id.
+async fn spawn_with_peer(global: &Path, peer: &Peer) -> (SocketAddr, String) {
+    let state = state_of(global);
+    let host = state.hosts.add_host("peer", &peer.url, None).unwrap();
+    (serve(state).await, host.id)
+}
+
+fn append_completed(global: &Path) {
+    let ev = Event::RunCompleted {
+        run_id: RUN.into(),
+        status: RunStatus::Completed,
+        finished_at: Utc::now(),
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(store(global).events_path(RUN))
+        .unwrap();
+    writeln!(f, "{}", serde_json::to_string(&ev).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn remote_run_events_resume_with_the_cursor() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    append_step(remote.path(), "two");
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let watch = json!([{"kind": "run_events", "run": RUN, "host": host}]);
+    let source = format!("run:{RUN}@{host}");
+
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 5000})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["events"][0]["source"], source.as_str(), "{r}");
+    assert_eq!(s["events"][1]["event"]["step_id"], "two", "{r}");
+    assert_eq!(s["cursor"], json!({ &source: 2 }), "{r}");
+    assert_eq!(s["fired"][0]["kind"], "run_events", "{r}");
+    assert!(s.get("warnings").is_none(), "{r}");
+
+    append_step(remote.path(), "three");
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": s["cursor"], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ &source: 3 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_remote_settled_run_fires() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Completed);
+    append_step(remote.path(), "one");
+    append_completed(remote.path());
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN, "host": host}],
+               "timeout_ms": 10_000}),
+    )
+    .await;
+    // The peer's stream ends 2 s after its last terminal event.
+    assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(s["fired"][0]["detail"]["status"], "completed", "{r}");
+    assert_eq!(s["timed_out"], false, "{r}");
+    // Watched for its state only: no cursor, no events.
+    assert_eq!(s["events"], json!([]), "{r}");
+    assert_eq!(s["cursor"], json!({}), "{r}");
+}
+
+#[tokio::test]
+async fn a_remote_parked_gate_fires() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut rec = super::sse::seed_run(RUN, RunStatus::AwaitingApproval);
+    rec.awaiting = vec![AwaitingGate {
+        step_id: "review".into(),
+        prompt: Some("ship it?".into()),
+        since: Utc::now(),
+        expires_at: None,
+    }];
+    store(remote.path())
+        .create(rec, "name: test\nsteps: []\n")
+        .unwrap();
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": RUN, "host": host}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let fired = &r["structuredContent"]["fired"][0];
+    assert_eq!(fired["kind"], "run_gate", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
+    assert_eq!(fired["detail"]["gates"][0]["prompt"], "ship it?", "{r}");
+}
+
+/// A run id that resolves to a host is watched there, as if `host` named it.
+#[tokio::test]
+async fn a_run_found_on_a_host_is_watched_there() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ format!("run:{RUN}@{host}"): 1 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn remote_messages_poll_with_a_string_cursor() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let bus = super::messages::workflow_run(remote.path(), RUN, RunStatus::Running);
+    let op = bus
+        .operator_send(OperatorMessage {
+            to: Address::Broadcast,
+            body: "focus".into(),
+            urgent: false,
+            via: OperatorVia::Cli,
+            viewer: None,
+            client: None,
+        })
+        .unwrap();
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let watch = json!([{"kind": "messages", "root": RUN, "host": host}]);
+    let source = format!("messages:{RUN}@{host}");
+
+    let r = wait(addr, json!({"watch": watch, "timeout_ms": 5000})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    let events = s["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1, "{r}");
+    assert_eq!(events[0]["source"], source.as_str(), "{r}");
+    assert_eq!(events[0]["id"], op.id(), "{r}");
+    assert_eq!(events[0]["event"]["body"], "focus", "{r}");
+    assert_eq!(s["fired"][0]["kind"], "messages", "{r}");
+    assert_eq!(s["cursor"], json!({ &source: op.id() }), "{r}");
+
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": s["cursor"], "timeout_ms": 300}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert_eq!(s["events"], json!([]), "{r}");
+    assert_eq!(s["cursor"], json!({ &source: op.id() }), "{r}");
+
+    // An integer is a line number: not a remote message space's cursor.
+    let r = wait(
+        addr,
+        json!({"watch": watch, "cursor": {&source: 3}, "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains(&format!("cursor.{source}")), "{r}");
+}
+
+#[tokio::test]
+async fn an_unknown_host_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    for watch in [
+        json!({"kind": "run_events", "run": RUN, "host": "host_nope"}),
+        json!({"kind": "messages", "root": RUN, "host": "host_nope"}),
+    ] {
+        let t = Instant::now();
+        let r = wait(addr, json!({"watch": [watch], "timeout_ms": 5000})).await;
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert_eq!(text_of(&r), "unknown host `host_nope`", "{r}");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_run_on_a_host_is_an_error() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    for kind in ["run_events", "run_gate"] {
+        let r = wait(
+            addr,
+            json!({"watch": [{"kind": kind, "run": "run_nope", "host": host}], "timeout_ms": 5000}),
+        )
+        .await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert_eq!(
+            text_of(&r),
+            format!("no run `run_nope` on host `{host}`"),
+            "{r}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_host_that_goes_away_mid_wait_returns_by_the_timeout_with_a_warning() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    let mut peer = Peer::start(remote.path());
+    let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
+    let t = Instant::now();
+    let pending = tokio::spawn(wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 3000}),
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    peer.stop();
+    let r = pending.await.unwrap();
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    let warnings = s["warnings"].as_array().unwrap_or_else(|| panic!("{r}"));
+    assert!(!warnings.is_empty(), "{r}");
+    let source = format!("run:{RUN}@{host}: ");
+    assert!(warnings[0].as_str().unwrap().starts_with(&source), "{r}");
 }
