@@ -5,14 +5,15 @@
 //
 // Composition: PageHeader (range + Usage →) → inbox pointer (count + link, never
 // the list) → "Last 30 days" KPI strip (type-first, Active now leads, attention
-// in red) → "Fleet" host cards → "Trends" two living charts → "Recent activity"
-// read-only feed → "Inventory" summary strip. Rendering only — every data source,
-// the per-host async load, the customer scope, and the "not reported ≠ 0" partial
-// rules are the SAME as before (`useDashboardData`, the scope helpers). The
-// pointer and the recent feed read existing run-list endpoints (no new API).
+// in red) → "Fleet" health strip (one line: live vs down + compact host chips)
+// → "Trends" two living charts → "Recent activity" read-only feed → "Inventory"
+// summary strip. Rendering only — every data source, the per-host async load, the
+// customer scope, and the "not reported ≠ 0" partial rules are the SAME as before
+// (`useDashboardData`, the scope helpers). The pointer and the recent feed read
+// existing run-list endpoints (no new API).
 //
 // Components come from the shared language (`components/ui/*`): PageHeader,
-// KpiStrip, Chart, SummaryStrip, Segmented, Skeleton. The pointer, fleet cards
+// KpiStrip, Chart, SummaryStrip, Segmented, Skeleton. The pointer, fleet strip
 // and recent-activity feed live in `components/dashboard/*`.
 
 import { useMemo, useState } from 'react';
@@ -20,7 +21,7 @@ import { Link } from 'react-router-dom';
 import { useDashboardData } from '../lib/dashboard/useDashboardData';
 import { InboxPointer } from '../components/dashboard/InboxPointer';
 import { RecentActivity } from '../components/dashboard/RecentActivity';
-import { FleetHostCards } from '../components/dashboard/FleetHostCards';
+import { FleetStrip } from '../components/dashboard/FleetStrip';
 import { PageHeader } from '../components/ui/PageHeader';
 import { KpiStrip, type KpiItem } from '../components/ui/KpiStrip';
 import { SummaryStrip, type SummaryItem } from '../components/ui/SummaryStrip';
@@ -213,7 +214,7 @@ export default function Dashboard() {
           <KpiStrip items={kpis} />
 
           <SectionLabel>Fleet</SectionLabel>
-          <FleetHostCards hosts={hosts} />
+          <FleetStrip hosts={hosts} />
 
           <SectionLabel>Trends</SectionLabel>
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
