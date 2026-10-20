@@ -5,12 +5,14 @@
 // tabs.
 
 import { useEffect, useState } from 'react';
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft, ShieldCheck, ShieldOff } from 'lucide-react';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { ShieldCheck, ShieldOff } from 'lucide-react';
 import CoverageCatalogTab from '../components/coverage/CoverageCatalogTab';
 import CoverageAuditTab from '../components/coverage/CoverageAuditTab';
 import CoverageGapTab from '../components/coverage/CoverageGapTab';
 import CoverageDiffTab from '../components/coverage/CoverageDiffTab';
+import { PageHeader } from '../components/ui/PageHeader';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import {
   api,
@@ -69,10 +71,8 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
   if (error) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
+        <PageHeader back={{ label: 'Coverage', to: '/coverage' }} title="Coverage" />
+        <ErrorBanner className="mt-4">{error}</ErrorBanner>
       </div>
     );
   }
@@ -80,8 +80,8 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
   if (!detail) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4"><Spinner label="Loading…" /></div>
+        <PageHeader back={{ label: 'Coverage', to: '/coverage' }} title="Coverage" />
+        <div className="mt-6"><Spinner label="Loading…" /></div>
       </div>
     );
   }
@@ -128,22 +128,12 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
 
   return (
     <div className="p-8">
-      <BackLink />
-
-      {/* Header */}
-      <header className="mt-3 flex items-start gap-4">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-2xl font-semibold text-ink break-all">{detail.target_id}</h1>
-            <CatalogBadge present={detail.has_catalog} />
-          </div>
-          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-ui text-ink-dim">
-            <span>{detail.assertions.length} assertion{detail.assertions.length !== 1 ? 's' : ''}</span>
-            <span>{sortedFindings.length} finding{sortedFindings.length !== 1 ? 's' : ''}</span>
-            <span>{files.length} file{files.length !== 1 ? 's' : ''} touched</span>
-          </div>
-        </div>
-      </header>
+      <PageHeader
+        back={{ label: 'Coverage', to: '/coverage' }}
+        title={<span className="break-all">{detail.target_id}</span>}
+        subtitle={`${detail.assertions.length} assertion${detail.assertions.length !== 1 ? 's' : ''} · ${sortedFindings.length} finding${sortedFindings.length !== 1 ? 's' : ''} · ${files.length} file${files.length !== 1 ? 's' : ''} touched`}
+        actions={<CatalogBadge present={detail.has_catalog} />}
+      />
 
       {/* Tab bar */}
       <nav className="mt-4 flex gap-1 border-b border-border">
@@ -521,14 +511,3 @@ function StatusCount({
   );
 }
 
-function BackLink() {
-  return (
-    <Link
-      to="/coverage"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Coverage
-    </Link>
-  );
-}

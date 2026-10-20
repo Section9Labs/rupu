@@ -13,8 +13,8 @@
 // calls also include the host param.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { Archive, ArrowLeft, FileText, GitBranch, GitFork, ListOrdered, MessagesSquare, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
+import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { Archive, FileText, GitBranch, GitFork, ListOrdered, MessagesSquare, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
@@ -28,7 +28,11 @@ import {
 } from '../lib/api';
 import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { TabBar, TabButton } from '../components/TabBar';
+
+const BACK = { label: 'Runs', to: '/runs' };
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
@@ -794,10 +798,8 @@ export default function RunDetail() {
   if (loadError) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {loadError}
-        </div>
+        <PageHeader back={BACK} title="Run" />
+        <ErrorBanner className="mt-4">{loadError}</ErrorBanner>
       </div>
     );
   }
@@ -806,7 +808,7 @@ export default function RunDetail() {
   if (!run || !model) {
     return (
       <div className="p-8">
-        <BackLink />
+        <PageHeader back={BACK} title="Run" />
         <div className="mt-4 text-sm text-ink-dim">Loading run…</div>
       </div>
     );
@@ -833,126 +835,123 @@ export default function RunDetail() {
     // the tab panel into a sliver. The panel below gets its own generous height.
     <div className="flex min-h-full flex-col">
       <div className="px-8 pt-6">
-        <BackLink />
-        <header className="mt-3 flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-3">
-              <h1 className="truncate text-2xl font-semibold text-ink">{run.workflow_name}</h1>
-              {run.codename && (
-                <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
+        <PageHeader
+          back={BACK}
+          title={run.workflow_name}
+          actions={
+            <>
+              {isRunning && (
+                <div className="flex flex-col items-end gap-1">
+                  <div className="flex items-center gap-2">
+                    {isPausable && (
+                      <Button
+                        variant="secondary"
+                        onClick={() => void onPause()}
+                        disabled={pausePending}
+                        aria-label="Pause run"
+                        className="gap-1.5"
+                      >
+                        <Pause size={14} /> {pausePending ? 'Pausing…' : 'Pause'}
+                      </Button>
+                    )}
+                    <Button
+                      variant="danger-outline"
+                      onClick={onCancel}
+                      disabled={cancelPending}
+                      aria-label="Cancel run"
+                    >
+                      {cancelPending ? 'Cancelling…' : 'Cancel'}
+                    </Button>
+                  </div>
+                  {pauseError && (
+                    <p className="text-note font-medium text-err" role="alert">
+                      {pauseError}
+                    </p>
+                  )}
+                  {cancelError && (
+                    <p className="text-note font-medium text-err" role="alert">
+                      {cancelError}
+                    </p>
+                  )}
+                </div>
               )}
-              <StatusPill status={effectiveStatus} />
-              <RunCustomerChip customer={run.customer} derived={run.customer_derived} />
-              {host && host !== 'local' && (
-                <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
-                  {host}
-                </span>
+              {!isRunning && (
+                <div className="flex flex-col items-end gap-1">
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="secondary"
+                      onClick={() => void onArchive()}
+                      disabled={actionPending}
+                      className="gap-1.5"
+                    >
+                      <Archive size={14} /> Archive
+                    </Button>
+                    <Button
+                      variant="danger-outline"
+                      onClick={() => void onDelete()}
+                      disabled={actionPending}
+                      className="gap-1.5"
+                    >
+                      <Trash2 size={14} /> Delete
+                    </Button>
+                  </div>
+                  {actionError && (
+                    <p role="alert" className="text-ui font-medium text-err">
+                      {actionError}
+                    </p>
+                  )}
+                </div>
               )}
-            </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
-              <span className="font-mono">{run.id}</span>
-              <span>started {absoluteTime(run.started_at)}</span>
-              {run.finished_at && <span>finished {absoluteTime(run.finished_at)}</span>}
-            </div>
-            {displayUsage && (
-              <div className="mt-1.5 flex items-center gap-4 text-xs text-ink-dim tabular-nums">
-                <span><span className="text-ink-mute">in</span> {formatTokens(displayUsage.input_tokens)}</span>
-                <span><span className="text-ink-mute">out</span> {formatTokens(displayUsage.output_tokens)}</span>
-                {displayUsage.cached_tokens > 0 && (
-                  <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
-                )}
-                {(displayUsage.cache_write_tokens ?? 0) > 0 && (
-                  <span>
-                    <span className="text-ink-mute">cache write</span> {formatTokens(displayUsage.cache_write_tokens ?? 0)}
-                  </span>
-                )}
-                <span
-                  title={
-                    displayUsage.partial
-                      ? 'Some transcripts were not readable on this CP (remote host not yet mirrored)'
-                      : undefined
-                  }
-                >
-                  <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
-                  {formatTokens(displayUsage.total_tokens)}
-                </span>
-                <span className="inline-flex items-center gap-1 font-medium text-ink">
-                  <PricingErrorMark error={displayUsage.pricing_error} />
-                  {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
-                </span>
-              </div>
+            </>
+          }
+        />
+        <div className="mt-2 flex flex-wrap items-center gap-3">
+          {run.codename && (
+            <CrewChip crew={parseCodename(run.codename).crew} derived={run.codename_derived} />
+          )}
+          <StatusPill status={effectiveStatus} />
+          <RunCustomerChip customer={run.customer} derived={run.customer_derived} />
+          {host && host !== 'local' && (
+            <span className="rounded bg-info-bg px-1.5 py-0.5 text-note font-medium text-info ring-1 ring-info/30 font-mono">
+              {host}
+            </span>
+          )}
+        </div>
+        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
+          <span className="font-mono">{run.id}</span>
+          <span>started {absoluteTime(run.started_at)}</span>
+          {run.finished_at && <span>finished {absoluteTime(run.finished_at)}</span>}
+        </div>
+        {displayUsage && (
+          <div className="mt-1.5 flex items-center gap-4 text-xs text-ink-dim tabular-nums">
+            <span><span className="text-ink-mute">in</span> {formatTokens(displayUsage.input_tokens)}</span>
+            <span><span className="text-ink-mute">out</span> {formatTokens(displayUsage.output_tokens)}</span>
+            {displayUsage.cached_tokens > 0 && (
+              <span><span className="text-ink-mute">cached</span> {formatTokens(displayUsage.cached_tokens)}</span>
             )}
-          </div>
-
-          {isRunning && (
-            <div className="flex shrink-0 flex-col items-end gap-1">
-              <div className="flex items-center gap-2">
-                {isPausable && (
-                  <Button
-                    variant="secondary"
-                    onClick={() => void onPause()}
-                    disabled={pausePending}
-                    aria-label="Pause run"
-                    className="gap-1.5"
-                  >
-                    <Pause size={14} /> {pausePending ? 'Pausing…' : 'Pause'}
-                  </Button>
-                )}
-                <Button
-                  variant="danger-outline"
-                  onClick={onCancel}
-                  disabled={cancelPending}
-                  aria-label="Cancel run"
-                >
-                  {cancelPending ? 'Cancelling…' : 'Cancel'}
-                </Button>
-              </div>
-              {pauseError && (
-                <p className="text-note font-medium text-err" role="alert">
-                  {pauseError}
-                </p>
-              )}
-              {cancelError && (
-                <p className="text-note font-medium text-err" role="alert">
-                  {cancelError}
-                </p>
-              )}
-            </div>
-          )}
-          {!isRunning && (
-            <div className="flex shrink-0 flex-col items-end gap-1">
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="secondary"
-                  onClick={() => void onArchive()}
-                  disabled={actionPending}
-                  className="gap-1.5"
-                >
-                  <Archive size={14} /> Archive
-                </Button>
-                <Button
-                  variant="danger-outline"
-                  onClick={() => void onDelete()}
-                  disabled={actionPending}
-                  className="gap-1.5"
-                >
-                  <Trash2 size={14} /> Delete
-                </Button>
-              </div>
-              {actionError && (
-                <p role="alert" className="text-ui font-medium text-err">
-                  {actionError}
-                </p>
-              )}
-            </div>
-          )}
-        </header>
-
-        {run.error_message && (
-          <div className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-            {run.error_message}
+            {(displayUsage.cache_write_tokens ?? 0) > 0 && (
+              <span>
+                <span className="text-ink-mute">cache write</span> {formatTokens(displayUsage.cache_write_tokens ?? 0)}
+              </span>
+            )}
+            <span
+              title={
+                displayUsage.partial
+                  ? 'Some transcripts were not readable on this CP (remote host not yet mirrored)'
+                  : undefined
+              }
+            >
+              <span className="text-ink-mute">total</span> {displayUsage.partial ? '≥' : ''}
+              {formatTokens(displayUsage.total_tokens)}
+            </span>
+            <span className="inline-flex items-center gap-1 font-medium text-ink">
+              <PricingErrorMark error={displayUsage.pricing_error} />
+              {formatCost(displayUsage.cost_usd)}{displayUsage.cost_usd !== null && !displayUsage.priced ? '*' : ''}
+            </span>
           </div>
         )}
+
+        {run.error_message && <ErrorBanner className="mt-3">{run.error_message}</ErrorBanner>}
 
         <RunWarningsBanner warnings={warnings} />
 
@@ -1459,14 +1458,3 @@ export default function RunDetail() {
   );
 }
 
-function BackLink() {
-  return (
-    <Link
-      to="/runs"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Runs
-    </Link>
-  );
-}

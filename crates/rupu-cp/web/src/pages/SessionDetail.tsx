@@ -25,6 +25,7 @@ import UsageChip from '../components/UsageChip';
 import { AgentName } from '../components/codename/AgentName';
 import { memberLabel } from '../lib/codename';
 import { Button } from '../components/ui/Button';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
 import SessionConversation from '../components/session/SessionConversation';
@@ -289,9 +290,7 @@ export default function SessionDetailPage() {
     return (
       <div className="p-8">
         <BackLink />
-        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {sessionError}
-        </div>
+        <ErrorBanner className="mt-4">{sessionError}</ErrorBanner>
       </div>
     );
   }
@@ -395,12 +394,9 @@ export default function SessionDetailPage() {
 
         {/* Session error banner — only shown when idle/terminal, never while a turn is in flight. */}
         {!active && (session.status === 'failed' || session.last_error) && (
-          <div
-            role="alert"
-            className="mt-2 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-ui text-err"
-          >
+          <ErrorBanner className="mt-2 px-3 py-2 text-ui">
             {session.last_error ?? 'Session failed.'}
-          </div>
+          </ErrorBanner>
         )}
 
         {/* Secondary: collapsed details (usage chart + identity fields). */}
@@ -514,12 +510,7 @@ export default function SessionDetailPage() {
           />
 
           {sendError && (
-            <div
-              role="alert"
-              className="mt-2 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-sm text-err"
-            >
-              {sendError}
-            </div>
+            <ErrorBanner className="mt-2 px-3 py-2">{sendError}</ErrorBanner>
           )}
 
           <div className="mt-2 flex items-center justify-between gap-3">

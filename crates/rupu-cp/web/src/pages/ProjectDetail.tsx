@@ -30,6 +30,8 @@ import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
 import { KpiStrip, type KpiItem } from '../components/ui/KpiStrip';
 import { Skeleton } from '../components/ui/Skeleton';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
@@ -124,22 +126,21 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   if (notFound) {
     return (
       <div className="p-8">
-        <div className="rounded-xl border border-dashed border-border bg-panel/50 py-16 flex flex-col items-center justify-center text-center">
-          <div className="w-12 h-12 rounded-full bg-surface flex items-center justify-center mb-3">
-            <Activity size={20} className="text-ink-mute" />
-          </div>
-          <h2 className="text-sm font-medium text-ink">Project not found</h2>
-          <p className="mt-1 text-xs text-ink-dim max-w-xs">
-            No project with ID <span className="font-mono">{wsId}</span> is registered on this
-            control plane.
-          </p>
-          <Link
-            to="/projects"
-            className="mt-4 text-xs font-medium text-brand-600 hover:text-brand-700"
-          >
-            ← Back to projects
-          </Link>
-        </div>
+        <EmptyState
+          icon={<Activity size={20} />}
+          title="Project not found"
+          hint={
+            <>
+              No project with ID <span className="font-mono">{wsId}</span> is registered on this
+              control plane.
+            </>
+          }
+          action={
+            <Link to="/projects" className="text-ui font-medium text-brand-600 hover:text-brand-700">
+              ← Back to projects
+            </Link>
+          }
+        />
       </div>
     );
   }
@@ -148,9 +149,7 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   if (error) {
     return (
       <div className="p-8">
-        <div className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
+        <ErrorBanner>{error}</ErrorBanner>
       </div>
     );
   }
