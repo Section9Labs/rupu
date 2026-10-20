@@ -7,7 +7,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api } from '../../lib/api';
 import type { AutoflowRunRow, HostView } from '../../lib/api';
@@ -97,14 +97,17 @@ describe('AutoflowRuns — the Workflows column order', () => {
 
   it('renders Turns and Duration for a run; dashes, not zeros, on an attempt', async () => {
     stubPage([RUN, ATTEMPT]);
-    renderPage();
+    const { container } = renderPage();
     await waitFor(() => expect(screen.getAllByText('fix-issue').length).toBe(2));
 
-    expect(screen.getByText('4')).toBeInTheDocument();
-    expect(screen.getByText('2m 0s')).toBeInTheDocument();
+    // Scope the row assertions to the table — the usage summary strip above it
+    // legitimately prints a run's zero token total (e.g. "Cached 0").
+    const table = within(container.querySelector('table')!);
+    expect(table.getByText('4')).toBeInTheDocument();
+    expect(table.getByText('2m 0s')).toBeInTheDocument();
     // The attempt's zero-filled usage and its equal start/finish stamps never
-    // show as "0" tokens or a "0ms" duration.
-    expect(screen.queryAllByText('0').length).toBe(0);
-    expect(screen.queryByText('0ms')).not.toBeInTheDocument();
+    // show as "0" tokens or a "0ms" duration in the table.
+    expect(table.queryAllByText('0').length).toBe(0);
+    expect(table.queryByText('0ms')).not.toBeInTheDocument();
   });
 });
