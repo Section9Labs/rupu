@@ -1,6 +1,8 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
-    api::fs_safety::{validate_name, validate_stem, validate_within, write_atomic},
+    api::fs_safety::{
+        validate_name, validate_new_name, validate_stem, validate_within, write_atomic,
+    },
     api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -30,6 +32,151 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agents/:name/run", post(run_agent))
         .route("/api/agents/:name/session", post(start_session))
         .route("/api/agents/generate", post(generate_agent))
+        .route(
+            "/api/agents/validate",
+            get(validate_all_agents).post(validate_agent),
+        )
+}
+
+/// Body of `POST /api/agents/validate`.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct ValidateAgentBody {
+    /// The agent file's full text (YAML frontmatter + system prompt).
+    raw: String,
+    /// The project (workspace id) whose skills layer the agent's skills are
+    /// checked against, beside the global one. Absent: global only.
+    #[serde(default)]
+    ws_id: Option<String>,
+}
+
+/// Query of `GET /api/agents/validate`.
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ValidateAgentsQuery {
+    /// Check only this project's agent files beside the global ones.
+    /// Absent: every registered project's (one workspace per repo).
+    #[serde(default)]
+    ws_id: Option<String>,
+}
+
+/// One agent file's check (`GET /api/agents/validate`): what `rupu agent
+/// validate` prints for it.
+#[derive(Serialize)]
+struct AgentValidateRow {
+    /// The frontmatter `name`, when the file parsed.
+    name: Option<String>,
+    layer: &'static str,
+    /// The project's workspace id, for a project file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope_id: Option<String>,
+    path: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn validate_rows(
+    checks: Vec<rupu_agent::AgentFileCheck>,
+    scope_id: Option<&str>,
+    keep: rupu_agent::AgentLayer,
+) -> impl Iterator<Item = AgentValidateRow> + '_ {
+    checks
+        .into_iter()
+        .filter(move |c| c.layer == keep)
+        .map(move |c| AgentValidateRow {
+            name: c.name,
+            layer: match c.layer {
+                rupu_agent::AgentLayer::Global => "global",
+                rupu_agent::AgentLayer::Project => "project",
+            },
+            scope_id: scope_id.map(str::to_string),
+            path: c.path.display().to_string(),
+            ok: c.error.is_none(),
+            error: c.error.map(|e| e.to_string()),
+        })
+}
+
+/// Every agent file `GET /api/agents/validate` checks, through
+/// `rupu_agent::check_agent_files` (what `rupu agent validate --all` runs):
+/// the global layer's against the global skills, then each project's against
+/// the global and its own. Reads the disk.
+fn agent_validate_rows(s: &AppState, ws_id: Option<&str>) -> ApiResult<Vec<AgentValidateRow>> {
+    use rupu_agent::AgentLayer;
+    let mut rows: Vec<AgentValidateRow> = validate_rows(
+        rupu_agent::check_agent_files(&s.global_dir, None),
+        None,
+        AgentLayer::Global,
+    )
+    .collect();
+    let projects: Vec<(String, String)> = match ws_id {
+        Some(id) => {
+            let w = crate::api::code::load_workspace(s, id)?;
+            vec![(w.id, w.path)]
+        }
+        None => distinct_repo_workspaces(store(s).list().unwrap_or_default(), &repo_store(s))
+            .into_iter()
+            .map(|r| (r.workspace.id, r.workspace.path))
+            .collect(),
+    };
+    for (id, path) in projects {
+        let Some(project) =
+            rupu_workspace::project_layer_dir(&s.global_dir, Some(FsPath::new(&path)))
+        else {
+            continue;
+        };
+        rows.extend(validate_rows(
+            rupu_agent::check_agent_files(&s.global_dir, Some(&project)),
+            Some(&id),
+            AgentLayer::Project,
+        ));
+    }
+    Ok(rows)
+}
+
+/// `GET /api/agents/validate[?ws_id=]` — check every agent file, global and
+/// project, as `rupu agent validate --all` does: each must parse, its
+/// `tools:` must name known tools and its skills must resolve. Answers
+/// `{ok, rows}`, `ok` false when any file failed; a failing file is a row,
+/// never an error status.
+async fn validate_all_agents(
+    State(s): State<AppState>,
+    Query(q): Query<ValidateAgentsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let rows = tokio::task::spawn_blocking(move || agent_validate_rows(&s, q.ws_id.as_deref()))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(serde_json::json!({
+        "ok": rows.iter().all(|r| r.ok),
+        "rows": rows,
+    })))
+}
+
+/// `POST /api/agents/validate` — check one agent file's text without saving
+/// it, as `rupu agent validate` checks a saved one: it parses, its `tools:`
+/// name known tools, and its skills resolve in the global layer (plus
+/// `ws_id`'s project layer). `{ok: true, name}`, or a 400 naming what's
+/// wrong — the shape of `POST /api/workflows/validate`.
+async fn validate_agent(
+    State(s): State<AppState>,
+    Json(b): Json<ValidateAgentBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let project = match b.ws_id.as_deref() {
+        None => None,
+        Some(id) => {
+            let w = crate::api::code::load_workspace(&s, id)?;
+            rupu_workspace::project_layer_dir(&s.global_dir, Some(FsPath::new(&w.path)))
+        }
+    };
+    let global = s.global_dir.clone();
+    let name = tokio::task::spawn_blocking(move || {
+        let spec = parse_agent_for_write(&b.raw)?;
+        let dirs = rupu_skills::LayerDirs::for_layers(&global, project.as_deref());
+        rupu_agent::check_agent_skills(&spec, &dirs, &mut None)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        Ok::<_, ApiError>(spec.name)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))??;
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
 }
 
 /// Directory where global agent `.md` definitions live.
@@ -173,7 +320,7 @@ fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<Pat
 /// `.md` (no write on parse failure), enforces frontmatter-name == url-name,
 /// then atomically writes `<dir>/<url_name>.md`. Returns the written path.
 fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf, ApiError> {
-    validate_name(url_name)?;
+    validate_new_name("agent", url_name)?;
     let spec = parse_agent_for_write(raw)?;
     if spec.name != url_name {
         return Err(ApiError::bad_request(
@@ -221,7 +368,7 @@ fn parse_agent_for_write(raw: &str) -> Result<rupu_agent::AgentSpec, ApiError> {
 fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError> {
     let spec = parse_agent_for_write(raw)?;
     let name = spec.name.clone();
-    validate_name(&name)?;
+    validate_new_name("agent", &name)?;
     let dir = global_dir.join("agents");
     let target = dir.join(format!("{name}.md"));
     if target.exists() {
@@ -895,7 +1042,7 @@ async fn create_agent(
     Json(body): Json<AgentWriteBody>,
 ) -> ApiResult<Json<AgentDetailDto>> {
     let spec = parse_agent_for_write(&body.raw)?;
-    validate_name(&spec.name)?;
+    validate_new_name("agent", &spec.name)?;
     if resolve_agent_scoped(&s, &spec.name).is_some() {
         return Err(ApiError::conflict("agent already exists"));
     }
@@ -1025,6 +1172,24 @@ pub(crate) struct AgentRunBody {
     /// `run.codename`. A malformed one is a 400.
     #[serde(default)]
     codename: Option<String>,
+    /// Optional model for the run — `rupu run --model`, over the agent's
+    /// `model:`. Local launches only: a remote host gets a 501.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional provider for the run — `rupu run --provider`, over the
+    /// agent's `provider:`. Local launches only, as `model`.
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+/// A body's `model` / `provider`: absent or non-blank.
+fn parse_override(field: &str, raw: Option<String>) -> Result<Option<String>, ApiError> {
+    match raw {
+        Some(v) if v.trim().is_empty() => {
+            Err(ApiError::bad_request(format!("{field}: must not be blank")))
+        }
+        other => Ok(other),
+    }
 }
 
 /// A body's `run_id` / `codename`: well-formed or a 400. The run id names a
@@ -1055,7 +1220,7 @@ fn parse_supplied_identity(
 
 /// Trim an engagement selection; a blank id is a 400, never a silent
 /// `code`-path fallback.
-fn parse_engagement_profiles(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
+pub(crate) fn parse_engagement_profiles(raw: Vec<String>) -> Result<Vec<String>, ApiError> {
     raw.into_iter()
         .map(|id| {
             let id = id.trim().to_string();
@@ -1118,6 +1283,9 @@ async fn run_agent_with(
     let messaging = parse_messaging(body.messaging)?;
     let (run_id, codename) = parse_supplied_identity(body.run_id, body.codename)?;
     let req = AgentLaunchRequest {
+        model: parse_override("model", body.model)?,
+        provider: parse_override("provider", body.provider)?,
+        continue_from: None,
         codename,
         agent: name.to_string(),
         prompt: body.prompt,
@@ -1261,7 +1429,13 @@ async fn run_agent(
     if host != "local" {
         // Remote: scope fields, if present, are silently ignored — see this
         // function's doc comment. The request proceeds exactly as it would
-        // with no scope fields at all.
+        // with no scope fields at all. A model or provider is refused: no
+        // host transport carries one.
+        if b.model.is_some() || b.provider.is_some() {
+            return Err(ApiError::not_available(format!(
+                "model and provider overrides are local-only: host `{host}` has no transport for them"
+            )));
+        }
         let findings_profile = parse_findings_profile(b.findings_profile.as_deref())?;
         let engagement_profiles = parse_engagement_profiles(b.engagement_profiles)?;
         let skills = parse_skill_entries("skills", b.skills)?;
@@ -1270,6 +1444,9 @@ async fn run_agent(
         let (run_id, codename) = parse_supplied_identity(b.run_id, b.codename)?;
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             codename,
             agent: name.clone(),
             prompt: b.prompt,
@@ -1532,6 +1709,8 @@ mod tests {
             last: Mutex::new(None),
         });
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: Some("do it".into()),
             mode: Some("bypass".into()),
             target: None,
@@ -1564,6 +1743,8 @@ mod tests {
             last: Mutex::new(None),
         });
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             findings_profile: Some("summary".into()),
             ..AgentRunBody::default()
         };
@@ -1581,6 +1762,8 @@ mod tests {
             last: Mutex::new(None),
         });
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             findings_profile: Some("verbose".into()),
             ..AgentRunBody::default()
         };
@@ -1614,6 +1797,8 @@ mod tests {
             last: Mutex::new(None),
         });
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             engagement_profiles: vec!["network".into(), "  ".into()],
             ..AgentRunBody::default()
         };
@@ -1763,6 +1948,8 @@ mod tests {
             last: Mutex::new(None),
         });
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             preload_skills: vec!["--mode".into()],
             ..AgentRunBody::default()
         };
@@ -1864,6 +2051,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -1909,6 +2098,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: Some("go".into()),
             mode: None,
             target: None,
@@ -1955,6 +2146,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -2005,6 +2198,8 @@ mod tests {
         // all — a local scope resolution would 404. The remote path must
         // never even attempt it.
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -2063,6 +2258,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -2112,6 +2309,8 @@ mod tests {
         std::fs::write(agents_dir(&s).join("triage.md"), VALID_TRIAGE_MD).unwrap();
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -2149,6 +2348,8 @@ mod tests {
         let s = test_state(&tmp).with_agent_launcher(Some(mock.clone()));
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,
@@ -2187,6 +2388,8 @@ mod tests {
         let s = test_state(&tmp).with_agent_launcher(Some(mock.clone()));
 
         let body = AgentRunBody {
+            model: None,
+            provider: None,
             prompt: None,
             mode: None,
             target: None,

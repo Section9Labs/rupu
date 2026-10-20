@@ -88,6 +88,11 @@ pub struct AgentRun {
     /// `--continue <run id>`: continue that interrupted run of the agent
     /// instead of starting from a prompt.
     pub continue_from: Option<String>,
+    /// `--model`: the model for this run, over the agent's `model:`.
+    pub model: Option<String>,
+    /// `--provider`: the provider for this run, over the agent's
+    /// `provider:`.
+    pub provider: Option<String>,
     /// A child a parent run launched (W7): its depth, ceiling, caps and
     /// usage root (hidden flags).
     pub launch: Option<LaunchLink>,
@@ -113,6 +118,8 @@ impl AgentRun {
             messaging: LaunchMessaging::Default,
             message_space: None,
             continue_from: None,
+            model: None,
+            provider: None,
             launch: None,
         }
     }
@@ -296,6 +303,9 @@ pub enum WorkflowControl {
         /// `--if-unfinished` (hidden): refuse a run that finished since the
         /// resume was requested.
         if_unfinished: bool,
+        /// `--restart-interrupted`: start every interrupted step and unit
+        /// over from its prompt instead of continuing it.
+        restart_interrupted: bool,
     },
 }
 
@@ -479,6 +489,14 @@ impl RunArgv {
                     LaunchMessaging::Off => a.push("--no-messaging"),
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
+                // One element each, like the prompt: a name starting with
+                // `-` can't be read as a flag.
+                if let Some(m) = &r.model {
+                    a.push(format!("--model={m}"));
+                }
+                if let Some(p) = &r.provider {
+                    a.push(format!("--provider={p}"));
+                }
                 if let Some(m) = &r.message_space {
                     a.push("--message-space");
                     a.push(m.dir.as_os_str());
@@ -544,11 +562,15 @@ impl RunArgv {
                         run_id,
                         mode,
                         if_unfinished,
+                        restart_interrupted,
                     } => {
                         a.push("resume");
                         a.push(run_id);
                         if *if_unfinished {
                             a.push("--if-unfinished");
+                        }
+                        if *restart_interrupted {
+                            a.push("--restart-interrupted");
                         }
                         a.opt_flag_value("--mode", mode.map(PermissionMode::as_str));
                     }
@@ -956,10 +978,21 @@ mod tests {
             run_id: "run_x".into(),
             mode: None,
             if_unfinished: true,
+            restart_interrupted: false,
         });
         assert_eq!(
             strs(&resume),
             ["workflow", "resume", "run_x", "--if-unfinished"]
+        );
+        let retry = RunArgv::WorkflowControl(WorkflowControl::Resume {
+            run_id: "run_x".into(),
+            mode: None,
+            if_unfinished: false,
+            restart_interrupted: true,
+        });
+        assert_eq!(
+            strs(&retry),
+            ["workflow", "resume", "run_x", "--restart-interrupted"]
         );
         let reject = RunArgv::WorkflowControl(WorkflowControl::Reject {
             run_id: "run_x".into(),

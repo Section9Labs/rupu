@@ -574,6 +574,9 @@ impl FleetUnitDispatcher {
         // workspace sync is active).
         let run_id = match conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: unit.codename.clone(),
                 agent: unit.agent,
                 prompt: Some(unit.rendered_prompt),

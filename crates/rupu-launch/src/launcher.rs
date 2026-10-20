@@ -1455,6 +1455,7 @@ impl RunLauncher {
                             run_id: child.run_id.clone(),
                             mode: Some(mode),
                             if_unfinished: false,
+                            restart_interrupted: false,
                         }),
                         cwd: Some(from.workspace.path.clone()),
                     }));

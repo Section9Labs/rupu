@@ -71,6 +71,17 @@ pub struct AgentLaunchRequest {
     /// (`RunArgv::for_peer`'s `Downgrade`), and the coordinator's records
     /// keep the name either way.
     pub codename: Option<String>,
+    /// The model for this run — `rupu run --model`, over the agent's
+    /// `model:`. A local launch only: the API refuses it on a remote one,
+    /// since no host transport carries it.
+    pub model: Option<String>,
+    /// The provider for this run — `rupu run --provider`. As `model`.
+    pub provider: Option<String>,
+    /// Continue this earlier run of the agent instead of starting fresh —
+    /// `rupu run --continue <id>` (a `sub_…` id too). The child restores the
+    /// flags the run was launched with; the ones set here replace their
+    /// own. Carries no prompt. A local launch only, as `model`.
+    pub continue_from: Option<String>,
 }
 
 impl AgentLaunchRequest {
@@ -119,6 +130,9 @@ impl AgentLaunchRequest {
             .map_err(|e| format!("skill bundle: {e}"))?;
         run.tmp_clone = self.target.is_some();
         run.messaging = self.messaging.clone();
+        run.model = self.model.clone();
+        run.provider = self.provider.clone();
+        run.continue_from = self.continue_from.clone();
         Ok(run)
     }
 }
@@ -158,6 +172,9 @@ mod tests {
 
     fn req() -> AgentLaunchRequest {
         AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: Some("bypass".into()),

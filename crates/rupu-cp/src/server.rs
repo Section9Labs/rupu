@@ -27,6 +27,7 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
 pub(crate) fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::api::agentiflows::routes())
+        .merge(crate::api::agentiflow_defs::routes())
         .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
         .merge(crate::api::assets::routes())
@@ -49,6 +50,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::findings::routes())
+        .merge(crate::api::query::routes())
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
         .merge(crate::api::graph::routes())

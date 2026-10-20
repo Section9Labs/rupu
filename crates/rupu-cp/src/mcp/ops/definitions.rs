@@ -16,7 +16,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "workflows.run",
             Method::POST,
             "/api/workflows/:name/run",
-            "Launch a workflow run.\n\n`name` is the workflow; `inputs` maps input names to string values; `mode` (ask|bypass|readonly), `target`, `working_dir`, `host` and `scope_kind`/`scope_id` are optional. Returns `{run_id, host_id}`.",
+            "Launch a workflow run.\n\n`name` is the workflow; `inputs` maps input names to string values; `mode` (ask|bypass|readonly), `target`, `working_dir`, `host`, `scope_kind`/`scope_id` and `engagement_profiles` (local launches only) are optional. For a workflow given as YAML, see workflows.run_yaml. Returns `{run_id, host_id}`.",
         )
         .body::<workflows::LaunchBody>()
         .open_world(),
@@ -30,7 +30,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "agents.run",
             Method::POST,
             "/api/agents/:name/run",
-            "Launch a standalone agent run.\n\n`name` is the agent; `prompt` is its task; `mode`, `target`, `working_dir`, `host`, `skills` and the other launch options are optional. Returns `{run_id, host_id}`.",
+            "Launch a standalone agent run.\n\n`name` is the agent; `prompt` is its task; `mode`, `target`, `working_dir`, `host`, `skills`, `engagement_profiles`, `model` and `provider` (these two on local launches only) and the other launch options are optional. Returns `{run_id, host_id}`.",
         )
         .body::<agents::AgentRunBody>()
         .open_world(),
@@ -195,5 +195,29 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .body::<models::RefreshBody>()
         .open_world(),
+        // Plan 3a, package B: the YAML launch and agent validation.
+        op(
+            "workflows.run_yaml",
+            Method::POST,
+            "/api/workflows/run",
+            "Launch a workflow given as YAML, without saving it under a name (`rupu workflow run --file`).\n\n`yaml` is the whole workflow file; `inputs`, `mode` (ask|bypass|readonly), `working_dir` and `engagement_profiles` are optional. The YAML is checked first (HTTP 400 with the parse error), then kept under the control plane's global dir as the run's source. Returns `{run_id, host_id, file}`; local-only (a remote `host` is a 501).",
+        )
+        .body::<workflows::LaunchYamlBody>()
+        .open_world(),
+        op(
+            "agents.validate",
+            Method::POST,
+            "/api/agents/validate",
+            "Check an agent definition's text without saving it, as `rupu agent validate` checks a file.\n\n`raw` is the whole `.md` file; `ws_id` adds that project's skills layer to the global one. It must parse, its `tools:` must name known tools and its skills must resolve. Returns `{ok: true, name}`, or HTTP 400 naming what is wrong.",
+        )
+        .body::<agents::ValidateAgentBody>()
+        .read_only(),
+        op(
+            "agents.validate_all",
+            Method::GET,
+            "/api/agents/validate",
+            "Check every agent file, global and project, as `rupu agent validate --all` does.\n\n`ws_id` limits the projects to that one; absent, every registered project is checked. Returns `{ok, rows}`: one row per file with `name`, `layer`, `scope_id`, `path`, `ok` and `error`; `ok` is false when any file failed.",
+        )
+        .query::<agents::ValidateAgentsQuery>(),
     ]
 }

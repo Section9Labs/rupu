@@ -160,6 +160,22 @@ fn agent_runs() -> Vec<RunArgv> {
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
+    // A CP continue, overriding the model and/or provider the original
+    // run was launched with; and a fresh launch on another model.
+    for (model, provider) in [
+        (Some("claude-opus-5-5"), None),
+        (None, Some("openai")),
+        (Some("-dash-model"), Some("anthropic")),
+    ] {
+        for continued in [false, true] {
+            let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+            r.continue_from = continued.then(|| "sub_01ROUNDTRIP".into());
+            r.prompt = (!continued).then(|| "go".into());
+            r.model = model.map(str::to_string);
+            r.provider = provider.map(str::to_string);
+            out.push(RunArgv::Agent(r));
+        }
+    }
     // A placed unit continued with its workflow's messaging still set.
     for messaging in messagings() {
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
@@ -252,11 +268,14 @@ fn controls() -> Vec<RunArgv> {
             }
         }
         for if_unfinished in [false, true] {
-            out.push(RunArgv::WorkflowControl(WorkflowControl::Resume {
-                run_id: "run_x".into(),
-                mode,
-                if_unfinished,
-            }));
+            for restart_interrupted in [false, true] {
+                out.push(RunArgv::WorkflowControl(WorkflowControl::Resume {
+                    run_id: "run_x".into(),
+                    mode,
+                    if_unfinished,
+                    restart_interrupted,
+                }));
+            }
         }
     }
     out
@@ -374,6 +393,8 @@ fn back(cli: Cli) -> RunArgv {
                     participant: f.participant,
                 }),
                 continue_from: a.continue_from,
+                model: a.model,
+                provider: a.provider,
                 launch: a.launch.link(),
             })
         }
@@ -437,11 +458,12 @@ fn back(cli: Cli) -> RunArgv {
                 if_unfinished,
                 restart_interrupted,
             } => {
-                assert!(!plain && !restart_interrupted, "never rendered");
+                assert!(!plain, "never rendered");
                 RunArgv::WorkflowControl(WorkflowControl::Resume {
                     run_id,
                     mode: mode(m),
                     if_unfinished,
+                    restart_interrupted,
                 })
             }
             other => panic!("not a rendered workflow command: {other:?}"),

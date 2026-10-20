@@ -9,6 +9,7 @@ mod backend;
 pub mod children;
 pub mod credential_manifest;
 pub mod file_cache;
+pub mod findings_opts;
 pub mod hop_builder;
 pub mod model_limits;
 pub mod net_capture;
