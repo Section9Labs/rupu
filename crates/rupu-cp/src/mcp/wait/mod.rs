@@ -13,6 +13,7 @@ mod findings;
 mod local;
 mod parse;
 mod remote;
+mod throttle;
 mod turns;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -75,11 +76,16 @@ pub fn tool_def() -> ToolDef {
 
 pub struct WaitSource {
     state: AppState,
+    /// Spaces SSH hosts' asks across this CP's calls.
+    throttle: std::sync::Arc<throttle::Throttle>,
 }
 
 impl WaitSource {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            throttle: Default::default(),
+        }
     }
 }
 
@@ -160,7 +166,7 @@ impl WaitSource {
                 _ => {}
             }
         }
-        let mut remote = match Remote::new(&self.state, &req.watch) {
+        let mut remote = match Remote::new(&self.state, &req.watch, self.throttle.clone()) {
             Ok(r) => r,
             Err(e) => return ToolResult::Error(e),
         };
@@ -458,6 +464,38 @@ mod tests {
         // time must not become the wake target.
         assert_eq!(progress_wake(false, now, deadline), None);
         assert_eq!(progress_wake(true, deadline, deadline), None);
+    }
+
+    /// An SSH-like host (every request its own connection) is asked once for
+    /// two back-to-back calls on the same gate: the second takes the first's
+    /// answer. Any other host is asked by each call.
+    #[tokio::test]
+    async fn back_to_back_calls_ask_a_per_request_host_once() {
+        use crate::host::connector::testing::{state_with_host, StubConnector};
+        use std::sync::atomic::Ordering;
+        for (spaced, asks) in [(true, 1), (false, 2)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let stub = std::sync::Arc::new(StubConnector {
+                connects_per_request: spaced,
+                get_run: Some(json!({"run": {"id": "run_r", "status": "running", "awaiting": []}})),
+                ..Default::default()
+            });
+            let source = WaitSource::new(state_with_host(&tmp, "host_s", stub.clone()));
+            let args = json!({"watch": [{"kind": "run_gate", "run": "run_r", "host": "host_s"}], "timeout_ms": 0});
+            for _ in 0..2 {
+                let ToolResult::Json(r) = source.wait(parse(args.clone()).unwrap(), None).await
+                else {
+                    panic!("not a result")
+                };
+                assert_eq!(r["timed_out"], true, "{r}");
+                assert!(r.get("warnings").is_none(), "{r}");
+            }
+            assert_eq!(
+                stub.get_run_calls.load(Ordering::SeqCst),
+                asks,
+                "spaced: {spaced}"
+            );
+        }
     }
 }
 

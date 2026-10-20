@@ -948,9 +948,7 @@ impl HostConnector for HttpHostConnector {
         let (runs_root, run_id, host) = (
             runs_root.to_path_buf(),
             run_id.to_string(),
-            self.host_id
-                .clone()
-                .unwrap_or_else(|| self.base_url.clone()),
+            self.host_id.clone().unwrap_or_else(|| self.base_url.clone()),
         );
         let rec = tokio::task::spawn_blocking(move || match fetched {
             Ok(bytes) => rupu_netflow::land::land_and_record(
@@ -1755,11 +1753,7 @@ mod tests {
             body.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(body, b"abcdefgh");
-        assert!(
-            t.elapsed() > Duration::from_millis(1500),
-            "{:?}",
-            t.elapsed()
-        );
+        assert!(t.elapsed() > Duration::from_millis(1500), "{:?}", t.elapsed());
     }
 
     /// The idle bound is per gap, not per transfer, and the pull's own

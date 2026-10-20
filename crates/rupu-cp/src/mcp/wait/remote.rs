@@ -17,14 +17,14 @@
 //!
 //! A failure in a host's first round fails the call; a later failure is
 //! retried at its next round and reported in the result's `warnings` (a later
-//! request the call's timeout cut short is one only when it had at least
-//! [`FIRST_ROUND_BUDGET`] to answer: a healthy host's round that went out just
-//! before the timeout is no news). A first round may run up to
-//! [`FIRST_ROUND_BUDGET`] past a shorter timeout (a `timeout_ms: 0` peek, which
-//! then reads what the streams it opened already have). Once something fired,
-//! a host whose first round is still out holds the result back by at most
-//! that much from the call's start; past it, only that host's sources are
-//! named in `warnings`.
+//! poll the call's timeout cut short is one only when it had at least
+//! [`FIRST_ROUND_BUDGET`] to answer: a healthy host's poll that went out just
+//! before the timeout is no news; a cut-short status always is). A first
+//! round may run up to [`FIRST_ROUND_BUDGET`] past a shorter timeout (a
+//! `timeout_ms: 0` peek, which then reads what the streams it opened already
+//! have). Once something fired, a host whose first round is still out holds
+//! the result back by at most that much from the call's start; past it, only
+//! that host's sources are named in `warnings`.
 
 use std::future::Future;
 use std::io;
@@ -41,6 +41,7 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 
 use super::parse::{Condition, Kind};
+use super::throttle::{Claim, Key, Throttle};
 use super::{Got, CATCH_UP_MAX};
 use crate::host::connector::{EventByteStream, HostConnector, HostConnectorError};
 use crate::host::messages::MessageRoute;
@@ -58,7 +59,8 @@ pub(super) const REMOTE_POLL: Duration = Duration::from_secs(2);
 /// agent keeps waiting — the kind of burst that gets the coordinator blocked
 /// by the host. (Its run's gates can't come from the coordinator's mirror
 /// instead: the SSH mirror holds only runs this coordinator launched, and
-/// takes their `run.json` only once it is terminal.)
+/// takes their `run.json` only once it is terminal.) The spacing holds across
+/// calls too ([`Throttle`]).
 pub(super) const SSH_POLL: Duration = Duration::from_secs(10);
 /// The most messages one poll of a space reads; the cursor then stops at the
 /// last of them, so the next poll reads on.
@@ -85,6 +87,9 @@ struct Host {
     answered: bool,
     /// How often its poll rounds go out ([`poll_every`]).
     poll: Duration,
+    /// Every request is a connection of its own: its gate and message asks
+    /// go through the [`Throttle`], spaced across calls.
+    spaced: bool,
     /// When its next poll round is due.
     next_poll: Instant,
 }
@@ -140,6 +145,8 @@ pub(super) struct Remote {
     turn: usize,
     /// The hosts' rounds in flight, at most one per host.
     inflight: FuturesUnordered<HostRound>,
+    /// Shared by every call on the CP.
+    throttle: Arc<Throttle>,
 }
 
 /// One host's round in flight: the host, then its answers.
@@ -202,7 +209,11 @@ pub(super) enum Answer {
 impl Remote {
     /// The remote sources of `watch`, each host resolved. An error names a
     /// host that isn't registered.
-    pub(super) fn new(state: &AppState, watch: &[Condition]) -> Result<Self, String> {
+    pub(super) fn new(
+        state: &AppState,
+        watch: &[Condition],
+        throttle: Arc<Throttle>,
+    ) -> Result<Self, String> {
         let mut r = Remote {
             hosts: Vec::new(),
             runs: Vec::new(),
@@ -210,6 +221,7 @@ impl Remote {
             msgs: Vec::new(),
             turn: 0,
             inflight: FuturesUnordered::new(),
+            throttle,
         };
         for c in watch {
             let Some(host_id) = &c.host else { continue };
@@ -226,6 +238,7 @@ impl Remote {
                     r.hosts.push(Host {
                         id: host_id.clone(),
                         poll: poll_every(conn.as_ref()),
+                        spaced: conn.connects_per_request(),
                         conn,
                         busy: false,
                         answered: false,
@@ -350,16 +363,58 @@ impl Remote {
         deadline: Instant,
         kind: RoundKind,
     ) -> bool {
-        let asks = self.asks_for(h, watch, got, kind);
-        if asks.is_empty() {
+        let mut asks = self.asks_for(h, watch, got, kind);
+        let mut ready = Vec::new();
+        let memo = if self.hosts[h].spaced {
+            asks = self.spaced(h, asks, &mut ready);
+            Some((Arc::clone(&self.throttle), self.hosts[h].id.clone()))
+        } else {
+            None
+        };
+        if asks.is_empty() && ready.is_empty() {
             return false;
         }
         let conn = Arc::clone(&self.hosts[h].conn);
         self.hosts[h].busy = true;
         self.inflight.push(Box::pin(async move {
-            (h, ask_host(conn, asks, deadline).await)
+            let mut answers = ask_host(conn, asks, deadline, memo).await;
+            answers.extend(ready);
+            (h, answers)
         }));
         true
+    }
+
+    /// Host `h`'s gate and message asks through the [`Throttle`]: those it
+    /// may make now are returned; one asked within [`SSH_POLL`] by any call
+    /// is answered in `ready` from that ask's answer, or else waits, its
+    /// host's next round due when the spacing allows.
+    fn spaced(&mut self, h: usize, asks: Vec<Ask>, ready: &mut Vec<Answer>) -> Vec<Ask> {
+        let host = self.hosts[h].id.clone();
+        let mut out = Vec::with_capacity(asks.len());
+        for ask in asks {
+            let claim = match &ask {
+                Ask::Gate { run, .. } => self.throttle.claim(&host, &Key::Gate(run.clone()), None),
+                Ask::Msgs { root, q, .. } => {
+                    self.throttle
+                        .claim(&host, &Key::Msgs(root.clone()), Some(q))
+                }
+                Ask::Open { .. } | Ask::Status { .. } => Claim::Ask,
+            };
+            match (claim, &ask) {
+                (Claim::Ask, _) => out.push(ask),
+                (Claim::Gate(v), Ask::Gate { src, .. }) => ready.push(Answer::Gate(*src, Ok(v))),
+                (Claim::Msgs(view), Ask::Msgs { src, .. }) => {
+                    ready.push(Answer::Msgs(*src, Ok(view)))
+                }
+                (Claim::Wait(at), _) => {
+                    let next = &mut self.hosts[h].next_poll;
+                    *next = (*next).min(at);
+                }
+                // A claim answers the kind of its ask.
+                (Claim::Gate(_) | Claim::Msgs(_), _) => out.push(ask),
+            }
+        }
+        out
     }
 
     /// Host `h`'s requests for a round of `kind`.
@@ -437,6 +492,7 @@ impl Remote {
         got: &mut Got,
         first: bool,
     ) -> Result<(), String> {
+        let asked = if first { Asked::First } else { Asked::Poll };
         for answer in answers {
             match answer {
                 Answer::Open(i, r) => match r {
@@ -444,7 +500,7 @@ impl Remote {
                     Err(f) => {
                         let s = &self.runs[i];
                         let host = &self.hosts[s.host].id;
-                        failed(got, first, &s.source, f, |e| {
+                        failed(got, asked, &s.source, f, |e| {
                             describe(host, "stream run events", "run", &s.run, e)
                         })?
                     }
@@ -466,7 +522,7 @@ impl Remote {
                         }
                         Err(f) => {
                             let host = &self.hosts[s.host].id;
-                            failed(got, first, &s.source, f, |e| {
+                            failed(got, asked, &s.source, f, |e| {
                                 describe(host, "read runs", "run", &s.run, e)
                             })?
                         }
@@ -479,7 +535,7 @@ impl Remote {
                         Err(f) => {
                             let host = &self.hosts[s.host].id;
                             let noun = MessageRoute::of_id(&s.root).map_or("run", |r| r.noun());
-                            failed(got, first, &s.source, f, |e| {
+                            failed(got, asked, &s.source, f, |e| {
                                 describe(host, "read messages", noun, &s.root, e)
                             })?
                         }
@@ -494,7 +550,7 @@ impl Remote {
                         Ok(v) => v.get("run").unwrap_or(&v).get("status").cloned(),
                         Err(f) => {
                             let host = &self.hosts[s.host].id;
-                            let _ = failed(got, false, &s.source, f, |e| {
+                            let _ = failed(got, Asked::Status, &s.source, f, |e| {
                                 describe(host, "read runs", "run", &s.run, e)
                             });
                             None
@@ -676,7 +732,7 @@ impl Remote {
             .filter(|&h| !self.hosts[h].busy)
             .map(|h| (h, self.asks_for(h, watch, got, RoundKind::Status)))
             .filter(|(_, asks)| !asks.is_empty())
-            .map(|(h, asks)| ask_host(Arc::clone(&self.hosts[h].conn), asks, deadline))
+            .map(|(h, asks)| ask_host(Arc::clone(&self.hosts[h].conn), asks, deadline, None))
             .collect();
         for answers in futures_util::future::join_all(rounds).await {
             // Never an error past the first round.
@@ -686,7 +742,14 @@ impl Remote {
 }
 
 /// `asks` against one host, one after another, each bounded by `deadline`.
-async fn ask_host(conn: Arc<dyn HostConnector>, asks: Vec<Ask>, deadline: Instant) -> Vec<Answer> {
+/// With `memo`, the gate and message answers are recorded for the calls the
+/// [`Throttle`] spaces.
+async fn ask_host(
+    conn: Arc<dyn HostConnector>,
+    asks: Vec<Ask>,
+    deadline: Instant,
+    memo: Option<(Arc<Throttle>, String)>,
+) -> Vec<Answer> {
     let mut out = Vec::with_capacity(asks.len());
     for ask in asks {
         out.push(match ask {
@@ -695,10 +758,18 @@ async fn ask_host(conn: Arc<dyn HostConnector>, asks: Vec<Ask>, deadline: Instan
                 bounded(deadline, conn.stream_run_events_after(&run, after)).await,
             ),
             Ask::Gate { src, run } => {
-                Answer::Gate(src, bounded(deadline, conn.get_run(&run)).await)
+                let r = bounded(deadline, conn.get_run(&run)).await;
+                if let (Some((t, host)), Ok(v)) = (&memo, &r) {
+                    t.gate_answered(host, &run, v);
+                }
+                Answer::Gate(src, r)
             }
             Ask::Msgs { src, root, q } => {
-                Answer::Msgs(src, bounded(deadline, conn.list_messages(&root, q)).await)
+                let r = bounded(deadline, conn.list_messages(&root, q.clone())).await;
+                if let (Some((t, host)), Ok(view)) = (&memo, &r) {
+                    t.msgs_answered(host, &root, q, view);
+                }
+                Answer::Msgs(src, r)
             }
             Ask::Status { src, run } => {
                 Answer::Status(src, bounded(deadline, conn.get_run(&run)).await)
@@ -722,24 +793,36 @@ async fn bounded<T>(
     }
 }
 
+/// Which request gave no answer.
+#[derive(Clone, Copy, PartialEq)]
+enum Asked {
+    /// One of a host's first round.
+    First,
+    /// A later poll (a gate, a space, a stream reopen).
+    Poll,
+    /// A run's status after its stream's `end`.
+    Status,
+}
+
 /// A request for `source` that gave no answer: the call's error on the first
 /// round, else a warning. A request the call's timeout cut short is only a
-/// warning, and after the first round only when it had [`FIRST_ROUND_BUDGET`]
-/// (the time a host is given to answer) — a round that went out just before
-/// the timeout says nothing about the host.
+/// warning. A later poll's is one only when it had [`FIRST_ROUND_BUDGET`] (the
+/// time a host is given to answer): a poll that went out just before the
+/// timeout says nothing about the host, and the next poll asks again. A
+/// status's always is, since its `run_settled` fires without one.
 fn failed(
     got: &mut Got,
-    first: bool,
+    asked: Asked,
     source: &str,
     f: Fail,
     describe: impl FnOnce(HostConnectorError) -> String,
 ) -> Result<(), String> {
     let msg = match f {
-        Fail::Late { had } if first || had >= FIRST_ROUND_BUDGET => {
+        Fail::Late { had } if asked != Asked::Poll || had >= FIRST_ROUND_BUDGET => {
             "no answer before the call's timeout".to_string()
         }
         Fail::Late { .. } => return Ok(()),
-        Fail::Conn(e) if first => return Err(describe(e)),
+        Fail::Conn(e) if asked == Asked::First => return Err(describe(e)),
         Fail::Conn(e) => describe(e),
     };
     got.warnings.insert(source.to_string(), msg);
@@ -762,7 +845,7 @@ fn describe(host: &str, what: &str, noun: &str, target: &str, e: HostConnectorEr
 /// The gates a remote run's `get_run` reply says are waiting, in the detail
 /// shape of a local `run_gate`: its `awaiting` set, else (a record from
 /// before it) the legacy `awaiting_step_id`.
-fn gates_of(reply: &Value) -> Vec<Value> {
+pub(super) fn gates_of(reply: &Value) -> Vec<Value> {
     let run = reply.get("run").unwrap_or(reply);
     if let Some(set) = run
         .get("awaiting")
@@ -834,6 +917,7 @@ mod tests {
                 busy: false,
                 answered: true,
                 poll: REMOTE_POLL,
+                spaced: false,
                 next_poll: now - Duration::from_secs(1),
             }],
             runs: Vec::new(),
@@ -841,6 +925,7 @@ mod tests {
             msgs: Vec::new(),
             turn: 0,
             inflight: FuturesUnordered::new(),
+            throttle: Arc::default(),
         };
         // Before the deadline the due poll is the wake target.
         assert!(r.next_poll_at(now + Duration::from_secs(5)).is_some());
@@ -868,6 +953,7 @@ mod tests {
             hosts: vec![Host {
                 id: "h".into(),
                 poll: poll_every(&ssh),
+                spaced: true,
                 conn: Arc::new(ssh),
                 busy: false,
                 answered: false,
@@ -878,6 +964,7 @@ mod tests {
             msgs: Vec::new(),
             turn: 0,
             inflight: FuturesUnordered::new(),
+            throttle: Arc::default(),
         };
         let before = Instant::now();
         let far = before + Duration::from_secs(60);
@@ -890,25 +977,22 @@ mod tests {
         let late = |had| Fail::Late { had };
         let mut got = Got::default();
         // A later round that went out just before the timeout: no news.
-        failed(
-            &mut got,
-            false,
-            "s",
-            late(Duration::from_millis(300)),
-            |e| e.to_string(),
-        )
-        .unwrap();
+        let short = || late(Duration::from_millis(300));
+        failed(&mut got, Asked::Poll, "s", short(), |e| e.to_string()).unwrap();
         assert!(got.warnings.is_empty());
         // One given the time a host has to answer, and didn't: a warning.
-        failed(&mut got, false, "s", late(FIRST_ROUND_BUDGET), |e| {
+        failed(&mut got, Asked::Poll, "s", late(FIRST_ROUND_BUDGET), |e| {
             e.to_string()
         })
         .unwrap();
         assert_eq!(got.warnings["s"], "no answer before the call's timeout");
-        // A first round's is always one.
-        let mut got = Got::default();
-        failed(&mut got, true, "s", late(Duration::ZERO), |e| e.to_string()).unwrap();
-        assert_eq!(got.warnings["s"], "no answer before the call's timeout");
+        // A first round's and a status's always are: a status cut short
+        // leaves `run_settled` firing with `status: null`.
+        for asked in [Asked::First, Asked::Status] {
+            let mut got = Got::default();
+            failed(&mut got, asked, "s", short(), |e| e.to_string()).unwrap();
+            assert_eq!(got.warnings["s"], "no answer before the call's timeout");
+        }
     }
 
     #[test]

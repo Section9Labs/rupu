@@ -1476,6 +1476,10 @@ pub(crate) mod testing {
         pub launched: Option<std::sync::Mutex<Vec<crate::agent_launcher::AgentLaunchRequest>>>,
         /// What `connects_per_request` answers (an SSH-like host).
         pub connects_per_request: bool,
+        /// Canned `get_run` reply. `None` → not configured.
+        pub get_run: Option<serde_json::Value>,
+        /// How many times `get_run` was called.
+        pub get_run_calls: std::sync::atomic::AtomicUsize,
     }
 
     /// An `AppState` whose host registry resolves `host_id` to `conn`. A
@@ -1575,7 +1579,12 @@ pub(crate) mod testing {
             unimplemented!("StubConnector: list_runs not configured")
         }
         async fn get_run(&self, _run_id: &str) -> Result<serde_json::Value, HostConnectorError> {
-            unimplemented!("StubConnector: get_run not configured")
+            self.get_run_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .get_run
+                .clone()
+                .expect("StubConnector: get_run not configured"))
         }
         async fn approve_run(&self, _run_id: &str, _mode: &str) -> Result<(), HostConnectorError> {
             unimplemented!("StubConnector: approve_run not configured")
