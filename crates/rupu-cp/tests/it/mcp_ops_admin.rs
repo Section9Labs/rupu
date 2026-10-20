@@ -6,7 +6,7 @@
 
 use super::admin_api::{Call, NoopLauncher, StubOps};
 use super::mcp::{assert_required_args, call_tool, json_of, rpc, text_of};
-use rupu_cp::admin_ops::{AdminOps, CronTickRequest, PruneKind, PruneRequest, RepairRequest};
+use rupu_cp::admin_ops::{AdminOps, CronTickRequest, RepairRequest};
 use rupu_cp::mcp::McpOpts;
 use rupu_cp::server::{router_with, RouterOpts};
 use serde_json::{json, Value};
@@ -19,6 +19,8 @@ async fn spawn(ops: Arc<StubOps>) -> (SocketAddr, tempfile::TempDir) {
     let state =
         rupu_cp::state::AppState::new(tmp.path().into(), rupu_config::PricingConfig::default())
             .with_launcher(Some(Arc::new(NoopLauncher)))
+            // Never the test process's cwd (the rupu checkout's `.rupu/`).
+            .with_workspace_dir(tmp.path().into())
             .with_admin_ops(Some(ops as Arc<dyn AdminOps>));
     let server = rupu_cp::mcp::build_server(
         &state,
@@ -151,13 +153,8 @@ async fn admin_writes_record_through_the_mcp() {
 
     let calls = ops.calls();
     assert_eq!(
-        calls[..3],
+        calls[..2],
         [
-            Call::Prune(PruneRequest {
-                kind: PruneKind::Netflow,
-                older_than: Some("14d".into()),
-                dry_run: true,
-            }),
             Call::Tick(CronTickRequest::default()),
             Call::Repair(RepairRequest {
                 issue_ref: "github:acme/widgets/issues/42".into(),
@@ -167,7 +164,12 @@ async fn admin_writes_record_through_the_mcp() {
             }),
         ]
     );
-    assert!(matches!(&calls[3], Call::Run(r) if r.name == "fix-issues"));
+    assert!(matches!(&calls[2], Call::Run(r) if r.name == "fix-issues"));
+    assert_eq!(
+        calls.len(),
+        3,
+        "the netflow prune ran its library, not the port"
+    );
 }
 
 #[tokio::test]

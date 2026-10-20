@@ -780,7 +780,7 @@ struct SessionShowOutput {
 }
 
 #[derive(Serialize)]
-struct SessionPruneRow {
+pub(crate) struct SessionPruneRow {
     session_id: String,
     scope: String,
     status: String,
@@ -798,7 +798,7 @@ struct SessionPruneCsvRow {
 }
 
 #[derive(Serialize)]
-struct SessionPruneReport {
+pub(crate) struct SessionPruneReport {
     kind: &'static str,
     version: u8,
     rows: Vec<SessionPruneRow>,
@@ -7092,19 +7092,9 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
 }
 
 async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let mut pruned = prune_archived_sessions(args.older_than.as_deref(), args.dry_run)?;
-    pruned.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    let rows = pruned
-        .iter()
-        .map(|row| SessionPruneRow {
-            session_id: row.session_id.clone(),
-            scope: row.scope.clone(),
-            status: row.status.clone(),
-            updated_at: row.updated_at.clone(),
-            action: row.action.clone(),
-        })
-        .collect::<Vec<_>>();
-    let csv_rows = pruned
+    let report = prune_report(args.older_than.as_deref(), args.dry_run)?;
+    let csv_rows = report
+        .rows
         .iter()
         .map(|row| SessionPruneCsvRow {
             session_id: row.session_id.clone(),
@@ -7114,26 +7104,20 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
             action: row.action.clone(),
         })
         .collect();
-    let output = SessionPruneOutput {
-        report: SessionPruneReport {
-            kind: "session_prune",
-            version: 1,
-            rows,
-        },
-        csv_rows,
-    };
+    let output = SessionPruneOutput { report, csv_rows };
     report::emit_collection(global_format, &output)
 }
 
-/// `rupu session prune`'s JSON report, for the control plane's
-/// `POST /api/maintenance/prune {kind: sessions}`.
-pub(crate) fn prune_json(
+/// `rupu session prune`'s report, sorted by session id: what the command
+/// prints and what the control plane's `POST /api/maintenance/prune {kind:
+/// sessions}` answers.
+pub(crate) fn prune_report(
     older_than: Option<&str>,
     dry_run: bool,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<SessionPruneReport> {
     let mut pruned = prune_archived_sessions(older_than, dry_run)?;
     pruned.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    Ok(serde_json::to_value(SessionPruneReport {
+    Ok(SessionPruneReport {
         kind: "session_prune",
         version: 1,
         rows: pruned
@@ -7146,7 +7130,7 @@ pub(crate) fn prune_json(
                 action: row.action,
             })
             .collect(),
-    })?)
+    })
 }
 
 pub(crate) fn prune_archived_sessions(
@@ -9631,17 +9615,22 @@ fn session_prune_cutoff(
     older_than: Option<&str>,
     global: &Path,
 ) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    let retention = if let Some(value) = older_than {
-        value.to_string()
-    } else {
-        let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
-        cfg.storage
-            .archived_session_retention
-            .unwrap_or_else(|| "30d".to_string())
+    // A bad `--older-than` is the caller's (400 over the control plane); a
+    // bad or unreadable `[storage]` value is the configuration's (500).
+    let retention = match older_than {
+        Some(value) => parse_retention_duration(value)
+            .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?,
+        None => {
+            let path = global.join("config.toml");
+            let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
+            let value = cfg
+                .storage
+                .archived_session_retention
+                .unwrap_or_else(|| "30d".to_string());
+            parse_retention_duration(&value)
+                .map_err(|e| rupu_cp::admin_ops::AdminOpError::Failed(format!("{e:#}")))?
+        }
     };
-    let retention = parse_retention_duration(&retention)
-        .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?;
     Ok(Utc::now() - retention)
 }
 

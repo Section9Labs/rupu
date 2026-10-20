@@ -269,7 +269,8 @@ async fn requeue_claim(
 /// `POST /api/autoflows/claims/repair` body.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(crate) struct RepairBody {
-    /// The claimed issue, e.g. `github:owner/repo/issues/42`.
+    /// The claimed issue in full form, e.g. `github:owner/repo/issues/42`;
+    /// a bare number is a 400.
     issue_ref: String,
     /// Release the claim after repairing (at most one of `release` and
     /// `requeue`).
@@ -306,7 +307,7 @@ async fn repair_claim(
     let ops = crate::admin_ops::ops(&s, "repairing an autoflow claim")?;
     Ok(Json(
         ops.autoflow_repair(crate::admin_ops::RepairRequest {
-            issue_ref: body.issue_ref,
+            issue_ref: crate::admin_ops::full_issue_ref(&body.issue_ref)?,
             release: body.release,
             requeue: body.requeue,
             dry_run: body.dry_run,

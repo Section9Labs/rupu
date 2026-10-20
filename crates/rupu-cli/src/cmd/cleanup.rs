@@ -251,6 +251,7 @@ fn cleanup_rows(
     if include_transcripts {
         for transcript in prune_archived_transcripts(older_than, dry_run)
             .context("cleanup archived transcripts")?
+            .rows
         {
             rows.push(CleanupRow {
                 kind: "transcript".into(),

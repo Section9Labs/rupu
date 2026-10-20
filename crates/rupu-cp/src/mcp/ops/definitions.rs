@@ -175,7 +175,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "autoflows.explain",
             Method::GET,
             "/api/autoflows/explain",
-            "Explain the autoflow state of one issue (rupu autoflow explain).\n\n`issue_ref` is the issue (`github:owner/repo/issues/42`); `repo` limits resolution to one bound repo. Returns the `autoflow_explain` report: status, claim, last run, queued wakes, recent cycle events; 400 for a bad ref.",
+            "Explain the autoflow state of one issue (rupu autoflow explain).\n\n`issue_ref` is the issue in full form (`github:owner/repo/issues/42`; a bare number is a 400); `repo` limits resolution to one bound repo. Returns the `autoflow_explain` report: status, claim, last run, queued wakes, recent cycle events.",
         )
         .query::<autoflows::ExplainQuery>(),
         op(
@@ -196,7 +196,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "autoflows.run",
             Method::POST,
             "/api/autoflows/:name/run",
-            "Run one autoflow cycle for an issue now, detached (rupu autoflow run).\n\n`name` is the autoflow; `issue` the issue in run-target form (`github:owner/repo/issues/42`); `repo` and `mode` (bypass|readonly) are optional. Returns 202 `{name, issue, started}` once the cycle's process starts; follow it with `autoflows.explain`. 404 for an unknown autoflow, 409 when another cycle holds the issue.",
+            "Run one autoflow cycle for an issue now, detached (rupu autoflow run).\n\n`name` is the autoflow; `issue` the issue in full form (`github:owner/repo/issues/42`); `repo` and `mode` (bypass|readonly) are optional. Returns 202 `{name, issue, started}` once the cycle's process starts; follow it with `autoflows.explain`. 404 for an unknown autoflow, 409 when another cycle holds the issue.",
         )
         .query::<crate::admin_ops::HostQuery>()
         .body::<autoflows::AutoflowRunBody>()
@@ -205,7 +205,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "claims.repair",
             Method::POST,
             "/api/autoflows/claims/repair",
-            "Repair one autoflow claim: drop bad wakes, rebuild its worktree (rupu autoflow repair).\n\n`issue_ref` names the claim; `release` or `requeue` (at most one) also releases it or queues a repair wake. `dry_run` defaults to true and lists the repairs without applying them; pass false to apply. Returns `{issue_ref, dry_run, repairs}`; 404 when no claim is tracked.",
+            "Repair one autoflow claim: drop bad wakes, rebuild its worktree (rupu autoflow repair).\n\n`issue_ref` names the claim, in full form (`github:owner/repo/issues/42`); `release` or `requeue` (at most one) also releases it or queues a repair wake. `dry_run` defaults to true and lists the repairs without applying them; pass false to apply. Returns `{issue_ref, dry_run, repairs}`; 404 when no claim is tracked.",
         )
         .query::<crate::admin_ops::HostQuery>()
         .body::<autoflow_claims::RepairBody>()

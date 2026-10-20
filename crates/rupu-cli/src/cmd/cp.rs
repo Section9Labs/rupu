@@ -481,15 +481,30 @@ pub async fn handle(action: Action) -> ExitCode {
                 cp_runtime_cfg.cron_tick_enabled,
                 Duration::from_secs(cp_runtime_cfg.cron_tick_interval_secs.max(1)),
                 shutdown_tx.subscribe(),
-                || async {
-                    // Single-flight with `POST /api/cron/tick`: a tick the
-                    // API started is still running, so this one is skipped.
-                    let Some(_tick) = crate::cmd::cron::try_begin_tick() else {
-                        tracing::info!("cp serve: cron tick skipped: a tick is already running");
-                        return;
-                    };
-                    if let Err(e) = crate::cmd::cron::tick(false, false, false).await {
-                        tracing::warn!(error = %e, "cp serve: cron tick failed");
+                {
+                    let global = global_dir.clone();
+                    move || {
+                        let global = global.clone();
+                        async move {
+                            // One tick at a time per RUPU_HOME: a tick a
+                            // `POST /api/cron/tick`, a crontab `rupu cron
+                            // tick` or another `cp serve` holds makes this
+                            // turn a skip.
+                            let _lock = match rupu_orchestrator::cron_triggers::TickLock::try_acquire(&global) {
+                                Ok(Some(lock)) => lock,
+                                Ok(None) => {
+                                    tracing::info!("cp serve: cron tick skipped: a tick is already running");
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::cmd::cron::tick(false, false, false, &mut |_| {}).await {
+                                tracing::warn!(error = %e, "cp serve: cron tick failed");
+                            }
+                        }
                     }
                 },
             ));

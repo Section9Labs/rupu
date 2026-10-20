@@ -21,6 +21,7 @@ pub mod launcher;
 pub mod mcp;
 pub mod model_catalog;
 pub mod netflow_index;
+pub mod netflow_prune;
 pub mod net;
 pub mod node;
 pub mod pagination;

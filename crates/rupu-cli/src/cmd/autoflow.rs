@@ -62,7 +62,6 @@ use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -12444,17 +12443,7 @@ fn parse_full_issue_target(target: &str) -> anyhow::Result<IssueRef> {
 }
 
 pub(crate) fn parse_issue_ref_text(value: &str) -> anyhow::Result<IssueRef> {
-    let (tracker, rest) = value
-        .split_once(':')
-        .ok_or_else(|| anyhow!("invalid issue ref `{value}`"))?;
-    let (project, number) = rest
-        .rsplit_once("/issues/")
-        .ok_or_else(|| anyhow!("invalid issue ref `{value}`"))?;
-    Ok(IssueRef {
-        tracker: IssueTracker::from_str(tracker).map_err(|err| anyhow!(err))?,
-        project: project.to_string(),
-        number: number.parse()?,
-    })
+    IssueRef::parse_full(value).map_err(|e| anyhow!(e))
 }
 
 fn resolved_source_ref_text(resolved: &ResolvedAutoflowWorkflow) -> anyhow::Result<String> {

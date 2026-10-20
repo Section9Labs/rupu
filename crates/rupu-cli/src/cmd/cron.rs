@@ -27,11 +27,15 @@ use crate::paths;
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_config::PollSourceEntry;
-use rupu_orchestrator::cron_schedule::{next_fire_after, parse_schedule, should_fire};
-use rupu_orchestrator::{annotate_event_payload, matching_event_id, TriggerKind, Workflow};
+use rupu_orchestrator::cron_schedule::{parse_schedule, should_fire};
+use rupu_orchestrator::cron_triggers::{
+    collect_cron_workflows, collect_event_workflows, cursor_path, event_cursors_dir, events_report,
+    list_report, read_cursor, source_slug, CronEventsReport, CronEventsRow, CronListReport,
+    CronListRow, TickLock,
+};
+use rupu_orchestrator::{annotate_event_payload, matching_event_id};
 use rupu_scm::EventSourceRef;
 use serde::Serialize;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -89,11 +93,7 @@ pub async fn handle(
             dry_run,
             skip_events,
             only_events,
-        } => tick(dry_run, skip_events, only_events).await.map(|report| {
-            for fire in &report.would_fire {
-                println!("{}", fire.line);
-            }
-        }),
+        } => cli_tick(dry_run, skip_events, only_events).await,
         Action::Events { no_color } => events(no_color, global_format).await,
     };
     match result {
@@ -109,42 +109,6 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Tick { .. } => ("cron tick", report::TABLE_ONLY),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
-}
-
-#[derive(Serialize)]
-struct CronListRow {
-    name: String,
-    schedule: String,
-    next_utc: Option<String>,
-    in_seconds: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct CronListReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<CronListRow>,
-}
-
-#[derive(Serialize)]
-struct CronEventsRow {
-    name: String,
-    event: String,
-    sources: Vec<String>,
-    cursor: Option<String>,
-}
-
-#[derive(Serialize)]
-struct CronEventsSummary {
-    poll_sources: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct CronEventsReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<CronEventsRow>,
-    summary: CronEventsSummary,
 }
 
 struct CronListOutput {
@@ -320,7 +284,8 @@ async fn list(
     absolute: bool,
     all_columns: bool,
 ) -> anyhow::Result<()> {
-    let workflows = collect_cron_workflows()?;
+    let (global, project_root) = layer_roots()?;
+    let workflows = collect_cron_workflows(&global, project_root.as_deref());
     if workflows.is_empty()
         && matches!(
             global_format.unwrap_or(OutputFormat::Table),
@@ -341,34 +306,13 @@ async fn list(
     report::emit_collection(global_format, &output)
 }
 
-/// `rupu cron list`'s JSON report, for the control plane's `GET /api/cron`.
-pub(crate) fn list_json() -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::to_value(list_report(
-        &collect_cron_workflows()?,
-        Utc::now(),
-    ))?)
-}
-
-fn list_report(workflows: &[CronWorkflow], now: DateTime<Utc>) -> CronListReport {
-    let rows = workflows
-        .iter()
-        .map(|workflow| {
-            let next = parse_schedule(&workflow.schedule)
-                .ok()
-                .and_then(|schedule| next_fire_after(&schedule, now));
-            CronListRow {
-                name: workflow.name.clone(),
-                schedule: workflow.schedule.clone(),
-                next_utc: next.map(|time| time.format("%Y-%m-%d %H:%M:%S").to_string()),
-                in_seconds: next.map(|time| (time - now).num_seconds()),
-            }
-        })
-        .collect();
-    CronListReport {
-        kind: "cron_list",
-        version: 1,
-        rows,
-    }
+/// The global dir and the project root of the working directory: the
+/// layers whose workflows the tick and the listings read.
+fn layer_roots() -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    let global = paths::global_dir()?;
+    let pwd = std::env::current_dir()?;
+    let project_root = paths::project_root_for(&pwd)?;
+    Ok((global, project_root))
 }
 
 fn ui_prefs(
@@ -409,74 +353,57 @@ pub(crate) struct WouldFire {
     pub(crate) line: String,
 }
 
-/// What a tick did. A real tick records nothing here (its runs are on the
-/// run store); a dry run lists what it would fire.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct CronTickReport {
-    kind: &'static str,
-    version: u8,
-    dry_run: bool,
-    pub(crate) would_fire: Vec<WouldFire>,
-}
-
-/// Held while a tick runs in this process: `cp serve`'s cron loop and
-/// `POST /api/cron/tick` both take it, so they never tick at once.
-pub(crate) struct TickGuard(());
-
-static TICKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-impl Drop for TickGuard {
-    fn drop(&mut self) {
-        TICKING.store(false, std::sync::atomic::Ordering::Release);
+/// `rupu cron tick`: a dry run prints each `would fire:` line as it finds
+/// it; a real tick takes the tick lock first and, when another tick (`cp
+/// serve`'s loop, another `rupu cron tick`) holds it, says so and fires
+/// nothing.
+async fn cli_tick(dry_run: bool, skip_events: bool, only_events: bool) -> anyhow::Result<()> {
+    let mut print = |fire: WouldFire| println!("{}", fire.line);
+    if dry_run {
+        return tick(true, skip_events, only_events, &mut print).await;
     }
-}
-
-/// The tick guard, or `None` while another tick in this process holds it.
-pub(crate) fn try_begin_tick() -> Option<TickGuard> {
-    TICKING
-        .compare_exchange(
-            false,
-            true,
-            std::sync::atomic::Ordering::Acquire,
-            std::sync::atomic::Ordering::Relaxed,
-        )
-        .ok()
-        .map(|_| TickGuard(()))
+    let global = paths::global_dir()?;
+    let Some(_lock) = TickLock::try_acquire(&global)? else {
+        eprintln!(
+            "cron tick skipped: another tick holds {}",
+            TickLock::path(&global).display()
+        );
+        return Ok(());
+    };
+    tick(false, skip_events, only_events, &mut print).await
 }
 
 /// The `rupu cron tick` core: fires due cron-scheduled workflows, then
 /// polls event-triggered workflows. `pub(crate)` so `rupu cp serve`'s
 /// cron-tick background loop (`crate::cmd::cp`) and its `POST
 /// /api/cron/tick` call the exact same entrypoint instead of reimplementing
-/// the tick logic; they hold [`try_begin_tick`]'s guard around it.
+/// the tick logic. A real tick's caller holds the [`TickLock`] around it; a
+/// dry run takes none. A dry run hands each workflow it would fire to
+/// `would_fire` as it finds it.
 pub(crate) async fn tick(
     dry_run: bool,
     skip_events: bool,
     only_events: bool,
-) -> anyhow::Result<CronTickReport> {
+    would_fire: &mut (dyn FnMut(WouldFire) + Send),
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
 
-    let mut would_fire = Vec::new();
     if !only_events {
-        tick_cron(&global, dry_run, &mut would_fire).await?;
+        tick_cron(&global, dry_run, would_fire).await?;
     }
     if !skip_events {
-        tick_polled_events(&global, dry_run, &mut would_fire).await?;
+        tick_polled_events(&global, dry_run, would_fire).await?;
     }
-    Ok(CronTickReport {
-        kind: "cron_tick",
-        version: 1,
-        dry_run,
-        would_fire,
-    })
+    Ok(())
 }
 
 async fn tick_cron(
     global: &Path,
     dry_run: bool,
-    would_fire: &mut Vec<WouldFire>,
+    would_fire: &mut (dyn FnMut(WouldFire) + Send),
 ) -> anyhow::Result<()> {
-    let workflows = collect_cron_workflows()?;
+    let (_, project_root) = layer_roots()?;
+    let workflows = collect_cron_workflows(global, project_root.as_deref());
     if workflows.is_empty() {
         info!("no cron-triggered workflows found");
         return Ok(());
@@ -505,7 +432,7 @@ async fn tick_cron(
         }
 
         if dry_run {
-            would_fire.push(WouldFire {
+            would_fire(WouldFire {
                 tier: "cron",
                 workflow: w.name.clone(),
                 last_fired: last_fired.map(|t| t.to_rfc3339()),
@@ -568,7 +495,7 @@ async fn tick_cron(
 async fn tick_polled_events(
     global: &Path,
     dry_run: bool,
-    would_fire: &mut Vec<WouldFire>,
+    would_fire: &mut (dyn FnMut(WouldFire) + Send),
 ) -> anyhow::Result<()> {
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
@@ -582,7 +509,7 @@ async fn tick_polled_events(
     }
     let max = triggers_cfg.effective_max_events_per_tick();
 
-    let event_workflows = collect_event_workflows()?;
+    let event_workflows = collect_event_workflows(global, project_root.as_deref());
     if event_workflows.is_empty() {
         debug!("no event-triggered workflows found; skipping event poll");
         return Ok(());
@@ -599,7 +526,7 @@ async fn tick_polled_events(
         rupu_scm::Registry::discover(&resolver, &cfg, Arc::new(rupu_netflow::NullSink)).await,
     );
 
-    let cursors_root = global.join("cron-state").join("event-cursors");
+    let cursors_root = event_cursors_dir(global);
     if !dry_run {
         paths::ensure_dir(&cursors_root)?;
     }
@@ -725,7 +652,7 @@ async fn tick_polled_events(
                 );
 
                 if dry_run {
-                    would_fire.push(WouldFire {
+                    would_fire(WouldFire {
                         tier: "event",
                         workflow: wf.name.clone(),
                         last_fired: None,
@@ -807,8 +734,8 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
     let project_root = paths::project_root_for(&pwd)?;
     let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
 
-    let workflows = collect_event_workflows()?;
-    let cursors_root = global.join("cron-state").join("event-cursors");
+    let workflows = collect_event_workflows(&global, project_root.as_deref());
+    let cursors_root = event_cursors_dir(&global);
 
     if workflows.is_empty()
         && matches!(
@@ -842,163 +769,6 @@ async fn events(no_color: bool, global_format: Option<OutputFormat>) -> anyhow::
         report: events_report(&cfg, &workflows, &cursors_root),
     };
     report::emit_collection(global_format, &output)
-}
-
-/// `rupu cron events`' JSON report, for the control plane's
-/// `GET /api/cron/events`.
-pub(crate) fn events_json() -> anyhow::Result<serde_json::Value> {
-    let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    let cfg = paths::load_config_for_display(&global, project_root.as_deref(), &pwd, true);
-    let workflows = collect_event_workflows()?;
-    let cursors_root = global.join("cron-state").join("event-cursors");
-    Ok(serde_json::to_value(events_report(
-        &cfg,
-        &workflows,
-        &cursors_root,
-    ))?)
-}
-
-fn events_report(
-    cfg: &rupu_config::Config,
-    workflows: &[EventWorkflow],
-    cursors_root: &Path,
-) -> CronEventsReport {
-    let poll_sources: Vec<String> = cfg
-        .triggers
-        .poll_sources
-        .iter()
-        .map(format_poll_source_entry)
-        .collect();
-    let rows = workflows
-        .iter()
-        .map(|wf| {
-            let cursor = cfg
-                .triggers
-                .poll_sources
-                .iter()
-                .filter_map(|s| s.source().parse::<EventSourceRef>().ok())
-                .find_map(|source| {
-                    let path = cursor_path(cursors_root, &source);
-                    read_cursor(&path).ok()
-                });
-            CronEventsRow {
-                name: wf.name.clone(),
-                event: wf.event.clone(),
-                sources: poll_sources.clone(),
-                cursor,
-            }
-        })
-        .collect();
-    CronEventsReport {
-        kind: "cron_events",
-        version: 1,
-        summary: CronEventsSummary { poll_sources },
-        rows,
-    }
-}
-
-struct EventWorkflow {
-    name: String,
-    event: String,
-    filter: Option<String>,
-}
-
-fn collect_event_workflows() -> anyhow::Result<Vec<EventWorkflow>> {
-    let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    let mut by_name: BTreeMap<String, EventWorkflow> = BTreeMap::new();
-    push_event(&global.join("workflows"), &mut by_name);
-    if let Some(p) = &project_root {
-        push_event(&p.join(".rupu/workflows"), &mut by_name);
-    }
-    Ok(by_name.into_values().collect())
-}
-
-fn push_event(dir: &Path, into: &mut BTreeMap<String, EventWorkflow>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("yaml") {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let body = match std::fs::read_to_string(&p) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "skipping unreadable workflow");
-                continue;
-            }
-        };
-        let wf = match Workflow::parse(&body) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "skipping malformed workflow");
-                continue;
-            }
-        };
-        if wf.trigger.on != TriggerKind::Event {
-            continue;
-        }
-        let Some(event) = wf.trigger.event.clone() else {
-            warn!(path = %p.display(), "trigger.on=event without event: field; skipping");
-            continue;
-        };
-        into.insert(
-            stem.to_string(),
-            EventWorkflow {
-                name: stem.to_string(),
-                event,
-                filter: wf.trigger.filter.clone(),
-            },
-        );
-    }
-}
-
-fn format_poll_source_entry(source: &PollSourceEntry) -> String {
-    match source.poll_interval() {
-        Some(interval) => format!("{}@{interval}", source.source()),
-        None => source.source().to_string(),
-    }
-}
-
-/// `<vendor>/<slug>.cursor` file naming. **Ignores `account`** (Task 6
-/// review item 4) — two `poll_sources` entries with the same
-/// `tracker`/`project` (or `platform`/`owner`/`repo`) but different
-/// `account` overrides collide on the same cursor file and silently
-/// share state. Not fixed here: today's data model has no per-account
-/// tracker multi-account case in production (`tracker_event_connectors`
-/// holds at most one entry per tracker — see its field doc in
-/// `rupu-scm/src/registry.rs`), so nobody can actually configure two
-/// `account`-distinguished poll sources for the same project yet. Left
-/// as a landmine for whoever adds that, not a live bug today.
-fn source_slug(source: &EventSourceRef) -> String {
-    let text = match source {
-        EventSourceRef::Repo { repo } => format!("repo-{}-{}", repo.owner, repo.repo),
-        EventSourceRef::TrackerProject { project, .. } => format!("project-{project}"),
-    };
-    text.chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
-            _ => '-',
-        })
-        .collect()
-}
-
-/// `<global>/cron-state/event-cursors/<vendor>/<source>.cursor`.
-fn cursor_path(root: &Path, source: &EventSourceRef) -> PathBuf {
-    root.join(source.vendor())
-        .join(format!("{}.cursor", source_slug(source)))
-}
-
-fn read_cursor(path: &Path) -> anyhow::Result<String> {
-    Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
 
 fn write_cursor(path: &Path, body: &str) -> anyhow::Result<()> {
@@ -1149,94 +919,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-struct CronWorkflow {
-    name: String,
-    schedule: String,
-}
-
-/// Walk global + project workflows directories, parse each YAML
-/// file, and collect every workflow with `trigger.on: cron`. Project
-/// entries shadow global by name (same precedence as
-/// `rupu workflow list`).
-fn collect_cron_workflows() -> anyhow::Result<Vec<CronWorkflow>> {
-    let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-
-    let mut by_name: BTreeMap<String, CronWorkflow> = BTreeMap::new();
-    push_cron(&global.join("workflows"), &mut by_name);
-    if let Some(p) = &project_root {
-        push_cron(&p.join(".rupu/workflows"), &mut by_name);
-    }
-    Ok(by_name.into_values().collect())
-}
-
-fn push_cron(dir: &Path, into: &mut BTreeMap<String, CronWorkflow>) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("yaml") {
-            continue;
-        }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let body = match std::fs::read_to_string(&p) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "skipping unreadable workflow");
-                continue;
-            }
-        };
-        let wf = match Workflow::parse(&body) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(path = %p.display(), error = %e, "skipping malformed workflow");
-                continue;
-            }
-        };
-        if wf.trigger.on != TriggerKind::Cron {
-            continue;
-        }
-        // An autoflow the operator disabled must not fire on the cron tick.
-        //
-        // The CP web UI's disable toggle (`api::autoflows::set_autoflow_enabled`)
-        // writes `autoflow.enabled: false` into this YAML, and the autoflow
-        // ENGINE honors it (`cmd/autoflow.rs`'s `.filter(|a| a.enabled)`). The
-        // cron tick is a SECOND, independent dispatch subsystem, and it used to
-        // select purely on `trigger.on: cron` — so a cron-triggered workflow
-        // showing as "disabled" in the UI kept firing on schedule. Observed
-        // live on `nightly-health`.
-        //
-        // Deliberately keyed on an EXPLICIT autoflow block: a workflow that
-        // never opted into autoflow has no such flag to consult and must keep
-        // firing, or this would silently break every ordinary cron job.
-        if wf.autoflow.as_ref().is_some_and(|a| !a.enabled) {
-            info!(
-                workflow = %stem,
-                "skipping: autoflow is disabled (autoflow.enabled: false)"
-            );
-            continue;
-        }
-        let Some(schedule) = wf.trigger.cron.clone() else {
-            // The schema validator should have caught this, but be
-            // defensive — a malformed cron-trigger workflow is just
-            // skipped, not fatal to the whole tick.
-            warn!(path = %p.display(), "trigger.on=cron without cron: field; skipping");
-            continue;
-        };
-        into.insert(
-            stem.to_string(),
-            CronWorkflow {
-                name: stem.to_string(),
-                schedule,
-            },
-        );
-    }
-}
-
 fn read_last_fired(path: &Path) -> anyhow::Result<DateTime<Utc>> {
     let s = std::fs::read_to_string(path)?;
     let parsed = DateTime::parse_from_rfc3339(s.trim())?.with_timezone(&Utc);
@@ -1272,7 +954,13 @@ mod tests {
         let old_home = std::env::var_os("RUPU_HOME");
         std::env::set_var("RUPU_HOME", &global);
 
-        let result = tick(/* dry_run */ true, /* skip_events */ true, false).await;
+        let result = tick(
+            /* dry_run */ true,
+            /* skip_events */ true,
+            false,
+            &mut |_| {},
+        )
+        .await;
 
         match old_home {
             Some(value) => std::env::set_var("RUPU_HOME", value),
@@ -1410,89 +1098,6 @@ mod tests {
     // disabled in the UI kept firing on schedule, with the UI showing it as
     // off. Observed live: `nightly-health` carried `autoflow.enabled: false`
     // and still fired, writing `cron-state/nightly-health.last_fired`.
-
-    fn tmp_wf_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
-        let d = tempfile::tempdir().expect("tempdir");
-        for (name, body) in files {
-            std::fs::write(d.path().join(name), body).expect("write workflow");
-        }
-        d
-    }
-
-    const CRON_DISABLED: &str = r#"
-name: nightly-health
-autoflow:
-  enabled: false
-trigger:
-  on: cron
-  cron: "0 6 * * *"
-steps:
-  - id: check
-    agent: investigator
-    prompt: "check"
-"#;
-
-    const CRON_ENABLED: &str = r#"
-name: nightly-enabled
-autoflow:
-  enabled: true
-  entity: issue
-trigger:
-  on: cron
-  cron: "0 6 * * *"
-steps:
-  - id: check
-    agent: investigator
-    prompt: "check"
-"#;
-
-    const CRON_PLAIN: &str = r#"
-name: plain-cron
-trigger:
-  on: cron
-  cron: "0 6 * * *"
-steps:
-  - id: check
-    agent: investigator
-    prompt: "check"
-"#;
-
-    #[test]
-    fn cron_tick_skips_a_workflow_disabled_in_the_cp_ui() {
-        let d = tmp_wf_dir(&[("nightly-health.yaml", CRON_DISABLED)]);
-        let mut got = std::collections::BTreeMap::new();
-        push_cron(d.path(), &mut got);
-        assert!(
-            !got.contains_key("nightly-health"),
-            "a workflow with `autoflow.enabled: false` must not be collected \
-             for the cron tick — the CP disable toggle writes exactly that flag"
-        );
-    }
-
-    #[test]
-    fn cron_tick_still_fires_a_plain_cron_workflow_with_no_autoflow_block() {
-        // Guard against over-correcting: a workflow that never opted into
-        // autoflow at all has no `enabled` flag to consult and must keep
-        // firing. Disabling would silently break every ordinary cron job.
-        let d = tmp_wf_dir(&[("plain-cron.yaml", CRON_PLAIN)]);
-        let mut got = std::collections::BTreeMap::new();
-        push_cron(d.path(), &mut got);
-        assert!(
-            got.contains_key("plain-cron"),
-            "a cron workflow with no `autoflow:` block must still fire"
-        );
-    }
-
-    #[test]
-    fn cron_tick_still_fires_an_enabled_autoflow() {
-        let d = tmp_wf_dir(&[("nightly-enabled.yaml", CRON_ENABLED)]);
-        let mut got = std::collections::BTreeMap::new();
-        push_cron(d.path(), &mut got);
-        assert!(
-            got.contains_key("nightly-enabled"),
-            "`autoflow.enabled: true` must still fire on schedule"
-        );
-    }
 
     fn cron_list_test_now() -> DateTime<Utc> {
         use chrono::TimeZone;

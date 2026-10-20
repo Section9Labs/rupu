@@ -1,8 +1,9 @@
 //! The autoflow, cron and maintenance endpoints (operator MCP Plan 3a,
-//! package E) over a recording `AdminOps` stub: each endpoint reaches the
-//! port with the request it was given, maps the port's refusals onto
-//! 400 / 404 / 409, refuses a remote `host` with a 501, and needs the port
-//! (and `cp serve`'s write gate for a write) to be installed.
+//! package E). The cron listings and the transcript / netflow prunes run
+//! their libraries over the test's `RUPU_HOME`; the rest reach a recording
+//! `AdminOps` stub with the request they were given. Every endpoint maps
+//! refusals onto 400 / 404 / 409 / 500, refuses a remote `host` with a 501,
+//! and a write needs `cp serve`'s write gate.
 
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
@@ -25,8 +26,6 @@ pub(super) enum Call {
     Wakes(Option<String>),
     Repair(RepairRequest),
     Run(AutoflowRunRequest),
-    CronList,
-    CronEvents,
     Tick(CronTickRequest),
     Prune(PruneRequest),
 }
@@ -94,18 +93,6 @@ impl AdminOps for StubOps {
         let report = json!({"started": true, "name": req.name, "issue": req.issue});
         self.answer(Call::Run(req), report)
     }
-    async fn cron_list(&self) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::CronList,
-            json!({"kind": "cron_list", "version": 1, "rows": [{"name": "nightly", "schedule": "0 4 * * *"}]}),
-        )
-    }
-    async fn cron_events(&self) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::CronEvents,
-            json!({"kind": "cron_events", "version": 1, "rows": [], "summary": {"poll_sources": []}}),
-        )
-    }
     async fn cron_tick(&self, req: CronTickRequest) -> Result<CronTickOutcome, AdminOpError> {
         let report = json!({"kind": "cron_tick", "version": 1, "dry_run": true, "would_fire": []});
         self.answer(Call::Tick(req), report.clone())?;
@@ -115,8 +102,9 @@ impl AdminOps for StubOps {
             CronTickOutcome::Started
         })
     }
-    async fn prune(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
-        let report = json!({"kind": req.kind.as_str(), "dry_run": req.dry_run, "would_remove": [], "errors": []});
+    async fn prune_sessions(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
+        let report =
+            json!({"kind": "session_prune", "version": 1, "rows": [{"session_id": "ses_1"}]});
         self.answer(Call::Prune(req), report)
     }
 }
@@ -139,6 +127,9 @@ async fn spawn(writable: bool, ops: Option<Arc<StubOps>>) -> (SocketAddr, tempfi
     let tmp = tempfile::tempdir().unwrap();
     let mut state =
         rupu_cp::state::AppState::new(tmp.path().into(), rupu_config::PricingConfig::default())
+            // Never the test process's cwd: that is the rupu checkout, whose
+            // `.rupu/` a prune would otherwise reach.
+            .with_workspace_dir(tmp.path().into())
             .with_admin_ops(ops.map(|o| o as Arc<dyn AdminOps>));
     if writable {
         state = state.with_launcher(Some(Arc::new(NoopLauncher)));
@@ -282,9 +273,13 @@ async fn every_endpoint_is_local_only() {
 }
 
 #[tokio::test]
-async fn without_the_port_every_endpoint_is_a_501() {
-    let (addr, _tmp) = spawn(true, None).await;
-    for path in ["/api/autoflows/x", "/api/autoflows/doctor", "/api/cron"] {
+async fn without_the_port_only_the_cli_backed_operations_are_501() {
+    let (addr, tmp) = spawn(true, None).await;
+    for path in [
+        "/api/autoflows/x",
+        "/api/autoflows/doctor",
+        "/api/autoflows/wakes",
+    ] {
         let (status, body) = get(addr, path).await;
         assert_eq!(status, 501, "{path}");
         assert!(
@@ -294,6 +289,21 @@ async fn without_the_port_every_endpoint_is_a_501() {
     }
     let (status, _) = post(addr, "/api/maintenance/prune", json!({"kind": "sessions"})).await;
     assert_eq!(status, 501);
+    let (status, _) = post(addr, "/api/cron/tick", json!({})).await;
+    assert_eq!(status, 501);
+
+    // The listings and the library prunes need no port.
+    assert_eq!(get(addr, "/api/cron").await.0, 200);
+    assert_eq!(get(addr, "/api/cron/events").await.0, 200);
+    for kind in ["transcripts", "netflow"] {
+        let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": kind})).await;
+        assert_eq!(
+            (status, &body["dry_run"]),
+            (200, &json!(true)),
+            "{kind}: {body}"
+        );
+    }
+    drop(tmp);
 }
 
 #[tokio::test]
@@ -345,8 +355,14 @@ async fn writes_need_cp_serve_but_dry_runs_do_not() {
         501
     );
     assert_eq!(post(addr, "/api/cron/tick", json!({})).await.0, 501);
-    let prune = json!({"kind": "netflow", "dry_run": false});
-    assert_eq!(post(addr, "/api/maintenance/prune", prune).await.0, 501);
+    for kind in ["netflow", "transcripts", "sessions"] {
+        let prune = json!({"kind": kind, "dry_run": false});
+        assert_eq!(
+            post(addr, "/api/maintenance/prune", prune).await.0,
+            501,
+            "{kind}"
+        );
+    }
     assert!(ops.calls().is_empty(), "no write reached the port");
 
     // Dry runs change nothing, so they need no write gate.
@@ -361,13 +377,98 @@ async fn writes_need_cp_serve_but_dry_runs_do_not() {
             .0,
         200
     );
-    assert_eq!(
-        post(addr, "/api/maintenance/prune", json!({"kind": "netflow"}))
-            .await
-            .0,
-        200
-    );
+    let prune = json!({"kind": "sessions"});
+    assert_eq!(post(addr, "/api/maintenance/prune", prune).await.0, 200);
     assert_eq!(ops.calls().len(), 3);
+}
+
+/// A bare `42` / `#42` would resolve against `cp serve`'s working directory
+/// in the CLI's parser, so the API takes only the full form.
+#[tokio::test]
+async fn a_bare_issue_number_is_refused_before_the_port() {
+    let ops = Arc::new(StubOps::default());
+    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    for bare in ["42", "%2342", "acme/widgets%2342"] {
+        let (status, body) = get(addr, &format!("/api/autoflows/explain?issue_ref={bare}")).await;
+        assert_eq!(status, 400, "{bare}: {body}");
+        assert!(error_of(&body).contains("full"), "{body}");
+    }
+    let (status, _) = post(
+        addr,
+        "/api/autoflows/claims/repair",
+        json!({"issue_ref": "42", "release": true, "dry_run": false}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = post(addr, "/api/autoflows/fix/run", json!({"issue": "#42"})).await;
+    assert_eq!(status, 400);
+    assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+}
+
+fn backdate(path: &std::path::Path, days: u64) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn netflow_and_transcript_prunes_run_their_libraries() {
+    let ops = Arc::new(StubOps::default());
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let netflow = tmp.path().join("netflow");
+    std::fs::create_dir_all(&netflow).unwrap();
+    let old = netflow.join("run_old.jsonl");
+    let new = netflow.join("run_new.jsonl");
+    std::fs::write(&old, "{}\n").unwrap();
+    std::fs::write(&new, "{}\n").unwrap();
+    backdate(&old, 60);
+
+    let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": "netflow"})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["would_remove"][0]["run_id"], "run_old");
+    assert_eq!(body["would_remove"].as_array().unwrap().len(), 1);
+    assert!(old.exists(), "a dry run deletes nothing");
+
+    let (status, body) = post(
+        addr,
+        "/api/maintenance/prune",
+        json!({"kind": "netflow", "dry_run": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["removed"][0]["status"], "deleted");
+    assert!(!old.exists() && new.exists());
+
+    // A bad argument is the caller's 400; a bad configured retention is a
+    // 500 configuration error.
+    let (status, _) = post(
+        addr,
+        "/api/maintenance/prune",
+        json!({"kind": "netflow", "older_than": "soon"}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = post(
+        addr,
+        "/api/maintenance/prune",
+        json!({"kind": "transcripts", "older_than": "soon"}),
+    )
+    .await;
+    assert_eq!(status, 400);
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[storage]\narchived_transcript_retention = \"soon\"\n",
+    )
+    .unwrap();
+    let (status, body) = post(
+        addr,
+        "/api/maintenance/prune",
+        json!({"kind": "transcripts"}),
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert!(ops.calls().is_empty(), "no library prune reached the port");
 }
 
 #[tokio::test]
@@ -384,17 +485,24 @@ async fn repair_and_prune_default_to_a_dry_run() {
     let (status, body) = post(
         addr,
         "/api/maintenance/prune",
-        json!({"kind": "transcripts", "older_than": "7d"}),
+        json!({"kind": "sessions", "older_than": "7d"}),
     )
     .await;
-    assert_eq!((status, &body["dry_run"]), (200, &json!(true)));
-    let (status, _) = post(
+    assert_eq!(status, 200);
+    assert_eq!(
+        body,
+        json!({"kind": "sessions", "dry_run": true, "would_remove": [{"session_id": "ses_1"}], "errors": []})
+    );
+    let (status, body) = post(
         addr,
         "/api/maintenance/prune",
         json!({"kind": "cleanup", "dry_run": false}),
     )
     .await;
-    assert_eq!(status, 200);
+    assert_eq!(
+        (status, &body["removed"][0]["session_id"]),
+        (200, &json!("ses_1"))
+    );
     assert_eq!(
         ops.calls(),
         vec![
@@ -405,7 +513,7 @@ async fn repair_and_prune_default_to_a_dry_run() {
                 dry_run: true,
             }),
             Call::Prune(PruneRequest {
-                kind: PruneKind::Transcripts,
+                kind: PruneKind::Sessions,
                 older_than: Some("7d".into()),
                 dry_run: true,
             }),
@@ -417,14 +525,14 @@ async fn repair_and_prune_default_to_a_dry_run() {
         ]
     );
 
-    // An unknown kind is the body's 422; a bad duration the port's 400.
+    // An unknown kind is the body's 422; the port's refusal its status.
     let (status, _) = post(addr, "/api/maintenance/prune", json!({"kind": "logs"})).await;
     assert_eq!(status, 422);
     ops.refuse_with(AdminOpError::Invalid("invalid duration `x`".into()));
     let (status, body) = post(
         addr,
         "/api/maintenance/prune",
-        json!({"kind": "netflow", "older_than": "x"}),
+        json!({"kind": "sessions", "older_than": "x"}),
     )
     .await;
     assert_eq!(
@@ -433,12 +541,21 @@ async fn repair_and_prune_default_to_a_dry_run() {
     );
 }
 
+const CRON_WF: &str = "name: nightly\ntrigger:\n  on: cron\n  cron: \"0 4 * * *\"\nsteps:\n  - id: one\n    agent: a\n    actions: []\n    prompt: hi\n";
+
 #[tokio::test]
 async fn cron_reads_and_ticks() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let wfs = tmp.path().join("workflows");
+    std::fs::create_dir_all(&wfs).unwrap();
+    std::fs::write(wfs.join("nightly.yaml"), CRON_WF).unwrap();
+
     let (status, body) = get(addr, "/api/cron").await;
-    assert_eq!((status, &body["rows"][0]["name"]), (200, &json!("nightly")));
+    assert_eq!(status, 200);
+    assert_eq!(body["kind"], "cron_list");
+    assert_eq!(body["rows"][0]["name"], "nightly");
+    assert_eq!(body["rows"][0]["schedule"], "0 4 * * *");
     let (status, body) = get(addr, "/api/cron/events").await;
     assert_eq!((status, &body["kind"]), (200, &json!("cron_events")));
 
@@ -466,7 +583,7 @@ async fn cron_reads_and_ticks() {
         (409, "a cron tick is already running".into())
     );
     assert_eq!(
-        ops.calls()[2..4],
+        ops.calls()[..2],
         [
             Call::Tick(CronTickRequest {
                 dry_run: true,

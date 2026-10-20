@@ -45,9 +45,10 @@ pub(crate) struct AutoflowRepoQuery {
 /// `GET /api/autoflows/explain` query.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExplainQuery {
-    /// The issue, e.g. `github:owner/repo/issues/42` or a tracker-native
-    /// ref (`linear:eng/issues/42`). A query parameter, not a path segment:
-    /// an issue ref carries `/`.
+    /// The issue in full form, `<tracker>:<project>/issues/<number>`
+    /// (`github:owner/repo/issues/42`, `linear:eng/issues/42`); a bare
+    /// number is a 400. A query parameter, not a path segment: an issue ref
+    /// carries `/`.
     pub(crate) issue_ref: String,
     /// Limit resolution to one bound repo, e.g. `github:owner/repo`.
     pub(crate) repo: Option<String>,
@@ -93,7 +94,7 @@ async fn autoflow_explain(
     admin_ops::local_only(q.host.as_deref(), "explaining an autoflow issue")?;
     let ops = admin_ops::ops(&s, "explaining an autoflow issue")?;
     Ok(Json(
-        ops.autoflow_explain(&q.issue_ref, q.repo.as_deref())
+        ops.autoflow_explain(&admin_ops::full_issue_ref(&q.issue_ref)?, q.repo.as_deref())
             .await?,
     ))
 }
@@ -135,10 +136,11 @@ async fn autoflow_run(
     crate::api::config::require_writable_to(&s, "running an autoflow")?;
     fs_safety::validate_name(&name)?;
     let ops = admin_ops::ops(&s, "running an autoflow")?;
+    let issue = admin_ops::full_issue_ref(&body.issue)?;
     let started = ops
         .autoflow_run(admin_ops::AutoflowRunRequest {
             name,
-            issue: body.issue,
+            issue,
             repo: body.repo,
             mode: body.mode,
         })

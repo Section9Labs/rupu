@@ -1,10 +1,18 @@
-//! Port: the autoflow, cron and maintenance operations only the CLI had —
-//! `rupu autoflow show|explain|doctor|wakes|repair|run`, `rupu cron
-//! list|events|tick` and `rupu transcript|session|netflow prune` /
-//! `rupu cleanup`. rupu-cp defines it; rupu-cli's `cp serve` implements it
-//! over the same functions those commands run (`cp_admin_ops.rs`), so the
-//! API and the CLI share one implementation. `None` → the endpoints
-//! answer 501.
+//! Port: the operations whose logic still lives in rupu-cli. rupu-cp defines
+//! it; rupu-cli's `cp serve` implements it (`cp_admin_ops.rs`) over the
+//! functions the CLI commands run, so the API and the CLI share one
+//! implementation. `None` → those endpoints answer 501.
+//!
+//! - `cron_tick` and `autoflow_run`: they run a workflow / spawn a `rupu`
+//!   child, which needs the CLI's workflow runtime.
+//! - The autoflow reads (`autoflow_show|explain|doctor|wakes`),
+//!   `autoflow_repair`, and the session prunes (`sessions`, `cleanup`):
+//!   their logic is still in `cmd/autoflow.rs` and `cmd/session.rs`, to be
+//!   extracted into libraries (operator MCP Plan 3a, package E follow-up).
+//!
+//! The cron listings and the transcript / netflow prunes are served from
+//! their libraries directly (`rupu_orchestrator::cron_triggers`,
+//! `rupu_orchestrator::archived_transcripts`, [`crate::netflow_prune`]).
 //!
 //! Every report is the JSON the CLI command prints with `--format json`
 //! (its `kind` + `version` + rows/item), carried through as it is.
@@ -136,15 +144,13 @@ pub trait AdminOps: Send + Sync {
         &self,
         req: AutoflowRunRequest,
     ) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu cron list`: the `cron_list` report.
-    async fn cron_list(&self) -> Result<serde_json::Value, AdminOpError>;
-    /// `rupu cron events`: the `cron_events` report.
-    async fn cron_events(&self) -> Result<serde_json::Value, AdminOpError>;
     /// The tick `cp serve`'s cron loop runs. Single-flight with that loop:
     /// [`AdminOpError::Conflict`] while a tick is in progress.
     async fn cron_tick(&self, req: CronTickRequest) -> Result<CronTickOutcome, AdminOpError>;
-    /// The CLI's prune / cleanup: the rows it removed or would remove.
-    async fn prune(&self, req: PruneRequest) -> Result<serde_json::Value, AdminOpError>;
+    /// `rupu session prune` (`kind: sessions`) or `rupu cleanup` (`kind:
+    /// cleanup`): the command's JSON report. Only those two kinds reach the
+    /// port; the control plane prunes transcripts and netflow itself.
+    async fn prune_sessions(&self, req: PruneRequest) -> Result<serde_json::Value, AdminOpError>;
 }
 
 impl From<AdminOpError> for crate::error::ApiError {
@@ -177,6 +183,20 @@ pub(crate) fn local_only(host: Option<&str>, what: &str) -> crate::error::ApiRes
             "{what} is local-only: host `{h}` can't serve it"
         ))),
     }
+}
+
+/// An issue ref in its full form, `<tracker>:<project>/issues/<number>`,
+/// or a 400. The control plane has no checkout of its own, so a bare `42`
+/// or `#42` — which the CLI resolves against its working directory — could
+/// only land on whatever repo `cp serve` happened to start in.
+pub(crate) fn full_issue_ref(value: &str) -> crate::error::ApiResult<String> {
+    rupu_scm::IssueRef::parse_full(value)
+        .map(|r| r.to_full())
+        .map_err(|e| {
+            crate::error::ApiError::bad_request(format!(
+                "{e}: give the full `<tracker>:<project>/issues/<number>` form"
+            ))
+        })
 }
 
 /// `?host=` on a local-only operation.

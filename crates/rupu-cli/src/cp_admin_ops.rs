@@ -1,12 +1,11 @@
-//! `cp serve` adapter for rupu-cp's `AdminOps` port: the control plane's
-//! autoflow, cron and maintenance endpoints run the same functions as
-//! `rupu autoflow show|explain|doctor|wakes|repair|run`, `rupu cron
-//! list|events|tick` and the prune / cleanup commands, and answer with the
-//! JSON report each command prints under `--format json`.
-//!
-//! Everything runs in this process except an autoflow cycle, which is
-//! started as a detached `rupu autoflow run` child (W6's `RunArgv`): a cycle
-//! fetches the issue and drives a workflow run, so it outlives the request.
+//! `cp serve` adapter for rupu-cp's `AdminOps` port: the operations whose
+//! logic still lives in this crate. The cron tick runs the CLI's own tick
+//! under the `RUPU_HOME` tick lock; an autoflow cycle is started as a
+//! detached `rupu autoflow run` child (W6's `RunArgv`). The autoflow reads,
+//! repair and the session prunes call the functions `rupu autoflow
+//! show|explain|doctor|wakes|repair`, `rupu session prune` and `rupu
+//! cleanup` run, and answer with the JSON report each command prints under
+//! `--format json`, until their extraction into libraries.
 
 use std::path::PathBuf;
 
@@ -140,79 +139,56 @@ impl AdminOps for CliAdminOps {
         }))
     }
 
-    async fn cron_list(&self) -> Result<Value, AdminOpError> {
-        blocking(crate::cmd::cron::list_json).await
-    }
-
-    async fn cron_events(&self) -> Result<Value, AdminOpError> {
-        blocking(crate::cmd::cron::events_json).await
-    }
-
     async fn cron_tick(&self, req: CronTickRequest) -> Result<CronTickOutcome, AdminOpError> {
-        let Some(guard) = crate::cmd::cron::try_begin_tick() else {
-            return Err(AdminOpError::Conflict(
-                "a cron tick is already running; try again when it ends".into(),
-            ));
-        };
         if req.dry_run {
-            let report = crate::cmd::cron::tick(true, req.skip_events, req.only_events)
-                .await
-                .map_err(classify)?;
-            drop(guard);
-            return serde_json::to_value(report)
-                .map(CronTickOutcome::DryRun)
-                .map_err(|e| AdminOpError::Failed(e.to_string()));
+            let mut found = Vec::new();
+            crate::cmd::cron::tick(true, req.skip_events, req.only_events, &mut |fire| {
+                found.push(fire)
+            })
+            .await
+            .map_err(classify)?;
+            return Ok(CronTickOutcome::DryRun(json!({
+                "kind": "cron_tick",
+                "version": 1,
+                "dry_run": true,
+                "would_fire": found,
+            })));
         }
+        let lock = rupu_orchestrator::cron_triggers::TickLock::try_acquire(&self.global)
+            .map_err(|e| AdminOpError::Failed(format!("taking the cron tick lock: {e}")))?
+            .ok_or_else(|| {
+                AdminOpError::Conflict(
+                    "a cron tick is already running; try again when it ends".into(),
+                )
+            })?;
         tokio::spawn(async move {
-            let _guard = guard;
-            if let Err(e) = crate::cmd::cron::tick(false, req.skip_events, req.only_events).await {
+            let _lock = lock;
+            if let Err(e) =
+                crate::cmd::cron::tick(false, req.skip_events, req.only_events, &mut |_| {}).await
+            {
                 tracing::warn!(error = %e, "cp serve: requested cron tick failed");
             }
         });
         Ok(CronTickOutcome::Started)
     }
 
-    async fn prune(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
-        let global = self.global.clone();
+    async fn prune_sessions(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
         blocking(move || {
             let older = req.older_than.as_deref();
-            let (report, errors) = match req.kind {
-                PruneKind::Transcripts => (
-                    crate::cmd::transcript::prune_json(older, req.dry_run)?,
-                    Vec::new(),
-                ),
-                PruneKind::Sessions => (
-                    crate::cmd::session::prune_json(older, req.dry_run)?,
-                    Vec::new(),
-                ),
-                PruneKind::Netflow => crate::cmd::netflow::prune_json(&global, older, req.dry_run)?,
-                PruneKind::Cleanup => (
-                    crate::cmd::cleanup::cleanup_json(older, req.dry_run)?,
-                    Vec::new(),
-                ),
-            };
-            Ok(prune_answer(req.kind, req.dry_run, report, errors))
+            match req.kind {
+                PruneKind::Sessions => Ok(serde_json::to_value(
+                    crate::cmd::session::prune_report(older, req.dry_run)?,
+                )?),
+                PruneKind::Cleanup => crate::cmd::cleanup::cleanup_json(older, req.dry_run),
+                other => Err(AdminOpError::Invalid(format!(
+                    "the control plane prunes `{}` itself",
+                    other.as_str()
+                ))
+                .into()),
+            }
         })
         .await
     }
-}
-
-/// `{kind, dry_run, would_remove | removed, errors}`: the report's rows
-/// under the key that says whether anything was deleted.
-pub(crate) fn prune_answer(
-    kind: PruneKind,
-    dry_run: bool,
-    report: Value,
-    errors: Vec<String>,
-) -> Value {
-    let rows = report.get("rows").cloned().unwrap_or_else(|| json!([]));
-    let key = if dry_run { "would_remove" } else { "removed" };
-    let mut out = serde_json::Map::new();
-    out.insert("kind".into(), json!(kind.as_str()));
-    out.insert("dry_run".into(), json!(dry_run));
-    out.insert(key.into(), rows);
-    out.insert("errors".into(), json!(errors));
-    Value::Object(out)
 }
 
 #[cfg(test)]
@@ -270,24 +246,36 @@ mod tests {
         assert!(matches!(err, AdminOpError::Invalid(_)), "{err:?}");
     }
 
+    /// A real tick while another holds the `RUPU_HOME` tick lock (`cp
+    /// serve`'s loop, a crontab `rupu cron tick`) is a conflict, and starts
+    /// nothing; a dry run takes no lock and still answers.
+    #[tokio::test]
+    async fn a_tick_while_the_lock_is_held_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ops = CliAdminOps {
+            exe: PathBuf::from("/bin/rupu"),
+            global: tmp.path().to_path_buf(),
+        };
+        let held = rupu_orchestrator::cron_triggers::TickLock::try_acquire(tmp.path())
+            .unwrap()
+            .expect("the lock is free");
+        let err = ops
+            .cron_tick(CronTickRequest {
+                dry_run: false,
+                skip_events: true,
+                only_events: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdminOpError::Conflict(_)), "{err:?}");
+        drop(held);
+    }
+
     #[test]
     fn a_typed_refusal_survives_context() {
         let e = anyhow::Error::from(AdminOpError::NotFound("no claim".into())).context("repair");
         assert_eq!(classify(e), AdminOpError::NotFound("no claim".into()));
         let e = anyhow::anyhow!("disk on fire");
         assert_eq!(classify(e), AdminOpError::Failed("disk on fire".into()));
-    }
-
-    #[test]
-    fn a_prune_answer_names_its_rows_by_what_happened() {
-        let report = json!({"kind": "session_prune", "version": 1, "rows": [{"session_id": "s"}]});
-        assert_eq!(
-            prune_answer(PruneKind::Sessions, true, report.clone(), vec![]),
-            json!({"kind": "sessions", "dry_run": true, "would_remove": [{"session_id": "s"}], "errors": []})
-        );
-        assert_eq!(
-            prune_answer(PruneKind::Sessions, false, report, vec!["x".into()]),
-            json!({"kind": "sessions", "dry_run": false, "removed": [{"session_id": "s"}], "errors": ["x"]})
-        );
     }
 }

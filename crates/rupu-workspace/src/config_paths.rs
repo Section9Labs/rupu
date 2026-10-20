@@ -112,6 +112,80 @@ pub fn config_paths(
     })
 }
 
+/// `e` and its sources as one line, `a: b: c` (anyhow's `{:#}`).
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(s) = source {
+        out.push_str(": ");
+        out.push_str(&s.to_string());
+        source = s.source();
+    }
+    out
+}
+
+/// [`config_paths`] for display-only reads (UI preferences, pricing tables,
+/// listings): a failed customer lookup is logged and the customer layer
+/// left out, so a broken assignment never stops `rupu transcript list`.
+/// Never use this where the config picks a provider, account or permission.
+pub fn config_paths_for_display(
+    home: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+) -> ConfigPaths {
+    config_paths(home, project_root, run_dir).unwrap_or_else(|e| {
+        tracing::warn!(error = %error_chain(&e), "customer config layer skipped for this display");
+        ConfigPaths::without_customer(home, project_root)
+    })
+}
+
+/// The config for a display-only read (UI preferences, pricing, listings),
+/// never failing: [`config_paths_for_display`] layers, loaded with
+/// `layer_files_locked` when `locked` (a policy-bearing value such as
+/// `[ui].editor` or pricing) else `layer_files`. A layer that fails to load
+/// is logged and the load retried without the customer layer; if that fails
+/// too, it is logged and `Config::default()` returned. Never use this where
+/// the config picks a provider, account or permission — use
+/// [`config_paths`] there.
+pub fn load_config_for_display(
+    home: &Path,
+    project_root: Option<&Path>,
+    run_dir: &Path,
+    locked: bool,
+) -> rupu_config::Config {
+    let load = |p: &ConfigPaths| {
+        if locked {
+            rupu_config::layer_files_locked(p.layers())
+        } else {
+            rupu_config::layer_files(p.layers())
+        }
+    };
+    let paths = config_paths_for_display(home, project_root, run_dir);
+    let first = match load(&paths) {
+        Ok(cfg) => return cfg,
+        Err(e) => e,
+    };
+    if paths.customer.is_some() {
+        tracing::warn!(
+            error = %error_chain(&first),
+            "config failed to load for this display; retrying without the customer layer"
+        );
+        match load(&ConfigPaths::without_customer(home, project_root)) {
+            Ok(cfg) => return cfg,
+            Err(e) => tracing::warn!(
+                error = %error_chain(&e),
+                "config failed to load for this display; using defaults"
+            ),
+        }
+    } else {
+        tracing::warn!(
+            error = %error_chain(&first),
+            "config failed to load for this display; using defaults"
+        );
+    }
+    rupu_config::Config::default()
+}
+
 /// Layers for a known customer `slug` (resume by the recorded slug).
 /// `Some(slug)` with no customer directory is [`CustomerError::NotFound`].
 pub fn config_paths_for_customer(

@@ -182,6 +182,29 @@ pub struct IssueRef {
     pub number: u64,
 }
 
+impl IssueRef {
+    /// Parse the full form `<tracker>:<project>/issues/<number>`
+    /// (`github:owner/repo/issues/42`, `linear:eng/issues/7`). Nothing is
+    /// resolved against a working directory: a bare `42` or `#42` is an
+    /// error, so a caller with no checkout of its own (the control plane)
+    /// can never land on the wrong repo's issue.
+    pub fn parse_full(value: &str) -> Result<Self, String> {
+        let invalid = || format!("invalid issue ref `{value}`");
+        let (tracker, rest) = value.split_once(':').ok_or_else(invalid)?;
+        let (project, number) = rest.rsplit_once("/issues/").ok_or_else(invalid)?;
+        Ok(Self {
+            tracker: tracker.parse()?,
+            project: project.to_string(),
+            number: number.parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
+        })
+    }
+
+    /// The full form [`Self::parse_full`] reads.
+    pub fn to_full(&self) -> String {
+        format!("{}:{}/issues/{}", self.tracker, self.project, self.number)
+    }
+}
+
 /// Best-effort subject identified for one polled event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -488,5 +511,27 @@ mod tests {
         assert!(f.state.is_none());
         assert!(f.author.is_none());
         assert!(f.limit.is_none());
+    }
+}
+
+#[cfg(test)]
+mod issue_ref_tests {
+    use super::*;
+
+    #[test]
+    fn the_full_form_round_trips_and_a_bare_number_is_refused() {
+        let r = IssueRef::parse_full("github:acme/widgets/issues/42").unwrap();
+        assert_eq!(
+            r,
+            IssueRef {
+                tracker: IssueTracker::Github,
+                project: "acme/widgets".into(),
+                number: 42,
+            }
+        );
+        assert_eq!(r.to_full(), "github:acme/widgets/issues/42");
+        for bad in ["42", "#42", "acme/widgets#42", "github:a/b/issues/x", "nope:a/b/issues/1"] {
+            assert!(IssueRef::parse_full(bad).is_err(), "{bad}");
+        }
     }
 }
