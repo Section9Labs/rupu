@@ -165,6 +165,11 @@ describe('RunTranscript continue', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
     const composer = screen.getByRole('region', { name: 'Continue this run' });
     const prompt = within(composer).getByLabelText(/Prompt/);
+    // Without a model change the prompt is needed, so it isn't "optional".
+    const label = composer.querySelector(`label[for="${prompt.id}"]`);
+    expect(label).toHaveTextContent('Prompt — or change the model below');
+    expect(label).not.toHaveTextContent(/optional/i);
+    expect(prompt).not.toHaveAttribute('placeholder', expect.stringMatching(/optional/i));
     fireEvent.change(prompt, { target: { value: '   ' } });
     expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeDisabled();
     fireEvent.change(prompt, { target: { value: 'It is authorised: go ahead.' } });
@@ -189,6 +194,7 @@ describe('RunTranscript continue', () => {
     const composer = screen.getByRole('region', { name: 'Continue this run' });
     const prompt = within(composer).getByLabelText(/Prompt/);
     expect(prompt).toHaveAttribute('placeholder', expect.stringMatching(/optional/i));
+    expect(composer.querySelector(`label[for="${prompt.id}"]`)).toHaveTextContent('Prompt (optional)');
     fireEvent.change(prompt, { target: { value: '/pdf then skip the appendix' } });
     fireEvent.keyDown(prompt, { key: 'Enter', metaKey: true });
     await waitFor(() =>

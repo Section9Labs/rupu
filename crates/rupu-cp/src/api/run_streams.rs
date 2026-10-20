@@ -83,7 +83,7 @@ pub(crate) struct ContinueAgentRunBody {
     /// --no-messaging`) or `{"tools": [...]}` (`--messaging-tool`). Absent
     /// keeps the launch's.
     #[serde(default)]
-    #[schemars(with = "Option<serde_json::Value>")]
+    #[schemars(with = "serde_json::Value")]
     messaging: rupu_runtime::argv::LaunchMessaging,
 }
 

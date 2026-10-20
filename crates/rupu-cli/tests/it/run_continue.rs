@@ -504,6 +504,60 @@ fn continue_with_a_prompt_carries_a_failed_run_on_the_same_model() {
     );
 }
 
+/// A prompt that only starts like a run target (`github: …`) is a prompt, on
+/// a fresh run (nothing is cloned) and on a continue (the recorded command,
+/// here with no target, stays as it was).
+#[test]
+fn a_prompt_that_starts_like_a_target_is_a_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    let prompt = "github: compare foo/bar with baz/qux";
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"compared","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--mode",
+        "bypass",
+        "--run-id",
+        "run_first",
+        prompt,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("compared"));
+    assert_eq!(user_messages(dir.path(), "run_first"), [prompt]);
+    assert_eq!(
+        run_start(dir.path(), "run_first")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_first", "--mode=bypass"])
+    );
+
+    let again = "github: now compare foo/bar with main";
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"compared again","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_second",
+        "--continue",
+        "run_first",
+        again,
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("compared again"));
+    assert_eq!(user_messages(dir.path(), "run_second"), [again]);
+    assert_eq!(
+        run_start(dir.path(), "run_second")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_second", "--mode=bypass"])
+    );
+}
+
 /// A blank prompt is no prompt: a finished run still just prints its answer.
 #[test]
 fn continue_with_a_blank_prompt_is_a_bare_continue() {

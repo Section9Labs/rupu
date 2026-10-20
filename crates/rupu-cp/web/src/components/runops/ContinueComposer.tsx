@@ -133,7 +133,11 @@ export function ContinueComposer({
       </p>
 
       <label htmlFor={promptId} className="mt-3 block text-note font-semibold text-ink">
-        Prompt{!completed && <span className="font-normal text-ink-mute"> (optional)</span>}
+        Prompt
+        {/* What the prompt takes: required on a finished run, needed on a
+            failed one unless the model changes, optional otherwise. */}
+        {failed && <span className="font-normal text-ink-mute"> — or change the model below</span>}
+        {!completed && !failed && <span className="font-normal text-ink-mute"> (optional)</span>}
       </label>
       <textarea
         id={promptId}
@@ -142,7 +146,7 @@ export function ContinueComposer({
         required={completed}
         rows={3}
         placeholder={
-          completed
+          completed || failed
             ? 'What should the run do next?'
             : 'Optional — what to tell the run next. Leave empty to carry on as it was.'
         }

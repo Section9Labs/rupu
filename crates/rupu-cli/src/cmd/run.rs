@@ -3068,11 +3068,14 @@ mod continue_restore_tests {
 
     #[test]
     fn launch_argv_leaves_out_a_target_that_is_the_prompt() {
-        let args = parse(&["a", "fix the bug", "--mode", "readonly"]);
-        assert_eq!(
-            launch_argv(&args, "run_9"),
-            ["a", "--run-id=run_9", "--mode=readonly"]
-        );
+        for prompt in ["fix the bug", "github: compare foo/bar"] {
+            let args = parse(&["a", prompt, "--mode", "readonly"]);
+            assert_eq!(
+                launch_argv(&args, "run_9"),
+                ["a", "--run-id=run_9", "--mode=readonly"],
+                "{prompt}"
+            );
+        }
     }
 
     #[test]
@@ -3168,6 +3171,13 @@ mod continue_restore_tests {
             assert!(!argv.iter().any(|a| a.contains("go")), "{argv:?}");
             assert_eq!(&argv[..2], ["a", "github:owner/repo"]);
         }
+        // A prompt that only starts like a target is the prompt: it keeps the
+        // recorded target.
+        let now = parse(&["a", "--continue", "run_1", "github: compare foo/bar"])
+            .prompt_words_out_of_target();
+        let merged = restore_launch(recorded(), now);
+        assert_eq!(merged.target.as_deref(), Some("github:owner/repo"));
+        assert_eq!(merged.given_prompt(), Some("github: compare foo/bar"));
         // A run target given on the continue is a target, and replaces the
         // recorded one.
         let now = parse(&["a", "--continue", "run_1", "github:o/other", "go on"])
