@@ -26,7 +26,7 @@ const fn text(
 }
 
 pub static FIELDS: Fields = &[
-    // Free-form: a standalone run's transcript status or a session turn's.
+    // Free-form: a standalone run's recorded status or a session turn's.
     text(
         "status",
         |r| opt(r, "status"),

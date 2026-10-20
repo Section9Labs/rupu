@@ -433,3 +433,109 @@ async fn plain_run_writes_its_own_usage_ledger() {
         rows[0].transcript
     );
 }
+
+/// `rupu run echo [--run-id <id>] go` in a fresh `RUPU_HOME` with no
+/// credentials (no mock provider), from a scratch project dir; the global
+/// dir is `<tmp>/.rupu`. Returns whether the command exited 0.
+async fn run_echo_without_credentials(tmp: &assert_fs::TempDir, run_id: Option<&str>) -> bool {
+    let global = tmp.child(".rupu");
+    global.child("agents").create_dir_all().unwrap();
+    global
+        .child("agents/echo.md")
+        .write_str(
+            "---\nname: echo\nprovider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 1\n---\nyou echo.",
+        )
+        .unwrap();
+    let project = tmp.child("project");
+    project.create_dir_all().unwrap();
+
+    std::env::set_var("RUPU_HOME", global.path());
+    std::env::remove_var("RUPU_MOCK_PROVIDER_SCRIPT");
+    std::env::remove_var("RUPU_AUTH_FILE");
+    std::env::set_current_dir(project.path()).unwrap();
+
+    let mut argv: Vec<String> = ["rupu", "run", "echo", "--mode", "bypass"]
+        .map(String::from)
+        .to_vec();
+    if let Some(id) = run_id {
+        argv.extend(["--run-id".to_string(), id.to_string()]);
+    }
+    argv.push("go".into());
+    let exit = rupu_cli::run(argv).await;
+
+    std::env::set_current_dir(tmp.path()).unwrap();
+    std::env::remove_var("RUPU_HOME");
+    format!("{exit:?}") == format!("{:?}", std::process::ExitCode::from(0))
+}
+
+/// A launch a coordinator named (`--run-id`, as the CP's agent launcher
+/// spawns it, detached with null stdio) whose provider can't be built
+/// records that failure under its id: the transcript a run whose first call
+/// failed would leave (naming the missing credential and the `rupu auth
+/// login` hint), the metadata the CP lists it from, and a failed run.json.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_id_launch_without_credentials_records_a_failed_run() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let run_id = "run_no_credentials_1";
+
+    let ok = run_echo_without_credentials(&tmp, Some(run_id)).await;
+    assert!(
+        !ok,
+        "a run whose provider can't be built must exit non-zero"
+    );
+
+    let global = tmp.child(".rupu");
+    let transcripts = global.child("transcripts");
+    let transcript = transcripts.child(format!("{run_id}.jsonl"));
+    let summary = rupu_transcript::JsonlReader::summary(transcript.path())
+        .expect("the failed launch leaves a transcript");
+    assert_eq!(summary.run_id, run_id);
+    assert_eq!(summary.agent, "echo");
+    assert_eq!(summary.status, rupu_transcript::RunStatus::Error);
+    let error = summary.error.expect("run_complete carries the error");
+    assert!(error.contains("anthropic"), "names the provider: {error}");
+    assert!(
+        error.contains("rupu auth login --provider anthropic"),
+        "carries the login hint: {error}"
+    );
+
+    assert!(
+        transcripts
+            .child(format!("{run_id}.meta.json"))
+            .path()
+            .is_file(),
+        "the run's metadata is written, so the CP lists it"
+    );
+
+    let rec = rupu_orchestrator::RunStore::new(global.path().join("runs"))
+        .load(run_id)
+        .expect("the failed launch leaves a run.json");
+    assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);
+    assert!(rec.finished_at.is_some());
+    let message = rec.error_message.unwrap_or_default();
+    assert!(
+        message.contains("rupu auth login"),
+        "run.json carries the error: {message}"
+    );
+}
+
+/// A terminal `rupu run` (no `--run-id`) still fails before anything lands
+/// on disk when its provider can't be built.
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_run_without_credentials_records_nothing() {
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let ok = run_echo_without_credentials(&tmp, None).await;
+    assert!(
+        !ok,
+        "a run whose provider can't be built must exit non-zero"
+    );
+
+    let transcripts = tmp.child(".rupu/transcripts");
+    let written: Vec<_> = std::fs::read_dir(transcripts.path())
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(written.is_empty(), "nothing is recorded: {written:?}");
+}

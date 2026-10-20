@@ -1370,10 +1370,21 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
 
         // The provider is built before a target is cloned, so a typo'd
         // provider or a missing credential fails the command before anything
-        // lands on disk.
-        let prepared = assembler
+        // lands on disk — except a launch a coordinator named (`--run-id`):
+        // nobody reads its terminal, so the failure is its run, recorded
+        // below (transcript, metadata, run.json) under the id it was given.
+        let (prepared, provider_failure) = match assembler
             .prepare_provider(&spec, &overrides, netflow_sink.clone())
-            .await?;
+            .await
+        {
+            Ok(prepared) => (Some(prepared), None),
+            Err(e) if args.run_id.is_some() => (None, Some(e)),
+            Err(e) => return Err(e.into()),
+        };
+        let (provider_name, model_name) = match &prepared {
+            Some(p) => (p.provider_name.clone(), p.model.clone()),
+            None => assembler.resolve_provider_model(&spec, &overrides),
+        };
         // The skills are resolved before the clone too, but a skill that
         // doesn't resolve is a failed run, recorded below like any assembly
         // failure: it skips the clone instead of failing the command.
@@ -1394,8 +1405,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         printer.agent_header(
             &spec.name,
             Some(&codename.to_string()),
-            &prepared.provider_name,
-            &prepared.model,
+            &provider_name,
+            &model_name,
             &run_id,
         );
 
@@ -1413,7 +1424,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         // function exit, keeping the directory alive for the run. Modes 2
         // and 3 set it to None — the user owns cleanup.
         let _clone_guard: Option<tempfile::TempDir>;
-        let clone_target = run_target.as_ref().filter(|_| skills_failure.is_none());
+        let clone_target = run_target
+            .as_ref()
+            .filter(|_| skills_failure.is_none() && provider_failure.is_none());
         let workspace_path: std::path::PathBuf = match clone_target {
             Some(crate::run_target::RunTarget::Repo {
                 platform,
@@ -1611,8 +1624,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             Some((messages, seed_source, Some(stopped_on), loaded_skills)) => {
                 let note = rupu_agent::recovery::recovery_retry_note(
                     &stopped_on.title,
-                    &prepared.provider_name,
-                    &prepared.model,
+                    &provider_name,
+                    &model_name,
                 );
                 rupu_agent::continuation::apply_continuation_with(
                     &mut prompt,
@@ -1660,19 +1673,41 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
                 message_bus: space_bus,
-                provider: Some(prepared),
+                provider: prepared,
                 skills: resolved_skills,
                 ..Default::default()
             },
             collectors: Vec::new(),
             link: launch_link.clone(),
         };
-        // A run that cannot be assembled (its grant fails, its skills don't
-        // resolve) is a failed run: recorded in run.json like any other
-        // failure, not an early exit.
-        let assembled = match skills_failure {
-            None => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
-            Some(e) => Err(match (e.into_run_error(), &skills_carried_from) {
+        // A run that cannot be assembled (its provider does not build, its
+        // grant fails, its skills don't resolve) is a failed run: recorded in
+        // run.json like any other failure, not an early exit. One whose
+        // provider did not build also writes the transcript a run whose first
+        // call failed would, carrying the error and its `rupu auth login`
+        // hint.
+        let assembled = match (provider_failure, skills_failure) {
+            (Some(e), _) => Err(e.record_unstarted(rupu_agent::UnstartedRun {
+                transcript_path: &transcript_path,
+                run_id: &run_id,
+                workspace_id: &ws.id,
+                agent: &spec.name,
+                provider: &provider_name,
+                model: &model_name,
+                mode: launch.mode,
+                codename: launch.codename.as_deref(),
+                customer: assembler.context().customer.as_deref(),
+                system_prompt: Some(&rupu_runtime::assembly::system_prompt_for(
+                    &launch.agent,
+                    &launch.overrides,
+                    None,
+                )),
+                prompt: &launch.prompt,
+                launch_skills: &launch.overrides.skills,
+                launch_preload_skills: &launch.overrides.preload_skills,
+            })),
+            (None, None) => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
+            (None, Some(e)) => Err(match (e.into_run_error(), &skills_carried_from) {
                 (rupu_agent::RunError::Preflight(m), Some(prev)) => {
                     rupu_agent::RunError::Preflight(format!(
                         "{m}\n  The launch skills ({}) came from run {prev}, which this run \
