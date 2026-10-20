@@ -35,6 +35,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/:id/cancel", post(cancel_run))
         .route("/api/runs/:id/pause", post(pause_run))
         .route("/api/runs/:id/resume", post(resume_run))
+        .route("/api/runs/:id/retry", post(retry_run))
         .route("/api/runs/:id/archive", post(archive_run))
         .route("/api/runs/:id/restore", post(restore_run))
 }
@@ -167,6 +168,24 @@ pub(crate) struct RunControlQuery {
     host: Option<String>,
     #[serde(default)]
     gate: Option<String>,
+}
+
+impl RunControlQuery {
+    /// The remote host this request names: `None` when `host` is absent or
+    /// `local`.
+    pub(crate) fn remote_host(&self) -> Option<&str> {
+        self.host.as_deref().filter(|h| *h != "local")
+    }
+}
+
+/// Optional body for `POST /api/runs/:id/retry`.
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct RetryBody {
+    /// Start every interrupted step and `for_each` unit over from its
+    /// prompt instead of continuing it from its transcript
+    /// (`--restart-interrupted`). Default false.
+    #[serde(default)]
+    restart_interrupted: bool,
 }
 
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
@@ -520,6 +539,82 @@ async fn resume_run(
     let mut resp = run_response(&s, &id).await?;
     resp.0["host_id"] = serde_json::json!("local");
     Ok(resp)
+}
+
+/// `POST /api/runs/:id/retry` — retry a failed, rejected or cancelled
+/// workflow run: a detached `rupu workflow resume <id>
+/// [--restart-interrupted]`, an operator's resume, which flips the run back
+/// to `Running` under the run lock before it runs it (what it left
+/// mid-flight is continued, unless `restart_interrupted`). A run left
+/// `Running` by a runner that died is reaped to `Failed` first, as the CLI
+/// does, and retried. 202 once the resume is spawned: the run's status is
+/// the confirmation.
+///
+/// 409 for a run that is running, pending, paused (`runs.resume`),
+/// awaiting approval or completed; 404 for an unknown run. Local-only:
+/// `?host=<remote>` is a 501, since a host's resume path serves only paused
+/// runs.
+async fn retry_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<RunControlQuery>,
+    body: Option<Json<RetryBody>>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    validate_id(&id)?;
+    if let Some(host) = q.remote_host() {
+        return Err(ApiError::not_available(format!(
+            "retrying a run is local-only: host `{host}` resumes only paused runs"
+        )));
+    }
+    let launcher = s
+        .launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("retrying a run requires `rupu cp serve`"))?;
+    let restart_interrupted = body.map(|b| b.0.restart_interrupted).unwrap_or(false);
+    let mut record = s.run_store.load(&id).map_err(|e| match e {
+        RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    if matches!(record.status, RunStatus::Running | RunStatus::Pending) {
+        let now = chrono::Utc::now();
+        let mut listed = record.clone();
+        record = s
+            .run_store
+            .blocking(move |store| store.reap_if_orphaned(&mut listed, now).map(|_| listed))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+    match record.status {
+        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
+        RunStatus::Paused => {
+            return Err(ApiError::conflict(format!(
+                "run {id} is `paused`: resume it (`runs.resume`) instead of retrying it"
+            )))
+        }
+        other => {
+            return Err(ApiError::conflict(format!(
+                "run {id} is `{}`: only a failed, rejected or cancelled run can be retried",
+                other.as_str()
+            )))
+        }
+    }
+    let req = crate::launcher::RetryRequest {
+        run_id: id.clone(),
+        restart_interrupted,
+    };
+    launcher.retry(req).await.map_err(|e| match e {
+        crate::launcher::LaunchError::Invalid(m) => ApiError::bad_request(m),
+        crate::launcher::LaunchError::Spawn(m) => ApiError::internal(m),
+    })?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "run_id": id,
+            "retrying": true,
+            "restart_interrupted": restart_interrupted,
+            "host_id": "local",
+        })),
+    ))
 }
 
 // ── Host-aware helpers ────────────────────────────────────────────────────────

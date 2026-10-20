@@ -22,6 +22,9 @@ const CODENAME: &str = "cobalt-harbor/heron#412";
 
 fn placed(run_id: &str, codename: Option<&str>) -> AgentLaunchRequest {
     AgentLaunchRequest {
+        model: None,
+        provider: None,
+        continue_from: None,
         agent: "recon".into(),
         prompt: Some("go".into()),
         mode: None,

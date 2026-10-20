@@ -5,7 +5,7 @@
 //! (and passed via `--run-id`) so the web UI can navigate to the run
 //! immediately.
 
-use rupu_cp::launcher::{LaunchError, LaunchRequest, RunLauncher};
+use rupu_cp::launcher::{LaunchError, LaunchRequest, RetryRequest, RunLauncher};
 use rupu_runtime::argv::RunArgv;
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use std::path::PathBuf;
@@ -38,6 +38,15 @@ impl RunLauncher for SubprocessLauncher {
             .map_err(|e| LaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }
+
+    /// `rupu workflow resume <id> [--restart-interrupted]`, detached like a
+    /// launch. It runs where the resume worker's children run: the resume
+    /// reads the run's own record and snapshot, not the cwd.
+    async fn retry(&self, req: RetryRequest) -> Result<(), LaunchError> {
+        spawn_detached(SpawnSpec::new(&self.exe, req.argv()))
+            .map_err(|e| LaunchError::Spawn(e.to_string()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +60,8 @@ mod tests {
         inputs.insert("k".to_string(), "v".to_string());
         inputs.insert("a".to_string(), "b".to_string());
         let req = LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: "audit".to_string(),
             inputs,
             mode: Some("bypass".to_string()),
@@ -83,6 +94,61 @@ mod tests {
             ]
         );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/p".as_ref()));
+    }
+
+    #[test]
+    fn engagement_profiles_and_a_file_are_on_the_argv() {
+        let req = LaunchRequest {
+            workflow: "ignored".to_string(),
+            engagement_profiles: vec!["network".into(), "web".into()],
+            file: Some("/g/cp/workflow-launches/w.yaml".into()),
+            ..LaunchRequest::default()
+        };
+        let spec = spawn_spec("/bin/rupu".as_ref(), &req, "run_X").unwrap();
+        let argv: Vec<String> = spec
+            .argv
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "workflow",
+                "run",
+                "--file",
+                "/g/cp/workflow-launches/w.yaml",
+                "--run-id",
+                "run_X",
+                "--plain",
+                "--engagement-profile",
+                "network",
+                "--engagement-profile",
+                "web",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_retry_is_an_operators_workflow_resume() {
+        for (restart, want) in [
+            (false, vec!["workflow", "resume", "run_X"]),
+            (
+                true,
+                vec!["workflow", "resume", "run_X", "--restart-interrupted"],
+            ),
+        ] {
+            let argv: Vec<String> = RetryRequest {
+                run_id: "run_X".into(),
+                restart_interrupted: restart,
+            }
+            .argv()
+            .to_args()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+            assert_eq!(argv, want);
+        }
     }
 
     #[test]

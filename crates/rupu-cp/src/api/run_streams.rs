@@ -5,10 +5,14 @@
 // Autoflow CLAIMS (/api/autoflows/claims) remain local-only.
 // /api/runs and /api/runs/workflows are host-aware via Slice 1's fan_out_list_runs.
 
-use crate::{error::ApiResult, state::AppState};
+use crate::{
+    error::{ApiError, ApiResult},
+    state::AppState,
+};
 use axum::{
-    extract::{Query, State},
-    routing::get,
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::{get, post},
     Json, Router,
 };
 use rupu_runtime::{
@@ -22,6 +26,207 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/autoflows", get(list_autoflow_runs))
         .route("/api/runs/autoflows/events", get(list_autoflow_events))
         .route("/api/runs/agents", get(list_agent_runs))
+        .route("/api/runs/agents/:id/continue", post(continue_agent_run))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/runs/agents/:id/continue
+// ---------------------------------------------------------------------------
+
+/// Body of `POST /api/runs/agents/:id/continue`. Every field is optional:
+/// the continued run restores every flag the original was launched with
+/// (`RunStart.launch_args`), and a field set here replaces only its own.
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ContinueAgentRunBody {
+    /// Model to continue on, over the one the run was launched with. A run
+    /// that failed on a provider-side outcome (a refusal, say) is continued
+    /// on it too.
+    #[serde(default)]
+    model: Option<String>,
+    /// Provider to continue on, over the one the run was launched with.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Permission mode (`ask` | `bypass` | `readonly`) to continue in, over
+    /// the one the run was launched with. A run started without one runs
+    /// `ask`, which a detached continuation can't answer.
+    #[serde(default)]
+    mode: Option<String>,
+    /// Refused: `rupu run --continue` takes no prompt, since the continued
+    /// conversation already holds it. Read only to say so.
+    #[serde(default)]
+    #[schemars(skip)]
+    prompt: Option<String>,
+}
+
+/// What continuing an agent run needs from the run it continues.
+#[derive(Debug)]
+struct ContinuedRun {
+    agent: String,
+    /// The directory the run was launched from: its project layer, agents
+    /// and transcripts dir are found from there, as they were for it.
+    working_dir: Option<std::path::PathBuf>,
+    /// Why the run can't be continued now: it is still running.
+    running: Option<String>,
+}
+
+/// The standalone run `id`'s metadata (`<transcripts>/<id>.meta.json`, next
+/// to its transcript): where it ran, and the pid of the process running it.
+fn standalone_meta(
+    transcript: &std::path::Path,
+    id: &str,
+) -> Option<(Option<std::path::PathBuf>, Option<u32>)> {
+    #[derive(Deserialize)]
+    struct Meta {
+        #[serde(default)]
+        workspace_path: Option<std::path::PathBuf>,
+        #[serde(default)]
+        pid: Option<u32>,
+    }
+    let path = transcript.with_file_name(format!("{id}.meta.json"));
+    let m: Meta = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some((m.workspace_path, m.pid))
+}
+
+/// Locate agent run `id` (a standalone `run_…` or a sub-agent's `sub_…`)
+/// and what continuing it needs. Reads the disk.
+fn continued_run(global: &std::path::Path, id: &str) -> ApiResult<ContinuedRun> {
+    let runs = rupu_orchestrator::RunStore::new(global.join("runs"));
+    let not_found = || ApiError::not_found(format!("agent run {id} not found"));
+    let (transcript, origin) = if id.starts_with("sub_") {
+        let transcript = runs.find_sub_run(id).ok_or_else(not_found)?;
+        // `<runs>/<parent>/sub/<id>/transcript.jsonl`: the parent ran it,
+        // so where the parent ran and whether it still does are the sub-run's.
+        let parent = transcript
+            .ancestors()
+            .nth(3)
+            .and_then(|d| d.file_name())
+            .and_then(|n| n.to_str())
+            .ok_or_else(not_found)?
+            .to_string();
+        (transcript, parent)
+    } else if crate::host::connector::valid_run_id(id) {
+        (
+            agent_run_transcript(global, id).ok_or_else(not_found)?,
+            id.to_string(),
+        )
+    } else {
+        return Err(ApiError::bad_request(format!(
+            "invalid agent run id: {id:?}"
+        )));
+    };
+    let head = rupu_transcript::JsonlReader::head(&transcript)
+        .map_err(|e| ApiError::bad_request(format!("agent run {id}: {e}")))?;
+    let live = |pid: Option<u32>| pid.is_some_and(rupu_orchestrator::runs::pid_is_running);
+    let (working_dir, running) = match runs.load(&origin) {
+        // A workflow run's sub-agent: the workflow's runner runs it.
+        Ok(rec)
+            if !rec
+                .workflow_name
+                .starts_with(rupu_orchestrator::AGENT_RUN_PREFIX) =>
+        {
+            let running = (matches!(
+                rec.status,
+                rupu_orchestrator::RunStatus::Running | rupu_orchestrator::RunStatus::Pending
+            ) && live(rec.runner_pid))
+            .then(|| format!("its workflow run {origin} is still running"));
+            (Some(rec.workspace_path), running)
+        }
+        // A standalone run (whose record is written only as it ends), or
+        // its sub-agent: its own process runs it.
+        _ => {
+            let parent_transcript = if origin == id {
+                Some(transcript.clone())
+            } else {
+                agent_run_transcript(global, &origin)
+            };
+            let (dir, pid) = parent_transcript
+                .and_then(|t| standalone_meta(&t, &origin))
+                .unwrap_or_default();
+            let running = live(pid).then(|| {
+                if origin == id {
+                    "it is still running".to_string()
+                } else {
+                    format!("the run that dispatched it, {origin}, is still running")
+                }
+            });
+            (dir, running)
+        }
+    };
+    Ok(ContinuedRun {
+        agent: head.agent,
+        working_dir: working_dir.filter(|d| d.is_dir()),
+        running,
+    })
+}
+
+/// `POST /api/runs/agents/:id/continue` — continue an agent run (a
+/// standalone `run_…` or a sub-agent's `sub_…`) from its transcript: a
+/// detached `rupu run <agent> --continue <id>` in the directory the run was
+/// launched from, under a new run id. The child restores every flag the run
+/// was launched with; `model` / `provider` / `mode` replace their own. A run that had
+/// finished answers with its recorded answer and calls no model. 202 with
+/// the new run's id: the continuation is spawned, not done.
+///
+/// 409 while the run (or the run that dispatched a sub-agent) is still
+/// running, 404 for an unknown run, 400 for a `prompt`. Local-only:
+/// `?host=<remote>` is a 501.
+async fn continue_agent_run(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<crate::api::runs::RunControlQuery>,
+    body: Option<Json<ContinueAgentRunBody>>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if let Some(host) = q.remote_host() {
+        return Err(ApiError::not_available(format!(
+            "continuing an agent run is local-only: host `{host}` has no transport for it"
+        )));
+    }
+    let b = body.map(|b| b.0).unwrap_or_default();
+    if b.prompt.is_some() {
+        return Err(ApiError::bad_request(
+            "a continue takes no prompt: the continued conversation already holds it",
+        ));
+    }
+    crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
+    let launcher = s
+        .agent_launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("continuing a run requires `rupu cp serve`"))?;
+    let (global, rid) = (s.global_dir.clone(), id.clone());
+    let run = tokio::task::spawn_blocking(move || continued_run(&global, &rid))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))??;
+    if let Some(why) = run.running {
+        return Err(ApiError::conflict(format!(
+            "agent run {id} can't be continued: {why}"
+        )));
+    }
+    let req = crate::agent_launcher::AgentLaunchRequest {
+        model: b.model.filter(|m| !m.trim().is_empty()),
+        provider: b.provider.filter(|p| !p.trim().is_empty()),
+        continue_from: Some(id.clone()),
+        agent: run.agent,
+        prompt: None,
+        mode: b.mode,
+        target: None,
+        working_dir: run.working_dir.map(|d| d.display().to_string()),
+        run_id: None,
+        findings_profile: None,
+        engagement_profiles: Vec::new(),
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
+        skill_bundle: None,
+        messaging: Default::default(),
+        codename: None,
+    };
+    let run_id = launcher.launch(req).await.map_err(|e| match e {
+        crate::agent_launcher::AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
+        crate::agent_launcher::AgentLaunchError::Spawn(m) => ApiError::internal(m),
+    })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "run_id": run_id, "continues": id, "host_id": "local" })),
+    ))
 }
 
 /// Slim DTO returned for each autoflow cycle.

@@ -1,4 +1,5 @@
 [
+  "agent_runs.continue",
   "agent_runs.list",
   "agentiflows.children",
   "agentiflows.events",
@@ -13,6 +14,8 @@
   "agents.list",
   "agents.run",
   "agents.save",
+  "agents.validate",
+  "agents.validate_all",
   "assets.list",
   "autoflow_runs.cycles",
   "autoflow_runs.events",
@@ -106,6 +109,7 @@
   "runs.reject",
   "runs.restore",
   "runs.resume",
+  "runs.retry",
   "runs.source",
   "runs.usage",
   "runs.usage_timeline",
@@ -135,6 +139,7 @@
   "workflows.get",
   "workflows.list",
   "workflows.run",
+  "workflows.run_yaml",
   "workflows.save",
   "workflows.validate"
 ]

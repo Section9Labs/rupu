@@ -46,6 +46,9 @@ mod tests {
 
     fn req() -> AgentLaunchRequest {
         AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             codename: None,
             agent: "triage".into(),
             prompt: Some("look at PR".into()),
@@ -167,6 +170,35 @@ mod tests {
             .collect();
             assert_eq!(args(&spec), want);
         }
+    }
+
+    /// A CP continue: `rupu run <agent> --continue <id>` under a new run
+    /// id, in the continued run's directory, with only the overrides it
+    /// names — the child restores the rest from the run's own command.
+    #[test]
+    fn a_continue_is_rupu_run_continue_with_its_overrides() {
+        let mut r = req();
+        r.prompt = None;
+        r.mode = None;
+        r.target = None;
+        r.continue_from = Some("sub_01PREV".into());
+        r.model = Some("claude-opus-5-5".into());
+        r.provider = Some("anthropic".into());
+        let (spec, run_id) = spawn_spec("/bin/rupu".as_ref(), &r).unwrap();
+        assert_eq!(
+            args(&spec),
+            [
+                "run",
+                "triage",
+                "--run-id",
+                &run_id,
+                "--continue",
+                "sub_01PREV",
+                "--model=claude-opus-5-5",
+                "--provider=anthropic",
+            ]
+        );
+        assert_eq!(spec.cwd.as_deref(), Some("/tmp/p".as_ref()));
     }
 
     #[test]
