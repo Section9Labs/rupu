@@ -140,6 +140,9 @@ impl CliContextFactory {
                 resolver,
                 scm: Some(registry),
                 findings: crate::findings_opts::base_options(&global, &global_cfg.findings),
+                catalog: Some(Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+                    &global, None,
+                ))),
                 ..rupu_runtime::assembly::AssemblyContext::minimal(global.clone())
             },
         ));
@@ -214,8 +217,13 @@ impl CliContextFactory {
         let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
         let registry = Arc::new(Self::discover(&resolver, &cfg));
         let findings = crate::findings_opts::base_options(&self.global, &cfg.findings);
+        let catalog = Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
+            &self.global,
+            project_root.as_deref(),
+        ));
         Ok(rupu_runtime::assembly::RunAssembler::new(
             rupu_runtime::assembly::AssemblyContext {
+                catalog: Some(catalog),
                 project_root,
                 customer: cfg_paths.customer_slug.clone(),
                 config: cfg,
@@ -332,18 +340,19 @@ pub async fn handle(action: Action) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                let unavailable = catalog.unavailable();
-                if !unavailable.is_empty() {
-                    tracing::info!(
-                        "mcp: not served (service missing): {}",
-                        unavailable
-                            .iter()
-                            .map(|u| u.notice_message())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    );
-                }
+                let unavailable = catalog.unavailable().to_vec();
                 let catalog: Arc<dyn rupu_mcp::ToolSource> = Arc::new(catalog);
+                // Only tools no source serves: an operator tool covers a
+                // catalog tool the catalog could not build.
+                let served = rupu_cp::mcp::served_names(Some(&catalog));
+                let unserved: Vec<String> = unavailable
+                    .iter()
+                    .filter(|u| !served.contains(u.tool))
+                    .map(|u| u.notice_message())
+                    .collect();
+                if !unserved.is_empty() {
+                    tracing::info!("mcp: not served (service missing): {}", unserved.join("; "));
+                }
                 // A bad `--tools` fails here, before any loop or the bind.
                 if let Err(e) = rupu_cp::mcp::validate_tools(&tools, Some(&catalog)) {
                     eprintln!("error: {e}");

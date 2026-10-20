@@ -61,7 +61,14 @@ pub fn validate_tools(
     tools: &[String],
     catalog: Option<&Arc<dyn ToolSource>>,
 ) -> Result<(), ServeError> {
-    let names: Vec<String> = sources(
+    let names: Vec<String> = served_names(catalog).into_iter().collect();
+    ToolFilter::parse(tools).apply(&names).map(|_| ())
+}
+
+/// The tool names the server serves, after shadowing (each once), built
+/// without an `AppState` as [`validate_tools`] does.
+pub fn served_names(catalog: Option<&Arc<dyn ToolSource>>) -> BTreeSet<String> {
+    sources(
         Arc::new(operator_source::OperatorSource::new(axum::Router::new())),
         Arc::new(Listed(vec![wait::tool_def()])),
         catalog,
@@ -69,8 +76,7 @@ pub fn validate_tools(
     .iter()
     .flat_map(|s| s.tools())
     .map(|t| t.name)
-    .collect();
-    ToolFilter::parse(tools).apply(&names).map(|_| ())
+    .collect()
 }
 
 /// What `/mcp` serves, in precedence order: the operator tools, `wait`,

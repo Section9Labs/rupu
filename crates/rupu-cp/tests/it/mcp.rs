@@ -953,3 +953,35 @@ async fn without_sse_in_accept_the_reply_is_json() {
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["result"]["content"][0]["text"], "ticked");
 }
+
+/// Serves `agents.list` (an operator tool also) and `stub.only`.
+struct Overlapping;
+
+#[async_trait]
+impl ToolSource for Overlapping {
+    fn tools(&self) -> Vec<ToolDef> {
+        ["agents.list", "stub.only"]
+            .into_iter()
+            .map(|n| ToolDef {
+                name: n.into(),
+                description: format!("catalog {n}"),
+                input_schema: json!({"type": "object"}),
+                hints: ToolHints::default(),
+            })
+            .collect()
+    }
+    async fn call(&self, name: &str, _args: Value, _cx: &CallCx) -> Option<ToolResult> {
+        Some(ToolResult::Text(format!("catalog {name}")))
+    }
+}
+
+#[test]
+fn served_names_counts_a_shadowed_catalog_tool_once() {
+    let catalog: Arc<dyn ToolSource> = Arc::new(Overlapping);
+    let with = rupu_cp::mcp::served_names(Some(&catalog));
+    let without = rupu_cp::mcp::served_names(None);
+    assert!(with.contains("agents.list") && with.contains("stub.only"));
+    assert!(without.contains("agents.list") && without.contains("wait"));
+    assert!(!without.contains("stub.only"));
+    assert_eq!(with.len(), without.len() + 1, "{with:?}");
+}

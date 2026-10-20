@@ -381,6 +381,7 @@ impl RunAssembler {
                 netflow_sink: Some(netflow_sink),
                 net_capture: self.ctx.net_capture.clone(),
                 customer: self.ctx.customer.clone(),
+                catalog: self.ctx.catalog.clone(),
                 ..Default::default()
             },
             call: Default::default(),
