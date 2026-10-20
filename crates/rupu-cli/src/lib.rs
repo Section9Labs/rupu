@@ -234,7 +234,8 @@ pub enum Cmd {
     /// Bootstrap a new rupu project (`.rupu/agents`, `.rupu/workflows`,
     /// `.rupu/netflow`, config).
     Init(cmd::init::InitArgs),
-    /// MCP server operations.
+    /// Deprecated: `mcp serve` runs `rupu cp serve --no-web` (the MCP over
+    /// HTTP at `/mcp`).
     Mcp {
         #[command(subcommand)]
         action: cmd::mcp::Action,

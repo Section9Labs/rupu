@@ -48,7 +48,7 @@ impl McpError {
     }
 }
 
-/// Why a [`crate::CatalogServer`] or [`crate::McpServer`] can't start.
+/// Why a [`crate::McpServer`] or [`crate::CatalogSource`] can't start.
 #[derive(Debug, Error)]
 pub enum ServeError {
     /// `--tools` names a tool or namespace the catalog doesn't have.

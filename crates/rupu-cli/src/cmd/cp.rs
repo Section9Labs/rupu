@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// The address `cp serve` binds without `--bind` (also `rupu mcp serve`'s).
+const DEFAULT_BIND: &str = "127.0.0.1:7878";
+
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Start the control-plane HTTP server.
@@ -28,7 +31,7 @@ pub enum Action {
     /// the occupant is another rupu control plane, the error names its PID.
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:7878.
-        #[arg(long, default_value = "127.0.0.1:7878")]
+        #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
         /// Optional access token. If set, every `/api/*` call needs it, as
         /// `Authorization: Bearer <token>` or the browser's token cookie.
@@ -61,7 +64,7 @@ pub enum Action {
 /// narrowed by `tools`, on the default bind.
 pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
     handle(Action::Serve {
-        bind: "127.0.0.1:7878".parse().expect("default bind"),
+        bind: DEFAULT_BIND.parse().expect("default bind"),
         token: None,
         no_open: true,
         no_web: true,
@@ -72,41 +75,156 @@ pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
 }
 
 /// The catalog tools' context: one `mcp_<ULID>` run identity per server
-/// process, the run assembler's call-site context over the workspace a call
-/// names.
+/// process, the run assembler's call-site context over the project a call
+/// names. A call naming a project is assembled from THAT project's layered
+/// config (global, its customer, the project: `[bash]`, `[findings]`, the
+/// SCM accounts and the customer slug), with an SCM registry of its own
+/// built once and kept; a call naming none uses the global layer.
 struct CliContextFactory {
-    assembler: rupu_runtime::assembly::RunAssembler,
     global: std::path::PathBuf,
     run_id: String,
+    global_assembler: Arc<rupu_runtime::assembly::RunAssembler>,
+    /// Per project id.
+    projects: std::sync::Mutex<HashMap<String, Arc<rupu_runtime::assembly::RunAssembler>>>,
+}
+
+impl CliContextFactory {
+    fn new(
+        global: std::path::PathBuf,
+        global_cfg: &rupu_config::Config,
+        resolver: Arc<rupu_auth::KeychainResolver>,
+        registry: Arc<rupu_scm::Registry>,
+    ) -> Self {
+        let global_assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                config: global_cfg.clone(),
+                resolver,
+                scm: Some(registry),
+                findings: crate::findings_opts::base_options(&global, &global_cfg.findings),
+                ..rupu_runtime::assembly::AssemblyContext::minimal(global.clone())
+            },
+        ));
+        Self {
+            global,
+            run_id: format!("mcp_{}", ulid::Ulid::new()),
+            global_assembler,
+            projects: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The registered project `ws` names: a project id, or (only when
+    /// absolute) the path of one. Anything else is an unknown id.
+    fn resolve_project(&self, ws: &str) -> Result<rupu_workspace::Workspace, String> {
+        let unknown = || format!("no registered project `{ws}`");
+        let store = rupu_workspace::WorkspaceStore {
+            root: self.global.join("workspaces"),
+        };
+        let path = std::path::Path::new(ws);
+        if !path.is_absolute() {
+            return match store.load(ws) {
+                Ok(Some(w)) => Ok(w),
+                Ok(None) => Err(unknown()),
+                Err(e) => Err(format!("reading project `{ws}`: {e}")),
+            };
+        }
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
+            Err(e) => return Err(format!("reading `{ws}`: {e}")),
+        };
+        match rupu_workspace::store::find_by_path(&store, &canonical) {
+            Ok(Some(w)) => Ok(w),
+            Ok(None) => Err(unknown()),
+            Err(e) => Err(format!("reading projects: {e}")),
+        }
+    }
+
+    /// `block_on` for the registry discovery a sync `context` call needs.
+    fn discover(
+        resolver: &rupu_auth::KeychainResolver,
+        cfg: &rupu_config::Config,
+    ) -> rupu_scm::Registry {
+        let fut = rupu_scm::Registry::discover(resolver, cfg, Arc::new(rupu_netflow::NullSink));
+        let handle = tokio::runtime::Handle::current();
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            }
+            // No other worker to hand the runtime to: discover on a thread
+            // of its own.
+            _ => std::thread::scope(|s| {
+                s.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("discovery runtime")
+                        .block_on(fut)
+                })
+                .join()
+                .expect("discovery thread")
+            }),
+        }
+    }
+
+    fn assembler_for(
+        &self,
+        w: &rupu_workspace::Workspace,
+    ) -> Result<Arc<rupu_runtime::assembly::RunAssembler>, String> {
+        let mut cache = self.projects.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(a) = cache.get(&w.id) {
+            return Ok(Arc::clone(a));
+        }
+        let path = std::path::PathBuf::from(&w.path);
+        let project_root =
+            paths::project_root_for(&path).map_err(|e| format!("project `{}`: {e:#}", w.id))?;
+        // Strict: this config picks accounts and limits for a real call.
+        let cfg_paths = paths::config_paths(&self.global, project_root.as_deref(), &path)
+            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
+        let cfg = rupu_config::layer_files_locked(cfg_paths.layers())
+            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
+        let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
+        let registry = Arc::new(Self::discover(&resolver, &cfg));
+        let findings = crate::findings_opts::base_options(&self.global, &cfg.findings);
+        let assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                project_root,
+                customer: cfg_paths.customer_slug.clone(),
+                config: cfg,
+                resolver,
+                scm: Some(registry),
+                findings,
+                ..rupu_runtime::assembly::AssemblyContext::minimal(self.global.clone())
+            },
+        ));
+        cache.insert(w.id.clone(), Arc::clone(&assembler));
+        Ok(assembler)
+    }
 }
 
 impl rupu_mcp::ContextFactory for CliContextFactory {
     fn context(&self, workspace: Option<&str>) -> Result<rupu_tools::ToolContext, String> {
         use rupu_runtime::assembly::WorkspaceBinding;
-        let binding = match workspace {
-            None => WorkspaceBinding {
-                id: String::new(),
-                path: self.global.clone(),
-            },
+        let (assembler, binding) = match workspace {
+            None => (
+                Arc::clone(&self.global_assembler),
+                WorkspaceBinding {
+                    id: String::new(),
+                    path: self.global.clone(),
+                },
+            ),
             Some(ws) => {
-                let store = rupu_workspace::WorkspaceStore {
-                    root: self.global.join("workspaces"),
-                };
-                let found = match store.load(ws) {
-                    Ok(Some(w)) => Some(w),
-                    _ => rupu_workspace::store::find_by_path(&store, std::path::Path::new(ws))
-                        .map_err(|e| format!("reading projects: {e}"))?,
-                };
-                match found {
-                    Some(w) => WorkspaceBinding {
+                let w = self.resolve_project(ws)?;
+                let assembler = self.assembler_for(&w)?;
+                (
+                    assembler,
+                    WorkspaceBinding {
                         id: w.id,
                         path: std::path::PathBuf::from(w.path),
                     },
-                    None => return Err(format!("no registered project `{ws}`")),
-                }
+                )
             }
         };
-        Ok(self.assembler.call_site_context(
+        Ok(assembler.call_site_context(
             rupu_tools::RunIdentity {
                 run_id: self.run_id.clone(),
                 surface: rupu_tools::Surface::Agent,
@@ -145,6 +263,69 @@ pub async fn handle(action: Action) -> ExitCode {
                     eprintln!("error: {e:#}");
                     return ExitCode::FAILURE;
                 }
+            };
+
+            // `cfg` is hoisted out of the registry block below purely so the
+            // resolver can be built from it: `resolver_for`, not a bare
+            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
+            // account becomes an `AccountSpec` and its SSO token can
+            // actually refresh (arc progress ledger, Ruling 7). This is the
+            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
+            // SCM sweep, so without it the Ruling 7 fix would be wired in
+            // `accounts.rs` yet inert everywhere `cp serve` runs.
+            let scm_cfg = {
+                let global_cfg = global_dir.join("config.toml");
+                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
+                    .unwrap_or_default()
+            };
+            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
+            let scm_registry = Arc::new(
+                rupu_scm::Registry::discover(
+                    scm_resolver.as_ref(),
+                    &scm_cfg,
+                    Arc::new(rupu_netflow::NullSink),
+                )
+                .await,
+            );
+            // The MCP's catalog tools: the same SCM registry, findings
+            // options and global config the control plane serves with.
+            let mcp = if no_mcp {
+                None
+            } else {
+                let factory = Arc::new(CliContextFactory::new(
+                    global_dir.clone(),
+                    &scm_cfg,
+                    Arc::clone(&scm_resolver),
+                    Arc::clone(&scm_registry),
+                ));
+                let catalog = match rupu_mcp::CatalogSource::new(factory) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: building the MCP catalog: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let unavailable = catalog.unavailable();
+                if !unavailable.is_empty() {
+                    tracing::info!(
+                        "mcp: not served (service missing): {}",
+                        unavailable
+                            .iter()
+                            .map(|u| u.notice_message())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                }
+                let catalog: Arc<dyn rupu_mcp::ToolSource> = Arc::new(catalog);
+                // A bad `--tools` fails here, before any loop or the bind.
+                if let Err(e) = rupu_cp::mcp::validate_tools(&tools, Some(&catalog)) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                Some(rupu_cp::mcp::McpOpts {
+                    catalog: Some(catalog),
+                    tools,
+                })
             };
 
             // Take the bind address BEFORE any background loop exists.
@@ -487,73 +668,6 @@ pub async fn handle(action: Action) -> ExitCode {
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
-            // `cfg` is hoisted out of the registry block below purely so the
-            // resolver can be built from it: `resolver_for`, not a bare
-            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
-            // account becomes an `AccountSpec` and its SSO token can
-            // actually refresh (arc progress ledger, Ruling 7). This is the
-            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
-            // SCM sweep, so without it the Ruling 7 fix would be wired in
-            // `accounts.rs` yet inert everywhere `cp serve` runs.
-            let scm_cfg = {
-                let global_cfg = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
-                    .unwrap_or_default()
-            };
-            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
-            let scm_registry = Arc::new(
-                rupu_scm::Registry::discover(
-                    scm_resolver.as_ref(),
-                    &scm_cfg,
-                    Arc::new(rupu_netflow::NullSink),
-                )
-                .await,
-            );
-            // The MCP's catalog tools: the same SCM registry, findings
-            // options and global config the control plane serves with.
-            let mcp = if no_mcp {
-                None
-            } else {
-                let assembler = rupu_runtime::assembly::RunAssembler::new(
-                    rupu_runtime::assembly::AssemblyContext {
-                        config: scm_cfg.clone(),
-                        resolver: Arc::clone(&scm_resolver),
-                        scm: Some(Arc::clone(&scm_registry)),
-                        findings: crate::findings_opts::base_options(
-                            &global_dir,
-                            &scm_cfg.findings,
-                        ),
-                        ..rupu_runtime::assembly::AssemblyContext::minimal(global_dir.clone())
-                    },
-                );
-                let factory = Arc::new(CliContextFactory {
-                    assembler,
-                    global: global_dir.clone(),
-                    run_id: format!("mcp_{}", ulid::Ulid::new()),
-                });
-                let catalog = match rupu_mcp::CatalogSource::new(factory) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("error: building the MCP catalog: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let unavailable = catalog.unavailable();
-                if !unavailable.is_empty() {
-                    tracing::info!(
-                        "mcp: not served (service missing): {}",
-                        unavailable
-                            .iter()
-                            .map(|u| u.notice_message())
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    );
-                }
-                Some(rupu_cp::mcp::McpOpts {
-                    catalog: Some(Arc::new(catalog)),
-                    tools,
-                })
-            };
             let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
                 Arc::new(crate::cp_repos::CpRepoLister {
                     registry: Arc::clone(&scm_registry),
@@ -4923,5 +5037,109 @@ mod tests {
             ..Default::default()
         };
         assert!(sweep_or_reaper_enabled(&cp_cfg, &asn, &reaper(false)));
+    }
+}
+
+#[cfg(test)]
+mod catalog_context_tests {
+    use super::CliContextFactory;
+    use rupu_mcp::ContextFactory;
+    use rupu_workspace::{CustomerStore, NewCustomer, ProjectRef, WorkspaceStore};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn factory(global: &Path) -> CliContextFactory {
+        let cfg = rupu_config::Config::default();
+        CliContextFactory::new(
+            global.to_path_buf(),
+            &cfg,
+            Arc::new(crate::accounts::resolver_for(&cfg)),
+            Arc::new(rupu_scm::Registry::empty()),
+        )
+    }
+
+    fn register(global: &Path, dir: &Path) -> rupu_workspace::Workspace {
+        rupu_workspace::store::upsert(
+            &WorkspaceStore {
+                root: global.join("workspaces"),
+            },
+            dir,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_call_is_layered_with_its_customers_config() {
+        crate::test_support::ensure_crypto_provider();
+        let global = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let wa = register(global.path(), a.path());
+        let wb = register(global.path(), b.path());
+        let customers = CustomerStore::new(global.path());
+        customers
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(customers.config_path("acme"), "[bash]\ntimeout_secs = 7\n").unwrap();
+        customers.assign("acme", ProjectRef::Id(&wa.id)).unwrap();
+
+        let f = factory(global.path());
+        let ca = f.context(Some(&wa.id)).unwrap();
+        assert_eq!(ca.services.customer.as_deref(), Some("acme"));
+        assert_eq!(ca.workspace.bash.timeout_secs, 7);
+        assert_eq!(ca.workspace.id, wa.id);
+        // Another project, no customer: neither the slug nor the value.
+        let cb = f.context(Some(&wb.id)).unwrap();
+        assert_eq!(cb.services.customer, None);
+        assert_ne!(cb.workspace.bash.timeout_secs, 7);
+        // By path, the same project as by id; no workspace = the global layer.
+        let by_path = f.context(Some(a.path().to_str().unwrap())).unwrap();
+        assert_eq!(by_path.services.customer.as_deref(), Some("acme"));
+        let none = f.context(None).unwrap();
+        assert_eq!(none.services.customer, None);
+        assert_eq!(
+            f.projects.lock().unwrap().len(),
+            2,
+            "one assembler per project"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_resolution_errors() {
+        let global = tempfile::tempdir().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let f = factory(global.path());
+        let err = |ws: &str| f.context(Some(ws)).map(|_| ()).unwrap_err();
+        assert_eq!(err("ws_nope"), "no registered project `ws_nope`");
+        // Exists, but was never registered.
+        let p = existing.path().to_str().unwrap();
+        assert_eq!(err(p), format!("no registered project `{p}`"));
+        // An absolute path that does not exist.
+        let gone = existing.path().join("gone");
+        let g = gone.to_str().unwrap();
+        assert_eq!(err(g), format!("no registered project `{g}`"));
+        // Relative: an unknown id, never resolved against the server's cwd.
+        assert_eq!(err("."), "no registered project `.`");
+        assert_eq!(err("a/b"), "no registered project `a/b`");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_project_record_is_reported_not_swallowed() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = global.path().join("workspaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ws_bad.toml"), "not = [valid").unwrap();
+        let f = factory(global.path());
+        let e = f.context(Some("ws_bad")).map(|_| ()).unwrap_err();
+        assert!(
+            e.contains("ws_bad") && !e.starts_with("no registered"),
+            "{e}"
+        );
     }
 }

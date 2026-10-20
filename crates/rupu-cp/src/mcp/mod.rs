@@ -33,6 +33,26 @@ pub fn build_server(state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>, 
     Ok(Arc::new(McpServer::new(sources, &filter)?))
 }
 
+/// Check `tools` (the `--tools` entries) against the names the server would
+/// serve, without an `AppState`, so a bad grant fails before anything starts.
+/// The names are the operator tools, `wait` and `catalog`'s, the same set
+/// [`build_server`] filters.
+pub fn validate_tools(
+    tools: &[String],
+    catalog: Option<&Arc<dyn ToolSource>>,
+) -> Result<(), ServeError> {
+    let mut names: Vec<String> = operator_source::OperatorSource::new(axum::Router::new())
+        .tools()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    names.push("wait".into());
+    if let Some(c) = catalog {
+        names.extend(c.tools().into_iter().map(|t| t.name));
+    }
+    ToolFilter::parse(tools).apply(&names).map(|_| ())
+}
+
 /// `api_routes().with_state(state)` with the unsafe-segment guard applied
 /// (no token layer): what in-process calls go through.
 pub(crate) fn inner_api(state: &AppState) -> axum::Router {
