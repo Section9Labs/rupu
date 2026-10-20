@@ -217,7 +217,7 @@ rupu run [OPTIONS] <AGENT> [TARGET] [PROMPT]
 |---|---|
 | `<AGENT>` | Agent name (matches an `agents/*.md` file) |
 | `[TARGET]` | Optional target reference, e.g. `github:owner/repo#42`. See `docs/scm.md#target-syntax` for the full grammar. Distinguished from `prompt` by parsing as a RunTarget |
-| `[PROMPT]` | Optional initial user message. Defaults to "go" if omitted |
+| `[PROMPT]` | Optional initial user message. Defaults to "go" if omitted. Leading `/skill` tokens (`/pdf summarize it`) invoke those skills: their instructions go ahead of the rest of the prompt |
 
 | Option | Description |
 |---|---|
@@ -232,6 +232,8 @@ rupu run [OPTIONS] <AGENT> [TARGET] [PROMPT]
 | `--engagement-profile <ID>` | Engagement profile(s) for this run — the asset domain(s) findings are validated against (e.g. `network`, `binary`, or a composite like `pentest`). Repeatable or comma-separated. Empty = the `code` path [aliases: --engagement-profiles] |
 | `--skill <SKILL>` | A skill this run may load, on top of the agent's own; repeat the flag for several. A coordinator passes a workflow step's `skills:` this way. `--continue` keeps the continued run's unless this is given, which replaces the whole list |
 | `--preload-skill <SKILL>` | A skill whose body goes in this run's system prompt; repeat the flag for several |
+| `--no-messaging` | Turn this run's messaging tools off, and its children's, as an agent's `messaging: false` would. A placed unit's coordinator passes it for a workflow whose messaging is off |
+| `--messaging-tool <NAME>` | A messaging tool this run is offered, and only these; repeat the flag for several (`--messaging-tool=` alone for none), as a workflow's `messaging: { tools }` gives its steps. A placed unit's coordinator passes them. Only `board.*` / `msg.*` tools |
 | `--continue <AGENT_RUN_ID>` | Continue an interrupted run of this agent from its transcript instead of starting fresh: the earlier conversation is rebuilt and the agent is told it was interrupted. Every flag and the target the original run was launched with are restored (recorded as `RunStart.launch_args`); a flag given here replaces only its own setting. A repo target reuses the checkout the original run cloned. A run that had already finished prints its recorded answer without calling the model. Run it from the same directory as the original run. With `--model` or `--provider`, a run that failed on a provider-side outcome (a refusal, say) is continued too, on that model |
 | `--model <MODEL>` | Model for this run, overriding the agent's `model:` and the config default |
 | `--provider <PROVIDER>` | Provider for this run, overriding the agent's `provider:` and the config default |
@@ -1904,7 +1906,7 @@ rupu session start [OPTIONS] <AGENT> [TARGET] [PROMPT]
 |---|---|
 | `<AGENT>` | Agent name (matches an `agents/*.md` file) |
 | `[TARGET]` | Optional target reference, e.g. `github:owner/repo#42` |
-| `[PROMPT]` | Optional initial user message. Defaults to `go` if omitted |
+| `[PROMPT]` | Optional initial user message. Defaults to `go` if omitted. Leading `/skill` tokens invoke those skills in the first turn |
 
 | Option | Description |
 |---|---|
@@ -2034,7 +2036,7 @@ rupu session send [OPTIONS] <SESSION_ID> [PROMPT]
 | Argument | Description |
 |---|---|
 | `<SESSION_ID>` | Session id (`ses_<ULID>`), a unique prefix, or a codename |
-| `[PROMPT]` | Follow-up prompt to send as the session's next turn. Optional when the turn invokes a skill |
+| `[PROMPT]` | Follow-up prompt to send as the session's next turn. Optional when the turn invokes a skill. Leading `/skill` tokens (`/pdf summarize it`) invoke those skills, as `--skill` does |
 
 | Option | Description |
 |---|---|
@@ -2183,7 +2185,7 @@ rupu init [OPTIONS] [PATH]
 <a id="rupu-mcp"></a>
 ### `rupu mcp`
 
-MCP server operations
+Deprecated: `mcp serve` runs `rupu cp serve --no-web` (the MCP over HTTP at `/mcp`)
 
 ```
 rupu mcp [OPTIONS] <COMMAND>
@@ -2191,12 +2193,12 @@ rupu mcp [OPTIONS] <COMMAND>
 
 | Subcommand | Description |
 |---|---|
-| [`serve`](#rupu-mcp-serve) | Run the MCP server for an external MCP-aware client |
+| [`serve`](#rupu-mcp-serve) | Deprecated: runs `rupu cp serve --no-web` (MCP over HTTP) |
 
 <a id="rupu-mcp-serve"></a>
 ### `rupu mcp serve`
 
-Run the MCP server for an external MCP-aware client
+Deprecated: runs `rupu cp serve --no-web` (MCP over HTTP)
 
 ```
 rupu mcp serve [OPTIONS]
@@ -2204,9 +2206,9 @@ rupu mcp serve [OPTIONS]
 
 | Option | Description |
 |---|---|
-| `--transport <TRANSPORT>` | Transport. v0 ships stdio only; http returns NotWiredInV0 [default: stdio] [possible values: stdio, http] |
-| `--tools <TOOLS>` | The tools to serve, in the agent `tools:` grammar: exact names, legacy aliases, `ns.*`, `core.*` or `*` (comma-separated or repeated). Default: the connector and findings tools (`scm.*,issues.*,github.*,gitlab.*,findings.*`) |
-| `--mode <MODE>` | Permission mode each call is decided under: `bypass` (default — the MCP client's own confirmation UX is in front of every call), `readonly` (refuse workspace writes and external actions) or `ask` (no operator to prompt here, so it allows) [default: bypass] |
+| `--transport <TRANSPORT>` | Ignored: stdio is no longer supported, the MCP is HTTP only [possible values: stdio, http] |
+| `--tools <TOOLS>` | The tools to serve, in the agent `tools:` grammar: exact names, legacy aliases, `ns.*`, `core.*` or `*` (comma-separated or repeated). Passed to `rupu cp serve --tools` |
+| `--mode <MODE>` | Ignored: every tool is served and your MCP client's permissions decide what runs |
 
 <a id="rupu-coverage"></a>
 ### `rupu coverage`
@@ -2736,6 +2738,9 @@ rupu cp serve [OPTIONS]
 | `--bind <BIND>` | Address to bind. Defaults to 127.0.0.1:7878 [default: 127.0.0.1:7878] |
 | `--token <TOKEN>` | Optional access token. If set, every `/api/*` call needs it, as `Authorization: Bearer <token>` or the browser's token cookie. The printed (and auto-opened) URL carries `?token=<token>`; opening it signs that browser in (cookie set, token dropped from the URL). `/healthz` and the page shell stay open; the UI shows no data until the browser is signed in |
 | `--no-open` | Do not open the served URL in a browser on startup. By default the URL is opened when running interactively (a terminal); the URL is always printed regardless |
+| `--no-web` | Serve no web UI or page shell: `/api/*`, `/healthz` and `/mcp` only. Implies `--no-open` |
+| `--no-mcp` | Do not serve the MCP endpoint (`/mcp` is a 404) |
+| `--tools <TOOLS>` | Narrow the MCP to these tools (exact names, `ns.*`, `*`; comma-separated). Default: every tool |
 
 <a id="rupu-usage"></a>
 ### `rupu usage`

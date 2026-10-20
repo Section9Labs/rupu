@@ -1,8 +1,9 @@
 //! Where a run's coverage, findings and asset records go: the ledger of its
 //! findings scope in its workspace, mirrored to its run stream when it has
 //! one. Every ledger tool derives its location here, from the call's
-//! [`ToolContext`], so the agent loop, an `action:` step and `rupu mcp serve`
-//! write the same bytes to the same place for the same identity.
+//! [`ToolContext`], so the agent loop, an `action:` step and the MCP endpoint
+//! (`rupu cp serve` /mcp) write the same bytes to the same place for the
+//! same identity.
 
 use crate::tool::ToolContext;
 use rupu_coverage::{target_id, CoveragePaths, RunStream, TagLog};

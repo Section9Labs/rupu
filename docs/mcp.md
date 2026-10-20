@@ -1,169 +1,266 @@
 # rupu's MCP server
 
-`rupu mcp serve` exposes rupu's tool catalog over JSON-RPC stdio per the
-[MCP spec](https://spec.modelcontextprotocol.io/). Any MCP-aware client can
-spawn it as a subprocess and call the same tools rupu's own agents and
-workflow `action:` steps call: the server owns no tools of its own, it is a
-transport over the one catalog (`rupu-tools`), and a call goes through the
-same tool body and permission policy wherever it comes from.
+`rupu cp serve` serves an [MCP](https://modelcontextprotocol.io/) endpoint at
+`/mcp` (streamable HTTP) beside the web UI and the `/api`. An MCP client such
+as Claude Code, Cursor or Claude Desktop connects to it and **operates rupu**:
+list and launch workflows and agents, watch runs, approve gates, drive
+sessions and message a live run. It also gets rupu's tool catalog (files,
+shell, SCM, issues, findings) as plain tools.
 
-## Wiring into Claude Desktop
+The endpoint is an adapter, not a second implementation: the operator tools
+call the control plane's own endpoints in process and return the same JSON as
+the CP API ([cp-api.md](cp-api.md)), and the catalog tools are the same tool
+bodies agents and workflow `action:` steps call.
 
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+## Full access
+
+The MCP gives a connected client the same reach as the CP's operator. rupu adds
+**no permission layer of its own** on `/mcp`: it does not prompt, and it has no
+`--mode`. What runs is decided by the MCP client's harness (Claude Code's
+permission prompts, `--allowedTools`, Cursor's approvals). Each tool carries
+read-only / destructive / open-world hints so a client's permission UI can tell
+`runs.list` from `runs.cancel`. Treat the bearer token like a key to the whole
+control plane, and narrow what is served with [`--tools`](#choosing-the-tools---tools)
+if you want less.
+
+## Serve modes
+
+| Command | Serves |
+|---|---|
+| `rupu cp serve` | web UI + `/api` + `/mcp` |
+| `rupu cp serve --no-web` | `/api` + `/mcp`, no web UI (implies `--no-open`) |
+| `rupu cp serve --no-mcp` | web UI + `/api`, no `/mcp` |
+
+`--no-web --no-mcp` is refused (nothing to serve), and so is `--tools` with
+`--no-mcp`. A bad `--tools` grant fails before the socket is bound. At startup
+the server prints the MCP URL and the command that connects Claude Code to it.
+
+`/mcp` sits behind the same bearer token as `/api` (`--token`), and the server
+checks two things on every request:
+
+- the `Origin` header, when present, must equal the `Host`;
+- on a loopback bind, the `Host` must be a loopback name (`127.0.0.1`,
+  `localhost`, `[::1]`), which closes DNS-rebinding.
+
+Binding beyond loopback is allowed; do it only with `--token`
+([control-plane.md](control-plane.md#authentication)).
+
+## Connecting a client
+
+### Claude Code
+
+```sh
+# no token (loopback, default bind)
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp
+
+# with a token
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp \
+  --header "Authorization: Bearer $CP_TOKEN"
+```
+
+`claude mcp add --scope user` makes it available in every project. Claude Code
+names each tool `mcp__rupu__<tool>` with dots turned to underscores
+(`runs.list` is `mcp__rupu__runs_list`). `claude mcp list` shows whether it
+connected.
+
+### Cursor
+
+`~/.cursor/mcp.json` (or the project's `.cursor/mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "rupu": {
-      "command": "/usr/local/bin/rupu",
-      "args": ["mcp", "serve", "--transport", "stdio"]
+      "url": "http://127.0.0.1:7878/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }
 ```
 
-After restart, Claude Desktop's tool catalog includes every `scm.*` and
-`issues.*` tool from `docs/scm.md`, the CI triggers and the `findings.*` tools
-(see [Tool catalog](#tool-catalog)). Authentication is shared with rupu's CLI
-through the same credential file (`~/.rupu/auth.json`) — running `rupu auth login --provider github --mode sso`
-once unlocks the catalog for both. `--provider` is an alias for `--account`;
-see `docs/providers.md` if you need two accounts of the same platform (e.g.
-`--account gh-work --kind github`).
+Leave `headers` out when the server runs without a token.
 
-## Wiring into Cursor
+### Claude Desktop
 
-Cursor's MCP config lives at the IDE's settings level:
+Add the URL as a custom connector if your plan offers remote connectors that
+can reach it. Otherwise bridge it with
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) in
+`claude_desktop_config.json`:
 
 ```json
 {
-  "mcp.servers": {
+  "mcpServers": {
     "rupu": {
-      "command": "/usr/local/bin/rupu",
-      "args": ["mcp", "serve"]
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:7878/mcp",
+               "--header", "Authorization: Bearer <token>"]
     }
   }
 }
 ```
 
-## Wiring into Claude Code
+Authentication to GitHub, GitLab and the model providers is shared with the
+CLI through the same credential store, so `rupu auth login` once unlocks the
+catalog tools for everything.
 
-```sh
-claude mcp add rupu -- rupu mcp serve --tools '<grant>'
+## Operator tools
+
+Thirteen tools over the CP's own endpoints. Each takes the arguments of the
+endpoint it wraps, an optional `host` where the API takes `?host=`, refuses
+unknown arguments, and returns the API's JSON as text. A JSON object is also
+sent as `structuredContent`; a list (a JSON array) is sent as text only,
+since MCP allows only an object there.
+
+| Tool | Does |
+|---|---|
+| `runs.list` | List workflow runs started by hand (the CP's `?q=` query language applies; not standalone agent runs, not event- or cron-started runs) |
+| `runs.get` | One workflow run, with its steps |
+| `runs.approve` | Approve a parked approval gate |
+| `runs.reject` | Reject a parked gate |
+| `runs.cancel` | Cancel a run |
+| `workflows.list` | List workflow definitions |
+| `workflows.run` | Launch a workflow |
+| `agents.list` | List agent definitions |
+| `agents.run` | Launch an agent |
+| `sessions.start` | Start a session |
+| `sessions.send` | Send a turn to a session |
+| `messages.list` | Read a run's, session's or agentiflow's message log |
+| `messages.send` | Send an operator message to a live run, session or agentiflow |
+
+Later releases add the remaining CP routes as tools (findings,
+autoflows, projects, usage, hosts and so on), `wait` support for findings,
+session turns, agentiflows and remote hosts, the CLI-only extras, and MCP
+resources and prompts. What is listed here is what ships today.
+
+### `wait`
+
+An MCP client cannot read the CP's SSE streams, so `wait` long-polls:
+
+```json
+{ "watch": [ {"kind": "run_settled", "run": "run_01J..."} ],
+  "cursor": {"run:run_01J...": 12}, "timeout_ms": 30000 }
 ```
 
-`<grant>` is a [`--tools`](#choosing-the-tools---tools) grant, for example
-`'scm.*,issues.*,findings.*'`; leave `--tools` out for the default set. Add
-`--mode readonly` after it to refuse writes (see [Permissions](#permissions)).
-`claude mcp add` registers the server for you in the current project; pass
-`--scope user` to have it in every project. Claude Code starts the server
-in the directory it runs in, so the fs/shell tools and the findings ledger act
-on that project.
+| Condition | Fires when |
+|---|---|
+| `{kind: "run_settled", run}` | the run reached a terminal status |
+| `{kind: "run_gate", run}` | the run has a parked approval gate |
+| `{kind: "run_events", run, types?}` | the run wrote an event (optionally only these types) |
+| `{kind: "messages", root, kinds?}` | the root's message log has a new message (optionally only these kinds) |
 
-Claude Code names each tool `mcp__rupu__<tool>` with the dots of rupu's
-name turned into underscores: `scm.repos.list` is
-`mcp__rupu__scm_repos_list`, `findings.report` is
-`mcp__rupu__findings_report`. `claude mcp list` shows whether the server
-connected.
+Behaviour:
 
-## Tool catalog
+- It checks state first, so a run that already settled or parked answers at
+  once. Then it catches up from `cursor` (ids are the SSE `id:` lines, so it
+  mixes safely with the streams) and waits for a new line.
+- The timeout defaults to 30 s and is capped at 55 s.
+- The reply carries `events`, the advanced `cursor` (an object: the last line
+  id read per watched source, `run:<id>` or `messages:<id>`), which conditions
+  `fired`, and `timed_out`. Pass the returned `cursor` back on the next call.
+- Local host only for now: a `host` naming a remote is not yet supported.
+- **Once `run_gate` has fired, drop it from `watch`** (or approve / reject the
+  gate): a parked gate is state, so it fires immediately on every call.
 
-Without `--tools`, the server serves the connector and findings tools
-(`scm.*,issues.*,github.*,gitlab.*,findings.*`, 22 tools). Each tool's input
-schema is returned in the MCP `tools/list` response.
+A loop that launches a workflow with a gate and finishes it:
 
-| Group | Tools |
-|-------|-------|
-| Repositories | `scm.repos.list`, `scm.repos.get` |
-| Branches | `scm.branches.list`, `scm.branches.create` |
-| Files | `scm.files.read` |
-| Pull / merge requests | `scm.prs.list`, `scm.prs.get`, `scm.prs.diff`, `scm.prs.comment`, `scm.prs.create` |
-| Issues | `issues.list`, `issues.get`, `issues.comments` (GitHub only), `issues.comment`, `issues.create`, `issues.update_state` (open/closed only) |
-| CI | `github.workflows_dispatch`, `gitlab.pipeline_trigger` |
-| Findings | `findings.report` (also answers to `findings.record`), `findings.verify`, `findings.query`, `findings.tag` |
+1. `workflows.run {name: "release"}` returns the run id.
+2. `wait {watch: [{kind: "run_gate", run: ID}, {kind: "run_settled", run: ID}]}`
+   returns with `run_gate` fired.
+3. `runs.approve {id: ID}`.
+4. `wait {watch: [{kind: "run_settled", run: ID}], cursor}` (no `run_gate`)
+   returns when the run settles, or with `timed_out: true`, in which case call
+   it again.
 
-The 18 SCM and issue tools are described one by one in
-`docs/scm.md#mcp-tool-catalog`.
+## Catalog tools
+
+Beside the operator tools the endpoint serves the `rupu-tools` catalog: the
+fs/shell tools (`read_file`, `write_file`, `edit_file`, `grep`, `glob`, `bash`,
+...), the SCM and issue tools (`scm.*`, `issues.*`, `github.*`, `gitlab.*`;
+[scm.md](scm.md#mcp-tool-catalog) describes each) and `findings.report` /
+`findings.verify`.
+
+The fs/shell and findings tools take a required **`workspace`** argument: a
+project id, or the absolute path of a registered project. The call runs with
+that project's layered config (global, then customer, then project), its SCM
+registry and its findings ledger. A project's config and registry are cached
+until the server restarts.
+
+Where a catalog tool has the name of an operator tool (`agents.list`,
+`workflows.list`), the operator tool is the one served. Every other catalog
+tool the server can serve is listed, `findings.query` and `findings.tag`
+included. A catalog tool whose service the server lacks (`agents.get` and
+`workflows.get` need a definitions catalog the MCP context does not have) is
+left out and named once in the server log at startup.
+Findings filed over MCP record under the `mcp` scope. A served `bash`'s network
+flows are not captured: the call is no run, so there is no run ledger for them.
 
 ### Choosing the tools: `--tools`
 
-`--tools` takes the agent `tools:` grammar ([agent-format.md](agent-format.md)):
-exact names, legacy aliases, `ns.*` namespaces, `core.*` (the fs/shell tools)
-and `*` (the whole catalog), comma-separated or repeated:
+`rupu cp serve --tools <grant>` narrows the MCP to the tools it names. It
+filters **every** tool: the operator tools and `wait` as well as the catalog
+tools. It uses the agent `tools:` grammar ([agent-format.md](agent-format.md)):
+exact names, legacy aliases, `ns.*`, `core.*` and `*`, comma-separated or
+repeated. Without `--tools` every tool is served.
 
 ```sh
-rupu mcp serve --tools 'issues.*,findings.*'
-rupu mcp serve --tools read_file,grep
+# operator tools, wait, messages and findings only
+rupu cp serve --no-web --tools 'runs.*,wait,messages.*,findings.*'
+# a read-only code browser: no operator tools at all
+rupu cp serve --no-web --tools read_file,grep
 ```
 
-The fs/shell tools act on the directory `rupu mcp serve` was started in (a served `bash`'s network flows are not captured: the server is no run, so there is no run ledger for them). A
-tool needs services the server must be able to provide; the server provides
-the SCM registry and the findings ledger of the current directory's workspace,
-but not a sub-agent launcher, an agentiflow message bus, a concern catalog or
-an engagement. A tool `--tools` names exactly whose service is missing (for
-example `dispatch`) is not listed, and startup prints one
-`tool_unavailable: …` line to stderr naming it and the missing service; a
-wildcard (`*`) skips such tools silently. An unknown name fails startup with a
-did-you-mean.
+A narrow grant such as `read_file,grep` therefore drops the operator tools
+and `wait`; name them (`runs.*,wait,...`) to keep them. A name that matches no
+tool fails startup, listing the namespaces served.
 
-### Findings from an MCP client
+## Attribution
 
-The `findings.*` tools work on the current directory's workspace. Findings are
-recorded under the `mcp` scope and attributed to the server session: each
-`rupu mcp serve` process mints a run id `mcp_<ULID>`, so `findings.verify` can
-tell a verification from the session that filed the finding. Findings record
-under the full profile unless the layered config's `[findings]` says
-otherwise; `findings.report`'s `tools/list` schema is that profile's.
-
-## Permissions
-
-`--mode` decides every call from the tool's effect, exactly as for an agent
-run ([agent-format.md](agent-format.md#permissionmode)):
-
-| `--mode` | Allows |
-|---|---|
-| `bypass` (default) | every call. The upstream MCP client (Claude Desktop, Cursor) prompts the user before a write; rupu does not prompt from the server |
-| `readonly` | `read` and `record` tools (connector reads, the `findings.*` tools); refuses `write` (workspace) and `external` (connector writes) |
-| `ask` | every call: there is no operator to prompt behind a stdio server, so `ask` behaves as `bypass` |
-
-Connector reads are `read`, connector writes are `external`, `findings.report`
-/ `findings.verify` / `findings.tag` are `record`, and `findings.query` is
-`read`. A refused call returns an MCP error result (`isError: true`) saying
-which mode refused which effect.
+An operator message sent through `messages.send` is recorded with
+`client: "mcp"` beside `via: "cp"`, so the Messages tab and the log can tell an
+MCP client from the web UI. A gate decision or cancel through `runs.approve`,
+`runs.reject` or `runs.cancel` on the local host records the actor `mcp`
+where the web UI records `web`. The mark comes from the `/mcp` endpoint
+itself, never from a request header, so a plain HTTP call can't claim it.
 
 ## Protocol
 
-The server speaks MCP over stdio, one JSON-RPC message per line:
+MCP streamable HTTP, JSON responses:
 
-- **Versions.** `initialize` answers the client's `protocolVersion` when the
-  server speaks it (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`),
-  and otherwise its newest (`2025-11-25`), leaving the client to decide
-  whether to go on. `2026-07-28` and later drop the `initialize` handshake and
-  are not served.
-- **Methods.** `initialize`, `ping`, `tools/list` and `tools/call`; any other
-  method is a `-32601` error. A tool that fails, refuses its arguments, is
-  unknown or is not served comes back as a `tools/call` result with
+- **POST** carries one JSON-RPC message or a batch. A body of only
+  notifications answers `202`. **GET** and **DELETE** answer `405` (no server
+  push, no session teardown).
+- `initialize` mints an `Mcp-Session-Id`, sent back in the response header; a
+  client echoes it on later calls. A `notifications/cancelled` is scoped to the
+  session that sent it.
+- Versions: `initialize` answers the client's `protocolVersion` when rupu
+  speaks it (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`), otherwise
+  its newest.
+- Methods: `initialize`, `ping`, `tools/list`, `tools/call`. A tool that fails,
+  refuses its arguments or is unknown comes back as a `tools/call` result with
   `isError: true`, so the model sees why.
-- **Concurrency and cancellation.** Each `tools/call` runs on its own, so a
-  slow call (a long `bash`, a connector that is rate-limited) holds up neither
-  a `ping` nor another call, and replies arrive in the order the calls finish.
-  A `notifications/cancelled` naming a running call's request id aborts it,
-  and that call gets no reply. When the client closes stdin, the calls still
-  running finish and are answered before the server exits.
-- **Bad input.** A line that is not JSON gets a `-32700` parse error (id
-  `null`) and the server keeps serving; blank lines are skipped. JSON that is
-  not a request, notification or response gets `-32600`. A batch (a JSON
-  array) is answered with one array of its requests' replies, in order.
+
+## `rupu mcp serve` is deprecated
+
+`rupu mcp serve` printed a stdio server. It now prints a deprecation notice and
+runs `rupu cp serve --no-web` on `127.0.0.1:7878`; `--transport` and `--mode`
+are ignored and `--tools` is passed on. **stdio is gone.** Point clients at the
+HTTP URL as above (for a client that only speaks stdio, use `mcp-remote`).
 
 ## Troubleshooting
 
-| Symptom                                       | Likely cause                                        |
-|-----------------------------------------------|-----------------------------------------------------|
-| Claude Desktop says `rupu` server failed      | `rupu` not on PATH, or no SCM credentials present    |
-| Tool returns "no connector for github"        | `rupu auth login --provider github` needed           |
-| Tools/list lacks a tool `--tools` names       | It needs a service the server lacks (see the `tool_unavailable` stderr line) |
-| A `tools/call` never answers                  | Long-running connector op or command; check rate limits, or cancel it (other calls keep running) |
+| Symptom | Likely cause |
+|---|---|
+| `401` from `/mcp` | The server runs with `--token` and the client sent none |
+| `403` from `/mcp` | `Origin` differs from `Host`, or a loopback bind got a non-loopback `Host` (a proxy or tunnel rewriting it) |
+| `405` on GET / DELETE | Expected: `/mcp` is POST only |
+| A fs / shell / findings tool says `workspace` is required | Pass a project id or the absolute path of a registered project |
+| `wait` returns instantly with `run_gate` | The gate is still parked; approve it or drop `run_gate` from `watch` |
+| `wait` on a remote host is refused | Remote hosts are not yet supported by `wait` |
+| Tool is missing from `tools/list` | `--tools` excludes it, or it is a catalog tool whose service the server lacks (logged at startup) |
 
 ## See also
 
-- `docs/scm.md` — full MCP tool catalog + schemas
-- `docs/scm/github.md` / `docs/scm/gitlab.md` — per-platform walkthroughs
+- [control-plane.md](control-plane.md) - the server, its token and its modes
+- [cp-api.md](cp-api.md) - the JSON the operator tools return
+- [scm.md](scm.md#mcp-tool-catalog) - the SCM and issue tools
+- [messaging.md](messaging.md) - message spaces behind `messages.*`

@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
+/// The address `cp serve` binds without `--bind` (also `rupu mcp serve`'s).
+const DEFAULT_BIND: &str = "127.0.0.1:7878";
+
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Start the control-plane HTTP server.
@@ -28,7 +31,7 @@ pub enum Action {
     /// the occupant is another rupu control plane, the error names its PID.
     Serve {
         /// Address to bind. Defaults to 127.0.0.1:7878.
-        #[arg(long, default_value = "127.0.0.1:7878")]
+        #[arg(long, default_value = DEFAULT_BIND)]
         bind: SocketAddr,
         /// Optional access token. If set, every `/api/*` call needs it, as
         /// `Authorization: Bearer <token>` or the browser's token cookie.
@@ -43,7 +46,224 @@ pub enum Action {
         /// always printed regardless.
         #[arg(long)]
         no_open: bool,
+        /// Serve no web UI or page shell: `/api/*`, `/healthz` and `/mcp`
+        /// only. Implies `--no-open`.
+        #[arg(long)]
+        no_web: bool,
+        /// Do not serve the MCP endpoint (`/mcp` is a 404).
+        #[arg(long)]
+        no_mcp: bool,
+        /// Narrow the MCP to these tools (exact names, `ns.*`, `*`;
+        /// comma-separated). Default: every tool.
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
     },
+}
+
+/// What `rupu mcp serve` runs: the control plane with no web UI, MCP only
+/// narrowed by `tools`, on the default bind.
+pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
+    handle(Action::Serve {
+        bind: DEFAULT_BIND.parse().expect("default bind"),
+        token: None,
+        no_open: true,
+        no_web: true,
+        no_mcp: false,
+        tools,
+    })
+    .await
+}
+
+/// The catalog tools' context: one `mcp_<ULID>` run identity per server
+/// process, the run assembler's call-site context over the project a call
+/// names. A call naming a project is assembled from THAT project's layered
+/// config (global, its customer, the project: `[bash]`, `[findings]`, the
+/// SCM accounts and the customer slug), with an SCM registry of its own
+/// built once and kept; a call naming none uses the global layer.
+struct CliContextFactory {
+    global: std::path::PathBuf,
+    run_id: String,
+    global_assembler: Arc<rupu_runtime::assembly::RunAssembler>,
+    /// Per project id.
+    projects: BuildCache<rupu_runtime::assembly::RunAssembler>,
+}
+
+/// Values kept per key, each built OUTSIDE the lock: a slow build (a
+/// project's SCM discovery) never holds up a caller whose value is cached,
+/// or the build of another key. Two first callers of one key may both
+/// build; the first to finish is kept.
+struct BuildCache<V> {
+    map: std::sync::Mutex<HashMap<String, Arc<V>>>,
+}
+
+impl<V> BuildCache<V> {
+    fn new() -> Self {
+        Self {
+            map: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<V>>> {
+        self.map.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_or_build<E>(
+        &self,
+        key: &str,
+        build: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        if let Some(v) = self.lock().get(key) {
+            return Ok(Arc::clone(v));
+        }
+        let built = Arc::new(build()?);
+        Ok(Arc::clone(
+            self.lock().entry(key.to_string()).or_insert(built),
+        ))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+impl CliContextFactory {
+    fn new(
+        global: std::path::PathBuf,
+        global_cfg: &rupu_config::Config,
+        resolver: Arc<rupu_auth::KeychainResolver>,
+        registry: Arc<rupu_scm::Registry>,
+    ) -> Self {
+        let global_assembler = Arc::new(rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                config: global_cfg.clone(),
+                resolver,
+                scm: Some(registry),
+                findings: crate::findings_opts::base_options(&global, &global_cfg.findings),
+                ..rupu_runtime::assembly::AssemblyContext::minimal(global.clone())
+            },
+        ));
+        Self {
+            global,
+            run_id: format!("mcp_{}", ulid::Ulid::new()),
+            global_assembler,
+            projects: BuildCache::new(),
+        }
+    }
+
+    /// The registered project `ws` names: a project id, or (only when
+    /// absolute) the path of one. Anything else is an unknown id.
+    fn resolve_project(&self, ws: &str) -> Result<rupu_workspace::Workspace, String> {
+        let unknown = || format!("no registered project `{ws}`");
+        let store = rupu_workspace::WorkspaceStore {
+            root: self.global.join("workspaces"),
+        };
+        let path = std::path::Path::new(ws);
+        if !path.is_absolute() {
+            return match store.load(ws) {
+                Ok(Some(w)) => Ok(w),
+                Ok(None) => Err(unknown()),
+                Err(e) => Err(format!("reading project `{ws}`: {e}")),
+            };
+        }
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
+            Err(e) => return Err(format!("reading `{ws}`: {e}")),
+        };
+        match rupu_workspace::store::find_by_path(&store, &canonical) {
+            Ok(Some(w)) => Ok(w),
+            Ok(None) => Err(unknown()),
+            Err(e) => Err(format!("reading projects: {e}")),
+        }
+    }
+
+    /// The registry discovery a `context` call needs, blocking on the
+    /// runtime: `context` runs on the blocking pool (`CatalogSource::call`).
+    fn discover(
+        resolver: &rupu_auth::KeychainResolver,
+        cfg: &rupu_config::Config,
+    ) -> rupu_scm::Registry {
+        tokio::runtime::Handle::current().block_on(rupu_scm::Registry::discover(
+            resolver,
+            cfg,
+            Arc::new(rupu_netflow::NullSink),
+        ))
+    }
+
+    fn assembler_for(
+        &self,
+        w: &rupu_workspace::Workspace,
+    ) -> Result<Arc<rupu_runtime::assembly::RunAssembler>, String> {
+        self.projects
+            .get_or_build(&w.id, || self.build_assembler(w))
+    }
+
+    fn build_assembler(
+        &self,
+        w: &rupu_workspace::Workspace,
+    ) -> Result<rupu_runtime::assembly::RunAssembler, String> {
+        let path = std::path::PathBuf::from(&w.path);
+        let project_root =
+            paths::project_root_for(&path).map_err(|e| format!("project `{}`: {e:#}", w.id))?;
+        // Strict: this config picks accounts and limits for a real call.
+        let cfg_paths = paths::config_paths(&self.global, project_root.as_deref(), &path)
+            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
+        let cfg = rupu_config::layer_files_locked(cfg_paths.layers())
+            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
+        let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
+        let registry = Arc::new(Self::discover(&resolver, &cfg));
+        let findings = crate::findings_opts::base_options(&self.global, &cfg.findings);
+        Ok(rupu_runtime::assembly::RunAssembler::new(
+            rupu_runtime::assembly::AssemblyContext {
+                project_root,
+                customer: cfg_paths.customer_slug.clone(),
+                config: cfg,
+                resolver,
+                scm: Some(registry),
+                findings,
+                ..rupu_runtime::assembly::AssemblyContext::minimal(self.global.clone())
+            },
+        ))
+    }
+}
+
+impl rupu_mcp::ContextFactory for CliContextFactory {
+    fn context(&self, workspace: Option<&str>) -> Result<rupu_tools::ToolContext, String> {
+        use rupu_runtime::assembly::WorkspaceBinding;
+        let (assembler, binding) = match workspace {
+            None => (
+                Arc::clone(&self.global_assembler),
+                WorkspaceBinding {
+                    id: String::new(),
+                    path: self.global.clone(),
+                },
+            ),
+            Some(ws) => {
+                let w = self.resolve_project(ws)?;
+                let assembler = self.assembler_for(&w)?;
+                (
+                    assembler,
+                    WorkspaceBinding {
+                        id: w.id,
+                        path: std::path::PathBuf::from(w.path),
+                    },
+                )
+            }
+        };
+        Ok(assembler.call_site_context(
+            rupu_tools::RunIdentity {
+                run_id: self.run_id.clone(),
+                surface: rupu_tools::Surface::Agent,
+                scope_name: Some("mcp".into()),
+                ..Default::default()
+            },
+            &binding,
+            // A long-lived server is no run: a served `bash`'s flows have no
+            // run ledger to land in.
+            Arc::new(rupu_netflow::NullSink),
+        ))
+    }
 }
 
 pub async fn handle(action: Action) -> ExitCode {
@@ -52,13 +272,87 @@ pub async fn handle(action: Action) -> ExitCode {
             bind,
             token,
             no_open,
+            no_web,
+            no_mcp,
+            tools,
         } => {
+            if no_mcp && !tools.is_empty() {
+                eprintln!("error: --tools needs the MCP; drop --no-mcp");
+                return ExitCode::FAILURE;
+            }
+            if no_web && no_mcp {
+                eprintln!("error: nothing to serve: --no-web and --no-mcp together");
+                return ExitCode::FAILURE;
+            }
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("error: {e:#}");
                     return ExitCode::FAILURE;
                 }
+            };
+
+            // `cfg` is hoisted out of the registry block below purely so the
+            // resolver can be built from it: `resolver_for`, not a bare
+            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
+            // account becomes an `AccountSpec` and its SSO token can
+            // actually refresh (arc progress ledger, Ruling 7). This is the
+            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
+            // SCM sweep, so without it the Ruling 7 fix would be wired in
+            // `accounts.rs` yet inert everywhere `cp serve` runs.
+            let scm_cfg = {
+                let global_cfg = global_dir.join("config.toml");
+                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
+                    .unwrap_or_default()
+            };
+            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
+            let scm_registry = Arc::new(
+                rupu_scm::Registry::discover(
+                    scm_resolver.as_ref(),
+                    &scm_cfg,
+                    Arc::new(rupu_netflow::NullSink),
+                )
+                .await,
+            );
+            // The MCP's catalog tools: the same SCM registry, findings
+            // options and global config the control plane serves with.
+            let mcp = if no_mcp {
+                None
+            } else {
+                let factory = Arc::new(CliContextFactory::new(
+                    global_dir.clone(),
+                    &scm_cfg,
+                    Arc::clone(&scm_resolver),
+                    Arc::clone(&scm_registry),
+                ));
+                let catalog = match rupu_mcp::CatalogSource::new(factory) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: building the MCP catalog: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let unavailable = catalog.unavailable();
+                if !unavailable.is_empty() {
+                    tracing::info!(
+                        "mcp: not served (service missing): {}",
+                        unavailable
+                            .iter()
+                            .map(|u| u.notice_message())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                }
+                let catalog: Arc<dyn rupu_mcp::ToolSource> = Arc::new(catalog);
+                // A bad `--tools` fails here, before any loop or the bind.
+                if let Err(e) = rupu_cp::mcp::validate_tools(&tools, Some(&catalog)) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                Some(rupu_cp::mcp::McpOpts {
+                    catalog: Some(catalog),
+                    tools,
+                })
             };
 
             // Take the bind address BEFORE any background loop exists.
@@ -401,28 +695,6 @@ pub async fn handle(action: Action) -> ExitCode {
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
-            // `cfg` is hoisted out of the registry block below purely so the
-            // resolver can be built from it: `resolver_for`, not a bare
-            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
-            // account becomes an `AccountSpec` and its SSO token can
-            // actually refresh (arc progress ledger, Ruling 7). This is the
-            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
-            // SCM sweep, so without it the Ruling 7 fix would be wired in
-            // `accounts.rs` yet inert everywhere `cp serve` runs.
-            let scm_cfg = {
-                let global_cfg = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
-                    .unwrap_or_default()
-            };
-            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
-            let scm_registry = Arc::new(
-                rupu_scm::Registry::discover(
-                    scm_resolver.as_ref(),
-                    &scm_cfg,
-                    Arc::new(rupu_netflow::NullSink),
-                )
-                .await,
-            );
             let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
                 Arc::new(crate::cp_repos::CpRepoLister {
                     registry: Arc::clone(&scm_registry),
@@ -482,7 +754,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     bind,
                     token,
                     global_dir,
-                    open_browser: !no_open,
+                    open_browser: !no_open && !no_web,
                     launcher: Some(launcher),
                     session_sender: Some(session_sender),
                     repos,
@@ -493,6 +765,8 @@ pub async fn handle(action: Action) -> ExitCode {
                     session_mutator,
                     transcript_mutator,
                     inventory: Some(inventory),
+                    web: !no_web,
+                    mcp,
                 },
             )
             .await;
@@ -4790,5 +5064,193 @@ mod tests {
             ..Default::default()
         };
         assert!(sweep_or_reaper_enabled(&cp_cfg, &asn, &reaper(false)));
+    }
+}
+
+#[cfg(test)]
+mod build_cache_tests {
+    use super::BuildCache;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A build in progress holds the lock of nobody: a cached key answers
+    /// at once, and another key's build runs alongside it.
+    #[test]
+    fn a_slow_build_holds_up_neither_a_cached_key_nor_another_build() {
+        let cache = std::sync::Arc::new(BuildCache::<u32>::new());
+        cache.get_or_build("cached", || Ok::<_, ()>(1)).unwrap();
+        let (entered_tx, entered) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel::<()>();
+        let slow = {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache
+                    .get_or_build("slow", || {
+                        entered_tx.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(30)).unwrap();
+                        Ok::<_, ()>(2)
+                    })
+                    .unwrap()
+            })
+        };
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        // While "slow" builds: the cached key, and another key's build,
+        // finish (each would deadlock if the build held the lock).
+        let (done_tx, done) = mpsc::channel();
+        {
+            let cache = std::sync::Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let a = *cache.get_or_build("cached", || Ok::<_, ()>(9)).unwrap();
+                let b = *cache.get_or_build("other", || Ok::<_, ()>(3)).unwrap();
+                done_tx.send((a, b)).unwrap();
+            });
+        }
+        assert_eq!(done.recv_timeout(Duration::from_secs(10)).unwrap(), (1, 3));
+        release_tx.send(()).unwrap();
+        assert_eq!(*slow.join().unwrap(), 2);
+        assert_eq!(cache.len(), 3);
+    }
+
+    #[test]
+    fn a_failed_build_is_not_kept() {
+        let cache = BuildCache::<u32>::new();
+        assert_eq!(cache.get_or_build("k", || Err("no")), Err("no"));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(*cache.get_or_build("k", || Ok::<_, &str>(4)).unwrap(), 4);
+        // Built once: a later build closure is never run.
+        assert_eq!(*cache.get_or_build("k", || Ok::<_, &str>(5)).unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+mod catalog_context_tests {
+    use super::CliContextFactory;
+    use rupu_mcp::ContextFactory;
+    use rupu_workspace::{CustomerStore, NewCustomer, ProjectRef, WorkspaceStore};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn factory(global: &Path) -> CliContextFactory {
+        let cfg = rupu_config::Config::default();
+        CliContextFactory::new(
+            global.to_path_buf(),
+            &cfg,
+            Arc::new(crate::accounts::resolver_for(&cfg)),
+            Arc::new(rupu_scm::Registry::empty()),
+        )
+    }
+
+    fn register(global: &Path, dir: &Path) -> rupu_workspace::Workspace {
+        rupu_workspace::store::upsert(
+            &WorkspaceStore {
+                root: global.join("workspaces"),
+            },
+            dir,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_call_is_layered_with_its_customers_config() {
+        crate::test_support::ensure_crypto_provider();
+        let global = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let wa = register(global.path(), a.path());
+        let wb = register(global.path(), b.path());
+        let customers = CustomerStore::new(global.path());
+        customers
+            .create(
+                "acme",
+                &NewCustomer {
+                    name: "Acme".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        std::fs::write(customers.config_path("acme"), "[bash]\ntimeout_secs = 7\n").unwrap();
+        customers.assign("acme", ProjectRef::Id(&wa.id)).unwrap();
+
+        let f = Arc::new(factory(global.path()));
+        let ca = on_pool(&f, Some(&wa.id)).await.unwrap();
+        assert_eq!(ca.services.customer.as_deref(), Some("acme"));
+        assert_eq!(ca.workspace.bash.timeout_secs, 7);
+        assert_eq!(ca.workspace.id, wa.id);
+        // Another project, no customer: neither the slug nor the value.
+        let cb = on_pool(&f, Some(&wb.id)).await.unwrap();
+        assert_eq!(cb.services.customer, None);
+        assert_ne!(cb.workspace.bash.timeout_secs, 7);
+        // By path, the same project as by id; no workspace = the global layer.
+        let by_path = on_pool(&f, Some(a.path().to_str().unwrap())).await.unwrap();
+        assert_eq!(by_path.services.customer.as_deref(), Some("acme"));
+        let none = on_pool(&f, None).await.unwrap();
+        assert_eq!(none.services.customer, None);
+        assert_eq!(f.projects.len(), 2, "one assembler per project");
+    }
+
+    /// `context` as `CatalogSource::call` runs it: on the blocking pool.
+    async fn on_pool(
+        f: &Arc<CliContextFactory>,
+        ws: Option<&str>,
+    ) -> Result<rupu_tools::ToolContext, String> {
+        let (f, ws) = (Arc::clone(f), ws.map(str::to_string));
+        tokio::task::spawn_blocking(move || f.context(ws.as_deref()))
+            .await
+            .unwrap()
+    }
+
+    /// Two projects' first contexts at once both complete (discovery runs
+    /// on the blocking pool, blocking on the runtime), each its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_first_contexts_for_two_projects_both_complete() {
+        crate::test_support::ensure_crypto_provider();
+        let global = tempfile::tempdir().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let wa = register(global.path(), a.path());
+        let wb = register(global.path(), b.path());
+        let f = Arc::new(factory(global.path()));
+        let (ca, cb) = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            futures_util::future::join(on_pool(&f, Some(&wa.id)), on_pool(&f, Some(&wb.id))),
+        )
+        .await
+        .expect("both contexts complete");
+        assert_eq!(ca.unwrap().workspace.id, wa.id);
+        assert_eq!(cb.unwrap().workspace.id, wb.id);
+        assert_eq!(f.projects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn workspace_resolution_errors() {
+        let global = tempfile::tempdir().unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let f = factory(global.path());
+        let err = |ws: &str| f.context(Some(ws)).map(|_| ()).unwrap_err();
+        assert_eq!(err("ws_nope"), "no registered project `ws_nope`");
+        // Exists, but was never registered.
+        let p = existing.path().to_str().unwrap();
+        assert_eq!(err(p), format!("no registered project `{p}`"));
+        // An absolute path that does not exist.
+        let gone = existing.path().join("gone");
+        let g = gone.to_str().unwrap();
+        assert_eq!(err(g), format!("no registered project `{g}`"));
+        // Relative: an unknown id, never resolved against the server's cwd.
+        assert_eq!(err("."), "no registered project `.`");
+        assert_eq!(err("a/b"), "no registered project `a/b`");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_project_record_is_reported_not_swallowed() {
+        let global = tempfile::tempdir().unwrap();
+        let dir = global.path().join("workspaces");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ws_bad.toml"), "not = [valid").unwrap();
+        let f = factory(global.path());
+        let e = f.context(Some("ws_bad")).map(|_| ()).unwrap_err();
+        assert!(
+            e.contains("ws_bad") && !e.starts_with("no registered"),
+            "{e}"
+        );
     }
 }

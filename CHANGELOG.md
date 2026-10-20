@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Operator MCP over `rupu cp serve`.** The control plane serves MCP (streamable HTTP) at `/mcp` behind the `/api` bearer token, with an Origin/Host guard. Thirteen operator tools (`runs.list|get|approve|reject|cancel`, `workflows.list|run`, `agents.list|run`, `sessions.start|send`, `messages.list|send`) call the CP's own endpoints in process, plus a `wait` tool (run settled / gate parked / run events / messages, with a cursor) and the tool catalog (files, shell, SCM, issues, findings; fs/shell and findings tools take a `workspace`). rupu adds no permission layer: the client's harness decides. Operator messages sent over MCP record `client: "mcp"`. See `docs/mcp.md`.
+- **`rupu cp serve --no-web`, `--no-mcp`, `--tools <grant>`.**
+
+### Changed
+- **`rupu mcp serve` is deprecated.** It prints a notice and runs `rupu cp serve --no-web` on 127.0.0.1:7878; the stdio transport is gone (`--transport` and `--mode` are ignored).
+
 ## v0.5.3 — GitHub auth fix + token cost tracking + completion polish (2026-05-07)
 
 ### Fixed

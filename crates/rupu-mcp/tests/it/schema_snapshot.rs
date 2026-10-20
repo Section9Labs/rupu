@@ -1,15 +1,24 @@
-//! Snapshot of `rupu mcp serve`'s default `tools/list` + jsonschema validity.
+//! Snapshot of the catalog source's `tools/list` + jsonschema validity.
 //!
 //! Run with `BLESS=1 cargo test -p rupu-mcp --test it schema_snapshot:: ...`
 //! to regenerate the snapshot file after intentionally changing the tools.
 
-use crate::serve::{list, server};
+use crate::catalog::source;
+use rupu_mcp::ToolSource;
+use serde_json::{json, Value};
+
+fn listed(root: &std::path::Path) -> Vec<Value> {
+    source(root)
+        .tools()
+        .into_iter()
+        .map(|t| json!({ "name": t.name, "inputSchema": t.input_schema }))
+        .collect()
+}
 
 #[tokio::test]
 async fn tools_list_matches_snapshot() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (client, handle, _) = server(tmp.path(), None, rupu_tools::PermissionMode::Bypass);
-    let tools = serde_json::Value::Array(list(&client).await);
+    let tools = Value::Array(listed(tmp.path()));
     let tools_pretty = serde_json::to_string_pretty(&tools).unwrap();
 
     let path = "tests/snapshots/tools_list.json";
@@ -32,19 +41,13 @@ async fn tools_list_matches_snapshot() {
         tools, expected,
         "tools/list snapshot drift — re-run with BLESS=1 to update if intentional"
     );
-
-    drop(client);
-    let _ = handle.await;
 }
 
 #[tokio::test]
 async fn every_listed_input_schema_compiles_as_jsonschema() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let (client, handle, _) = server(tmp.path(), Some(&["*"]), rupu_tools::PermissionMode::Bypass);
-    for tool in list(&client).await {
+    for tool in listed(tmp.path()) {
         jsonschema::JSONSchema::compile(&tool["inputSchema"])
             .unwrap_or_else(|e| panic!("tool {} has invalid inputSchema: {e}", tool["name"]));
     }
-    drop(client);
-    let _ = handle.await;
 }

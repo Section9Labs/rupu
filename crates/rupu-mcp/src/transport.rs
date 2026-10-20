@@ -5,7 +5,6 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::error::McpError;
@@ -79,64 +78,6 @@ impl Transport for InProcessTransport {
     }
     async fn send(&self, msg: Value) -> Result<(), McpError> {
         self.send_raw(&encode(&msg)?)
-    }
-}
-
-/// Stdio transport: newline-delimited JSON over stdin/stdout (the
-/// canonical MCP wire format for spawned servers).
-pub struct StdioTransport {
-    stdin: Arc<TokioMutex<BufReader<Stdin>>>,
-    stdout: Arc<TokioMutex<Stdout>>,
-}
-
-impl StdioTransport {
-    pub fn new() -> Self {
-        Self {
-            stdin: Arc::new(TokioMutex::new(BufReader::new(tokio::io::stdin()))),
-            stdout: Arc::new(TokioMutex::new(tokio::io::stdout())),
-        }
-    }
-}
-
-impl Default for StdioTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Transport for StdioTransport {
-    async fn recv(&self) -> Result<Option<Value>, McpError> {
-        let mut stdin = self.stdin.lock().await;
-        loop {
-            let mut buf = String::new();
-            let n = stdin
-                .read_line(&mut buf)
-                .await
-                .map_err(|e| McpError::Transport(anyhow::anyhow!("stdin read: {e}")))?;
-            if n == 0 {
-                return Ok(None);
-            }
-            if let Some(decoded) = decode_line(&buf) {
-                return decoded.map(Some);
-            }
-        }
-    }
-    async fn send(&self, msg: Value) -> Result<(), McpError> {
-        let line = encode(&msg)?;
-        // One lock per line, so replies sent from concurrent calls never
-        // interleave.
-        let mut out = self.stdout.lock().await;
-        out.write_all(line.as_bytes())
-            .await
-            .map_err(|e| McpError::Transport(anyhow::anyhow!("stdout write: {e}")))?;
-        out.write_all(b"\n")
-            .await
-            .map_err(|e| McpError::Transport(anyhow::anyhow!("stdout write: {e}")))?;
-        out.flush()
-            .await
-            .map_err(|e| McpError::Transport(anyhow::anyhow!("stdout flush: {e}")))?;
-        Ok(())
     }
 }
 

@@ -188,6 +188,7 @@ fn send(global: &Path, args: &SendArgs, caps: rupu_fleet::BusCaps) -> anyhow::Re
         urgent: args.urgent,
         via: OperatorVia::Cli,
         viewer: None,
+        client: None,
     };
     let receipt = root
         .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)
@@ -553,6 +554,7 @@ fn helper(global: &Path, action: HelperAction) -> Result<serde_json::Value, Mess
                 urgent,
                 via: OperatorVia::Cp,
                 viewer,
+                client: None,
             };
             let receipt = root
                 .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)

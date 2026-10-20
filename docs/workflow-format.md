@@ -599,7 +599,7 @@ Required fields:
 
 ## `action:` connector steps
 
-Use `action:` when a step should call a catalog tool directly — no agent, no LLM turn at all. The step runs the same tool an agent or `rupu mcp serve` would call, under the run's permission mode.
+Use `action:` when a step should call a catalog tool directly — no agent, no LLM turn at all. The step runs the same tool an agent or the MCP endpoint (`rupu cp serve`, `/mcp`) would call, under the run's permission mode.
 
 ```yaml
 steps:

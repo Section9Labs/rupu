@@ -930,7 +930,7 @@ not gain any.
   findings and returns each finding's tags before and after. Both work only on
   the agent's own workspace, and `findings.tag` is allowed in `readonly` mode:
   it annotates the ledger and never touches the workspace's files.
-- **Workflow `action:` steps and `rupu mcp serve`.** They call the same
+- **Workflow `action:` steps and the MCP endpoint (`rupu cp serve`, `/mcp`).** They call the same
   `findings.query` and `findings.tag` tools (one implementation, same inputs
   and results), and `findings.report` (which a workflow calls as
   `action: findings.record`) accepts `tags`.

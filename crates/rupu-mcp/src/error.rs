@@ -48,7 +48,7 @@ impl McpError {
     }
 }
 
-/// Why a [`crate::CatalogServer`] can't start.
+/// Why a [`crate::McpServer`] or [`crate::CatalogSource`] can't start.
 #[derive(Debug, Error)]
 pub enum ServeError {
     /// `--tools` names a tool or namespace the catalog doesn't have.
@@ -58,4 +58,10 @@ pub enum ServeError {
     /// bug in `rupu_tools`).
     #[error("`{0}` is granted but has no implementation")]
     NoBody(String),
+    /// Two sources serve the same tool name.
+    #[error("tool `{0}` is served by more than one source")]
+    Duplicate(String),
+    /// A `--tools` entry matches no tool (the message names it).
+    #[error("{0}")]
+    Filter(String),
 }

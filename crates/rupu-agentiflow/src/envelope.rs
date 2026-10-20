@@ -349,6 +349,7 @@ impl Envelope {
             urgent,
             via: OperatorVia::Cli,
             viewer: None,
+            client: None,
         };
         match self.space.operator_send(msg) {
             Ok(receipt) => tracing::info!(
@@ -652,6 +653,7 @@ mod tests {
                 urgent: false,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             })
             .unwrap();
     }

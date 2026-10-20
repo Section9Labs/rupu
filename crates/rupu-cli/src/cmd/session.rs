@@ -12415,6 +12415,7 @@ mod tests {
                 urgent: false,
                 via: rupu_fleet::OperatorVia::Cli,
                 viewer: None,
+                client: None,
             })
             .unwrap();
         assert_eq!(sent.delivery().undelivered, [], "the agent is joined");

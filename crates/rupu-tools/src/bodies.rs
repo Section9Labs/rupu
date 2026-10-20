@@ -1,7 +1,7 @@
 //! The body of each catalog tool, built for one run from its
 //! [`ToolContext`]. The agent loop builds its registry here, an `action:`
-//! step its one tool and `rupu mcp serve` its listing: three callers, one
-//! set of bodies (spec W4 §3.3).
+//! step its one tool and the MCP endpoint (`rupu cp serve` /mcp) its
+//! listing: three callers, one set of bodies (spec W4 §3.3).
 
 use crate::tool::{Tool, ToolContext};
 use crate::{

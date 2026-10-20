@@ -134,6 +134,7 @@ pub fn send(
         urgent: req.urgent,
         via: OperatorVia::Cp,
         viewer: req.viewer,
+        client: req.client,
     };
     let receipt = root
         .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)

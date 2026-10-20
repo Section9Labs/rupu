@@ -1088,8 +1088,8 @@ async fn get_session_runs(
 
 /// Request body for `POST /api/sessions/:id/send`. A send carries a
 /// prompt, skills to invoke (`rupu session send --skill`), or both.
-#[derive(Deserialize)]
-struct SendBody {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct SendBody {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
@@ -1132,8 +1132,8 @@ impl SendBody {
 /// Optional `?host=<id>` query param for `POST /api/sessions/:id/send`.
 /// Absent or `"local"` → local path; a remote id proxies via
 /// [`HostConnector::send_session_turn`].
-#[derive(Deserialize, Default)]
-struct SendQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct SendQuery {
     #[serde(default)]
     host: Option<String>,
 }

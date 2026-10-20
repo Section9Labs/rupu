@@ -1643,6 +1643,7 @@ mod tests {
                 urgent,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             })
             .unwrap()
             .id()

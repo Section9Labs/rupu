@@ -623,8 +623,8 @@ async fn delete_workflow(
 
 /// Request body for `POST /api/workflows/:name/run`. All fields optional; a
 /// bodyless POST launches the workflow with no inputs in its default mode.
-#[derive(Deserialize, Default)]
-struct LaunchBody {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct LaunchBody {
     #[serde(default)]
     inputs: std::collections::BTreeMap<String, String>,
     #[serde(default)]

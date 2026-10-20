@@ -99,6 +99,9 @@ pub struct OperatorMessageRequest {
     pub body: String,
     pub urgent: bool,
     pub viewer: Option<String>,
+    /// The client behind a local write (`mcp`); never forwarded to a remote
+    /// host, which keeps its own attribution.
+    pub client: Option<String>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────

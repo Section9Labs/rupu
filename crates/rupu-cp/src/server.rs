@@ -23,16 +23,9 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
     )
 }
 
-/// Build the control-plane router.
-///
-/// `token`: when `Some`, every `/api/*` route requires the token — as
-/// `Authorization: Bearer <token>` or as the browser's token cookie, which a
-/// page load with `?token=<token>` sets ([`crate::auth`]) — and otherwise
-/// returns `401`. `/healthz`, the node WS endpoint (enrollment-token gated)
-/// and the static UI / SPA fallback stay open: the pages hold no data, every
-/// byte of it comes from `/api/*`.
-pub fn router(state: AppState, token: Option<String>) -> Router {
-    let api = Router::new()
+/// Every `/api/*` route, no auth layer: the in-process MCP caller's router.
+pub(crate) fn api_routes() -> Router<AppState> {
+    Router::new()
         .merge(crate::api::agentiflows::routes())
         .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
@@ -69,7 +62,58 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         .merge(crate::api::hosts::routes())
         .merge(crate::api::skills::routes())
         .merge(crate::api::tools::routes())
-        .merge(crate::api::workspace::routes());
+        .merge(crate::api::workspace::routes())
+}
+
+/// What `router_with` serves besides `/api/*` and `/healthz`.
+pub struct RouterOpts {
+    /// Serve the embedded web UI (the SPA fallback). `false` = `--no-web`:
+    /// an unmatched path is a plain 404.
+    pub web: bool,
+    /// The `/mcp` endpoint's server. `None` = `--no-mcp`: `/mcp` is a JSON 404.
+    pub mcp: Option<Arc<rupu_mcp::McpServer>>,
+}
+
+/// Build the control-plane router: the web UI and no MCP.
+///
+/// `token`: see [`router_with`].
+pub fn router(state: AppState, token: Option<String>) -> Router {
+    router_with(
+        state,
+        token,
+        RouterOpts {
+            web: true,
+            mcp: None,
+        },
+    )
+}
+
+async fn mcp_off() -> crate::error::ApiError {
+    crate::error::ApiError(
+        axum::http::StatusCode::NOT_FOUND,
+        "MCP is off (--no-mcp)".into(),
+    )
+}
+
+/// Build the control-plane router.
+///
+/// `token`: when `Some`, every `/api/*` route and `/mcp` requires the token —
+/// as `Authorization: Bearer <token>` or as the browser's token cookie, which
+/// a page load with `?token=<token>` sets ([`crate::auth`]) — and otherwise
+/// returns `401`. `/healthz`, the node WS endpoint (enrollment-token gated)
+/// and the static UI / SPA fallback stay open: the pages hold no data, every
+/// byte of it comes from `/api/*`.
+pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> Router {
+    let loopback = state
+        .bind
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_loopback());
+    let mcp = match opts.mcp {
+        Some(server) => crate::mcp::endpoint::routes(server, loopback),
+        // Mounted explicitly so the SPA fallback never answers `/mcp`.
+        None => Router::new().route("/mcp", axum::routing::any(mcp_off)),
+    };
+    let api = api_routes().merge(mcp);
 
     let token = token.map(crate::auth::Token::new);
     let api = match &token {
@@ -87,13 +131,18 @@ pub fn router(state: AppState, token: Option<String>) -> Router {
         // it here (same level as /healthz) keeps it reachable even when a
         // bearer token is configured.
         .merge(crate::node::server::routes())
-        .merge(api)
-        // Registered routes above match first. Anything else is handled by the
-        // embedded-UI fallback: an unmatched `/api` or `/api/*` path is a JSON
-        // 404 (never the SPA — that made every missing endpoint look present
-        // on an older CP), and every other path (incl. client-side routes like
-        // `/runs/abc`) falls through to the embedded SPA.
-        .fallback(crate::embed::static_handler);
+        .merge(api);
+    // Registered routes above match first. Anything else is handled by the
+    // embedded-UI fallback: an unmatched `/api` or `/api/*` path is a JSON
+    // 404 (never the SPA — that made every missing endpoint look present
+    // on an older CP), and every other path (incl. client-side routes like
+    // `/runs/abc`) falls through to the embedded SPA. Without the web UI
+    // (`--no-web`) every other path is a plain 404.
+    let app = if opts.web {
+        app.fallback(crate::embed::static_handler)
+    } else {
+        app.fallback(crate::embed::no_web_handler)
+    };
     let app = match token {
         Some(t) => app.layer(from_fn_with_state(t, crate::auth::bootstrap_cookie)),
         None => app,

@@ -305,7 +305,7 @@ index on `command_run` events without parsing `tool_call` inputs.
 **1. Live action-node shape (current, real effects).** Written by
 `execute_action_step` (`rupu-orchestrator`) whenever a standalone `action:`
 workflow step calls its catalog tool (the same tool body an agent or `rupu
-mcp serve` calls). `kind` is the tool name as the step wrote it (e.g. `issues.create`, not a bespoke verb);
+cp serve` `/mcp` calls). `kind` is the tool name as the step wrote it (e.g. `issues.create`, not a bespoke verb);
 `payload` is the rendered `with:` args sent to the connector; `applied` is
 `true` whenever the dispatcher call actually reached the connector
 (regardless of whether the connector call itself succeeded) and `false` only

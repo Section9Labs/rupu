@@ -103,7 +103,7 @@ single Rust binary that:
   the terminal (a three-pane workflow dashboard) and `rupu watch <run_id>`
   re-attaches or replays.
 - **Embeds an MCP server** — one typed GitHub + GitLab tool catalog for agents,
-  also served to Claude Desktop / Cursor / any MCP host via `rupu mcp serve`
+  also served to Claude Code / Cursor / Claude Desktop / any MCP host over HTTP by `rupu cp serve` at `/mcp`
   ([docs/mcp.md](docs/mcp.md)).
 - **Updates itself** — `rupu update` follows the `stable` or `beta` channel
   with checksum-verified, atomic in-place swaps.
@@ -417,8 +417,8 @@ rupu repos list
 # 3. Run an agent against a PR
 rupu run review-pr github:section9labs/rupu#42
 
-# 4. Or expose the same surface to Claude Desktop / Cursor:
-rupu mcp serve --transport stdio
+# 4. Or expose the same surface (and rupu itself) to an MCP client:
+rupu cp serve --no-web    # MCP at http://127.0.0.1:7878/mcp
 ```
 
 | Capability             | GitHub | GitLab |
@@ -565,7 +565,7 @@ this repo:
 - [`docs/providers.md`](docs/providers.md) — LLM providers, accounts and auth modes (per-provider pages in [`docs/providers/`](docs/providers/))
 - [`docs/response-outcomes.md`](docs/response-outcomes.md) — reply outcomes, the recovery ladder and `fallbacks:`
 - [`docs/scm.md`](docs/scm.md) — GitHub / GitLab / issue-tracker integration (per-platform pages in [`docs/scm/`](docs/scm/))
-- [`docs/mcp.md`](docs/mcp.md) — the embedded MCP server and its tool catalog
+- [`docs/mcp.md`](docs/mcp.md) — the MCP endpoint (`/mcp`), operator tools, `wait` and the tool catalog
 - [`docs/coverage.md`](docs/coverage.md) — coverage harness, finding reports, queries, tags and exports
 - [`docs/engagement-profiles.md`](docs/engagement-profiles.md) — engagement profiles: asset kinds, the built-in catalog, writing your own, the asset ledger, the stock fleet
 - [`docs/netflow.md`](docs/netflow.md) — per-run network flow capture: what is recorded, ledgers, ASN enrichment, `rupu netflow`, `[netflow]` config
@@ -623,8 +623,9 @@ rupu repos {list, attach, prefer, tracked, forget}
 rupu scm {bind, accounts}             Multi-account SCM routing rules and account roster
 rupu cron {list, tick, events}        Cron + polled-event trigger runtime
 rupu webhook serve [--addr]           Long-lived webhook receiver for GitHub / GitLab / Linear / Jira
-rupu mcp serve [--transport]          Expose rupu's tools to MCP clients
-rupu cp serve [--bind] [--token]      Local control-plane HTTP server for the rupu web UI
+rupu cp serve [--bind] [--token] [--no-web] [--no-mcp] [--tools]
+                                       Control plane: the web UI, its API and MCP at /mcp
+                                       (rupu mcp serve is deprecated)
 rupu host {add, list, remove}         Manage named remote hosts (SSH / HTTP / tunnel / bucket)
 rupu node [--cp-url] | {enroll, pull} Dial-home tunnel agent, node enrollment, bucket worker
 rupu auth {login, logout, status, backend}
@@ -857,7 +858,7 @@ clap dispatcher.
 | `rupu-coverage` | Coverage ledgers, concern catalogs, engagement profiles, finding reports, query language and tags |
 | `rupu-findings-report` | Pure finding-report renderers (Markdown / HTML / PDF via Typst) and the Markdown importer |
 | `rupu-scm` | GitHub / GitLab repo + issue connectors and event pollers |
-| `rupu-mcp` | Embedded MCP server (in-process and stdio) over the SCM tool catalog |
+| `rupu-mcp` | MCP protocol core (HTTP, served by `rupu cp serve` at `/mcp`) over the tool catalog |
 | `rupu-webhook` | Webhook receiver for event-triggered workflows (GitHub, GitLab, Linear, Jira) |
 | `rupu-cp` | Control-plane HTTP server, host connectors (local / SSH / HTTP / tunnel / bucket) and the embedded web UI |
 | `rupu-netflow` | Network egress observability: per-run flow ledgers for rupu's own HTTP |

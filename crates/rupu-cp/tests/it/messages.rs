@@ -82,7 +82,7 @@ async fn post(addr: SocketAddr, path: &str, body: Value) -> (u16, Value) {
 
 /// A workflow run recorded `status`, whose runner is this process, with
 /// `lynx#1` joined in its space.
-fn workflow_run(global: &Path, id: &str, status: RunStatus) -> Bus {
+pub(super) fn workflow_run(global: &Path, id: &str, status: RunStatus) -> Bus {
     let store = RunStore::new(global.join("runs"));
     let mut rec = super::sse::seed_run(id, status);
     rec.runner_pid = Some(std::process::id());
@@ -368,6 +368,7 @@ async fn steer_alias_parity() {
                 urgent: true,
                 via: OperatorVia::Cli,
                 viewer: None,
+                client: None,
             },
             BusCaps::default(),
             &rupu_orchestrator::runs::pid_is_running,

@@ -64,13 +64,27 @@ fn serve_index(state: &AppState) -> Response {
     }
 }
 
+/// The JSON 404 for an unmatched `/api` or `/api/*` path (`path` has no
+/// leading slash); `None` for any other path.
+fn api_not_found(path: &str) -> Option<Response> {
+    (path == "api" || path.starts_with("api/")).then(|| {
+        crate::error::ApiError::not_found(format!("no API route for /{path}")).into_response()
+    })
+}
+
+/// The fallback when the web UI is off (`--no-web`): the same JSON 404 for
+/// API paths, a plain 404 for everything else.
+pub async fn no_web_handler(uri: Uri) -> Response {
+    api_not_found(uri.path().trim_start_matches('/'))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
 pub async fn static_handler(State(state): State<AppState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     // An unmatched API path is a client error, not a page: serving the SPA
     // with 200 made every newer endpoint look present on an older CP.
-    if path == "api" || path.starts_with("api/") {
-        return crate::error::ApiError::not_found(format!("no API route for /{path}"))
-            .into_response();
+    if let Some(resp) = api_not_found(path) {
+        return resp;
     }
     if path.is_empty() || path == "index.html" {
         return serve_index(&state);

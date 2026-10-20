@@ -113,6 +113,10 @@ pub struct LogMessage {
     /// CP's viewer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewer: Option<String>,
+    /// The client that drove the sending surface (`mcp`), when it says so.
+    /// Rides beside `via`, whose closed enum older binaries must still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 /// The surface an operator message came through (spec F1b §3.1).
@@ -126,6 +130,8 @@ pub enum OperatorVia {
 /// One line of `log.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
+// A message dominates the log; boxing it would touch every reader for no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum LogLine {
     Msg(LogMessage),
     /// A message reached a model: `by` saw `id` on its turn `turn`.

@@ -61,8 +61,9 @@ pub fn routes() -> Router<AppState> {
                     move |State(s): State<AppState>,
                           Path(id): Path<String>,
                           Query(q): Query<HostQuery>,
+                          via: crate::mcp::ViaMcp,
                           Json(body): Json<PostBody>| async move {
-                        post(route, &s, &id, q.host.as_deref(), body).await
+                        post(route, &s, &id, q.host.as_deref(), &via, body).await
                     },
                 ),
             )
@@ -81,7 +82,7 @@ pub fn routes() -> Router<AppState> {
     router
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ListQuery {
     host: Option<String>,
     after: Option<String>,
@@ -90,13 +91,13 @@ pub(crate) struct ListQuery {
     kind: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub(crate) struct HostQuery {
     host: Option<String>,
 }
 
 /// The body of `POST …/messages`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PostBody {
     /// The recipient; the root's default (an agentiflow's lead, everyone
     /// elsewhere) when absent.
@@ -183,17 +184,22 @@ pub(crate) async fn post(
     s: &AppState,
     id: &str,
     host: Option<&str>,
+    via: &crate::mcp::ViaMcp,
     body: PostBody,
 ) -> ApiResult<Response> {
     check_route(route, id)?;
     crate::api::config::require_writable_to(s, "messaging a run")?;
     // The CP authenticates a shared token, not a person: there is no viewer
-    // to record.
+    // to record. A call through `/mcp` (the operator source's request
+    // extension, never a header) records `client: mcp`, on a local write
+    // only: a remote host keeps its own attribution.
+    let client = (remote(host).is_none() && via.is_some()).then(|| "mcp".to_string());
     let msg = OperatorMessageRequest {
         to: body.to,
         body: body.body,
         urgent: body.urgent,
         viewer: None,
+        client,
     };
     let reply: OperatorSendReply = if let Some(host) = remote(host) {
         let conn = crate::api::runs::resolve_host(s, host)?;

@@ -352,7 +352,7 @@ impl RunAssembler {
     }
 
     /// The tool context of a caller that is not an agent run (spec W4
-    /// §3.3): an `action:` workflow step or `rupu mcp serve`. `identity` is
+    /// §3.3): an `action:` workflow step or the control plane's MCP catalog. `identity` is
     /// the caller's (an action step's workflow run, an MCP server session);
     /// the workspace carries the config's `[bash]`, and the services are what
     /// such a caller provides — the context's SCM registry, its findings base

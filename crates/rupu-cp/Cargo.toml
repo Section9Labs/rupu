@@ -66,6 +66,11 @@ rupu-findings-report = { path = "../rupu-findings-report", default-features = fa
 rupu-codename = { workspace = true }
 rupu-skills = { workspace = true }
 rupu-query = { workspace = true }
+# The operator MCP endpoint (`/mcp`): the protocol core over tool sources.
+rupu-mcp = { path = "../rupu-mcp" }
+tower.workspace = true
+http.workspace = true
+schemars.workspace = true
 # Agentiflows view: the run-dir record/def/unit readers (`api/agentiflows.rs`).
 # rupu-agentiflow depends on neither rupu-cp nor rupu-cli, so this edge is acyclic.
 rupu-agentiflow = { path = "../rupu-agentiflow" }
@@ -85,7 +90,5 @@ tokio-tungstenite = { workspace = true }
 rupu-providers = { path = "../rupu-providers" }
 futures-util = { workspace = true }
 serde_json.workspace = true
-tower.workspace = true
 http-body-util.workspace = true
-http.workspace = true
 tar.workspace = true

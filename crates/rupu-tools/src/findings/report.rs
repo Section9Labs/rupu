@@ -1,6 +1,6 @@
 //! `findings.report`: record a finding in the run's findings ledger. The one
 //! implementation behind the agent loop, `action: findings.record` steps and
-//! `rupu mcp serve` (spec W4 §3.2).
+//! the MCP endpoint (`rupu cp serve` /mcp) (spec W4 §3.2).
 
 use crate::coverage_emit::attribution_from;
 use crate::descriptor::{Alias, Effect, Service, ToolDescriptor};

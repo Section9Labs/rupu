@@ -1352,6 +1352,7 @@ fn send(
         urgent: now,
         via: rupu_fleet::OperatorVia::Cli,
         viewer: None,
+        client: None,
     };
     let receipt = root
         .operator_send(global, msg, caps, &rupu_orchestrator::runs::pid_is_running)
