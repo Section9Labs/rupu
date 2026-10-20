@@ -479,31 +479,16 @@ pub(super) fn text_of(result: &Value) -> String {
         .to_string()
 }
 
-const OPERATOR_TOOLS: [&str; 13] = [
-    "runs.list",
-    "runs.get",
-    "runs.approve",
-    "runs.reject",
-    "runs.cancel",
-    "workflows.list",
-    "workflows.run",
-    "agents.list",
-    "agents.run",
-    "sessions.start",
-    "sessions.send",
-    "messages.list",
-    "messages.send",
-];
-
 #[tokio::test]
-async fn tools_list_has_the_13_operator_tools_with_schemas() {
+async fn tools_list_matches_the_pinned_names() {
     let (addr, _tmp) = spawn_operator().await;
     let v = rpc(addr, "tools/list", json!({})).await;
     let tools = v["result"]["tools"].as_array().unwrap();
     let mut names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     names.sort();
     // The operator tools plus `wait` (its own source).
-    let mut want = OPERATOR_TOOLS.to_vec();
+    let pinned = super::mcp_routes::pinned_tool_names();
+    let mut want: Vec<&str> = pinned.iter().map(String::as_str).collect();
     want.push("wait");
     want.sort();
     assert_eq!(names, want);

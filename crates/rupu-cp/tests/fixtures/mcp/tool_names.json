@@ -1,0 +1,15 @@
+[
+  "agents.list",
+  "agents.run",
+  "messages.list",
+  "messages.send",
+  "runs.approve",
+  "runs.cancel",
+  "runs.get",
+  "runs.list",
+  "runs.reject",
+  "sessions.send",
+  "sessions.start",
+  "workflows.list",
+  "workflows.run"
+]

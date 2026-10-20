@@ -1,12 +1,23 @@
 //! The operator tool table: each tool is one CP API route, described by its
 //! method, path template and the handler's own query/body structs (their
-//! `JsonSchema` is the tool's input schema).
+//! `JsonSchema` is the tool's input schema). Each area file lists its tools
+//! with [`op`]; [`ops`] is all of them.
+
+mod agentiflows;
+mod definitions;
+mod findings;
+mod fleet;
+mod observe;
+mod projects;
+mod runs;
+mod sessions;
 
 use rupu_mcp::ToolHints;
 
 type SchemaFn = fn() -> Option<schemars::schema::RootSchema>;
 
 /// One operator tool.
+#[derive(Clone)]
 pub struct OpSpec {
     pub name: &'static str,
     pub method: http::Method,
@@ -21,6 +32,9 @@ pub struct OpSpec {
     /// JSON body.
     pub body: SchemaFn,
     pub hints: ToolHints,
+    /// The 2xx body is a file (an export, an artifact): returned as an
+    /// embedded resource rather than parsed.
+    pub bytes: bool,
 }
 
 fn none() -> Option<schemars::schema::RootSchema> {
@@ -31,158 +45,97 @@ fn schema<T: schemars::JsonSchema>() -> Option<schemars::schema::RootSchema> {
     Some(schemars::schema_for!(T))
 }
 
-const READ: ToolHints = ToolHints {
-    read_only: true,
-    destructive: false,
-    idempotent: true,
-    open_world: false,
-};
-const DESTRUCTIVE: ToolHints = ToolHints {
-    read_only: false,
-    destructive: true,
-    idempotent: false,
-    open_world: false,
-};
-const OPEN_WORLD: ToolHints = ToolHints {
-    read_only: false,
-    destructive: false,
-    idempotent: false,
-    open_world: true,
-};
-const PLAIN: ToolHints = ToolHints {
-    read_only: false,
-    destructive: false,
-    idempotent: false,
-    open_world: false,
-};
-
-/// The 13 operator tools, in listing order.
-pub fn ops() -> &'static [OpSpec] {
-    static OPS: std::sync::OnceLock<Vec<OpSpec>> = std::sync::OnceLock::new();
-    OPS.get_or_init(build)
+/// A tool for `method path`, with no query or body and the method's hints:
+/// `GET` read-only and idempotent, `PUT` idempotent, `DELETE` destructive,
+/// anything else none. `description`'s first line says what the tool is for
+/// on its own, ends with a period and is at most 120 characters; its second
+/// paragraph names the arguments that matter and what the tool returns.
+pub(crate) fn op(
+    name: &'static str,
+    method: http::Method,
+    path: &'static str,
+    description: &'static str,
+) -> OpSpec {
+    let hints = ToolHints {
+        read_only: method == http::Method::GET,
+        destructive: method == http::Method::DELETE,
+        idempotent: method == http::Method::GET || method == http::Method::PUT,
+        open_world: false,
+    };
+    OpSpec {
+        name,
+        method,
+        path,
+        description,
+        query: none,
+        body: none,
+        hints,
+        bytes: false,
+    }
 }
 
-fn build() -> Vec<OpSpec> {
-    use crate::api::{agents, messages, runs, sessions, workflows};
-    vec![
-        OpSpec {
-            name: "runs.list",
-            method: http::Method::GET,
-            path: "/api/runs/workflows",
-            description: "List workflow runs started by hand (not standalone agent runs, not event- or cron-started ones), newest first.\n\nFilter with `q` (the query line, e.g. `status:running`), `lifecycle` (active|completed|failed), `since`/`until`, `host`, and page with `offset`/`limit`. Returns a JSON array of run rows; with `facets` set, an object `{rows, facets, facets_partial}`.",
-            query: schema::<runs::WorkflowRunsQuery>,
-            body: none,
-            hints: READ,
-        },
-        OpSpec {
-            name: "runs.get",
-            method: http::Method::GET,
-            path: "/api/runs/:id",
-            description: "Get one workflow run's full record.\n\n`id` is the run id; `host` picks a remote host. Returns the run detail: status, inputs, steps, any parked gate.",
-            query: schema::<runs::RunDetailQuery>,
-            body: none,
-            hints: READ,
-        },
-        OpSpec {
-            name: "runs.approve",
-            method: http::Method::POST,
-            path: "/api/runs/:id/approve",
-            description: "Approve a workflow run's parked gate so the run continues.\n\n`id` is the run id; `gate` names the gate step when several are parked; `mode` (ask|bypass|readonly) sets the permission mode the resumed run uses. Returns once the approval is recorded, not when the run has resumed.",
-            query: schema::<runs::RunControlQuery>,
-            body: schema::<runs::ApproveBody>,
-            hints: PLAIN,
-        },
-        OpSpec {
-            name: "runs.reject",
-            method: http::Method::POST,
-            path: "/api/runs/:id/reject",
-            description: "Reject a workflow run's parked gate; the run's rejection path runs.\n\n`id` is the run id; `gate` names the gate step when several are parked; `reason` is recorded with the decision. Returns once the rejection is recorded.",
-            query: schema::<runs::RunControlQuery>,
-            body: schema::<runs::RejectBody>,
-            hints: DESTRUCTIVE,
-        },
-        OpSpec {
-            name: "runs.cancel",
-            method: http::Method::POST,
-            path: "/api/runs/:id/cancel",
-            description: "Cancel a running or paused workflow run.\n\n`id` is the run id; `reason` is recorded. A finished run is refused with HTTP 409. Returns once the cancel is recorded.",
-            query: schema::<runs::RunControlQuery>,
-            body: schema::<runs::CancelBody>,
-            hints: DESTRUCTIVE,
-        },
-        OpSpec {
-            name: "workflows.list",
-            method: http::Method::GET,
-            path: "/api/workflows",
-            description: "List the workflows this control plane can run.\n\nTakes no arguments. Returns a JSON array of workflow summaries (name, scope, description).",
-            query: none,
-            body: none,
-            hints: READ,
-        },
-        OpSpec {
-            name: "workflows.run",
-            method: http::Method::POST,
-            path: "/api/workflows/:name/run",
-            description: "Launch a workflow run.\n\n`name` is the workflow; `inputs` maps input names to string values; `mode` (ask|bypass|readonly), `target`, `working_dir`, `host` and `scope_kind`/`scope_id` are optional. Returns the new run id.",
-            query: none,
-            body: schema::<workflows::LaunchBody>,
-            hints: OPEN_WORLD,
-        },
-        OpSpec {
-            name: "agents.list",
-            method: http::Method::GET,
-            path: "/api/agents",
-            description: "List the agents this control plane can run.\n\nTakes no arguments. Returns a JSON array of agent definitions (name, description, provider, model, tools).",
-            query: none,
-            body: none,
-            hints: READ,
-        },
-        OpSpec {
-            name: "agents.run",
-            method: http::Method::POST,
-            path: "/api/agents/:name/run",
-            description: "Launch a standalone agent run.\n\n`name` is the agent; `prompt` is its task; `mode`, `target`, `working_dir`, `host`, `skills` and the other launch options are optional. Returns the new run id.",
-            query: none,
-            body: schema::<agents::AgentRunBody>,
-            hints: OPEN_WORLD,
-        },
-        OpSpec {
-            name: "sessions.start",
-            method: http::Method::POST,
-            path: "/api/agents/:name/session",
-            description: "Start an interactive agent session.\n\n`name` is the agent; `prompt` is the first message; `mode`, `target`, `working_dir`, `host` and `skills` are optional. Returns the new session id.",
-            query: none,
-            body: schema::<agents::SessionStartBody>,
-            hints: OPEN_WORLD,
-        },
-        OpSpec {
-            name: "sessions.send",
-            method: http::Method::POST,
-            path: "/api/sessions/:id/send",
-            description: "Send a message to a live session, starting a new turn.\n\n`id` is the session id; `prompt` is the message and `skills` are skills to invoke (at least one is required). Returns the run id of the turn.",
-            query: schema::<sessions::SendQuery>,
-            body: schema::<sessions::SendBody>,
-            hints: OPEN_WORLD,
-        },
-        OpSpec {
-            name: "messages.list",
-            method: http::Method::GET,
-            path: "/api/{root}/:id/messages",
-            description: "Read the message log of a run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `after` is a message id to continue from, `limit` caps the page, `kind` filters (comma-separated). Returns the participants and messages.",
-            query: schema::<messages::ListQuery>,
-            body: none,
-            hints: READ,
-        },
-        OpSpec {
-            name: "messages.send",
-            method: http::Method::POST,
-            path: "/api/{root}/:id/messages",
-            description: "Send an operator message to a live run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `body` is the text, `to` the recipient (default: the root's default), `urgent` interrupts a running turn. Returns the message id and its delivery.",
-            query: schema::<messages::HostQuery>,
-            body: schema::<messages::PostBody>,
-            hints: PLAIN,
-        },
-    ]
+impl OpSpec {
+    /// The handler's query struct.
+    pub(crate) fn query<T: schemars::JsonSchema>(mut self) -> Self {
+        self.query = schema::<T>;
+        self
+    }
+
+    /// The handler's JSON body struct.
+    pub(crate) fn body<T: schemars::JsonSchema>(mut self) -> Self {
+        self.body = schema::<T>;
+        self
+    }
+
+    /// The call can destroy or overwrite something.
+    pub(crate) fn destructive(mut self) -> Self {
+        self.hints.destructive = true;
+        self
+    }
+
+    /// The call reaches outside the CP (launches a model run, contacts a host).
+    pub(crate) fn open_world(mut self) -> Self {
+        self.hints.open_world = true;
+        self
+    }
+
+    /// A `POST` that changes nothing (validate, preview, export).
+    // First used by the area tools that follow Plan 2's Task 4.
+    #[allow(dead_code)]
+    pub(crate) fn read_only(mut self) -> Self {
+        self.hints.read_only = true;
+        self
+    }
+
+    /// The 2xx body is returned as an embedded resource.
+    // First used by the area tools that follow Plan 2's Task 4.
+    #[allow(dead_code)]
+    pub(crate) fn bytes(mut self) -> Self {
+        self.bytes = true;
+        self
+    }
+}
+
+/// Every operator tool, in listing order: the area files' tools in the
+/// order runs, sessions, agentiflows, definitions, findings, observe,
+/// fleet, projects.
+pub fn ops() -> &'static [OpSpec] {
+    static OPS: std::sync::OnceLock<Vec<OpSpec>> = std::sync::OnceLock::new();
+    OPS.get_or_init(|| {
+        [
+            runs::ops(),
+            sessions::ops(),
+            agentiflows::ops(),
+            definitions::ops(),
+            findings::ops(),
+            observe::ops(),
+            fleet::ops(),
+            projects::ops(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    })
 }
 
 /// Routes that are deliberately not operator tools, each with the reason.
@@ -369,3 +322,39 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("POST", "/api/workflows/generate"),
     ("POST", "/api/workflows/validate"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Method;
+
+    fn hints(o: OpSpec) -> (bool, bool, bool, bool) {
+        let h = o.hints;
+        (h.read_only, h.destructive, h.idempotent, h.open_world)
+    }
+
+    #[test]
+    fn hints_default_from_the_method_and_the_builder_overrides_them() {
+        let o = |m| op("t.x", m, "/t", "T.");
+        assert_eq!(hints(o(Method::GET)), (true, false, true, false));
+        assert_eq!(hints(o(Method::PUT)), (false, false, true, false));
+        assert_eq!(hints(o(Method::DELETE)), (false, true, false, false));
+        assert_eq!(hints(o(Method::POST)), (false, false, false, false));
+        assert_eq!(hints(o(Method::PATCH)), (false, false, false, false));
+        assert_eq!(
+            hints(o(Method::POST).read_only()),
+            (true, false, false, false)
+        );
+        assert_eq!(
+            hints(o(Method::POST).open_world()),
+            (false, false, false, true)
+        );
+        assert_eq!(
+            hints(o(Method::PUT).destructive()),
+            (false, true, true, false)
+        );
+        let plain = o(Method::GET);
+        assert!(!plain.bytes && (plain.query)().is_none() && (plain.body)().is_none());
+        assert!(o(Method::GET).bytes().bytes);
+    }
+}

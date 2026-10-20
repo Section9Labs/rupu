@@ -70,6 +70,8 @@ rupu-query = { workspace = true }
 rupu-mcp = { path = "../rupu-mcp" }
 tower.workspace = true
 http.workspace = true
+# `LengthLimitError`: how an operator tool call tells an oversize response.
+http-body-util.workspace = true
 schemars.workspace = true
 # Agentiflows view: the run-dir record/def/unit readers (`api/agentiflows.rs`).
 # rupu-agentiflow depends on neither rupu-cp nor rupu-cli, so this edge is acyclic.
@@ -90,5 +92,4 @@ tokio-tungstenite = { workspace = true }
 rupu-providers = { path = "../rupu-providers" }
 futures-util = { workspace = true }
 serde_json.workspace = true
-http-body-util.workspace = true
 tar.workspace = true
