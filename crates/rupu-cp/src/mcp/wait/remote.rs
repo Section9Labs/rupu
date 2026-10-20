@@ -274,6 +274,11 @@ impl Remote {
     /// [`REMOTE_POLL`], else the statuses its `end` frames owe.
     pub(super) fn schedule(&mut self, watch: &[Condition], got: &Got, deadline: Instant) {
         let now = Instant::now();
+        // A hung host can keep the loop running to its first-round cut, past
+        // the deadline: a round started now would only be cut off and warn.
+        if now >= deadline {
+            return;
+        }
         for h in 0..self.hosts.len() {
             if self.hosts[h].busy {
                 continue;

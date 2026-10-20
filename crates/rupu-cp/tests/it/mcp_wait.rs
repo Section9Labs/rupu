@@ -1813,3 +1813,51 @@ async fn a_hosts_first_round_error_is_not_lost_beside_a_hung_host() {
         "{r}"
     );
 }
+
+/// A wait that was given a progress token reports while it waits, with
+/// `progress` growing, then answers.
+#[tokio::test]
+async fn a_wait_with_a_progress_token_reports_while_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let addr = spawn(tmp.path()).await;
+    let body = reqwest::Client::new()
+        .post(format!("http://{addr}/mcp"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "wait",
+                       "arguments": {"watch": [{"kind": "run_events", "run": RUN}],
+                                     "timeout_ms": 11000},
+                       "_meta": {"progressToken": "w1"}}}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let frames: Vec<Value> = body
+        .split("\n\n")
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| {
+            let data = f.lines().find_map(|l| l.strip_prefix("data:")).unwrap();
+            serde_json::from_str(data.trim()).unwrap()
+        })
+        .collect();
+    let (last, progress) = frames.split_last().unwrap();
+    assert!(progress.len() >= 2, "{body}");
+    let mut prev = -1.0;
+    for f in progress {
+        assert_eq!(f["method"], "notifications/progress", "{body}");
+        assert_eq!(f["params"]["progressToken"], "w1");
+        assert_eq!(f["params"]["total"], 11000.0);
+        assert_eq!(f["params"]["message"], "waiting: run_events");
+        let p = f["params"]["progress"].as_f64().unwrap();
+        assert!(p > prev, "{body}");
+        prev = p;
+    }
+    assert_eq!(last["id"], 7);
+    assert_eq!(
+        last["result"]["structuredContent"]["timed_out"], true,
+        "{body}"
+    );
+}

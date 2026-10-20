@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
 use rupu_fleet::LogLine;
-use rupu_mcp::{CallCx, ToolDef, ToolHints, ToolResult, ToolSource};
+use rupu_mcp::{CallCx, Progress, ToolDef, ToolHints, ToolResult, ToolSource};
 use rupu_orchestrator::executor::Event;
 use serde_json::{json, Value};
 use tokio::time::Instant;
@@ -47,6 +47,8 @@ const RECHECK_MIN_GAP: Duration = Duration::from_millis(200);
 /// How long a run or session turn still appearing is looked for before the
 /// call says it doesn't exist.
 pub(crate) const APPEAR_GRACE: Duration = Duration::from_secs(10);
+/// How often a call reports progress to a client that asked for it.
+pub(crate) const PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
 /// `timeout_ms` as the call's timeout: [`DEFAULT_TIMEOUT`] when absent,
 /// never past [`MAX_TIMEOUT`].
@@ -102,20 +104,21 @@ impl ToolSource for WaitSource {
         vec![tool_def()]
     }
 
-    async fn call(&self, name: &str, args: Value, _cx: &CallCx) -> Option<ToolResult> {
+    async fn call(&self, name: &str, args: Value, cx: &CallCx) -> Option<ToolResult> {
         if name != "wait" {
             return None;
         }
         Some(match parse(args) {
-            Ok(req) => self.wait(req).await,
+            Ok(req) => self.wait(req, cx.progress.as_ref()).await,
             Err(e) => ToolResult::Error(e),
         })
     }
 }
 
 impl WaitSource {
-    async fn wait(&self, mut req: Request) -> ToolResult {
-        let deadline = Instant::now() + req.timeout;
+    async fn wait(&self, mut req: Request, progress: Option<&Progress>) -> ToolResult {
+        let began = Instant::now();
+        let deadline = began + req.timeout;
         if let Err(e) = findings::validate(&self.state, &req.watch).await {
             return ToolResult::Error(e);
         }
@@ -297,6 +300,8 @@ impl WaitSource {
         let tailing = !tails.is_empty();
         let mut lines = futures_util::stream::select_all(tails);
 
+        let mut reporter = progress.map(|p| Reporter::new(p, began, &req));
+        let mut next_progress = Instant::now();
         let mut next_check = Instant::now() + RECHECK_EVERY;
         let mut last_check = Instant::now();
         loop {
@@ -310,10 +315,19 @@ impl WaitSource {
             } else {
                 deadline
             };
-            let wake_at = match remote.next_poll_at() {
+            if let Some(r) = reporter.as_mut() {
+                if Instant::now() >= next_progress {
+                    r.report();
+                    next_progress = Instant::now() + PROGRESS_EVERY;
+                }
+            }
+            let mut wake_at = match remote.next_poll_at() {
                 Some(at) => next_check.min(at).min(end),
                 None => next_check.min(end),
             };
+            if reporter.is_some() {
+                wake_at = wake_at.min(next_progress);
+            }
             let wake = tokio::select! {
                 line = async {
                     if tailing {
@@ -405,6 +419,44 @@ impl WaitSource {
             remote.drain(&req.watch, &mut got, deadline).await;
         }
         got.finish(&req.watch)
+    }
+}
+
+/// Reports a waiting call's progress: elapsed milliseconds out of the
+/// timeout, naming the kinds watched. Holds the call's `Progress` only for
+/// the call.
+struct Reporter<'a> {
+    progress: &'a Progress,
+    began: Instant,
+    total_ms: f64,
+    message: String,
+    last: f64,
+}
+
+impl<'a> Reporter<'a> {
+    fn new(progress: &'a Progress, began: Instant, req: &Request) -> Self {
+        let mut kinds: Vec<&str> = Vec::new();
+        for c in &req.watch {
+            let n = c.kind.name();
+            if !kinds.contains(&n) {
+                kinds.push(n);
+            }
+        }
+        Self {
+            progress,
+            began,
+            total_ms: req.timeout.as_millis() as f64,
+            message: format!("waiting: {}", kinds.join(", ")),
+            last: -1.0,
+        }
+    }
+
+    /// One report; `progress` grows strictly with each.
+    fn report(&mut self) {
+        let elapsed = (self.began.elapsed().as_millis() as f64).max(self.last + 1.0);
+        self.last = elapsed;
+        self.progress
+            .report(elapsed, Some(self.total_ms), Some(&self.message));
     }
 }
 
