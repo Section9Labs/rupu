@@ -624,7 +624,12 @@ async fn an_agent_run_that_never_appears_is_an_error_after_the_grace() {
     .await;
     assert!(t.elapsed() < Duration::from_secs(12), "{:?}", t.elapsed());
     assert_eq!(r["isError"], json!(true), "{r}");
-    assert!(text_of(&r).contains("run_none"), "{r}");
+    assert_eq!(
+        text_of(&r),
+        "no agent run `run_none` (a launch that failed before writing its transcript, \
+         e.g. missing provider credentials, leaves none)",
+        "{r}"
+    );
 }
 
 #[tokio::test]
@@ -1023,6 +1028,42 @@ async fn a_ledger_created_mid_wait_is_read_from_its_first_line() {
     assert_eq!(ids(&r), vec![1, 2], "{r}");
     assert_eq!(
         r["structuredContent"]["events"][0]["source"], "findings:ws1/t2",
+        "{r}"
+    );
+}
+
+/// A first workspace listing that fails finds nothing, and the listing that
+/// first succeeds counts as the call's start: its old findings don't fire,
+/// a new one does.
+#[tokio::test]
+async fn workspaces_first_listed_after_a_failed_listing_start_at_their_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    // The workspace store's dir is a file: listing it fails.
+    let dir = tmp.path().join("workspaces");
+    let aside = tmp.path().join("workspaces.aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    std::fs::write(&dir, b"not a dir").unwrap();
+    let addr = spawn(tmp.path()).await;
+    let (d, a, r2) = (dir.clone(), aside.clone(), repo.clone());
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        std::fs::remove_file(&d).unwrap();
+        std::fs::rename(&a, &d).unwrap();
+        // Past the next re-check (1 s), which lists the workspace.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::Low));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings"}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![2], "{r}");
+    assert_eq!(
+        r["structuredContent"]["events"][0]["event"]["id"], "fnd_new",
         "{r}"
     );
 }
@@ -1586,6 +1627,73 @@ async fn a_stream_cut_then_reopened_is_not_a_warning() {
         t.elapsed()
     );
     assert_eq!(counts.lock().unwrap()["/api/events/stream"], 2);
+}
+
+/// A `timeout_ms: 0` peek at a remote run's events returns what the host has,
+/// as a local peek returns what is on disk.
+#[tokio::test]
+async fn a_remote_peek_returns_the_events_the_host_has() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/events/stream" => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 2\ndata: {\"type\":\"step_started\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 0}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], false, "{r}");
+    assert_eq!(
+        s["cursor"],
+        json!({ format!("run:{RUN}@{host}"): 2 }),
+        "{r}"
+    );
+    assert!(s.get("warnings").is_none(), "{r}");
+}
+
+/// A healthy host's later round that the call's timeout cuts short (it went
+/// out just before it) is not named in `warnings`.
+#[tokio::test]
+async fn a_round_cut_short_by_the_timeout_is_not_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let remote_run = "run_01J9ZQ3K4M5N6P7Q8R9S0T1REM";
+    let (url, _) = fake_peer(move |path, n| {
+        if path == format!("/api/runs/{remote_run}") && n == 0 {
+            Reply::Close(json_reply(
+                "200 OK",
+                &json!({"run": {"id": remote_run, "status": "running", "awaiting": []}}),
+            ))
+        } else if path.starts_with("/api/runs/") {
+            // Slow, not dead: the timeout lands while it answers.
+            Reply::Hold(String::new())
+        } else {
+            not_found()
+        }
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    // The second round goes out at 2 s, 500 ms before the timeout.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": remote_run, "host": host}],
+               "timeout_ms": 2500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["timed_out"], true, "{r}");
+    assert!(s.get("warnings").is_none(), "{r}");
 }
 
 /// A host that replays from the start despite the cursor: frames at or

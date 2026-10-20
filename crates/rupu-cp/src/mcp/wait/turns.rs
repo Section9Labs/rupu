@@ -121,7 +121,10 @@ fn run_end(path: &Path) -> Option<(Value, Option<String>, u64)> {
 
 fn agent_run_end(global: &Path, run: &str) -> Result<Probe, String> {
     let Some(path) = crate::api::run_streams::agent_run_transcript(global, run) else {
-        return Ok(Probe::Missing(format!("no agent run `{run}`")));
+        return Ok(Probe::Missing(format!(
+            "no agent run `{run}` (a launch that failed before writing its transcript, \
+             e.g. missing provider credentials, leaves none)"
+        )));
     };
     Ok(match run_end(&path) {
         None => Probe::Pending,

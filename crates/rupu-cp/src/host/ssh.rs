@@ -3721,6 +3721,11 @@ impl HostConnector for SshHostConnector {
         true
     }
 
+    /// Every command is its own `ssh` process (no ControlMaster).
+    fn connects_per_request(&self) -> bool {
+        true
+    }
+
     /// SSH's `launch_agent` passes `AgentLaunchRequest.run_id` through to the
     /// remote as `rupu run --run-id <id>`, so a coordinator-minted id is the
     /// id the run actually executes under.
@@ -7603,6 +7608,13 @@ mod tests {
         // structurally cannot serve (see `proxy_get_json`).
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::ok(vec![])));
         assert!(conn.serves_runs_from_local_mirror());
+    }
+
+    #[test]
+    fn ssh_connects_per_request() {
+        // Each command is a fresh ssh process: pollers (`wait`) slow down.
+        let (conn, _store, _tmp) = make_conn(std::sync::Arc::new(FakeExec::ok(vec![])));
+        assert!(conn.connects_per_request());
     }
 
     #[tokio::test]

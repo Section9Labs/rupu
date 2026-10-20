@@ -5,21 +5,26 @@
 //! `list_messages` from the id of the last message seen (a string cursor).
 //!
 //! Requests go out in rounds, per host: each host's first round at the
-//! call's start, then one every [`REMOTE_POLL`] (or at once when an `end`
-//! frame needs its run's status). A host has at most one round in flight, and
-//! within it its requests go one after another; hosts' rounds are independent
-//! owned futures the wait loop polls beside its other sources, each applied as
-//! it lands, so a slow or hung host delays neither the local sources nor
-//! another host. A stream is its host's long-lived connection, not a poll; one
-//! that ends without its `end` frame is reopened from its cursor at that
-//! host's next round, silently when the reopen succeeds.
+//! call's start, then one every [`REMOTE_POLL`] — [`SSH_POLL`] for a host
+//! whose every request is a connection of its own (SSH) — or at once when an
+//! `end` frame needs its run's status. A host has at most one round in
+//! flight, and within it its requests go one after another; hosts' rounds are
+//! independent owned futures the wait loop polls beside its other sources,
+//! each applied as it lands, so a slow or hung host delays neither the local
+//! sources nor another host. A stream is its host's long-lived connection,
+//! not a poll; one that ends without its `end` frame is reopened from its
+//! cursor at that host's next round, silently when the reopen succeeds.
 //!
 //! A failure in a host's first round fails the call; a later failure is
-//! retried at its next round and reported in the result's `warnings`. A first
-//! round may run up to [`FIRST_ROUND_BUDGET`] past a shorter timeout (a
-//! `timeout_ms: 0` peek). Once something fired, a host whose first round is
-//! still out holds the result back by at most that much from the call's
-//! start; past it, only that host's sources are named in `warnings`.
+//! retried at its next round and reported in the result's `warnings` (a later
+//! request the call's timeout cut short is one only when it had at least
+//! [`FIRST_ROUND_BUDGET`] to answer: a healthy host's round that went out just
+//! before the timeout is no news). A first round may run up to
+//! [`FIRST_ROUND_BUDGET`] past a shorter timeout (a `timeout_ms: 0` peek, which
+//! then reads what the streams it opened already have). Once something fired,
+//! a host whose first round is still out holds the result back by at most
+//! that much from the call's start; past it, only that host's sources are
+//! named in `warnings`.
 
 use std::future::Future;
 use std::io;
@@ -43,8 +48,18 @@ use crate::sse::{parse_run_frames, RunFrame};
 use crate::state::AppState;
 
 /// How often a remote run's gates and a remote message space are polled, and
-/// an ended stream is reopened.
+/// an ended stream is reopened, on a host that holds a connection (HTTP) or
+/// answers from the coordinator's own mirror (tunnel, bucket).
 pub(super) const REMOTE_POLL: Duration = Duration::from_secs(2);
+/// The same on a host whose every request opens a connection of its own
+/// ([`HostConnector::connects_per_request`]: SSH, where `get_run` and
+/// `list_messages` are each a fresh `ssh` process). A gate and a space polled
+/// every 2 s would open about one connection a second for as long as an
+/// agent keeps waiting — the kind of burst that gets the coordinator blocked
+/// by the host. (Its run's gates can't come from the coordinator's mirror
+/// instead: the SSH mirror holds only runs this coordinator launched, and
+/// takes their `run.json` only once it is terminal.)
+pub(super) const SSH_POLL: Duration = Duration::from_secs(10);
 /// The most messages one poll of a space reads; the cursor then stops at the
 /// last of them, so the next poll reads on.
 const MESSAGES_PAGE: usize = 200;
@@ -68,8 +83,19 @@ struct Host {
     busy: bool,
     /// Its first round answered.
     answered: bool,
+    /// How often its poll rounds go out ([`poll_every`]).
+    poll: Duration,
     /// When its next poll round is due.
     next_poll: Instant,
+}
+
+/// How often `conn`'s poll rounds go out.
+fn poll_every(conn: &dyn HostConnector) -> Duration {
+    if conn.connects_per_request() {
+        SSH_POLL
+    } else {
+        REMOTE_POLL
+    }
 }
 
 /// A remote run's event stream, read for the `run_events` and `run_settled`
@@ -160,8 +186,10 @@ enum RoundKind {
 /// Why a request gave no answer.
 pub(super) enum Fail {
     Conn(HostConnectorError),
-    /// The call's timeout came first.
-    Late,
+    /// The call's timeout came first, `had` after the request went out.
+    Late {
+        had: Duration,
+    },
 }
 
 pub(super) enum Answer {
@@ -197,6 +225,7 @@ impl Remote {
                     })?;
                     r.hosts.push(Host {
                         id: host_id.clone(),
+                        poll: poll_every(conn.as_ref()),
                         conn,
                         busy: false,
                         answered: false,
@@ -263,7 +292,7 @@ impl Remote {
     /// Every host's first round, each bounded by `first_by`.
     pub(super) fn start(&mut self, watch: &[Condition], got: &Got, first_by: Instant) {
         for h in 0..self.hosts.len() {
-            self.hosts[h].next_poll = Instant::now() + REMOTE_POLL;
+            self.hosts[h].next_poll = Instant::now() + self.hosts[h].poll;
             if !self.launch(h, watch, got, first_by, RoundKind::All) {
                 self.hosts[h].answered = true;
             }
@@ -271,7 +300,7 @@ impl Remote {
     }
 
     /// Start each idle host's round that is due: its poll round every
-    /// [`REMOTE_POLL`], else the statuses its `end` frames owe.
+    /// [`poll_every`], else the statuses its `end` frames owe.
     pub(super) fn schedule(&mut self, watch: &[Condition], got: &Got, deadline: Instant) {
         let now = Instant::now();
         // A hung host can keep the loop running to its first-round cut, past
@@ -284,7 +313,7 @@ impl Remote {
                 continue;
             }
             if now >= self.hosts[h].next_poll {
-                self.hosts[h].next_poll = now + REMOTE_POLL;
+                self.hosts[h].next_poll = now + self.hosts[h].poll;
                 self.launch(h, watch, got, deadline, RoundKind::All);
             } else if self.runs.iter().any(|s| s.host == h && s.needs_status) {
                 self.launch(h, watch, got, deadline, RoundKind::Status);
@@ -683,16 +712,21 @@ async fn bounded<T>(
     deadline: Instant,
     request: impl Future<Output = Result<T, HostConnectorError>>,
 ) -> Result<T, Fail> {
+    let sent = Instant::now();
     match tokio::time::timeout_at(deadline, request).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(Fail::Conn(e)),
-        Err(_) => Err(Fail::Late),
+        Err(_) => Err(Fail::Late {
+            had: deadline.saturating_duration_since(sent),
+        }),
     }
 }
 
 /// A request for `source` that gave no answer: the call's error on the first
 /// round, else a warning. A request the call's timeout cut short is only a
-/// warning.
+/// warning, and after the first round only when it had [`FIRST_ROUND_BUDGET`]
+/// (the time a host is given to answer) — a round that went out just before
+/// the timeout says nothing about the host.
 fn failed(
     got: &mut Got,
     first: bool,
@@ -701,7 +735,10 @@ fn failed(
     describe: impl FnOnce(HostConnectorError) -> String,
 ) -> Result<(), String> {
     let msg = match f {
-        Fail::Late => "no answer before the call's timeout".to_string(),
+        Fail::Late { had } if first || had >= FIRST_ROUND_BUDGET => {
+            "no answer before the call's timeout".to_string()
+        }
+        Fail::Late { .. } => return Ok(()),
         Fail::Conn(e) if first => return Err(describe(e)),
         Fail::Conn(e) => describe(e),
     };
@@ -796,6 +833,7 @@ mod tests {
                 conn: Arc::new(StubConnector::default()),
                 busy: false,
                 answered: true,
+                poll: REMOTE_POLL,
                 next_poll: now - Duration::from_secs(1),
             }],
             runs: Vec::new(),
@@ -812,6 +850,65 @@ mod tests {
         assert!(r.next_poll_at(past).is_none());
         r.schedule(&[], &Got::default(), past);
         assert!(!r.hosts[0].busy);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_connects_per_request_is_polled_every_10s() {
+        use crate::host::connector::testing::StubConnector;
+        let ssh = StubConnector {
+            connects_per_request: true,
+            ..Default::default()
+        };
+        assert_eq!(poll_every(&ssh), SSH_POLL);
+        assert!(SSH_POLL >= Duration::from_secs(10));
+        assert_eq!(poll_every(&StubConnector::default()), REMOTE_POLL);
+
+        // The host's interval is what `start` schedules its next round at.
+        let mut r = Remote {
+            hosts: vec![Host {
+                id: "h".into(),
+                poll: poll_every(&ssh),
+                conn: Arc::new(ssh),
+                busy: false,
+                answered: false,
+                next_poll: Instant::now(),
+            }],
+            runs: Vec::new(),
+            gates: Vec::new(),
+            msgs: Vec::new(),
+            turn: 0,
+            inflight: FuturesUnordered::new(),
+        };
+        let before = Instant::now();
+        let far = before + Duration::from_secs(60);
+        r.start(&[], &Got::default(), far);
+        assert!(r.next_poll_at(far).unwrap() >= before + SSH_POLL);
+    }
+
+    #[test]
+    fn a_late_answer_warns_only_when_the_host_had_time_to_answer() {
+        let late = |had| Fail::Late { had };
+        let mut got = Got::default();
+        // A later round that went out just before the timeout: no news.
+        failed(
+            &mut got,
+            false,
+            "s",
+            late(Duration::from_millis(300)),
+            |e| e.to_string(),
+        )
+        .unwrap();
+        assert!(got.warnings.is_empty());
+        // One given the time a host has to answer, and didn't: a warning.
+        failed(&mut got, false, "s", late(FIRST_ROUND_BUDGET), |e| {
+            e.to_string()
+        })
+        .unwrap();
+        assert_eq!(got.warnings["s"], "no answer before the call's timeout");
+        // A first round's is always one.
+        let mut got = Got::default();
+        failed(&mut got, true, "s", late(Duration::ZERO), |e| e.to_string()).unwrap();
+        assert_eq!(got.warnings["s"], "no answer before the call's timeout");
     }
 
     #[test]

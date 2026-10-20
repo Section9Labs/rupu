@@ -46,11 +46,14 @@ struct Src {
 #[derive(Default)]
 pub(super) struct Findings {
     sources: BTreeMap<String, Src>,
-    /// Whether the first poll happened: a ledger found later is read from
-    /// its first line.
-    polled: bool,
-    /// Workspaces whose targets could not be listed on the first poll: when
-    /// they are listed, their ledgers count as existing, not created later.
+    /// Whether a poll listed the workspaces: a workspace or ledger found
+    /// after that is read from its first line. Until one does (a failed
+    /// first listing), every workspace a listing finds counts as there when
+    /// the call began.
+    listed: bool,
+    /// Workspaces whose targets could not be listed on the first listing:
+    /// when they are listed, their ledgers count as existing, not created
+    /// later.
     pending_first: HashSet<String>,
 }
 
@@ -158,12 +161,22 @@ fn poll_blocking(
         .collect();
     let covers = |ws: &str| conds.iter().any(|c| c.project.is_none_or(|p| p == ws));
     let any_run = conds.iter().any(|c| c.run.is_some());
-    let first = !memo.polled;
-    memo.polled = true;
     let mut cursor_out: BTreeMap<String, u64> = BTreeMap::new();
 
     // Ledgers: the scoped workspaces' target dirs, listed afresh each poll.
-    let workspaces = store_for(global).list().unwrap_or_default();
+    // A failed listing finds nothing, and the next that succeeds is the
+    // first.
+    let first = !memo.listed;
+    let workspaces = match store_for(global).list() {
+        Ok(w) => {
+            memo.listed = true;
+            w
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "wait: listing workspaces for findings failed");
+            Vec::new()
+        }
+    };
     for w in workspaces.iter().filter(|w| covers(&w.id)) {
         let wp = std::path::Path::new(&w.path);
         let Ok(targets) = rupu_coverage::discover_targets(wp) else {
@@ -172,8 +185,8 @@ fn poll_blocking(
             }
             continue;
         };
-        // Ledgers that existed when the call began (or were first listed
-        // after a failed first listing) start at their end.
+        // Ledgers that existed when the call began (or whose targets were
+        // first listed after a failed first listing) start at their end.
         let existing = first || memo.pending_first.remove(&w.id);
         for t in targets {
             let source = format!("findings:{}/{}", w.id, t.target_id);

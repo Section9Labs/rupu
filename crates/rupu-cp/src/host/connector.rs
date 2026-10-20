@@ -472,6 +472,15 @@ pub trait HostConnector: Send + Sync {
         false
     }
 
+    /// Whether every request to this host opens a connection of its own (SSH:
+    /// a fresh `ssh` process per command, no ControlMaster), so a caller that
+    /// polls it must poll slowly: a burst of connections can get the
+    /// coordinator blocked by the host. `false` — the default — for the
+    /// transports that hold a connection or read the coordinator's own mirror.
+    fn connects_per_request(&self) -> bool {
+        false
+    }
+
     /// Whether this transport executes an [`AgentLaunchRequest`] under the
     /// `run_id` the CALLER supplied, rather than minting its own.
     ///
@@ -1465,6 +1474,8 @@ pub(crate) mod testing {
         /// `Some` → `launch_agent` records each request here and answers
         /// `run_STUB`. `None` → not configured.
         pub launched: Option<std::sync::Mutex<Vec<crate::agent_launcher::AgentLaunchRequest>>>,
+        /// What `connects_per_request` answers (an SSH-like host).
+        pub connects_per_request: bool,
     }
 
     /// An `AppState` whose host registry resolves `host_id` to `conn`. A
@@ -1500,6 +1511,10 @@ pub(crate) mod testing {
 
     #[async_trait::async_trait]
     impl HostConnector for StubConnector {
+        fn connects_per_request(&self) -> bool {
+            self.connects_per_request
+        }
+
         async fn ship_skills(
             &self,
             _: &crate::host::skill_ship::SkillBundle,

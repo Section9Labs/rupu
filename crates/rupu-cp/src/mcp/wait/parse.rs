@@ -85,7 +85,7 @@ pub(super) struct Request {
 }
 
 pub(super) fn input_schema() -> Value {
-    let host = json!({"type": "string", "description": "`local` (the default), or a registered host's id. On a remote host the run's events come from its event stream; its gates and a message space are polled every 2 s."});
+    let host = json!({"type": "string", "description": "`local` (the default), or a registered host's id. On a remote host the run's events come from its event stream; its gates and a message space are polled every 2 s (10 s over SSH)."});
     let run = json!({"type": "string", "description": "A workflow run id."});
     json!({
         "type": "object",

@@ -95,8 +95,8 @@ it returns when a condition fires, a watched stream has new lines, or the timeou
 for the session's active turn, or the next one if it is idle. An error in any one condition (a \
 run, session or turn that doesn't appear within 10 s) fails the whole call. Pass the returned \
 `cursor` back to resume where the last call left off. With `host`, a run's events come from that \
-host's event stream and its gates and a message space are polled every 2 s; a host that stops \
-answering after its first answer is retried and named in `warnings`.";
+host's event stream and its gates and a message space are polled every 2 s (10 s over SSH); a host \
+that stops answering after its first answer is retried and named in `warnings`.";
 
 #[async_trait]
 impl ToolSource for WaitSource {
@@ -304,6 +304,10 @@ impl WaitSource {
         let mut next_progress = Instant::now();
         let mut next_check = Instant::now() + RECHECK_EVERY;
         let mut last_check = Instant::now();
+        // The last first round landed past the deadline (a `timeout_ms: 0`
+        // peek): the streams it opened are read for what the host already
+        // has, as a local peek's catch-up reads what is on disk.
+        let mut peeked = false;
         loop {
             // Each idle host's round that is due goes out; the hosts' rounds
             // are polled beside the other sources, so a slow host holds up
@@ -376,10 +380,15 @@ impl WaitSource {
                     }
                 }
                 Wake::Remote(RemoteWake::Round(host, answers)) => {
+                    let first_was_pending = remote.first_pending();
                     if let Err(e) = remote.landed(host, answers, &req.watch, &mut got) {
                         return ToolResult::Error(e);
                     }
-                    if got.any() || (Instant::now() >= deadline && !remote.first_pending()) {
+                    if got.any() {
+                        break;
+                    }
+                    if Instant::now() >= deadline && !remote.first_pending() {
+                        peeked = first_was_pending;
                         break;
                     }
                 }
@@ -421,6 +430,9 @@ impl WaitSource {
                 return ToolResult::Error(e);
             }
             remote.drain(&req.watch, &mut got, deadline).await;
+        } else if peeked {
+            // The deadline has passed: bounded like the first round.
+            remote.drain(&req.watch, &mut got, first_by).await;
         }
         got.finish(&req.watch)
     }

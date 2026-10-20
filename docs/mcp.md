@@ -180,11 +180,24 @@ Behaviour:
   once. Then it catches up from `cursor` (ids are the SSE `id:` lines, so it
   mixes safely with the streams) and waits for a new line.
 - The timeout defaults to 30 s and is capped at 55 s.
-- The reply carries `events`, the advanced `cursor` (an object: the last line
-  id read per watched source, `run:<id>` or `messages:<id>`), which conditions
+- The reply carries `events`, the advanced `cursor`, which conditions
   `fired`, `timed_out`, and a `warnings` list when something needs saying (a
   remote host that stopped answering and is being retried). Pass the returned
   `cursor` back on the next call.
+- **Cursor keys** name the watched source, the same name `events` and
+  `warnings` use. The cursor holds the last line id read per source that
+  returns lines:
+  - `run:<id>` for `run_events`;
+  - `messages:<root>` for `messages`;
+  - `agentiflow:<id>` for `agentiflow`;
+  - `findings:<ws_id>/<target>` for `findings`, one key per ledger (a
+    project's coverage target).
+
+  A source on a remote host adds `@<host>`: `run:<id>@<host>`,
+  `messages:<root>@<host>`. That includes a run found on a host without
+  `host` being named. `run_settled`, `run_gate`, `agent_run_end`
+  (`agent_run:<id>`) and `session_turn` (`session:<id>`) watch state, so they
+  keep no cursor.
 - **Cursor values** are integers (line numbers) for local sources and for a
   remote run's events; a remote message space is polled, and its cursor value
   is the last message **id**, a string.
@@ -193,11 +206,13 @@ Behaviour:
   at the beginning.
 - **Remote hosts** (`host` on the four run/message kinds). A remote run is
   read from the host's event stream; its gates and a remote message space are
-  polled every 2 s. A remote `run_settled` fires once the host's stream ends,
+  polled every 2 s, or every 10 s over SSH, where each poll is a new `ssh`
+  connection. A remote `run_settled` fires once the host's stream ends,
   about 2 s after the run's last event. A call watching a remote host can
   wait up to 5 s from its start for that host's first answer, even with
-  `timeout_ms: 0` or when something already fired. A host that stops
-  answering after its first answer is retried and named in `warnings`.
+  `timeout_ms: 0` or when something already fired. A `timeout_ms: 0` peek at
+  a remote run's events returns the events the host already has. A host that
+  stops answering after its first answer is retried and named in `warnings`.
 - A condition error (a run, session or turn that does not appear within 10 s)
   fails the whole call.
 - **Progress.** When the client sends a `progressToken` and accepts SSE, the
