@@ -4,12 +4,18 @@
 //! gates are polled through `get_run`, and a remote message space through
 //! `list_messages` from the id of the last message seen (a string cursor).
 //!
-//! Polls go out every [`REMOTE_POLL`], each host's one after another (at most
-//! one in flight per host). A stream is that host's one long-lived
-//! connection, not a poll; one that ends without its `end` frame is reopened
-//! from its cursor at the next round. The first request for a source failing
-//! fails the call; a later failure is retried next round and reported in the
-//! result's `warnings`.
+//! Requests go out in rounds: the first at the call's start, then one every
+//! [`REMOTE_POLL`] (or at once when an `end` frame needs its run's status).
+//! A round is an owned future the wait loop polls beside its other sources,
+//! so a slow host delays nothing else; within it, each host's requests go
+//! one after another (at most one in flight per host), and only one round is
+//! in flight at a time. A stream is its host's long-lived connection, not a
+//! poll; one that ends without its `end` frame is reopened from its cursor at
+//! the next round, silently when the reopen succeeds. The first request for a
+//! source failing fails the call; a later failure is retried next round and
+//! reported in the result's `warnings`. The first round may run up to
+//! [`FIRST_ROUND_BUDGET`] past a shorter timeout (a `timeout_ms: 0` peek), and
+//! holds back a result something else fired by at most that.
 
 use std::future::Future;
 use std::io;
@@ -19,7 +25,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::Stream;
-use rupu_fleet::MessageKind;
+use rupu_fleet::{LogLine, MessageKind};
 use rupu_runtime::services::operator::{MessagesView, ViewQuery};
 use serde_json::{json, Value};
 use tokio::time::Instant;
@@ -40,6 +46,10 @@ const MESSAGES_PAGE: usize = 200;
 /// Once something fired, the frames still arriving are collected until the
 /// streams stay quiet this long.
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
+/// The least the first round may take to answer, whatever the call's timeout:
+/// so `timeout_ms: 0` still peeks at a remote gate or space, and still finds
+/// an unknown run.
+pub(super) const FIRST_ROUND_BUDGET: Duration = Duration::from_secs(5);
 /// The `after` of a stream only watched for its `end`: every event is behind
 /// it, so the host sends none.
 const NO_EVENTS: u64 = u64::MAX;
@@ -62,6 +72,9 @@ struct RunSrc {
     stream: Option<Frames>,
     /// Its `end` frame arrived: the run is over, and it isn't reopened.
     ended: bool,
+    /// Its `end` arrived with `run_settled` conditions unfired: the next
+    /// round asks for the run's status, which fires them.
+    needs_status: bool,
 }
 
 /// A remote run whose gates are polled.
@@ -105,19 +118,36 @@ enum Ask {
         root: String,
         q: ViewQuery,
     },
+    Status {
+        src: usize,
+        run: String,
+    },
 }
 
+/// Which requests a round makes.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum RoundKind {
+    /// Reopen streams, poll gates and spaces, and ask the statuses owed.
+    All,
+    /// Only the statuses owed.
+    Status,
+}
+
+/// A round in flight: its answers, once every host has given them.
+pub(super) type Round = Pin<Box<dyn Future<Output = Vec<Answer>> + Send>>;
+
 /// Why a request gave no answer.
-enum Fail {
+pub(super) enum Fail {
     Conn(HostConnectorError),
     /// The call's timeout came first.
     Late,
 }
 
-enum Answer {
+pub(super) enum Answer {
     Open(usize, Result<EventByteStream, Fail>),
     Gate(usize, Result<Value, Fail>),
     Msgs(usize, Result<MessagesView, Fail>),
+    Status(usize, Result<Value, Fail>),
 }
 
 impl Remote {
@@ -162,6 +192,7 @@ impl Remote {
                             collects,
                             stream: None,
                             ended: false,
+                            needs_status: false,
                         }),
                     }
                 }
@@ -208,34 +239,28 @@ impl Remote {
         self.hosts.is_empty()
     }
 
-    /// The first round: open every stream and poll every gate and space. Any
-    /// failure is the call's error.
-    pub(super) async fn start(
-        &mut self,
-        watch: &[Condition],
-        got: &mut Got,
-        deadline: Instant,
-    ) -> Result<(), String> {
-        self.round(watch, got, deadline, true).await
+    /// An `end` frame left `run_settled` conditions waiting for a status.
+    pub(super) fn owes_status(&self) -> bool {
+        self.runs.iter().any(|s| s.needs_status)
     }
 
-    /// A later round: reopen the streams that ended without their `end`,
-    /// poll the gates and spaces again. A failure is a warning.
-    pub(super) async fn poll(&mut self, watch: &[Condition], got: &mut Got, deadline: Instant) {
-        // Never an error past the first round.
-        let _ = self.round(watch, got, deadline, false).await;
-    }
-
-    async fn round(
-        &mut self,
+    /// The next round's requests as an owned future, each bounded by
+    /// `deadline`; `None` when there is nothing to ask.
+    pub(super) fn round(
+        &self,
         watch: &[Condition],
-        got: &mut Got,
+        got: &Got,
         deadline: Instant,
-        first: bool,
-    ) -> Result<(), String> {
+        kind: RoundKind,
+    ) -> Option<Round> {
         let mut asks: Vec<Vec<Ask>> = self.hosts.iter().map(|_| Vec::new()).collect();
         for (src, s) in self.runs.iter().enumerate() {
-            if s.stream.is_none() && !s.ended {
+            if s.needs_status {
+                asks[s.host].push(Ask::Status {
+                    src,
+                    run: s.run.clone(),
+                });
+            } else if kind == RoundKind::All && s.stream.is_none() && !s.ended {
                 let after = if s.collects {
                     got.cursor.get(&s.source).copied().unwrap_or(0)
                 } else {
@@ -248,37 +273,61 @@ impl Remote {
                 });
             }
         }
-        for (src, s) in self.gates.iter().enumerate() {
-            let pending = watch.iter().enumerate().any(|(i, c)| {
-                c.source == s.source && matches!(c.kind, Kind::Gate) && !got.fired.contains_key(&i)
-            });
-            if pending {
-                asks[s.host].push(Ask::Gate {
+        if kind == RoundKind::All {
+            for (src, s) in self.gates.iter().enumerate() {
+                let pending = watch.iter().enumerate().any(|(i, c)| {
+                    c.source == s.source
+                        && matches!(c.kind, Kind::Gate)
+                        && !got.fired.contains_key(&i)
+                });
+                if pending {
+                    asks[s.host].push(Ask::Gate {
+                        src,
+                        run: s.run.clone(),
+                    });
+                }
+            }
+            for (src, s) in self.msgs.iter().enumerate() {
+                asks[s.host].push(Ask::Msgs {
                     src,
-                    run: s.run.clone(),
+                    root: s.root.clone(),
+                    q: ViewQuery {
+                        after: got.ids.get(&s.source).cloned(),
+                        limit: MESSAGES_PAGE,
+                        kinds: s.kinds.clone(),
+                    },
                 });
             }
         }
-        for (src, s) in self.msgs.iter().enumerate() {
-            asks[s.host].push(Ask::Msgs {
-                src,
-                root: s.root.clone(),
-                q: ViewQuery {
-                    after: got.ids.get(&s.source).cloned(),
-                    limit: MESSAGES_PAGE,
-                    kinds: s.kinds.clone(),
-                },
-            });
+        if asks.iter().all(Vec::is_empty) {
+            return None;
         }
         // Hosts side by side; each host's requests one after another.
-        let answers = futures_util::future::join_all(
-            self.hosts
-                .iter()
-                .zip(asks)
-                .map(|(h, asks)| ask_host(Arc::clone(&h.conn), asks, deadline)),
-        )
-        .await;
-        for answer in answers.into_iter().flatten() {
+        let hosts: Vec<_> = self
+            .hosts
+            .iter()
+            .zip(asks)
+            .map(|(h, asks)| ask_host(Arc::clone(&h.conn), asks, deadline))
+            .collect();
+        Some(Box::pin(async move {
+            futures_util::future::join_all(hosts)
+                .await
+                .into_iter()
+                .flatten()
+                .collect()
+        }))
+    }
+
+    /// Take a round's answers. On the `first` round any failure is the call's
+    /// error; later, a warning.
+    pub(super) fn apply(
+        &mut self,
+        answers: Vec<Answer>,
+        watch: &[Condition],
+        got: &mut Got,
+        first: bool,
+    ) -> Result<(), String> {
+        for answer in answers {
             match answer {
                 Answer::Open(i, r) => match r {
                     Ok(bytes) => self.runs[i].stream = Some(Box::pin(parse_run_frames(bytes))),
@@ -326,9 +375,63 @@ impl Remote {
                         }
                     }
                 }
+                Answer::Status(i, r) => {
+                    let s = &mut self.runs[i];
+                    s.needs_status = false;
+                    // The `end` frame says the run is over: its conditions
+                    // fire whether or not the status could be read.
+                    let status = match r {
+                        Ok(v) => v.get("run").unwrap_or(&v).get("status").cloned(),
+                        Err(f) => {
+                            let host = &self.hosts[s.host].id;
+                            let _ = failed(got, false, &s.source, f, |e| {
+                                describe(host, "read runs", "run", &s.run, e)
+                            });
+                            None
+                        }
+                    };
+                    for (c, cond) in watch.iter().enumerate() {
+                        if cond.source == s.source && matches!(cond.kind, Kind::Settled) {
+                            got.fired.entry(c).or_insert_with(
+                                || json!({ "status": status.clone().unwrap_or(Value::Null) }),
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// The first round, once something else fired: its answers (any failure
+    /// the call's error) if they come by `cut`; else it is dropped, so a slow
+    /// host holds the result back by at most [`FIRST_ROUND_BUDGET`], and every
+    /// remote source is named in `warnings`.
+    pub(super) async fn settle_first(
+        &mut self,
+        round: Option<Round>,
+        cut: Instant,
+        watch: &[Condition],
+        got: &mut Got,
+    ) -> Result<(), String> {
+        let Some(round) = round else { return Ok(()) };
+        match tokio::time::timeout_at(cut, round).await {
+            Ok(answers) => self.apply(answers, watch, got, true),
+            Err(_) => {
+                let sources = self
+                    .runs
+                    .iter()
+                    .map(|s| &s.source)
+                    .chain(self.gates.iter().map(|s| &s.source))
+                    .chain(self.msgs.iter().map(|s| &s.source));
+                for source in sources {
+                    got.warnings.entry(source.clone()).or_insert_with(|| {
+                        format!("no first answer within {} s", FIRST_ROUND_BUDGET.as_secs())
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 
     /// The next frame of any open stream, with the index of its source;
@@ -352,15 +455,15 @@ impl Remote {
     }
 
     /// Take what source `i`'s stream yielded: an event its `run_events`
-    /// conditions want, its `end` (which fires its `run_settled`
-    /// conditions), or its end without one (reopened at the next round).
-    pub(super) async fn on_frame(
+    /// conditions want; its `end`, which owes its `run_settled` conditions a
+    /// status ([`Self::owes_status`]); or its end without one, broken or not,
+    /// which the next round reopens (a warning only if that fails).
+    pub(super) fn on_frame(
         &mut self,
         i: usize,
         item: Option<io::Result<RunFrame>>,
         watch: &[Condition],
         got: &mut Got,
-        deadline: Instant,
     ) {
         let s = &mut self.runs[i];
         match item {
@@ -399,60 +502,38 @@ impl Remote {
             Some(Ok(RunFrame::End)) => {
                 s.stream = None;
                 s.ended = true;
-                let settled: Vec<usize> = watch
-                    .iter()
-                    .enumerate()
-                    .filter(|(c, cond)| {
-                        cond.source == s.source
-                            && matches!(cond.kind, Kind::Settled)
-                            && !got.fired.contains_key(c)
-                    })
-                    .map(|(c, _)| c)
-                    .collect();
-                if settled.is_empty() {
-                    return;
-                }
-                let host = &self.hosts[s.host];
-                let status = match bounded(deadline, host.conn.get_run(&s.run)).await {
-                    Ok(v) => v.get("run").unwrap_or(&v).get("status").cloned(),
-                    Err(f) => {
-                        let _ = failed(got, false, &s.source, f, |e| {
-                            describe(&host.id, "read runs", "run", &s.run, e)
-                        });
-                        None
-                    }
-                };
-                for c in settled {
-                    got.fired.insert(
-                        c,
-                        json!({ "status": status.clone().unwrap_or(Value::Null) }),
-                    );
-                }
+                s.needs_status = watch.iter().enumerate().any(|(c, cond)| {
+                    cond.source == s.source
+                        && matches!(cond.kind, Kind::Settled)
+                        && !got.fired.contains_key(&c)
+                });
             }
             Some(Err(e)) => {
+                tracing::debug!(source = %s.source, error = %e, "wait: remote event stream broke; reopening");
                 s.stream = None;
-                let host = &self.hosts[s.host].id;
-                got.warnings.insert(
-                    s.source.clone(),
-                    format!("host `{host}`: the event stream broke ({e})"),
-                );
             }
             None => s.stream = None,
         }
     }
 
     /// Once something fired: the frames that still arrive before the streams
-    /// go quiet for [`DRAIN_QUIET`] (or the call's timeout).
+    /// go quiet for [`DRAIN_QUIET`] (or the call's timeout), then the statuses
+    /// an `end` among them owes.
     pub(super) async fn drain(&mut self, watch: &[Condition], got: &mut Got, deadline: Instant) {
         for _ in 0..CATCH_UP_MAX {
             if self.runs.iter().all(|s| s.stream.is_none()) {
-                return;
+                break;
             }
             let quiet = (Instant::now() + DRAIN_QUIET).min(deadline);
             match tokio::time::timeout_at(quiet, self.next_frame()).await {
-                Ok((i, item)) => self.on_frame(i, item, watch, got, deadline).await,
-                Err(_) => return,
+                Ok((i, item)) => self.on_frame(i, item, watch, got),
+                Err(_) => break,
             }
+        }
+        if let Some(round) = self.round(watch, got, deadline, RoundKind::Status) {
+            let answers = round.await;
+            // Never an error past the first round.
+            let _ = self.apply(answers, watch, got, false);
         }
     }
 }
@@ -471,6 +552,9 @@ async fn ask_host(conn: Arc<dyn HostConnector>, asks: Vec<Ask>, deadline: Instan
             }
             Ask::Msgs { src, root, q } => {
                 Answer::Msgs(src, bounded(deadline, conn.list_messages(&root, q)).await)
+            }
+            Ask::Status { src, run } => {
+                Answer::Status(src, bounded(deadline, conn.get_run(&run)).await)
             }
         });
     }
@@ -551,9 +635,10 @@ fn gates_of(reply: &Value) -> Vec<Value> {
     }
 }
 
-/// Keep the messages of a poll of `source` its conditions want (each as its
-/// `MessagesView` object, receipts folded in) and move its cursor to the last
-/// one read.
+/// Keep the messages of a poll of `source` its conditions want, each in the
+/// shape a local `messages` event has (its `LogLine::Msg` line) plus the
+/// `seen` receipts the view folds in, and move its cursor to the last one
+/// read.
 fn take_messages(watch: &[Condition], source: &str, view: MessagesView, got: &mut Got) {
     for m in view.messages {
         let id = m.message.id.clone();
@@ -569,7 +654,8 @@ fn take_messages(watch: &[Condition], source: &str, view: MessagesView, got: &mu
             }
         }
         if taken {
-            if let Ok(event) = serde_json::to_value(&m) {
+            if let Ok(mut event) = serde_json::to_value(LogLine::Msg(m.message)) {
+                event["seen"] = json!(m.seen);
                 got.events
                     .push(json!({"source": source, "id": id, "event": event}));
             }

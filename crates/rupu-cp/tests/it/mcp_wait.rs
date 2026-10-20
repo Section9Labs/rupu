@@ -1293,6 +1293,17 @@ async fn a_remote_parked_gate_fires() {
     assert_eq!(fired["kind"], "run_gate", "{r}");
     assert_eq!(fired["detail"]["gates"][0]["step_id"], "review", "{r}");
     assert_eq!(fired["detail"]["gates"][0]["prompt"], "ship it?", "{r}");
+
+    // `timeout_ms: 0` still peeks: the first answer gets its own budget.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": RUN, "host": host}], "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["kind"], "run_gate",
+        "{r}"
+    );
 }
 
 /// A run id that resolves to a host is watched there, as if `host` named it.
@@ -1346,6 +1357,20 @@ async fn remote_messages_poll_with_a_string_cursor() {
     assert_eq!(events[0]["event"]["body"], "focus", "{r}");
     assert_eq!(s["fired"][0]["kind"], "messages", "{r}");
     assert_eq!(s["cursor"], json!({ &source: op.id() }), "{r}");
+    // The event is the local shape (its log line), plus its receipts.
+    let local = wait(
+        spawn(remote.path()).await,
+        json!({"watch": [{"kind": "messages", "root": RUN}], "timeout_ms": 5000}),
+    )
+    .await;
+    let mut remote_event = events[0]["event"].clone();
+    assert_eq!(remote_event["t"], "msg", "{r}");
+    assert_eq!(remote_event["seen"], json!([]), "{r}");
+    remote_event.as_object_mut().unwrap().remove("seen");
+    assert_eq!(
+        remote_event, local["structuredContent"]["events"][0]["event"],
+        "{local}"
+    );
 
     let t = Instant::now();
     let r = wait(
@@ -1390,10 +1415,10 @@ async fn an_unknown_run_on_a_host_is_an_error() {
     let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let peer = Peer::start(remote.path());
     let (addr, host) = spawn_with_peer(coord.path(), &peer).await;
-    for kind in ["run_events", "run_gate"] {
+    for (kind, timeout) in [("run_events", 5000), ("run_gate", 5000), ("run_gate", 0)] {
         let r = wait(
             addr,
-            json!({"watch": [{"kind": kind, "run": "run_nope", "host": host}], "timeout_ms": 5000}),
+            json!({"watch": [{"kind": kind, "run": "run_nope", "host": host}], "timeout_ms": timeout}),
         )
         .await;
         assert_eq!(r["isError"], json!(true), "{r}");
@@ -1427,4 +1452,279 @@ async fn a_host_that_goes_away_mid_wait_returns_by_the_timeout_with_a_warning() 
     assert!(!warnings.is_empty(), "{r}");
     let source = format!("run:{RUN}@{host}: ");
     assert!(warnings[0].as_str().unwrap().starts_with(&source), "{r}");
+}
+
+/// What a [`fake_peer`] does with one request (one per connection).
+enum Reply {
+    /// Send it and close.
+    Close(String),
+    /// Send it and keep the connection open.
+    Hold(String),
+    /// Send it, then drop the connection mid-body (a chunked body never
+    /// ended).
+    Cut(String),
+}
+
+/// A bare HTTP peer answering each request with `answer(path, n)`, `n`
+/// counting that path's earlier requests; the counts, by path.
+async fn fake_peer(
+    answer: impl Fn(&str, usize) -> Reply + Send + Sync + 'static,
+) -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let counts = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let answer = std::sync::Arc::new(answer);
+    let seen = counts.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let (answer, seen) = (answer.clone(), seen.clone());
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let path = head
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    let n = seen.entry(path.clone()).or_insert(0);
+                    *n += 1;
+                    *n - 1
+                };
+                match answer(&path, n) {
+                    Reply::Close(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                    }
+                    Reply::Hold(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                    Reply::Cut(r) => {
+                        let _ = stream.write_all(r.as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+    (url, counts)
+}
+
+fn json_reply(status: &str, body: &Value) -> String {
+    let body = body.to_string();
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// An event-stream response head, then `frames` as one chunk.
+fn sse_reply(frames: &str) -> String {
+    let mut r = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                 transfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        .to_string();
+    if !frames.is_empty() {
+        r.push_str(&format!("{:x}\r\n{frames}\r\n", frames.len()));
+    }
+    r
+}
+
+fn not_found() -> Reply {
+    Reply::Close(json_reply("404 Not Found", &json!({"error": "not found"})))
+}
+
+/// A coordinator with a [`fake_peer`] registered; its address and the peer's
+/// host id.
+async fn spawn_with_fake_peer(global: &Path, url: &str) -> (SocketAddr, String) {
+    let state = state_of(global);
+    let host = state.hosts.add_host("fake", url, None).unwrap();
+    (serve(state).await, host.id)
+}
+
+/// A stream cut short (no `end`) whose reopen succeeds is a silent
+/// reconnect: the reopened stream's events come back, with no warning.
+#[tokio::test]
+async fn a_stream_cut_then_reopened_is_not_a_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, counts) = fake_peer(|path, n| match (path, n) {
+        ("/api/events/stream", 0) => Reply::Cut(sse_reply("")),
+        ("/api/events/stream", _) => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\",\"step_id\":\"one\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+    assert!(r["structuredContent"].get("warnings").is_none(), "{r}");
+    // Reopened at the next round, not at once.
+    assert!(
+        t.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(counts.lock().unwrap()["/api/events/stream"], 2);
+}
+
+/// A host that replays from the start despite the cursor: frames at or
+/// before it are dropped.
+#[tokio::test]
+async fn replayed_frames_at_or_before_the_cursor_are_dropped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/events/stream" => Reply::Hold(sse_reply(
+            "id: 1\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 2\ndata: {\"type\":\"step_started\"}\n\n\
+             id: 3\ndata: {\"type\":\"step_started\"}\n\n",
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let source = format!("run:{RUN}@{host}");
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": host}],
+               "cursor": {&source: 2}, "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(ids(&r), vec![3], "{r}");
+    assert_eq!(
+        r["structuredContent"]["cursor"],
+        json!({ &source: 3 }),
+        "{r}"
+    );
+}
+
+/// A peer whose `/api/host/info` doesn't list `run.messages` can't serve a
+/// message space: an error naming the host.
+#[tokio::test]
+async fn a_peer_without_run_messages_is_an_error_naming_the_host() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (url, _) = fake_peer(|path, _| match path {
+        "/api/host/info" => Reply::Close(json_reply(
+            "200 OK",
+            &json!({"version": "0.70.0", "features": []}),
+        )),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "messages", "root": RUN, "host": host}], "timeout_ms": 5000}),
+    )
+    .await;
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let text = text_of(&r);
+    assert!(
+        text.starts_with(&format!("host `{host}` can't read messages (")),
+        "{text}"
+    );
+    assert!(text.contains("run.messages"), "{text}");
+}
+
+/// A remote round that hangs holds up nothing else: a local line written
+/// while it is in flight returns at once.
+#[tokio::test]
+async fn a_slow_host_round_does_not_hold_up_local_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Running);
+    let remote_run = "run_01J9ZQ3K4M5N6P7Q8R9S0T1REM";
+    let (url, counts) = fake_peer(move |path, n| {
+        if path == format!("/api/runs/{remote_run}") && n == 0 {
+            // The first poll answers (no gate); every later one hangs.
+            Reply::Close(json_reply(
+                "200 OK",
+                &json!({"run": {"id": remote_run, "status": "running", "awaiting": []}}),
+            ))
+        } else if path.starts_with("/api/runs/") {
+            Reply::Hold(String::new())
+        } else {
+            not_found()
+        }
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let pending = tokio::spawn(wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN},
+                         {"kind": "run_gate", "run": remote_run, "host": host}],
+               "timeout_ms": 20_000}),
+    ));
+    // Past the second round (2 s), which hangs.
+    while counts
+        .lock()
+        .unwrap()
+        .get(&format!("/api/runs/{remote_run}"))
+        .copied()
+        .unwrap_or(0)
+        < 2
+    {
+        assert!(t.elapsed() < Duration::from_secs(10), "no second poll");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let written = Instant::now();
+    append_step(tmp.path(), "one");
+    let r = pending.await.unwrap();
+    assert!(
+        written.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        written.elapsed()
+    );
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1], "{r}");
+}
+
+/// A first round that hangs, once a local condition fired, holds the result
+/// back by at most 5 s and is named in `warnings`.
+#[tokio::test]
+async fn a_hung_first_round_holds_a_fired_result_back_at_most_5s() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path(), RunStatus::Completed);
+    let (url, _) = fake_peer(|path, _| match path {
+        p if p.starts_with("/api/runs/") => Reply::Hold(String::new()),
+        _ => not_found(),
+    })
+    .await;
+    let (addr, host) = spawn_with_fake_peer(tmp.path(), &url).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN},
+                         {"kind": "run_gate", "run": "run_other", "host": host}],
+               "timeout_ms": 20_000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(7), "{:?}", t.elapsed());
+    let s = &r["structuredContent"];
+    assert_eq!(s["fired"][0]["kind"], "run_settled", "{r}");
+    assert_eq!(
+        s["warnings"],
+        json!([format!("run:run_other@{host}: no first answer within 5 s")]),
+        "{r}"
+    );
 }

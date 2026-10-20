@@ -192,7 +192,7 @@ pub(super) fn input_schema() -> Value {
             "timeout_ms": {
                 "type": "integer",
                 "minimum": 0,
-                "description": "How long to wait (default 30000; a longer one is clamped to 55000). A timeout returns `timed_out: true`, not an error."
+                "description": "How long to wait (default 30000; a longer one is clamped to 55000). A timeout returns `timed_out: true`, not an error. A remote host's first answer is waited for up to 5 s even past a shorter timeout, so `timeout_ms: 0` still peeks at its state."
             }
         }
     })

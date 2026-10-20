@@ -42,6 +42,15 @@ const ARTIFACT_PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// whole [`ARTIFACT_PULL_TIMEOUT`]. The SSH and tunnel pulls use the same 60 s.
 const ARTIFACT_PULL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Whole-life bound for one run event stream: in place of the client's 30 s
+/// total timeout, which would cut a live stream (and a `wait` reading it)
+/// every 30 s. The connect timeout still applies.
+const EVENT_STREAM_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long a run event stream's response head may take: the old total bound,
+/// so a remote that accepts but never answers still fails fast.
+const EVENT_STREAM_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Whole-transfer bound for one shipped skill's `PUT` (up to 32 MiB), in
 /// place of the client's 30 s total timeout.
 const SKILL_PUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -796,16 +805,27 @@ impl HostConnector for HttpHostConnector {
         run_id: &str,
         after: u64,
     ) -> Result<EventByteStream, HostConnectorError> {
+        // A per-request timeout overrides the client's 30 s total one, which
+        // would end the stream mid-run; the head is still bounded.
         let mut req = self
             .client
             .get(self.url("/api/events/stream"))
             .query(&[("run", run_id)])
-            .header("Accept", "text/event-stream");
+            .header("Accept", "text/event-stream")
+            .timeout(EVENT_STREAM_TIMEOUT);
         if after > 0 {
             req = req.header("Last-Event-ID", after.to_string());
         }
 
-        let resp = self.send(req).await?;
+        let resp = tokio::time::timeout(EVENT_STREAM_HEAD_TIMEOUT, self.send(req))
+            .await
+            .map_err(|_| {
+                HostConnectorError::Unreachable(format!(
+                    "no answer from {} for {} s",
+                    self.base_url,
+                    EVENT_STREAM_HEAD_TIMEOUT.as_secs()
+                ))
+            })??;
 
         let stream = resp
             .bytes_stream()
@@ -1634,6 +1654,31 @@ mod tests {
             "{err:?}"
         );
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    /// A run event stream is long-lived: its own per-request timeout
+    /// overrides the client's total one, so a client built with a 1 s total
+    /// timeout still reads a stream that trickles over ~2 s.
+    #[tokio::test]
+    async fn an_event_stream_outlives_the_clients_total_timeout() {
+        let addr = artifact_remote(BlobPlan::Chunks {
+            chunks: vec![(0, b"ab"), (700, b"cd"), (700, b"ef"), (700, b"gh")],
+            stall: false,
+        })
+        .await;
+        let conn = HttpHostConnector::new_with_timeout(
+            format!("http://{addr}"),
+            None,
+            Duration::from_secs(1),
+        );
+        let t = std::time::Instant::now();
+        let mut stream = conn.stream_run_events_after("run_x", 0).await.unwrap();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"abcdefgh");
+        assert!(t.elapsed() > Duration::from_millis(1500), "{:?}", t.elapsed());
     }
 
     /// The idle bound is per gap, not per transfer, and the pull's own
