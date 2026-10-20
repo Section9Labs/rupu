@@ -113,6 +113,9 @@ pub struct AppState {
     /// `/api/skills/install|update`). Defaults to `None`; rupu-cli's `cp
     /// serve` installs `GitFetcher` via [`AppState::with_skill_installer`].
     pub skill_installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
+    /// The autoflow / cron / maintenance operations port (rupu-cli's
+    /// `cp serve` provides it). `None` → those endpoints return 501.
+    pub admin_ops: Option<Arc<dyn crate::admin_ops::AdminOps>>,
 }
 
 impl AppState {
@@ -187,6 +190,7 @@ impl AppState {
             host_probes: Arc::default(),
             agentiflow_launcher: None,
             skill_installer: None,
+            admin_ops: None,
         }
     }
 
@@ -313,6 +317,12 @@ impl AppState {
     /// The token value itself is never threaded through `AppState`.
     pub fn with_token_set(mut self, token_set: bool) -> Self {
         self.token_set = token_set;
+        self
+    }
+
+    /// Install the autoflow / cron / maintenance adapter (or clear it).
+    pub fn with_admin_ops(mut self, ops: Option<Arc<dyn crate::admin_ops::AdminOps>>) -> Self {
+        self.admin_ops = ops;
         self
     }
 

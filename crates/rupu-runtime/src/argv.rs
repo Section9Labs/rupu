@@ -53,6 +53,9 @@ pub enum RunArgv {
     /// `rupu agentiflow run --run-id <id> -- <definition>` — the detached
     /// child of `agentiflow run --detach`.
     Agentiflow(AgentiflowRun),
+    /// `rupu autoflow run [--repo] [--mode] -- <name> <target>` — one
+    /// autoflow cycle, detached by the CP (`POST /api/autoflows/:name/run`).
+    AutoflowRun(AutoflowRun),
 }
 
 /// `rupu run <agent> …`.
@@ -364,6 +367,19 @@ pub struct AgentiflowRun {
     pub run_id: String,
 }
 
+/// `rupu autoflow run [--repo <repo>] [--mode <mode>] -- <name> <target>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoflowRun {
+    /// The autoflow-enabled workflow.
+    pub name: String,
+    /// The issue in full run-target form (`github:owner/repo/issues/42`).
+    pub target: String,
+    /// `--repo`: limit resolution to one bound repo.
+    pub repo: Option<String>,
+    /// `--mode`: `bypass` | `readonly`.
+    pub mode: Option<PermissionMode>,
+}
+
 /// What a peer's `rupu` can take, for [`RunArgv::for_peer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureSet {
@@ -650,6 +666,16 @@ impl RunArgv {
                 // `--` keeps a definition name from being read as a flag.
                 a.push("--");
                 a.push(&f.definition);
+            }
+            Self::AutoflowRun(r) => {
+                a.push("autoflow");
+                a.push("run");
+                a.opt_flag_value("--repo", r.repo.as_deref());
+                a.opt_flag_value("--mode", r.mode.map(PermissionMode::as_str));
+                // `--` keeps a name or target from being read as a flag.
+                a.push("--");
+                a.push(&r.name);
+                a.push(&r.target);
             }
         }
         a.0

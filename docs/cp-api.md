@@ -20,7 +20,7 @@ MCP tool at `/mcp` (plus a `wait` long-poll); see [`mcp.md`](mcp.md).
 - [Events and transcripts](#events-and-transcripts)
 - [Sessions](#sessions)
 - [Launch, agents and workflows](#launch-agents-and-workflows) · [Skills](#skills)
-- [Autoflows](#autoflows)
+- [Autoflows](#autoflows) · [Cron and maintenance](#cron-and-maintenance)
 - [Findings](#findings) · [Coverage and assets](#coverage-and-assets)
 - [Usage and dashboard](#usage-and-dashboard) · [Netflow](#netflow)
 - [Projects and code](#projects-and-code)
@@ -470,6 +470,35 @@ symlinked project `skills/`.
 | GET | `/api/autoflows/claims` | Issue claims held by the entity engine (`ClaimRow`). | |
 | POST | `/api/autoflows/claims/release` | Drop a claim. | Body `{issue_ref}` → `{released}`. |
 | POST | `/api/autoflows/claims/requeue` | Queue a manual wake for a claimed issue. | Body `{issue_ref, not_before?}` → `{wake_id}`. 404 no claim. |
+| GET | `/api/autoflows/:name` | One autoflow's resolved metadata and YAML: `rupu autoflow show`'s `autoflow_show` report. | `repo` picks one when several repos define the name. 404 none visible, 409 several. |
+| GET | `/api/autoflows/explain` | One issue's autoflow state: claim, last run, queued wakes, recent cycle events (`autoflow_explain`). | `issue_ref` (required, the full `<tracker>:<project>/issues/<number>` form — a bare `42` / `#42` is a 400; a query parameter because an issue ref carries `/`), `repo`. |
+| GET | `/api/autoflows/doctor` | Consistency problems across claims, wakes and runs (`autoflow_doctor`: `ok`, `rows`). | `repo`. |
+| GET | `/api/autoflows/wakes` | Queued wakes and the ten most recently processed (`autoflow_wakes`). | `repo`. |
+| POST | `/api/autoflows/:name/run` | Run one autoflow cycle for an issue now (`rupu autoflow run`, detached). | Body `{issue, repo?, mode?}` (`issue` in the full `<tracker>:<project>/issues/<number>` form, `mode` `bypass\|readonly`). Checked first, then started: 404 the autoflow doesn't resolve for the issue, 409 several do or another cycle holds the issue's claim, 400 a bad issue or mode. 202 `{started, name, issue, pid, log}` once the child runs; `log` keeps its stderr. Follow it with `GET /api/autoflows/explain`. |
+| POST | `/api/autoflows/claims/repair` | `rupu autoflow repair`: drop the claim's invalid queued wakes, rebuild its missing worktree, then release it or queue a repair wake. | Body `{issue_ref, release?, requeue?, dry_run?}`. **`dry_run` defaults to `true`**: it lists the repairs (`would …`) and changes nothing. → `{issue_ref, dry_run, repairs}`. 400 `release` with `requeue`, or a ref that isn't the full form (a bare number is refused), 404 no claim. |
+
+Every autoflow read and write above except the definitions list and
+enable/disable runs on this control plane's own `RUPU_HOME` only: a `host`
+other than `local` is a 501. They answer with the JSON report the matching
+CLI command prints under `--format json`, and need `rupu cp serve` (501
+otherwise) while their logic still lives in the CLI. A write that isn't a dry run also needs it as the write gate.
+`GET /api/autoflows/:name` never shadows the literal `claims`, `doctor`,
+`wakes` and `explain` routes.
+
+## Cron and maintenance
+
+Local host only (`host` other than `local` → 501). They read the global
+layer and the project layer of the directory `rupu cp serve` started in, as
+its cron loop does. The listings and the transcript / netflow prunes work on
+any control plane; the tick and the session prunes need `rupu cp serve`
+(501 otherwise).
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/cron` | Cron-triggered workflows and when each fires next: `rupu cron list`'s `cron_list` report. | `next_utc` / `in_seconds` are null when the schedule can't be computed. |
+| GET | `/api/cron/events` | Event-triggered workflows, the configured poll sources and their latest cursors (`cron_events`). | |
+| POST | `/api/cron/tick` | Run the cron + event-trigger tick `cp serve`'s loop runs, now. | Body `{dry_run?, skip_events?, only_events?}`. A real tick fires due workflows in the background → 202 `{started: true, dry_run: false}`. A dry run → 200 `{kind: "cron_tick", dry_run: true, would_fire: [{tier, workflow, …}]}` and changes nothing. One tick at a time per `RUPU_HOME`: a real tick holds an exclusive lock on `<RUPU_HOME>/cron-state/tick.lock`, as do `cp serve`'s cron loop and `rupu cron tick`, so this answers 409 while any of them (in this process or another) ticks, and the loop skips its turn while a requested one runs. A dry run takes no lock. 400 `skip_events` with `only_events`. |
+| POST | `/api/maintenance/prune` | Delete old archived transcripts, archived sessions or netflow ledgers. | Body `{kind, older_than?, dry_run?}`; `kind` is `transcripts` (`rupu transcript prune`), `sessions` (`rupu session prune`), `netflow` (`rupu netflow prune`) or `cleanup` (`rupu cleanup`: sessions and transcripts). **`dry_run` defaults to `true`** → `{kind, dry_run: true, would_remove: [...], errors}`; `dry_run: false` deletes → `{kind, dry_run: false, removed: [...], errors}`. The rows are the CLI report's rows; `errors` names files or directories that couldn't be removed or scanned (netflow). `older_than` (`30d`, `12h`, `1w`) overrides the default retention; a bad one is a 400, a bad configured `[storage]` retention a 500. `sessions` and `cleanup` need `rupu cp serve`. |
 
 ## Findings
 

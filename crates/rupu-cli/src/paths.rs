@@ -68,7 +68,7 @@ pub fn archived_sessions_dir(global: &Path) -> PathBuf {
 
 /// Archive directory nested under a transcript root.
 pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
-    transcripts_dir.join("archive")
+    rupu_orchestrator::archived_transcripts::archived_transcripts_dir(transcripts_dir)
 }
 
 /// Global UI theme directory.
@@ -167,66 +167,27 @@ pub fn config_paths(
     Ok(rupu_workspace::config_paths(global, project_root, run_dir)?)
 }
 
-/// [`config_paths`] for display-only reads (UI preferences, pricing tables,
-/// listings): a failed customer lookup is logged and the customer layer
-/// left out, so a broken assignment never stops `rupu transcript list`.
-/// Never use this where the config picks a provider, account or permission.
+/// [`config_paths`] for display-only reads: see
+/// [`rupu_workspace::config_paths_for_display`].
 pub fn config_paths_for_display(
     global: &Path,
     project_root: Option<&Path>,
     run_dir: &Path,
 ) -> ConfigPaths {
-    config_paths(global, project_root, run_dir).unwrap_or_else(|e| {
-        tracing::warn!(error = %format!("{e:#}"), "customer config layer skipped for this display");
-        ConfigPaths::without_customer(global, project_root)
-    })
+    rupu_workspace::config_paths_for_display(global, project_root, run_dir)
 }
 
-/// The config for a display-only read (UI preferences, pricing, listings),
-/// never failing: [`config_paths_for_display`] layers, loaded with
-/// `layer_files_locked` when `locked` (a policy-bearing value such as
-/// `[ui].editor` or pricing) else `layer_files`. A layer that fails to load
-/// is logged and the load retried without the customer layer; if that fails
-/// too, it is logged and `Config::default()` returned. Never use this where
-/// the config picks a provider, account or permission — use
-/// [`config_paths`] there.
+/// The config for a display-only read, never failing: see
+/// [`rupu_workspace::load_config_for_display`]. Never use this where the
+/// config picks a provider, account or permission — use [`config_paths`]
+/// there.
 pub fn load_config_for_display(
     global: &Path,
     project_root: Option<&Path>,
     run_dir: &Path,
     locked: bool,
 ) -> rupu_config::Config {
-    let load = |p: &ConfigPaths| {
-        if locked {
-            rupu_config::layer_files_locked(p.layers())
-        } else {
-            rupu_config::layer_files(p.layers())
-        }
-    };
-    let paths = config_paths_for_display(global, project_root, run_dir);
-    let first = match load(&paths) {
-        Ok(cfg) => return cfg,
-        Err(e) => e,
-    };
-    if paths.customer.is_some() {
-        tracing::warn!(
-            error = %format!("{first:#}"),
-            "config failed to load for this display; retrying without the customer layer"
-        );
-        match load(&ConfigPaths::without_customer(global, project_root)) {
-            Ok(cfg) => return cfg,
-            Err(e) => tracing::warn!(
-                error = %format!("{e:#}"),
-                "config failed to load for this display; using defaults"
-            ),
-        }
-    } else {
-        tracing::warn!(
-            error = %format!("{first:#}"),
-            "config failed to load for this display; using defaults"
-        );
-    }
-    rupu_config::Config::default()
+    rupu_workspace::load_config_for_display(global, project_root, run_dir, locked)
 }
 
 #[cfg(test)]

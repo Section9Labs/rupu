@@ -69,6 +69,8 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::workspace::routes())
         .merge(crate::api::scm::routes())
         .merge(crate::api::auth_status::routes())
+        .merge(crate::api::cron::routes())
+        .merge(crate::api::maintenance::routes())
 }
 
 /// What `router_with` serves besides `/api/*` and `/healthz`.

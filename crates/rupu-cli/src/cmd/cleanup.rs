@@ -186,42 +186,12 @@ async fn run(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<
     }
     let include_sessions = args.sessions || !args.transcripts;
     let include_transcripts = args.transcripts || !args.sessions;
-
-    let mut rows = Vec::new();
-    if include_sessions {
-        for session in prune_archived_sessions(args.older_than.as_deref(), args.dry_run)
-            .context("cleanup archived sessions")?
-        {
-            rows.push(CleanupRow {
-                kind: "session".into(),
-                id: session.session_id,
-                scope: session.scope,
-                retained_at: session.updated_at,
-                action: session.action,
-                detail: format!("status {}", session.status),
-            });
-        }
-    }
-    if include_transcripts {
-        for transcript in prune_archived_transcripts(args.older_than.as_deref(), args.dry_run)
-            .context("cleanup archived transcripts")?
-        {
-            rows.push(CleanupRow {
-                kind: "transcript".into(),
-                id: transcript.run_id,
-                scope: transcript.scope,
-                retained_at: transcript.archived_at,
-                action: transcript.action,
-                detail: transcript.location,
-            });
-        }
-    }
-    rows.sort_by(|a, b| {
-        a.kind
-            .cmp(&b.kind)
-            .then_with(|| a.id.cmp(&b.id))
-            .then_with(|| a.scope.cmp(&b.scope))
-    });
+    let rows = cleanup_rows(
+        args.older_than.as_deref(),
+        args.dry_run,
+        include_sessions,
+        include_transcripts,
+    )?;
     let csv_rows = rows
         .iter()
         .map(|row| CleanupCsvRow {
@@ -242,6 +212,64 @@ async fn run(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<
         csv_rows,
     };
     report::emit_collection(global_format, &output)
+}
+
+/// `rupu cleanup`'s JSON report (archived sessions and transcripts), for the
+/// control plane's `POST /api/maintenance/prune {kind: cleanup}`.
+pub(crate) fn cleanup_json(
+    older_than: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::to_value(CleanupReport {
+        kind: "cleanup",
+        version: 1,
+        rows: cleanup_rows(older_than, dry_run, true, true)?,
+    })?)
+}
+
+fn cleanup_rows(
+    older_than: Option<&str>,
+    dry_run: bool,
+    include_sessions: bool,
+    include_transcripts: bool,
+) -> anyhow::Result<Vec<CleanupRow>> {
+    let mut rows = Vec::new();
+    if include_sessions {
+        for session in
+            prune_archived_sessions(older_than, dry_run).context("cleanup archived sessions")?
+        {
+            rows.push(CleanupRow {
+                kind: "session".into(),
+                id: session.session_id,
+                scope: session.scope,
+                retained_at: session.updated_at,
+                action: session.action,
+                detail: format!("status {}", session.status),
+            });
+        }
+    }
+    if include_transcripts {
+        for transcript in prune_archived_transcripts(older_than, dry_run)
+            .context("cleanup archived transcripts")?
+            .rows
+        {
+            rows.push(CleanupRow {
+                kind: "transcript".into(),
+                id: transcript.run_id,
+                scope: transcript.scope,
+                retained_at: transcript.archived_at,
+                action: transcript.action,
+                detail: transcript.location,
+            });
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.scope.cmp(&b.scope))
+    });
+    Ok(rows)
 }
 
 async fn render_stats(args: Args, global_format: Option<OutputFormat>) -> anyhow::Result<()> {

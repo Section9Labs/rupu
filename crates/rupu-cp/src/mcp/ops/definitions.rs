@@ -1,7 +1,9 @@
 //! The definitions operator tools: the workflows and agents the CP can run.
 
 use super::{op, OpSpec};
-use crate::api::{agents, autoflow_claims, models, repo_scope::ScopeQuery, skills, workflows};
+use crate::api::{
+    agents, autoflow_claims, autoflows, models, repo_scope::ScopeQuery, skills, workflows,
+};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -161,6 +163,53 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Queue a manual wake for a claimed issue.\n\n`issue_ref` names the claim; `not_before` (RFC 3339) defers the wake, and an unparseable value means now. Returns `{wake_id}`; 404 when no claim is tracked.",
         )
         .body::<autoflow_claims::RequeueBody>(),
+        // Autoflow operations only the CLI had (Plan 3a, package E).
+        op(
+            "autoflows.get",
+            Method::GET,
+            "/api/autoflows/:name",
+            "Show one autoflow's resolved metadata and its YAML (rupu autoflow show).\n\n`name` is the autoflow's workflow name; `repo` (`github:owner/repo`) picks one when several repos define it. Returns the `autoflow_show` report: repo, entity, source, selector, workspace, claim TTL, `body`; 404 when none is visible, 409 when several are.",
+        )
+        .query::<autoflows::AutoflowRepoQuery>(),
+        op(
+            "autoflows.explain",
+            Method::GET,
+            "/api/autoflows/explain",
+            "Explain the autoflow state of one issue (rupu autoflow explain).\n\n`issue_ref` is the issue in full form (`github:owner/repo/issues/42`; a bare number is a 400); `repo` limits resolution to one bound repo. Returns the `autoflow_explain` report: status, claim, last run, queued wakes, recent cycle events.",
+        )
+        .query::<autoflows::ExplainQuery>(),
+        op(
+            "autoflows.doctor",
+            Method::GET,
+            "/api/autoflows/doctor",
+            "Check autoflow claims, wakes and runs for inconsistencies (rupu autoflow doctor).\n\n`repo` limits the check to one tracked repo. Returns the `autoflow_doctor` report: `ok`, and one row (scope, problem, detail) per problem found.",
+        )
+        .query::<autoflows::AutoflowRepoQuery>(),
+        op(
+            "autoflows.wakes",
+            Method::GET,
+            "/api/autoflows/wakes",
+            "List queued and recently processed autoflow wakes (rupu autoflow wakes).\n\n`repo` limits it to one tracked repo. Returns the `autoflow_wakes` report: rows (wake_id, state queued|processed, source, event, entity, not_before, repo).",
+        )
+        .query::<autoflows::AutoflowRepoQuery>(),
+        op(
+            "autoflows.run",
+            Method::POST,
+            "/api/autoflows/:name/run",
+            "Run one autoflow cycle for an issue now, detached (rupu autoflow run).\n\n`name` is the autoflow; `issue` the issue in full form (`github:owner/repo/issues/42`); `repo` and `mode` (bypass|readonly) are optional. Returns 202 `{name, issue, started}` once the cycle's process starts; follow it with `autoflows.explain`. 404 for an unknown autoflow, 409 when another cycle holds the issue.",
+        )
+        .query::<crate::admin_ops::HostQuery>()
+        .body::<autoflows::AutoflowRunBody>()
+        .open_world(),
+        op(
+            "claims.repair",
+            Method::POST,
+            "/api/autoflows/claims/repair",
+            "Repair one autoflow claim: drop bad wakes, rebuild its worktree (rupu autoflow repair).\n\n`issue_ref` names the claim, in full form (`github:owner/repo/issues/42`); `release` or `requeue` (at most one) also releases it or queues a repair wake. `dry_run` defaults to true and lists the repairs without applying them; pass false to apply. Returns `{issue_ref, dry_run, repairs}`; 404 when no claim is tracked.",
+        )
+        .query::<crate::admin_ops::HostQuery>()
+        .body::<autoflow_claims::RepairBody>()
+        .destructive(),
         op(
             "skills.list",
             Method::GET,

@@ -8,6 +8,7 @@ mod definitions;
 mod findings;
 mod fleet;
 mod observe;
+mod ops_admin;
 mod projects;
 mod query;
 mod runs;
@@ -119,7 +120,7 @@ impl OpSpec {
 
 /// Every operator tool, in listing order: the area files' tools in the
 /// order runs, sessions, agentiflows, definitions, findings, observe,
-/// fleet, projects, query, scm, setup.
+/// fleet, projects, query, scm, setup, ops_admin.
 pub fn ops() -> &'static [OpSpec] {
     static OPS: std::sync::OnceLock<Vec<OpSpec>> = std::sync::OnceLock::new();
     OPS.get_or_init(|| {
@@ -135,6 +136,7 @@ pub fn ops() -> &'static [OpSpec] {
             query::ops(),
             scm::ops(),
             setup::ops(),
+            ops_admin::ops(),
         ]
         .into_iter()
         .flatten()

@@ -2,6 +2,7 @@
 //!
 //! `serve` is the main entrypoint; wire it from `rupu cp serve`.
 
+pub mod admin_ops;
 pub mod agent_launcher;
 pub mod agentiflow_launcher;
 pub mod api;
@@ -20,6 +21,7 @@ pub mod launcher;
 pub mod mcp;
 pub mod model_catalog;
 pub mod netflow_index;
+pub mod netflow_prune;
 pub mod net;
 pub mod node;
 pub mod pagination;
@@ -105,6 +107,9 @@ pub struct ServeOpts {
     /// `/api/skills/install|update`). rupu-cli's `cp serve` provides it;
     /// `None` → those endpoints return 501.
     pub skill_installer: Option<std::sync::Arc<crate::skill_installer::SkillInstaller>>,
+    /// Optional autoflow / cron / maintenance adapter. rupu-cli's `cp serve`
+    /// provides it; `None` → those endpoints return 501.
+    pub admin_ops: Option<std::sync::Arc<dyn crate::admin_ops::AdminOps>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -274,7 +279,8 @@ pub fn build_state(opts: &ServeOpts) -> state::AppState {
         .with_agentiflow_launcher(opts.agentiflow_launcher.clone())
         .with_skill_installer(opts.skill_installer.clone())
         .with_bind(opts.bind.to_string())
-        .with_token_set(opts.token.is_some());
+        .with_token_set(opts.token.is_some())
+        .with_admin_ops(opts.admin_ops.clone());
 
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.
