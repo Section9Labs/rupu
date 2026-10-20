@@ -1,7 +1,8 @@
 //! One tool call made outside the agent loop: an `action:` workflow step or
-//! a `rupu mcp serve` client's `tools/call`. The permission decision is the
-//! run's [`PermissionPolicy`] over the tool's effect, exactly as the agent
-//! loop decides; what differs is only who asked.
+//! an MCP client's `tools/call` (the MCP endpoint, `rupu cp serve` /mcp).
+//! The permission decision is the run's [`PermissionPolicy`] over the
+//! tool's effect, exactly as the agent loop decides; what differs is only
+//! who asked.
 
 use crate::permission::{AllowAlways, Decision, DenyReason, PermissionMode, PermissionPolicy};
 use crate::tool::{Tool, ToolContext, ToolError};
@@ -45,9 +46,9 @@ pub async fn call(
 }
 
 /// [`call`] for callers that run calls concurrently over one "allow always"
-/// set (`rupu mcp serve`): the set is locked only while the call is decided,
-/// so a decision (and any prompt behind it) is atomic with its update while
-/// the tool itself runs unlocked.
+/// set (the MCP endpoint, `rupu cp serve` /mcp): the set is locked only
+/// while the call is decided, so a decision (and any prompt behind it) is
+/// atomic with its update while the tool itself runs unlocked.
 pub async fn call_shared(
     tool: &dyn Tool,
     input: Value,

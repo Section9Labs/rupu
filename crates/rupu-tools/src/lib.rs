@@ -19,8 +19,8 @@
 //! its [`ToolContext`]. Permission is [`PermissionPolicy`]: a pure function of
 //! a descriptor's effect and the run's [`PermissionMode`] — tools themselves
 //! are not aware of permission state. The agent loop, `action:` workflow
-//! steps ([`call`]) and `rupu mcp serve` ([`call`]) are three callers of the
-//! same tools (spec W4).
+//! steps ([`call`]) and the MCP endpoint (`rupu cp serve` /mcp, [`call`])
+//! are three callers of the same tools (spec W4).
 
 pub mod assets;
 pub mod board;

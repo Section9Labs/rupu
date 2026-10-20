@@ -15,7 +15,8 @@ use std::time::Instant;
 use thiserror::Error;
 
 /// Why a connector call failed. Its text is the call's error, in every
-/// transport (agent loop, `action:` step, `rupu mcp serve`).
+/// transport (agent loop, `action:` step, the MCP endpoint (`rupu cp serve`
+/// /mcp)).
 #[derive(Debug, Error)]
 pub enum ConnectorError {
     /// The connector was reached and failed.
