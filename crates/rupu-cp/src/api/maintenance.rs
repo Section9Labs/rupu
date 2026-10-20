@@ -1,14 +1,15 @@
 //! Housekeeping: `POST /api/maintenance/prune` — the CLI's `transcript
-//! prune` (`rupu_orchestrator::archived_transcripts`), `netflow prune`
-//! ([`crate::netflow_prune`]), and `session prune` / `cleanup` (through the
-//! `AdminOps` port while session records live in the CLI).
+//! prune` (`rupu_orchestrator::archived_transcripts`), `session prune`
+//! (`rupu_runtime::sessions`), `cleanup` (`rupu_orchestrator::cleanup`) and
+//! `netflow prune` ([`crate::netflow_prune`]), each the library function
+//! the command calls.
 //!
 //! Local-only: it deletes from this control plane's own `RUPU_HOME`, with
 //! the project layer of the directory `cp serve` started in — the same
 //! layers the CLI commands read from there.
 
 use crate::{
-    admin_ops::{self, HostQuery, PruneKind, PruneRequest},
+    admin_ops::{self, HostQuery},
     error::{ApiError, ApiResult},
     state::AppState,
 };
@@ -18,11 +19,78 @@ use axum::{
     Json, Router,
 };
 use rupu_orchestrator::archived_transcripts::{self, PruneError};
-use serde::Deserialize;
+use rupu_orchestrator::cleanup::{self, CleanupSelection};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/maintenance/prune", post(prune))
+}
+
+/// What `POST /api/maintenance/prune` removes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneKind {
+    /// Archived standalone transcripts (`rupu transcript prune`).
+    Transcripts,
+    /// Archived sessions (`rupu session prune`).
+    Sessions,
+    /// Netflow ledgers (`rupu netflow prune`).
+    Netflow,
+    /// Archived sessions and transcripts together (`rupu cleanup`).
+    Cleanup,
+}
+
+impl PruneKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Transcripts => "transcripts",
+            Self::Sessions => "sessions",
+            Self::Netflow => "netflow",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+/// A transcript prune's failure as its status: a bad `older_than` is the caller's
+/// 400; a bad configured retention, or a failed read or delete, a 500.
+fn prune_error(e: PruneError) -> ApiError {
+    match e {
+        PruneError::InvalidRetention(e) => ApiError::bad_request(e.to_string()),
+        PruneError::Config(m) => ApiError::internal(format!("config: {m}")),
+        PruneError::Failed(m) => ApiError::internal(m),
+    }
+}
+
+/// A session prune's failure as the status and message `rupu session
+/// prune` gave the control plane before it was a library: a bad
+/// `older_than` is a 400, anything else a 500, each with the prune's own
+/// message.
+fn session_prune_error(e: PruneError) -> ApiError {
+    match e {
+        PruneError::InvalidRetention(e) => ApiError::bad_request(e.to_string()),
+        PruneError::Config(m) | PruneError::Failed(m) => ApiError::internal(m),
+    }
+}
+
+/// A cleanup's failure, as `rupu cleanup` gave it: a retention the session
+/// stage refused (a bad `older_than`: 400, a bad configured
+/// `[storage].archived_session_retention`: 500) with its message alone;
+/// anything else a 500 naming its stage over the error
+/// (`cleanup archived sessions: …`), as the CLI prints it.
+fn cleanup_error(e: cleanup::CleanupError) -> ApiError {
+    let sessions_stage = e.stage == "cleanup archived sessions";
+    match &e.source {
+        PruneError::InvalidRetention(r) if sessions_stage => ApiError::bad_request(r.to_string()),
+        PruneError::Config(m) if sessions_stage => ApiError::internal(m.clone()),
+        _ => ApiError::internal(format!("{:#}", anyhow::Error::new(e))),
+    }
+}
+
+/// A newer rupu's session record a prune kept: `cp serve`'s log says so,
+/// as the CLI says it on stderr.
+fn log_kept_session(warning: &str) {
+    tracing::warn!("{warning}");
 }
 
 /// `POST /api/maintenance/prune` body.
@@ -76,11 +144,35 @@ async fn prune(
                 )
             })
             .await?
-            .map_err(|e| match e {
-                PruneError::InvalidRetention(e) => ApiError::bad_request(e.to_string()),
-                PruneError::Config(m) => ApiError::internal(format!("config: {m}")),
-                PruneError::Failed(m) => ApiError::internal(m),
-            })?;
+            .map_err(prune_error)?;
+            (json!(report), Vec::new())
+        }
+        PruneKind::Sessions => {
+            let report = blocking(move || {
+                rupu_runtime::sessions::prune_report(
+                    &global,
+                    older_than.as_deref(),
+                    dry_run,
+                    &mut log_kept_session,
+                )
+            })
+            .await?
+            .map_err(session_prune_error)?;
+            (json!(report), Vec::new())
+        }
+        PruneKind::Cleanup => {
+            let report = blocking(move || {
+                cleanup::cleanup_report(
+                    &global,
+                    project_root.as_deref(),
+                    older_than.as_deref(),
+                    dry_run,
+                    CleanupSelection::ALL,
+                    &mut log_kept_session,
+                )
+            })
+            .await?
+            .map_err(cleanup_error)?;
             (json!(report), Vec::new())
         }
         PruneKind::Netflow => {
@@ -95,17 +187,6 @@ async fn prune(
             .await?
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
             (json!(done.report), done.problems)
-        }
-        PruneKind::Sessions | PruneKind::Cleanup => {
-            let ops = admin_ops::ops(&s, "pruning sessions")?;
-            let report = ops
-                .prune_sessions(PruneRequest {
-                    kind,
-                    older_than: body.older_than,
-                    dry_run,
-                })
-                .await?;
-            (report, Vec::new())
         }
     };
     Ok(Json(prune_answer(kind, dry_run, report, errors)))

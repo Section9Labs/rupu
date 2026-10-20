@@ -19,6 +19,7 @@ members = [
     "crates/rupu-tools",
     "crates/rupu-agent",
     "crates/rupu-orchestrator",
+    "crates/rupu-autoflow",
     "crates/rupu-mcp",
     "crates/rupu-webhook",
     "crates/rupu-cp",
@@ -221,6 +222,10 @@ rupu-query = { path = "crates/rupu-query" }
 # The agentiflow envelope: deterministic goal/coverage/budget supervisor
 # driving a LeadDriver round loop.
 rupu-agentiflow = { path = "crates/rupu-agentiflow" }
+
+# Autoflows' read side and claim repair (show / explain / doctor / wakes /
+# repair / the run precheck), shared by the CLI and the control plane.
+rupu-autoflow = { path = "crates/rupu-autoflow" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

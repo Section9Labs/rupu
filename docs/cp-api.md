@@ -480,8 +480,12 @@ symlinked project `skills/`.
 Every autoflow read and write above except the definitions list and
 enable/disable runs on this control plane's own `RUPU_HOME` only: a `host`
 other than `local` is a 501. They answer with the JSON report the matching
-CLI command prints under `--format json`, and need `rupu cp serve` (501
-otherwise) while their logic still lives in the CLI. A write that isn't a dry run also needs it as the write gate.
+CLI command prints under `--format json`, from the same library
+(`rupu-autoflow`), on any control plane. Autoflows are visible from the
+directory `rupu cp serve` started in, as from the CLI's working directory.
+Starting a cycle (`POST /api/autoflows/:name/run`) needs `rupu cp serve`
+(501 otherwise), which spawns it; a write that isn't a dry run also needs
+it as the write gate.
 `GET /api/autoflows/:name` never shadows the literal `claims`, `doctor`,
 `wakes` and `explain` routes.
 
@@ -489,16 +493,15 @@ otherwise) while their logic still lives in the CLI. A write that isn't a dry ru
 
 Local host only (`host` other than `local` → 501). They read the global
 layer and the project layer of the directory `rupu cp serve` started in, as
-its cron loop does. The listings and the transcript / netflow prunes work on
-any control plane; the tick and the session prunes need `rupu cp serve`
-(501 otherwise).
+its cron loop does. The listings and every prune work on any control plane;
+the tick needs `rupu cp serve` (501 otherwise), which runs the workflows.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/cron` | Cron-triggered workflows and when each fires next: `rupu cron list`'s `cron_list` report. | `next_utc` / `in_seconds` are null when the schedule can't be computed. |
 | GET | `/api/cron/events` | Event-triggered workflows, the configured poll sources and their latest cursors (`cron_events`). | |
 | POST | `/api/cron/tick` | Run the cron + event-trigger tick `cp serve`'s loop runs, now. | Body `{dry_run?, skip_events?, only_events?}`. A real tick fires due workflows in the background → 202 `{started: true, dry_run: false}`. A dry run → 200 `{kind: "cron_tick", dry_run: true, would_fire: [{tier, workflow, …}]}` and changes nothing. One tick at a time per `RUPU_HOME`: a real tick holds an exclusive lock on `<RUPU_HOME>/cron-state/tick.lock`, as do `cp serve`'s cron loop and `rupu cron tick`, so this answers 409 while any of them (in this process or another) ticks, and the loop skips its turn while a requested one runs. A dry run takes no lock. 400 `skip_events` with `only_events`. |
-| POST | `/api/maintenance/prune` | Delete old archived transcripts, archived sessions or netflow ledgers. | Body `{kind, older_than?, dry_run?}`; `kind` is `transcripts` (`rupu transcript prune`), `sessions` (`rupu session prune`), `netflow` (`rupu netflow prune`) or `cleanup` (`rupu cleanup`: sessions and transcripts). **`dry_run` defaults to `true`** → `{kind, dry_run: true, would_remove: [...], errors}`; `dry_run: false` deletes → `{kind, dry_run: false, removed: [...], errors}`. The rows are the CLI report's rows; `errors` names files or directories that couldn't be removed or scanned (netflow). `older_than` (`30d`, `12h`, `1w`) overrides the default retention; a bad one is a 400, a bad configured `[storage]` retention a 500. `sessions` and `cleanup` need `rupu cp serve`. |
+| POST | `/api/maintenance/prune` | Delete old archived transcripts, archived sessions or netflow ledgers. | Body `{kind, older_than?, dry_run?}`; `kind` is `transcripts` (`rupu transcript prune`), `sessions` (`rupu session prune`), `netflow` (`rupu netflow prune`) or `cleanup` (`rupu cleanup`: sessions and transcripts). **`dry_run` defaults to `true`** → `{kind, dry_run: true, would_remove: [...], errors}`; `dry_run: false` deletes → `{kind, dry_run: false, removed: [...], errors}`. The rows are the CLI report's rows; `errors` names files or directories that couldn't be removed or scanned (netflow). `older_than` (`30d`, `12h`, `1w`) overrides the default retention; a bad one is a 400, a bad configured `[storage]` retention a 500. A real prune (`dry_run: false`) needs the write gate. |
 
 ## Findings
 

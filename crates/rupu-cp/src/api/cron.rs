@@ -1,4 +1,4 @@
-//! Cron and polled-event triggers, through the `AdminOps` port:
+//! Cron and polled-event triggers:
 //! - `GET  /api/cron`        — `rupu cron list`: cron-triggered workflows and
 //!   when each fires next (`rupu_orchestrator::cron_triggers`).
 //! - `GET  /api/cron/events` — `rupu cron events`: event-triggered workflows,

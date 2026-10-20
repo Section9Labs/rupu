@@ -38,7 +38,10 @@ pub mod state;
 pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
-pub mod usage_index;
+/// The usage index moved to `rupu_orchestrator` (a run's usage is one
+/// definition for the control plane and the CLI); re-exported at its old
+/// path.
+pub use rupu_orchestrator::usage_index;
 pub mod usage_sources;
 
 use anyhow::Context as _;
@@ -107,8 +110,8 @@ pub struct ServeOpts {
     /// `/api/skills/install|update`). rupu-cli's `cp serve` provides it;
     /// `None` → those endpoints return 501.
     pub skill_installer: Option<std::sync::Arc<crate::skill_installer::SkillInstaller>>,
-    /// Optional autoflow / cron / maintenance adapter. rupu-cli's `cp serve`
-    /// provides it; `None` → those endpoints return 501.
+    /// Optional cron-tick and autoflow-cycle adapter. rupu-cli's `cp serve`
+    /// provides it; `None` → those two endpoints return 501.
     pub admin_ops: Option<std::sync::Arc<dyn crate::admin_ops::AdminOps>>,
 }
 

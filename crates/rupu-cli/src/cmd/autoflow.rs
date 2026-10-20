@@ -3,7 +3,6 @@
 use super::autoflow_wake::wake_requests_from_polled_event_for_repo;
 use crate::cmd::completers::workflow_names;
 use crate::cmd::issues::canonical_issue_ref as canonical_repo_issue_ref;
-use crate::cmd::issues::{autodetect_repo_from_path, canonical_repo_ref};
 use crate::cmd::transcript::truncate_single_line;
 use crate::cmd::ui::{LiveViewMode, UiPrefs};
 use crate::cmd::workflow::{
@@ -33,8 +32,41 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 use crossterm::{execute, queue};
 use jsonschema::JSONSchema;
 use rupu_auth::CredentialResolver;
+pub(crate) use rupu_autoflow::claims::claim_lease_expired;
+use rupu_autoflow::claims::{
+    cleanup_claim_artifacts, ensure_manual_run_can_take_claim, filter_claims_by_repo,
+    format_contenders, next_action_summary, selected_priority, status_name,
+};
+use rupu_autoflow::format::{format_cost, format_count, truncate_text};
+use rupu_autoflow::history::{
+    filter_monitor_events, history_rows_from_events, monitor_event_name, worker_filter_matches,
+    AutoflowHistoryRow,
+};
+use rupu_autoflow::refs::{
+    format_issue_ref, issue_ref_to_repo_ref, normalize_repo_filter, parse_full_issue_target,
+    parse_issue_ref_text,
+};
+use rupu_autoflow::reports::{build_autoflow_show_report, AutoflowDoctorRow};
+use rupu_autoflow::run_summary::{
+    completed_steps, format_run_metrics_line, load_run_summary, AutoflowRunSummary, StepOutcome,
+};
+pub(crate) use rupu_autoflow::visible::{
+    discover_tick_autoflows, discover_tick_autoflows_reporting, RepoConfigSkip,
+};
+use rupu_autoflow::visible::{
+    filter_visible_autoflows, issue_ref_for_autoflow, record_repo_config_skip,
+    resolve_autoflow_from_path, resolve_autoflow_permission_mode,
+    resolve_autoflow_workflow_for_issue, resolve_config, resolve_config_in, visible_autoflows,
+    ResolvedAutoflowWorkflow, VisibleAutoflowWorkflow,
+};
+use rupu_autoflow::wakes::{
+    enqueue_issue_wake, filter_wakes_by_repo, wakes_report, AutoflowWakeRow, AutoflowWakesReport,
+};
+use rupu_autoflow::{
+    doctor_report, explain_report, repair_claim, show_entry, AutoflowDoctorReport,
+    AutoflowExplainReport, AutoflowShowReport,
+};
 use rupu_config::{AutoflowCheckout, Config, PollSourceEntry};
-use rupu_cp::admin_ops::AdminOpError;
 use rupu_orchestrator::templates::{render_step_prompt, RenderMode, StepContext};
 use rupu_orchestrator::{
     author_allowed, pr_event_context, AutoflowWorkspaceStrategy, ContractFormat, RunStatus,
@@ -42,19 +74,17 @@ use rupu_orchestrator::{
 };
 use rupu_runtime::{
     AutoflowCycleEvent, AutoflowCycleRecord, AutoflowHistoryEventRecord, AutoflowHistoryStore,
-    RunTriggerSource, WakeEnqueueRequest, WakeEntity, WakeEntityKind, WakeEvent, WakeRecord,
-    WakeSource, WakeStore, WakeStoreError,
+    RunTriggerSource, WakeEntityKind, WakeSource, WakeStore, WakeStoreError,
 };
 use rupu_scm::{
     EventSourceRef, Issue, IssueFilter, IssueRef, IssueState, IssueTracker, Platform, Pr, PrFilter,
     PrRef, PrState, RepoConnector, RepoRef,
 };
-use rupu_transcript::event::{Event as TranscriptEvent, FileEditKind};
+use rupu_transcript::event::Event as TranscriptEvent;
 use rupu_transcript::reader::JsonlReader;
-use rupu_workspace::autoflow_claim_store::issue_key;
 use rupu_workspace::{
-    ensure_issue_worktree, issue_dir_name, remove_issue_worktree, AutoflowClaimRecord,
-    AutoflowClaimStore, AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
+    ensure_issue_worktree, issue_dir_name, AutoflowClaimRecord, AutoflowClaimStore,
+    AutoflowContender, ClaimStatus, PendingDispatch, RepoRegistryStore,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -235,49 +265,6 @@ pub struct RepoFilterArgs {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedAutoflowWorkflow {
-    pub(crate) scope: String,
-    pub(crate) name: String,
-    pub(crate) workflow: Workflow,
-    pub(crate) workflow_path: PathBuf,
-    pub(crate) project_root: Option<PathBuf>,
-    pub(crate) repo_ref: String,
-    pub(crate) preferred_checkout: PathBuf,
-    pub(crate) cfg: Config,
-}
-
-impl ResolvedAutoflowWorkflow {
-    fn autoflow(&self) -> anyhow::Result<&rupu_orchestrator::Autoflow> {
-        self.workflow
-            .autoflow
-            .as_ref()
-            .filter(|autoflow| autoflow.enabled)
-            .ok_or_else(|| anyhow!("workflow `{}` is not autoflow-enabled", self.workflow.name))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct VisibleAutoflowWorkflow {
-    scope: String,
-    name: String,
-    workflow: Workflow,
-    workflow_path: PathBuf,
-    project_root: Option<PathBuf>,
-    repo_ref: Option<String>,
-    preferred_checkout: Option<PathBuf>,
-}
-
-impl VisibleAutoflowWorkflow {
-    fn autoflow(&self) -> anyhow::Result<&rupu_orchestrator::Autoflow> {
-        self.workflow
-            .autoflow
-            .as_ref()
-            .filter(|autoflow| autoflow.enabled)
-            .ok_or_else(|| anyhow!("workflow `{}` is not autoflow-enabled", self.workflow.name))
-    }
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct IssueMatch {
     pub(crate) resolved: ResolvedAutoflowWorkflow,
     pub(crate) issue: Issue,
@@ -357,24 +344,6 @@ struct AutoflowListReport {
     kind: &'static str,
     version: u8,
     rows: Vec<AutoflowListRow>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowWakeRow {
-    wake_id: String,
-    state: String,
-    source: String,
-    event: String,
-    entity: String,
-    not_before: String,
-    repo: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowWakesReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<AutoflowWakeRow>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -502,22 +471,6 @@ struct AutoflowMonitorReport {
     claims: Vec<AutoflowClaimRow>,
     activity: Vec<AutoflowMonitorActivityRow>,
     wakes: AutoflowMonitorWakeSummary,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowHistoryRow {
-    at: String,
-    cycle_id: String,
-    mode: String,
-    worker: String,
-    event: String,
-    issue: String,
-    source: String,
-    workflow: String,
-    repo: String,
-    run: String,
-    wake: String,
-    detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -916,21 +869,6 @@ impl CollectionOutput for AutoflowHistoryOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowDoctorRow {
-    scope: String,
-    problem: String,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowDoctorReport {
-    kind: &'static str,
-    version: u8,
-    ok: bool,
-    rows: Vec<AutoflowDoctorRow>,
-}
-
 struct AutoflowDoctorOutput {
     report: AutoflowDoctorReport,
 }
@@ -975,39 +913,6 @@ impl CollectionOutput for AutoflowDoctorOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowShowItem {
-    name: String,
-    scope: String,
-    path: String,
-    repo: Option<String>,
-    project_root: Option<String>,
-    preferred_checkout: Option<String>,
-    description: Option<String>,
-    entity: String,
-    source: String,
-    priority: i32,
-    workspace: String,
-    workspace_branch: Option<String>,
-    reconcile_every: Option<String>,
-    claim_ttl: Option<String>,
-    outcome_output: Option<String>,
-    wake_on: Vec<String>,
-    labels_all: Vec<String>,
-    labels_any: Vec<String>,
-    labels_none: Vec<String>,
-    selector_states: Vec<String>,
-    selector_limit: Option<u32>,
-    body: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowShowReport {
-    kind: &'static str,
-    version: u8,
-    item: AutoflowShowItem,
-}
-
 struct AutoflowShowOutput {
     prefs: UiPrefs,
     report: AutoflowShowReport,
@@ -1028,84 +933,6 @@ impl DetailOutput for AutoflowShowOutput {
     fn render_human(&self) -> anyhow::Result<()> {
         crate::cmd::ui::paginate(&self.rendered, &self.prefs)
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainLock {
-    owner: String,
-    acquired_at: String,
-    lease_expires: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainPendingDispatch {
-    workflow: String,
-    target: String,
-    inputs: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainRun {
-    run_id: String,
-    status: String,
-    backend: String,
-    worker: String,
-    source_wake: Option<String>,
-    approval_step: Option<String>,
-    approval_expires: Option<String>,
-    execution: Option<String>,
-    models: Option<String>,
-    usage: Option<String>,
-    changes: Option<String>,
-    started_at: Option<String>,
-    finished_at: Option<String>,
-    workspace: Option<String>,
-    merge_target: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainClaim {
-    issue_display: Option<String>,
-    issue_title: Option<String>,
-    issue_tracker: Option<String>,
-    issue_state: Option<String>,
-    source: Option<String>,
-    issue_url: Option<String>,
-    workflow: String,
-    status: String,
-    priority: Option<String>,
-    contenders: String,
-    workspace: String,
-    branch: String,
-    pr: String,
-    claim_owner: String,
-    lease_expires: String,
-    active_lock: Option<AutoflowExplainLock>,
-    last_run: Option<AutoflowExplainRun>,
-    next_action: String,
-    pending_dispatch: Option<AutoflowExplainPendingDispatch>,
-    next_retry: Option<String>,
-    summary: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainItem {
-    issue: String,
-    repo: String,
-    status: String,
-    source: Option<String>,
-    candidate_workflows: Vec<String>,
-    claim: Option<AutoflowExplainClaim>,
-    queued_wakes: Vec<AutoflowWakeRow>,
-    recent_processed_wake: Option<AutoflowWakeRow>,
-    recent_cycle_events: Vec<AutoflowHistoryRow>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct AutoflowExplainReport {
-    kind: &'static str,
-    version: u8,
-    item: AutoflowExplainItem,
 }
 
 struct AutoflowExplainOutput {
@@ -1318,80 +1145,6 @@ impl Drop for AutoflowServeScreenGuard {
 }
 
 #[derive(Debug, Clone)]
-struct AutoflowRunStepSummary {
-    step_id: String,
-    status: UiStatus,
-    detail: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AutoflowUsageSummary {
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_tokens: u64,
-    total_tokens: u64,
-    cost_usd: Option<f64>,
-    cost_partial: bool,
-}
-
-#[derive(Debug, Clone)]
-struct AutoflowWorkspaceDiffSummary {
-    files_changed: usize,
-    created: usize,
-    modified: usize,
-    deleted: usize,
-    renamed: usize,
-    insertions: u64,
-    deletions: u64,
-    top_files: Vec<String>,
-    merge_target: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct AutoflowRunSummary {
-    run_id: String,
-    workflow: String,
-    status: String,
-    awaiting_step: Option<String>,
-    error: Option<String>,
-    worker: Option<String>,
-    backend: Option<String>,
-    started_at: chrono::DateTime<chrono::Utc>,
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
-    duration_ms: Option<u64>,
-    workspace: Option<String>,
-    agents: Vec<String>,
-    providers: Vec<String>,
-    models: Vec<String>,
-    assistant_messages: u64,
-    tool_calls: u64,
-    command_runs: u64,
-    actions_emitted: u64,
-    file_edit_events: u64,
-    file_creates: u64,
-    file_modifies: u64,
-    file_deletes: u64,
-    usage: Option<AutoflowUsageSummary>,
-    diff: Option<AutoflowWorkspaceDiffSummary>,
-    steps: Vec<AutoflowRunStepSummary>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TranscriptSummaryAccumulator {
-    agents: BTreeSet<String>,
-    providers: BTreeSet<String>,
-    models: BTreeSet<String>,
-    assistant_messages: u64,
-    tool_calls: u64,
-    command_runs: u64,
-    actions_emitted: u64,
-    file_edit_events: u64,
-    file_creates: u64,
-    file_modifies: u64,
-    file_deletes: u64,
-}
-
-#[derive(Debug, Clone)]
 struct RecentIssueActivity {
     at: String,
     event: String,
@@ -1588,7 +1341,7 @@ async fn list(
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
     let repo_filter = normalize_repo_filter(repo)?;
-    let entries = visible_autoflows()?;
+    let entries = visible_autoflows(&paths::global_dir()?, &std::env::current_dir()?)?;
     let entries = filter_visible_autoflows(entries, repo_filter.as_deref());
     if entries.is_empty()
         && matches!(
@@ -1647,159 +1400,15 @@ fn build_autoflow_show_output(
     })
 }
 
-/// The `autoflow_show` report `rupu autoflow show --format json` prints and
-/// `GET /api/autoflows/:name` serves.
-fn build_autoflow_show_report(
-    entry: &VisibleAutoflowWorkflow,
-    body: String,
-) -> anyhow::Result<AutoflowShowReport> {
-    let autoflow = entry.autoflow()?;
-    let selector_states = autoflow
-        .selector
-        .states
-        .iter()
-        .map(|state| match state {
-            rupu_orchestrator::AutoflowIssueState::Open => "open".to_string(),
-            rupu_orchestrator::AutoflowIssueState::Closed => "closed".to_string(),
-        })
-        .collect::<Vec<_>>();
-    let item = AutoflowShowItem {
-        name: entry.name.clone(),
-        scope: entry.scope.clone(),
-        path: entry.workflow_path.display().to_string(),
-        repo: entry.repo_ref.clone(),
-        project_root: entry
-            .project_root
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        preferred_checkout: entry
-            .preferred_checkout
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        description: entry.workflow.description.clone(),
-        entity: match autoflow.entity {
-            rupu_orchestrator::AutoflowEntity::Issue => "issue".to_string(),
-            rupu_orchestrator::AutoflowEntity::PullRequest => "pull_request".to_string(),
-        },
-        source: autoflow
-            .source
-            .clone()
-            .or_else(|| entry.repo_ref.clone())
-            .unwrap_or_else(|| "-".to_string()),
-        priority: autoflow.priority,
-        workspace: autoflow
-            .workspace
-            .as_ref()
-            .map(|workspace| match workspace.strategy {
-                AutoflowWorkspaceStrategy::Worktree => "worktree".to_string(),
-                AutoflowWorkspaceStrategy::InPlace => "in_place".to_string(),
-            })
-            .unwrap_or_else(|| "worktree".to_string()),
-        workspace_branch: autoflow
-            .workspace
-            .as_ref()
-            .and_then(|workspace| workspace.branch.clone()),
-        reconcile_every: autoflow.reconcile_every.clone(),
-        claim_ttl: autoflow.claim.as_ref().and_then(|claim| claim.ttl.clone()),
-        outcome_output: autoflow
-            .outcome
-            .as_ref()
-            .map(|outcome| outcome.output.clone()),
-        wake_on: autoflow.wake_on.clone(),
-        labels_all: autoflow.selector.labels_all.clone(),
-        labels_any: autoflow.selector.labels_any.clone(),
-        labels_none: autoflow.selector.labels_none.clone(),
-        selector_states,
-        selector_limit: autoflow.selector.limit,
-        body,
-    };
-    Ok(AutoflowShowReport {
-        kind: "autoflow_show",
-        version: 1,
-        item,
-    })
-}
-
 async fn show(
     name: &str,
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
-    let entry = show_entry(name, repo)?;
+    let entry = show_entry(&paths::global_dir()?, &std::env::current_dir()?, name, repo)?;
     let body = std::fs::read_to_string(&entry.workflow_path)?;
     let output = build_autoflow_show_output(&entry, body)?;
     output_report::emit_detail(global_format, &output)
-}
-
-/// `rupu autoflow show`'s JSON report, for the control plane's
-/// `GET /api/autoflows/:name`.
-pub(crate) fn show_json(name: &str, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
-    let entry = show_entry(name, repo)?;
-    let body = std::fs::read_to_string(&entry.workflow_path)?;
-    Ok(serde_json::to_value(build_autoflow_show_report(
-        &entry, body,
-    )?)?)
-}
-
-/// The one visible autoflow named `name`: none is [`AdminOpError::NotFound`],
-/// several (pass `--repo`) [`AdminOpError::Conflict`].
-fn show_entry(name: &str, repo: Option<&str>) -> anyhow::Result<VisibleAutoflowWorkflow> {
-    let matches = visible_autoflow_matches(name, repo)?;
-    let entry = match matches.as_slice() {
-        [] => {
-            return Err(AdminOpError::NotFound(match repo {
-                Some(repo) => format!("no autoflow named `{name}` is visible for repo `{repo}`"),
-                None => format!("no autoflow named `{name}` is visible"),
-            })
-            .into())
-        }
-        [entry] => entry,
-        many => {
-            let mut options = many
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "- {} ({}, {})",
-                        entry.repo_ref.as_deref().unwrap_or("-"),
-                        entry.scope,
-                        entry.workflow_path.display()
-                    )
-                })
-                .collect::<Vec<_>>();
-            options.sort();
-            return Err(AdminOpError::Conflict(format!(
-                "multiple autoflows named `{name}` are visible:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
-                options.join("\n")
-            ))
-            .into());
-        }
-    };
-    Ok(entry.clone())
-}
-
-/// What `rupu autoflow run` checks before it fetches the issue, for the
-/// control plane to answer before it starts the cycle detached: the target
-/// is an issue ([`AdminOpError::Invalid`]), the autoflow resolves for it
-/// ([`AdminOpError::NotFound`] / [`AdminOpError::Conflict`] when ambiguous),
-/// the mode is one autoflows take, and no other cycle holds the issue's
-/// claim ([`AdminOpError::Conflict`]).
-pub(crate) fn run_precheck(
-    global: &Path,
-    name: &str,
-    target: &str,
-    repo: Option<&str>,
-    mode: Option<&str>,
-) -> anyhow::Result<()> {
-    let issue_ref =
-        parse_full_issue_target(target).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
-    let resolved = resolve_autoflow_workflow_for_issue(global, name, &issue_ref, repo)?;
-    resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())
-        .map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
-    let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(global),
-    };
-    let fetch_ref = issue_ref_for_autoflow(&issue_ref, &resolved)?;
-    ensure_manual_run_can_take_claim(&claim_store, &format_issue_ref(&fetch_ref))
 }
 
 async fn run(
@@ -1812,7 +1421,13 @@ async fn run(
     let issue_ref = parse_full_issue_target(target)?;
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
-    let resolved = resolve_autoflow_workflow_for_issue(&global, name, &issue_ref, repo)?;
+    let resolved = resolve_autoflow_workflow_for_issue(
+        &global,
+        &std::env::current_dir()?,
+        name,
+        &issue_ref,
+        repo,
+    )?;
     let _ =
         resolve_autoflow_permission_mode(mode, resolved.cfg.autoflow.permission_mode.as_deref())?;
     let claim_store = AutoflowClaimStore {
@@ -1843,41 +1458,6 @@ async fn run(
         None,
     )
     .await
-}
-
-fn ensure_manual_run_can_take_claim(
-    claim_store: &AutoflowClaimStore,
-    issue_ref_text: &str,
-) -> anyhow::Result<()> {
-    let Some(claim) = claim_store.load(issue_ref_text)? else {
-        return Ok(());
-    };
-    if matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released) {
-        return Ok(());
-    }
-    if claim.status == ClaimStatus::Blocked {
-        return Err(AdminOpError::Conflict(format!(
-            "issue `{issue_ref_text}` has a blocked autoflow claim for workflow `{}`; release it first with `rupu autoflow release {issue_ref_text}`",
-            claim.workflow
-        ))
-        .into());
-    }
-    if claim_store.read_active_lock(issue_ref_text)?.is_some() {
-        return Err(AdminOpError::Conflict(format!(
-            "issue `{issue_ref_text}` already has an active autoflow cycle for workflow `{}`",
-            claim.workflow
-        ))
-        .into());
-    }
-    if !claim_lease_expired(&claim)? {
-        return Err(AdminOpError::Conflict(format!(
-            "issue `{issue_ref_text}` already has an owned autoflow claim for workflow `{}` with status `{}`; wait for it, run `rupu autoflow tick`, or release it first",
-            claim.workflow,
-            status_name(claim.status)
-        ))
-        .into());
-    }
-    Ok(())
 }
 
 async fn tick_with_resolver(resolver: Arc<dyn CredentialResolver>) -> anyhow::Result<()> {
@@ -3975,7 +3555,7 @@ fn build_issue_canvas_lines(
         } else if Some(step.step_id.as_str()) == awaiting_step {
             UiStatus::Awaiting
         } else if let Some(step) = completed_step {
-            step.status
+            step_outcome_ui(step.status)
         } else {
             UiStatus::Waiting
         };
@@ -4156,6 +3736,15 @@ fn step_kind_label(kind: StepKind) -> &'static str {
         // I-39: an unrecognized future kind — render it like a linear step
         // rather than panicking or fabricating a made-up label.
         StepKind::Unknown => "linear",
+    }
+}
+
+/// The palette status a run step's outcome shows as.
+fn step_outcome_ui(outcome: StepOutcome) -> UiStatus {
+    match outcome {
+        StepOutcome::Complete => UiStatus::Complete,
+        StepOutcome::Skipped => UiStatus::Skipped,
+        StepOutcome::Failed => UiStatus::Failed,
     }
 }
 
@@ -4784,53 +4373,6 @@ async fn wakes(
     output_report::emit_collection(global_format, &output)
 }
 
-/// The `autoflow_wakes` report: queued wakes, then the ten most recently
-/// processed. `rupu autoflow wakes` and `GET /api/autoflows/wakes` both
-/// serve it.
-pub(crate) fn wakes_json(global: &Path, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::to_value(wakes_report(global, repo)?)?)
-}
-
-fn wakes_report(global: &Path, repo: Option<&str>) -> anyhow::Result<AutoflowWakesReport> {
-    let repo_filter = normalize_repo_filter(repo)?;
-    let store = WakeStore::new(paths::autoflow_wakes_dir(global));
-    let queued = filter_wakes_by_repo(store.list_queued()?, repo_filter.as_deref());
-    let mut processed = filter_wakes_by_repo(store.list_processed()?, repo_filter.as_deref());
-    processed.sort_by(|left, right| {
-        right
-            .received_at
-            .cmp(&left.received_at)
-            .then_with(|| right.wake_id.cmp(&left.wake_id))
-    });
-    let recent_processed = processed.into_iter().take(10).collect::<Vec<_>>();
-    let mut rows = queued
-        .into_iter()
-        .map(|wake| AutoflowWakeRow {
-            wake_id: wake.wake_id,
-            state: "queued".into(),
-            source: wake_source_name(wake.source).into(),
-            event: wake.event.id,
-            entity: wake.entity.ref_text,
-            not_before: wake.not_before,
-            repo: wake.repo_ref,
-        })
-        .collect::<Vec<_>>();
-    rows.extend(recent_processed.into_iter().map(|wake| AutoflowWakeRow {
-        wake_id: wake.wake_id,
-        state: "processed".into(),
-        source: wake_source_name(wake.source).into(),
-        event: wake.event.id,
-        entity: wake.entity.ref_text,
-        not_before: wake.not_before,
-        repo: wake.repo_ref,
-    }));
-    Ok(AutoflowWakesReport {
-        kind: "autoflow_wakes",
-        version: 1,
-        rows,
-    })
-}
-
 async fn monitor(
     repo: Option<&str>,
     worker: Option<&str>,
@@ -5293,66 +4835,6 @@ fn build_history_report(query: &AutoflowHistoryQuery<'_>) -> anyhow::Result<Auto
         total_events,
         rows,
     })
-}
-
-fn history_rows_from_events(
-    events: &[AutoflowHistoryEventRecord],
-    issue_filter: Option<&str>,
-    source_filter: Option<&str>,
-    event_filter: Option<&str>,
-) -> Vec<AutoflowHistoryRow> {
-    events
-        .iter()
-        .filter_map(|record| {
-            let event = &record.event;
-            let event_name = monitor_event_name(event);
-            let issue = event
-                .issue_display_ref
-                .clone()
-                .or_else(|| event.issue_ref.clone())
-                .unwrap_or_else(|| "-".into());
-            let issue_ref = event.issue_ref.as_deref().unwrap_or("");
-            let source = event.source_ref.clone().unwrap_or_else(|| "-".into());
-            let worker = record
-                .worker_name
-                .clone()
-                .or_else(|| record.worker_id.clone())
-                .unwrap_or_else(|| "-".into());
-            let repo = event.repo_ref.clone().unwrap_or_else(|| "-".into());
-            let workflow = event.workflow.clone().unwrap_or_else(|| "-".into());
-            let run = event.run_id.clone().unwrap_or_else(|| "-".into());
-            let wake = event
-                .wake_id
-                .clone()
-                .or_else(|| event.wake_event_id.clone())
-                .unwrap_or_else(|| "-".into());
-            let detail = event.detail.clone().unwrap_or_else(|| "-".into());
-            let source_match = source_filter.is_none_or(|filter| filter == source);
-            let issue_match =
-                issue_filter.is_none_or(|filter| filter == issue_ref || filter == issue);
-            let event_match = event_filter.is_none_or(|filter| filter == event_name);
-            if !(source_match && issue_match && event_match) {
-                return None;
-            }
-            Some(AutoflowHistoryRow {
-                at: record.at.clone(),
-                cycle_id: record.cycle_id.clone(),
-                mode: match record.mode {
-                    rupu_runtime::AutoflowCycleMode::Tick => "tick".into(),
-                    rupu_runtime::AutoflowCycleMode::Serve => "serve".into(),
-                },
-                worker,
-                event: event_name.to_string(),
-                issue,
-                source,
-                workflow,
-                repo,
-                run,
-                wake,
-                detail,
-            })
-        })
-        .collect()
 }
 
 fn recent_activity_by_issue(
@@ -6940,16 +6422,17 @@ fn render_run_summary(summary: &AutoflowRunSummary) {
     for step in summary.steps.iter().take(5) {
         let mut step_line = String::new();
         push_serve_body_prefix(&mut step_line, 2);
+        let status = step_outcome_ui(step.status);
         let _ = palette::write_bold_colored(
             &mut step_line,
-            &step.status.glyph().to_string(),
-            step.status.color(),
+            &status.glyph().to_string(),
+            status.color(),
         );
         step_line.push(' ');
         let _ = palette::write_colored(
             &mut step_line,
             &truncate_text(&step.step_id, 28),
-            step.status.color(),
+            status.color(),
         );
         if let Some(detail) = step.detail.as_deref() {
             step_line.push_str("  ");
@@ -7241,452 +6724,6 @@ fn compact_timestamp(value: &str) -> String {
         .unwrap_or_else(|_| truncate_text(value, 24))
 }
 
-fn load_run_summary(
-    run_store: &RunStore,
-    run_id: &str,
-    pricing: &rupu_config::PricingConfig,
-) -> Option<AutoflowRunSummary> {
-    let record = run_store.load(run_id).ok()?;
-    let rows = run_store.read_step_results(run_id).unwrap_or_default();
-    let transcript = summarize_run_transcripts(&rows);
-    let diff = summarize_workspace_diff(&record.workspace_path);
-    // Spend is the run's usage fold — every ledger row (units, dispatched
-    // sub-agents, compaction calls) plus a fold of any known transcript
-    // without rows — not just the completed steps' transcripts.
-    let usage = usage_summary_from_fold(&rupu_cp::usage::summarize_run(run_store, run_id, pricing));
-    let duration_ms = run_duration_ms(&record);
-    let workspace = Some(record.workspace_path.display().to_string());
-    let run_id = record.id.clone();
-    let workflow = record.workflow_name.clone();
-    let status = record.status.as_str().to_string();
-    let awaiting_step = record.awaiting_step_id.clone();
-    let error = record.error_message.clone();
-    let worker = record.worker_id.clone();
-    let backend = record.backend_id.clone();
-    let started_at = record.started_at;
-    let finished_at = record.finished_at;
-    let steps = rows
-        .into_iter()
-        .map(|row| {
-            let status = step_status_ui(&row);
-            let detail = step_summary_detail(&row);
-            AutoflowRunStepSummary {
-                step_id: row.step_id,
-                status,
-                detail,
-            }
-        })
-        .collect::<Vec<_>>();
-    Some(AutoflowRunSummary {
-        run_id,
-        workflow,
-        status,
-        awaiting_step,
-        error,
-        worker,
-        backend,
-        started_at,
-        finished_at,
-        duration_ms: Some(duration_ms),
-        workspace,
-        agents: transcript.agents.into_iter().collect(),
-        providers: transcript.providers.into_iter().collect(),
-        models: transcript.models.into_iter().collect(),
-        assistant_messages: transcript.assistant_messages,
-        tool_calls: transcript.tool_calls,
-        command_runs: transcript.command_runs,
-        actions_emitted: transcript.actions_emitted,
-        file_edit_events: transcript.file_edit_events,
-        file_creates: transcript.file_creates,
-        file_modifies: transcript.file_modifies,
-        file_deletes: transcript.file_deletes,
-        usage,
-        diff,
-        steps,
-    })
-}
-
-/// Activity counts (agents, models, messages, tool calls, edits) across a
-/// run's step transcripts. Token spend is NOT tallied here — it comes from
-/// the run's usage fold ([`usage_summary_from_fold`]).
-fn summarize_run_transcripts(rows: &[StepResultRecord]) -> TranscriptSummaryAccumulator {
-    let mut out = TranscriptSummaryAccumulator::default();
-    let mut seen = BTreeSet::new();
-    for row in rows {
-        summarize_transcript_path(&row.transcript_path, &mut out, &mut seen);
-        for item in &row.items {
-            summarize_transcript_path(&item.transcript_path, &mut out, &mut seen);
-        }
-    }
-    out
-}
-
-fn summarize_transcript_path(
-    path: &Path,
-    out: &mut TranscriptSummaryAccumulator,
-    seen: &mut BTreeSet<PathBuf>,
-) {
-    if !seen.insert(path.to_path_buf()) {
-        return;
-    }
-
-    let Ok(iter) = JsonlReader::iter(path) else {
-        return;
-    };
-    for event in iter.flatten() {
-        match event {
-            TranscriptEvent::RunStart {
-                agent,
-                provider,
-                model,
-                ..
-            } => {
-                out.agents.insert(agent);
-                out.providers.insert(provider);
-                out.models.insert(model);
-            }
-            TranscriptEvent::AssistantMessage { content, .. } if !content.trim().is_empty() => {
-                out.assistant_messages += 1;
-            }
-            TranscriptEvent::ToolCall { .. } => out.tool_calls += 1,
-            TranscriptEvent::CommandRun { .. } => out.command_runs += 1,
-            TranscriptEvent::ActionEmitted { .. } => out.actions_emitted += 1,
-            TranscriptEvent::FileEdit { kind, .. } => {
-                out.file_edit_events += 1;
-                match kind {
-                    FileEditKind::Create => out.file_creates += 1,
-                    FileEditKind::Modify => out.file_modifies += 1,
-                    FileEditKind::Delete => out.file_deletes += 1,
-                }
-            }
-            TranscriptEvent::Usage {
-                provider, model, ..
-            } => {
-                out.providers.insert(provider);
-                out.models.insert(model);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// A run's spend for the autoflow views, from its priced usage fold.
-/// `None` when the run spent nothing yet. `cost_partial` = some rows were
-/// priced and some were not.
-fn usage_summary_from_fold(usage: &rupu_cp::usage::UsageSummary) -> Option<AutoflowUsageSummary> {
-    if usage.total_tokens == 0 && usage.cached_tokens == 0 {
-        return None;
-    }
-    Some(AutoflowUsageSummary {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_tokens: usage.cached_tokens,
-        total_tokens: usage.total_tokens,
-        cost_usd: usage.cost_usd,
-        cost_partial: usage.cost_usd.is_some() && !usage.priced,
-    })
-}
-
-fn summarize_workspace_diff(path: &Path) -> Option<AutoflowWorkspaceDiffSummary> {
-    let status_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
-    if !status_out.status.success() {
-        return None;
-    }
-
-    let mut created = 0usize;
-    let mut modified = 0usize;
-    let mut deleted = 0usize;
-    let mut renamed = 0usize;
-    let mut changed_files = BTreeSet::new();
-    let mut top_files = Vec::new();
-    let mut untracked = Vec::new();
-
-    for line in String::from_utf8_lossy(&status_out.stdout).lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let status = &line[..2];
-        let raw_path = line[3..].trim();
-        let path_name = raw_path
-            .split(" -> ")
-            .last()
-            .unwrap_or(raw_path)
-            .trim()
-            .to_string();
-        if path_name.is_empty() {
-            continue;
-        }
-        if changed_files.insert(path_name.clone()) && top_files.len() < 4 {
-            top_files.push(path_name.clone());
-        }
-
-        let mut chars = status.chars();
-        let left = chars.next().unwrap_or(' ');
-        let right = chars.next().unwrap_or(' ');
-        if status == "??" {
-            created += 1;
-            untracked.push(path.join(&path_name));
-        } else if left == 'R' || right == 'R' {
-            renamed += 1;
-        } else if left == 'D' || right == 'D' {
-            deleted += 1;
-        } else if left == 'A' || right == 'A' {
-            created += 1;
-        } else {
-            modified += 1;
-        }
-    }
-
-    let numstat_out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["diff", "--numstat", "--find-renames", "HEAD", "--"])
-        .output()
-        .ok();
-    let mut insertions = 0u64;
-    let mut deletions = 0u64;
-    if let Some(out) = numstat_out.filter(|out| out.status.success()) {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let mut parts = line.splitn(3, '\t');
-            let added = parts.next().unwrap_or("0");
-            let removed = parts.next().unwrap_or("0");
-            insertions += added.parse::<u64>().unwrap_or(0);
-            deletions += removed.parse::<u64>().unwrap_or(0);
-        }
-    }
-    for file in untracked {
-        insertions += count_file_lines(&file).unwrap_or(0);
-    }
-
-    Some(AutoflowWorkspaceDiffSummary {
-        files_changed: changed_files.len(),
-        created,
-        modified,
-        deleted,
-        renamed,
-        insertions,
-        deletions,
-        top_files,
-        merge_target: detect_origin_default_branch(path),
-    })
-}
-
-fn count_file_lines(path: &Path) -> Option<u64> {
-    let content = std::fs::read_to_string(path).ok()?;
-    Some(content.lines().count() as u64)
-}
-
-fn detect_origin_default_branch(path: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args([
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        if let Some(branch) = value.strip_prefix("origin/") {
-            if !branch.is_empty() {
-                return Some(branch.to_string());
-            }
-        }
-    }
-
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
-fn run_duration_ms(record: &rupu_orchestrator::RunRecord) -> u64 {
-    match record.finished_at {
-        Some(finished_at) => (finished_at - record.started_at).num_milliseconds().max(0) as u64,
-        None => (chrono::Utc::now() - record.started_at)
-            .num_milliseconds()
-            .max(0) as u64,
-    }
-}
-
-fn step_status_ui(step: &StepResultRecord) -> UiStatus {
-    if step.skipped {
-        UiStatus::Skipped
-    } else if step.success {
-        UiStatus::Complete
-    } else {
-        UiStatus::Failed
-    }
-}
-
-fn step_summary_detail(step: &StepResultRecord) -> Option<String> {
-    if step.skipped {
-        return Some("skipped".into());
-    }
-    if !step.findings.is_empty() {
-        return Some(format!("{} finding(s)", step.findings.len()));
-    }
-    if !step.items.is_empty() {
-        let ok = step.items.iter().filter(|item| item.success).count();
-        return Some(format!("{ok}/{} item(s) ok", step.items.len()));
-    }
-    let first_line = step
-        .output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("");
-    if first_line.is_empty() {
-        return None;
-    }
-    Some(first_line.to_string())
-}
-
-fn completed_steps(summary: &AutoflowRunSummary) -> usize {
-    summary
-        .steps
-        .iter()
-        .filter(|step| matches!(step.status, UiStatus::Complete | UiStatus::Skipped))
-        .count()
-}
-
-fn format_run_models_line(summary: &AutoflowRunSummary) -> String {
-    let agents = if summary.agents.is_empty() {
-        "—".into()
-    } else {
-        truncate_text(&summary.agents.join(", "), 28)
-    };
-    let providers = if summary.providers.is_empty() {
-        "—".into()
-    } else {
-        truncate_text(&summary.providers.join(", "), 24)
-    };
-    let models = if summary.models.is_empty() {
-        "—".into()
-    } else {
-        truncate_text(&summary.models.join(", "), 36)
-    };
-    format!("agents {agents}  ·  providers {providers}  ·  models {models}")
-}
-
-fn format_run_usage_line(summary: &AutoflowRunSummary) -> String {
-    let counts = format!(
-        "messages {}  ·  tools {}  ·  commands {}  ·  actions {}",
-        format_count(summary.assistant_messages),
-        format_count(summary.tool_calls),
-        format_count(summary.command_runs),
-        format_count(summary.actions_emitted),
-    );
-    match &summary.usage {
-        Some(usage) => format!(
-            "{counts}  ·  tokens {} in / {} out / {} cached  ·  total {}  ·  cost {}",
-            format_count(usage.input_tokens),
-            format_count(usage.output_tokens),
-            format_count(usage.cached_tokens),
-            format_count(usage.total_tokens),
-            format_cost(usage.cost_usd, usage.cost_partial),
-        ),
-        None => counts,
-    }
-}
-
-fn format_run_diff_line(summary: &AutoflowRunSummary) -> String {
-    let edit_counts = format!(
-        "edit events {}  ·  creates {}  ·  modifies {}  ·  deletes {}",
-        format_count(summary.file_edit_events),
-        format_count(summary.file_creates),
-        format_count(summary.file_modifies),
-        format_count(summary.file_deletes),
-    );
-    match &summary.diff {
-        Some(diff) => {
-            let mut parts = vec![format!(
-                "workspace {} file(s)  ·  {} new  ·  {} modified  ·  {} deleted  ·  {} renamed  ·  +{}/-{}",
-                diff.files_changed,
-                diff.created,
-                diff.modified,
-                diff.deleted,
-                diff.renamed,
-                format_count(diff.insertions),
-                format_count(diff.deletions),
-            )];
-            if !diff.top_files.is_empty() {
-                parts.push(format!(
-                    "files {}",
-                    truncate_text(&diff.top_files.join(", "), 44)
-                ));
-            }
-            if let Some(target) = diff.merge_target.as_deref() {
-                parts.push(format!("merge -> {target}"));
-            }
-            format!("{edit_counts}  ·  {}", parts.join("  ·  "))
-        }
-        None => edit_counts,
-    }
-}
-
-fn format_run_metrics_line(summary: &AutoflowRunSummary) -> String {
-    let mut parts = vec![format!(
-        "steps {}/{}",
-        completed_steps(summary),
-        summary.steps.len()
-    )];
-    if let Some(duration_ms) = summary.duration_ms {
-        parts.push(format!(
-            "duration {}",
-            format_duration(std::time::Duration::from_millis(duration_ms))
-        ));
-    }
-    parts.push(format!("tools {}", format_count(summary.tool_calls)));
-    if let Some(usage) = &summary.usage {
-        parts.push(format!("tokens {}", format_count(usage.total_tokens)));
-        parts.push(format!(
-            "cost {}",
-            format_cost(usage.cost_usd, usage.cost_partial)
-        ));
-    }
-    if let Some(diff) = &summary.diff {
-        parts.push(format!(
-            "diff {} file(s) +{}/-{}",
-            diff.files_changed,
-            format_count(diff.insertions),
-            format_count(diff.deletions)
-        ));
-    }
-    parts.join("  ·  ")
-}
-
-fn format_count(n: u64) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out.chars().rev().collect()
-}
-
 fn format_compact_count(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
@@ -7701,13 +6738,6 @@ fn compact_with_suffix(value: f64, suffix: &str) -> String {
         format!("{value:.0}{suffix}")
     } else {
         format!("{value:.1}{suffix}")
-    }
-}
-
-fn format_cost(cost_usd: Option<f64>, partial: bool) -> String {
-    match cost_usd {
-        Some(value) => format!("${value:.4}{}", if partial { "*" } else { "" }),
-        None => "—".into(),
     }
 }
 
@@ -7851,15 +6881,6 @@ fn display_issue_headline(claim: &AutoflowClaimRow) -> String {
         Some(tracker) => format!("{} {}", human_tracker_name(tracker), display),
         None => display.to_string(),
     }
-}
-
-fn truncate_text(value: &str, max: usize) -> String {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.len() <= max {
-        return value.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    format!("{}…", chars.into_iter().take(keep).collect::<String>())
 }
 
 fn autoflow_pricing_config() -> rupu_config::PricingConfig {
@@ -8087,29 +7108,6 @@ fn filter_monitor_cycles(
         .collect()
 }
 
-fn filter_monitor_events(
-    events: Vec<AutoflowHistoryEventRecord>,
-    repo_filter: Option<&str>,
-    worker_filter: Option<&str>,
-) -> Vec<AutoflowHistoryEventRecord> {
-    events
-        .into_iter()
-        .filter(|record| {
-            repo_filter.is_none_or(|filter| {
-                record.repo_filter.as_deref() == Some(filter)
-                    || record.event.repo_ref.as_deref() == Some(filter)
-            })
-        })
-        .filter(|record| {
-            worker_filter_matches(
-                worker_filter,
-                record.worker_id.as_deref().unwrap_or(""),
-                record.worker_name.as_deref().unwrap_or(""),
-            )
-        })
-        .collect()
-}
-
 fn latest_cycle_by_worker(cycles: &[AutoflowCycleRecord]) -> BTreeMap<&str, &AutoflowCycleRecord> {
     let mut out = BTreeMap::new();
     for cycle in cycles {
@@ -8121,39 +7119,6 @@ fn latest_cycle_by_worker(cycles: &[AutoflowCycleRecord]) -> BTreeMap<&str, &Aut
         }
     }
     out
-}
-
-fn worker_filter_matches(filter: Option<&str>, worker_id: &str, worker_name: &str) -> bool {
-    filter.is_none_or(|filter| filter == worker_id || filter == worker_name)
-}
-
-fn monitor_event_name(event: &AutoflowCycleEvent) -> String {
-    match event.kind {
-        rupu_runtime::AutoflowCycleEventKind::WakeConsumed => "wake_consumed",
-        rupu_runtime::AutoflowCycleEventKind::WakeSkipped => "wake_skipped",
-        rupu_runtime::AutoflowCycleEventKind::ClaimAcquired => "claim_acquired",
-        rupu_runtime::AutoflowCycleEventKind::ClaimReleased => "claim_released",
-        rupu_runtime::AutoflowCycleEventKind::ClaimTakeover => "claim_takeover",
-        rupu_runtime::AutoflowCycleEventKind::RunLaunched => "run_launched",
-        rupu_runtime::AutoflowCycleEventKind::IssueCommented => "issue_commented",
-        rupu_runtime::AutoflowCycleEventKind::IssueStateChanged => match event.status.as_deref() {
-            Some("closed") => "issue_closed",
-            Some("open") => "issue_reopened",
-            _ => "issue_state_changed",
-        },
-        rupu_runtime::AutoflowCycleEventKind::PullRequestOpened => match event.status.as_deref() {
-            Some("draft") => "draft_pr_opened",
-            _ => "pr_opened",
-        },
-        rupu_runtime::AutoflowCycleEventKind::AwaitingHuman => "awaiting_human",
-        rupu_runtime::AutoflowCycleEventKind::AwaitingExternal => "awaiting_external",
-        rupu_runtime::AutoflowCycleEventKind::RetryScheduled => "retry_scheduled",
-        rupu_runtime::AutoflowCycleEventKind::DispatchQueued => "dispatch_queued",
-        rupu_runtime::AutoflowCycleEventKind::CleanupPerformed => "cleanup_performed",
-        rupu_runtime::AutoflowCycleEventKind::CycleSkipped => "cycle_skipped",
-        rupu_runtime::AutoflowCycleEventKind::CycleFailed => "cycle_failed",
-    }
-    .into()
 }
 
 fn build_autoflow_live_event_hook(
@@ -8280,18 +7245,6 @@ fn pr_preview_from_input(input: &serde_json::Value) -> Option<String> {
         None
     } else {
         Some(truncate_text(title.trim(), 72))
-    }
-}
-
-fn wake_row_from_record(wake: &WakeRecord, state: &str) -> AutoflowWakeRow {
-    AutoflowWakeRow {
-        wake_id: wake.wake_id.clone(),
-        state: state.to_string(),
-        source: wake_source_name(wake.source).into(),
-        event: wake.event.id.clone(),
-        entity: wake.entity.ref_text.clone(),
-        not_before: wake.not_before.clone(),
-        repo: wake.repo_ref.clone(),
     }
 }
 
@@ -8454,212 +7407,16 @@ async fn explain(
     repo: Option<&str>,
     global_format: Option<crate::output::formats::OutputFormat>,
 ) -> anyhow::Result<()> {
-    let report = explain_report(r#ref, repo)?;
+    let issue_ref = canonical_autoflow_issue_ref(r#ref)?;
+    let report = explain_report(
+        &paths::global_dir()?,
+        &std::env::current_dir()?,
+        &issue_ref,
+        repo,
+        &autoflow_pricing_config(),
+    )?;
     let rendered = render_autoflow_explain_report(&report);
     output_report::emit_detail(global_format, &AutoflowExplainOutput { report, rendered })
-}
-
-/// `rupu autoflow explain`'s JSON report, for the control plane's
-/// `GET /api/autoflows/explain`. A ref that isn't an issue ref is
-/// [`AdminOpError::Invalid`].
-pub(crate) fn explain_json(r#ref: &str, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::to_value(explain_report(r#ref, repo)?)?)
-}
-
-fn explain_report(r#ref: &str, repo: Option<&str>) -> anyhow::Result<AutoflowExplainReport> {
-    let issue_ref =
-        canonical_autoflow_issue_ref(r#ref).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
-    let global = paths::global_dir()?;
-    let pricing = autoflow_pricing_config();
-    let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(&global),
-    };
-    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
-    let run_store = RunStore::new(global.join("runs"));
-    let history_store = AutoflowHistoryStore::new(paths::autoflow_history_dir(&global));
-    let claim = claim_store.load(&issue_ref)?;
-    let issue_ref_parsed = parse_issue_ref_text(&issue_ref)?;
-    let source_matches = if claim.is_none() {
-        visible_autoflow_matches_for_issue(&issue_ref_parsed, repo)?
-    } else {
-        Vec::new()
-    };
-    let repo_ref = match claim.as_ref() {
-        Some(claim) => claim.repo_ref.clone(),
-        None => resolve_repo_binding_for_issue(&issue_ref_parsed, repo)?,
-    };
-    let queued = wakes_for_issue(
-        filter_wakes_by_repo(wake_store.list_queued()?, Some(&repo_ref)),
-        &issue_ref,
-    );
-    let mut processed = wakes_for_issue(
-        filter_wakes_by_repo(wake_store.list_processed()?, Some(&repo_ref)),
-        &issue_ref,
-    );
-    processed.sort_by(|left, right| right.received_at.cmp(&left.received_at));
-    let recent_history = history_rows_from_events(
-        &filter_monitor_events(
-            history_store.list_recent_events(400)?,
-            Some(&repo_ref),
-            None,
-        ),
-        Some(&issue_ref),
-        None,
-        None,
-    )
-    .into_iter()
-    .take(5)
-    .collect::<Vec<_>>();
-    let queued_wakes = queued
-        .iter()
-        .map(|wake| wake_row_from_record(wake, "queued"))
-        .collect::<Vec<_>>();
-    let recent_processed_wake = processed
-        .first()
-        .map(|wake| wake_row_from_record(wake, "processed"));
-    let candidate_workflows = source_matches
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect::<Vec<_>>();
-
-    let claim_report = if let Some(claim) = claim {
-        let active_lock =
-            claim_store
-                .read_active_lock(&issue_ref)?
-                .map(|lock| AutoflowExplainLock {
-                    owner: lock.owner,
-                    acquired_at: lock.acquired_at,
-                    lease_expires: lock.lease_expires_at,
-                });
-        let last_run = match claim.last_run_id.as_deref() {
-            Some(run_id) => match run_store.load(run_id) {
-                Ok(run) => {
-                    let summary = load_run_summary(&run_store, run_id, &pricing);
-                    Some(AutoflowExplainRun {
-                        run_id: run_id.to_string(),
-                        status: run.status.as_str().to_string(),
-                        backend: run.backend_id.unwrap_or_else(|| "-".into()),
-                        worker: run.worker_id.unwrap_or_else(|| "-".into()),
-                        source_wake: run.source_wake_id.as_deref().map(|source_wake_id| {
-                            describe_wake_source(&global, &wake_store, source_wake_id)
-                        }),
-                        approval_step: (run.status == RunStatus::AwaitingApproval)
-                            .then(|| run.awaiting_step_id.unwrap_or_else(|| "-".into())),
-                        approval_expires: (run.status == RunStatus::AwaitingApproval).then(|| {
-                            run.expires_at
-                                .map(|value| value.to_rfc3339())
-                                .unwrap_or_else(|| "-".into())
-                        }),
-                        execution: summary.as_ref().map(format_run_metrics_line),
-                        models: summary.as_ref().map(format_run_models_line),
-                        usage: summary.as_ref().map(format_run_usage_line),
-                        changes: summary.as_ref().map(format_run_diff_line),
-                        started_at: summary
-                            .as_ref()
-                            .map(|summary| summary.started_at.to_rfc3339()),
-                        finished_at: summary.as_ref().map(|summary| {
-                            summary
-                                .finished_at
-                                .as_ref()
-                                .map(|value| value.to_rfc3339())
-                                .unwrap_or_else(|| "-".into())
-                        }),
-                        workspace: summary
-                            .as_ref()
-                            .map(|summary| summary.workspace.as_deref().unwrap_or("-").to_string()),
-                        merge_target: summary.as_ref().map(|summary| {
-                            summary
-                                .diff
-                                .as_ref()
-                                .and_then(|diff| diff.merge_target.as_deref())
-                                .unwrap_or("-")
-                                .to_string()
-                        }),
-                    })
-                }
-                Err(error) => Some(AutoflowExplainRun {
-                    run_id: run_id.to_string(),
-                    status: format!("missing ({error})"),
-                    backend: "-".into(),
-                    worker: "-".into(),
-                    source_wake: None,
-                    approval_step: None,
-                    approval_expires: None,
-                    execution: None,
-                    models: None,
-                    usage: None,
-                    changes: None,
-                    started_at: None,
-                    finished_at: None,
-                    workspace: None,
-                    merge_target: None,
-                }),
-            },
-            None => None,
-        };
-        let priority = selected_priority(&claim).map(|value| value.to_string());
-        let contenders = format_contenders(&claim.contenders);
-        let next_action = next_action_summary(&claim);
-        Some(AutoflowExplainClaim {
-            issue_display: claim.issue_display_ref,
-            issue_title: claim.issue_title,
-            issue_tracker: claim.issue_tracker,
-            issue_state: claim.issue_state_name,
-            source: claim.source_ref,
-            issue_url: claim.issue_url,
-            workflow: claim.workflow,
-            status: status_name(claim.status).to_string(),
-            priority,
-            contenders,
-            workspace: claim.worktree_path.unwrap_or_else(|| "-".into()),
-            branch: claim.branch.unwrap_or_else(|| "-".into()),
-            pr: claim.pr_url.unwrap_or_else(|| "-".into()),
-            claim_owner: claim.claim_owner.unwrap_or_else(|| "-".into()),
-            lease_expires: claim.lease_expires_at.unwrap_or_else(|| "-".into()),
-            active_lock,
-            last_run,
-            next_action,
-            pending_dispatch: claim.pending_dispatch.map(|dispatch| {
-                AutoflowExplainPendingDispatch {
-                    workflow: dispatch.workflow,
-                    target: dispatch.target,
-                    inputs: format_inputs(&dispatch.inputs),
-                }
-            }),
-            next_retry: claim.next_retry_at,
-            summary: claim.last_summary,
-        })
-    } else {
-        None
-    };
-
-    let report = AutoflowExplainReport {
-        kind: "autoflow_explain",
-        version: 1,
-        item: AutoflowExplainItem {
-            issue: issue_ref,
-            repo: repo_ref,
-            status: claim_report
-                .as_ref()
-                .map(|claim| claim.status.clone())
-                .unwrap_or_else(|| "unclaimed".into()),
-            source: claim_report
-                .as_ref()
-                .and_then(|claim| claim.source.clone())
-                .or_else(|| {
-                    source_matches
-                        .first()
-                        .and_then(|entry| entry.autoflow().ok())
-                        .and_then(|autoflow| autoflow.source.clone())
-                }),
-            candidate_workflows,
-            claim: claim_report,
-            queued_wakes,
-            recent_processed_wake,
-            recent_cycle_events: recent_history,
-        },
-    };
-    Ok(report)
 }
 
 async fn doctor(
@@ -8673,170 +7430,16 @@ async fn doctor(
     output_report::emit_collection(global_format, &output)
 }
 
-/// `rupu autoflow doctor`'s JSON report, for the control plane's
-/// `GET /api/autoflows/doctor`.
-pub(crate) fn doctor_json(global: &Path, repo: Option<&str>) -> anyhow::Result<serde_json::Value> {
-    Ok(serde_json::to_value(doctor_report(global, repo)?)?)
-}
-
-fn doctor_report(global: &Path, repo: Option<&str>) -> anyhow::Result<AutoflowDoctorReport> {
-    let global = global.to_path_buf();
-    let repo_filter = normalize_repo_filter(repo)?;
-    let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
-    };
-    let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(&global),
-    };
-    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(&global));
-    let run_store = RunStore::new(global.join("runs"));
-    let mut findings = Vec::new();
-    let claims = filter_claims_by_repo(claim_store.list()?, repo_filter.as_deref());
-    let queued_wakes = filter_wakes_by_repo(wake_store.list_queued()?, repo_filter.as_deref());
-
-    for claim in &claims {
-        if repo_store.load(&claim.repo_ref)?.is_none() {
-            findings.push(DoctorFinding::new(
-                &claim.issue_ref,
-                "missing_repo_binding",
-                format!("repo `{}` is not tracked", claim.repo_ref),
-            ));
-        }
-        if !matches!(claim.status, ClaimStatus::Complete | ClaimStatus::Released)
-            && claim
-                .worktree_path
-                .as_deref()
-                .is_some_and(|path| !Path::new(path).exists())
-        {
-            findings.push(DoctorFinding::new(
-                &claim.issue_ref,
-                "missing_worktree",
-                format!(
-                    "workspace path `{}` does not exist",
-                    claim.worktree_path.as_deref().unwrap_or("-")
-                ),
-            ));
-        }
-        if let Some(manifest_path) = claim.artifact_manifest_path.as_deref() {
-            if !Path::new(manifest_path).exists() {
-                findings.push(DoctorFinding::new(
-                    &claim.issue_ref,
-                    "artifact_missing",
-                    format!("artifact manifest `{manifest_path}` does not exist"),
-                ));
-            }
-        }
-        if let Some(run_id) = claim.last_run_id.as_deref() {
-            match run_store.load(run_id) {
-                Ok(run) => {
-                    if run.issue_ref.as_deref() != Some(claim.issue_ref.as_str()) {
-                        findings.push(DoctorFinding::new(
-                            &claim.issue_ref,
-                            "claim_run_mismatch",
-                            format!(
-                                "run `{run_id}` is bound to `{}`",
-                                run.issue_ref.as_deref().unwrap_or("-")
-                            ),
-                        ));
-                    }
-                    if run.workflow_name != claim.workflow && claim.pending_dispatch.is_none() {
-                        findings.push(DoctorFinding::new(
-                            &claim.issue_ref,
-                            "claim_run_mismatch",
-                            format!(
-                                "claim workflow `{}` disagrees with run workflow `{}`",
-                                claim.workflow, run.workflow_name
-                            ),
-                        ));
-                    }
-                }
-                Err(error) => findings.push(DoctorFinding::new(
-                    &claim.issue_ref,
-                    "missing_run",
-                    format!("last run `{run_id}` could not be loaded: {error}"),
-                )),
-            }
-        }
-        let lock_path = claim_store
-            .root
-            .join(issue_key(&claim.issue_ref))
-            .join(".lock");
-        if lock_path.exists() {
-            match claim_store.read_active_lock(&claim.issue_ref) {
-                Ok(Some(lock)) if claim.status != ClaimStatus::Running => {
-                    findings.push(DoctorFinding::new(
-                        &claim.issue_ref,
-                        "stale_lock",
-                        format!(
-                            "active lock owned by `{}` remains while claim status is `{}`",
-                            lock.owner,
-                            status_name(claim.status)
-                        ),
-                    ))
-                }
-                Err(error) => findings.push(DoctorFinding::new(
-                    &claim.issue_ref,
-                    "stale_lock",
-                    format!("active lock is unreadable: {error}"),
-                )),
-                _ => {}
-            }
-        }
-    }
-
-    for entry in std::fs::read_dir(&claim_store.root)
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let issue_dir = entry.path();
-        let lock_path = issue_dir.join(".lock");
-        let claim_path = issue_dir.join("claim.toml");
-        if lock_path.is_file() && !claim_path.is_file() {
-            findings.push(DoctorFinding::new(
-                issue_dir
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("unknown"),
-                "stale_lock",
-                format!(
-                    "orphan active lock `{}` has no claim.toml",
-                    lock_path.display()
-                ),
-            ));
-        }
-    }
-
-    for wake in &queued_wakes {
-        if let Some(problem) = invalid_wake_payload_detail(&wake_store, wake) {
-            findings.push(DoctorFinding::new(
-                &wake.entity.ref_text,
-                "invalid_wake_payload",
-                format!("wake `{}` {problem}", wake.wake_id),
-            ));
-        }
-    }
-
-    let rows = findings
-        .into_iter()
-        .map(|finding| AutoflowDoctorRow {
-            scope: finding.scope,
-            problem: finding.kind.to_string(),
-            detail: finding.detail,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(AutoflowDoctorReport {
-        kind: "autoflow_doctor",
-        version: 1,
-        ok: rows.is_empty(),
-        rows,
-    })
-}
-
 async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let outcome = repair_claim(&global, r#ref, release, requeue_requested, false)?;
+    // Conflicting flags are refused before the ref is read, so leave a ref
+    // the library won't read as it is.
+    let issue_ref = if release && requeue_requested {
+        r#ref.to_string()
+    } else {
+        canonical_autoflow_issue_ref(r#ref)?
+    };
+    let outcome = repair_claim(&global, &issue_ref, release, requeue_requested, false)?;
     if outcome.repairs.is_empty() {
         println!("no repairs applied for {}", outcome.issue_ref);
     } else {
@@ -8846,143 +7449,6 @@ async fn repair(r#ref: &str, release: bool, requeue_requested: bool) -> anyhow::
         }
     }
     Ok(())
-}
-
-/// What [`repair_claim`] did, or with `dry_run` would do: one line per
-/// repair.
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct RepairOutcome {
-    pub(crate) issue_ref: String,
-    pub(crate) dry_run: bool,
-    pub(crate) repairs: Vec<String>,
-}
-
-/// `rupu autoflow repair <ref> [--release | --requeue]`: delete the claim's
-/// invalid queued wakes, rebuild its missing worktree (unless releasing),
-/// then release the claim or queue a repair wake. `dry_run` checks the same
-/// things and reports each repair as `would …`, changing nothing — the
-/// control plane's `POST /api/autoflows/claims/repair` defaults to it.
-pub(crate) fn repair_claim(
-    global: &Path,
-    r#ref: &str,
-    release: bool,
-    requeue_requested: bool,
-    dry_run: bool,
-) -> anyhow::Result<RepairOutcome> {
-    if release && requeue_requested {
-        return Err(AdminOpError::Invalid(
-            "repair accepts at most one of `--release` or `--requeue`".into(),
-        )
-        .into());
-    }
-
-    let issue_ref =
-        canonical_autoflow_issue_ref(r#ref).map_err(|e| AdminOpError::Invalid(format!("{e:#}")))?;
-    let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(global),
-    };
-    let claim_store = AutoflowClaimStore {
-        root: paths::autoflow_claims_dir(global),
-    };
-    let wake_store = WakeStore::new(paths::autoflow_wakes_dir(global));
-    let Some(mut claim) = claim_store.load(&issue_ref)? else {
-        return Err(AdminOpError::NotFound(format!("no autoflow claim for `{issue_ref}`")).into());
-    };
-    let would = |text: String| {
-        if dry_run {
-            format!("would {text}")
-        } else {
-            text
-        }
-    };
-
-    let mut repairs = Vec::new();
-    let queued = wakes_for_issue(
-        filter_wakes_by_repo(wake_store.list_queued()?, Some(&claim.repo_ref)),
-        &issue_ref,
-    );
-    for wake in queued {
-        if invalid_wake_payload_detail(&wake_store, &wake).is_some() {
-            if !dry_run {
-                wake_store.delete(&wake.wake_id)?;
-            }
-            repairs.push(would(format!(
-                "{} invalid queued wake {}",
-                if dry_run { "delete" } else { "deleted" },
-                wake.wake_id
-            )));
-        }
-    }
-
-    if !release
-        && claim
-            .worktree_path
-            .as_deref()
-            .zip(claim.branch.as_deref())
-            .is_some_and(|(path, _)| !Path::new(path).exists())
-    {
-        let tracked = repo_store
-            .load(&claim.repo_ref)?
-            .ok_or_else(|| anyhow!("repo `{}` is not tracked", claim.repo_ref))?;
-        let branch = claim
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("rupu/{}", issue_dir_name(&claim.issue_ref)));
-        if dry_run {
-            repairs.push(would(format!(
-                "rebuild worktree {} on branch {branch}",
-                claim.worktree_path.as_deref().unwrap_or("-")
-            )));
-        } else {
-            let worktree = ensure_issue_worktree(
-                Path::new(&tracked.preferred_path),
-                &paths::autoflow_worktrees_dir(global),
-                &claim.repo_ref,
-                &claim.issue_ref,
-                &branch,
-                Some("HEAD"),
-            )?;
-            claim.worktree_path = Some(worktree.path.display().to_string());
-            claim.branch = Some(branch);
-            claim.updated_at = chrono::Utc::now().to_rfc3339();
-            claim_store.save(&claim)?;
-            repairs.push(format!(
-                "rebuilt worktree {}",
-                claim.worktree_path.as_deref().unwrap_or("-")
-            ));
-        }
-    }
-
-    if release {
-        if !dry_run {
-            cleanup_claim_artifacts(&repo_store, &claim)?;
-            claim_store.delete(&issue_ref)?;
-        }
-        repairs.push(would(format!(
-            "{} claim {issue_ref}",
-            if dry_run { "release" } else { "released" }
-        )));
-    } else if requeue_requested {
-        if dry_run {
-            repairs.push(would("queue a repair wake".to_string()));
-        } else {
-            let wake = enqueue_issue_wake(
-                &wake_store,
-                WakeSource::Repair,
-                &claim.repo_ref,
-                &issue_ref,
-                "autoflow.repair.requeue",
-                chrono::Utc::now(),
-            )?;
-            repairs.push(format!("queued repair wake {}", wake.wake_id));
-        }
-    }
-
-    Ok(RepairOutcome {
-        issue_ref,
-        dry_run,
-        repairs,
-    })
 }
 
 async fn requeue(r#ref: &str, event: Option<&str>, not_before: Option<&str>) -> anyhow::Result<()> {
@@ -9294,562 +7760,15 @@ async fn release(r#ref: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn visible_autoflow_matches(
-    name: &str,
-    repo: Option<&str>,
-) -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
-    let repo_filter = normalize_repo_filter(repo)?;
-    let mut entries = visible_autoflows()?
-        .into_iter()
-        .filter(|entry| entry.name == name)
-        .collect::<Vec<_>>();
-    entries = filter_visible_autoflows(entries, repo_filter.as_deref());
-    entries.sort_by(|left, right| {
-        left.repo_ref
-            .cmp(&right.repo_ref)
-            .then_with(|| left.scope.cmp(&right.scope))
-            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
-    });
-    Ok(entries)
-}
-
-fn visible_autoflow_matches_for_issue(
-    issue_ref: &IssueRef,
-    repo: Option<&str>,
-) -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
-    let repo_filter = normalize_repo_filter(repo)?;
-    let mut entries = visible_autoflows()?
-        .into_iter()
-        .filter(|entry| issue_matches_visible_source(issue_ref, entry))
-        .collect::<Vec<_>>();
-    entries = filter_visible_autoflows(entries, repo_filter.as_deref());
-    entries.sort_by(|left, right| {
-        left.repo_ref
-            .cmp(&right.repo_ref)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.scope.cmp(&right.scope))
-            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
-    });
-    Ok(entries)
-}
-
-fn issue_matches_visible_source(issue_ref: &IssueRef, entry: &VisibleAutoflowWorkflow) -> bool {
-    let Ok(autoflow) = entry.autoflow() else {
-        return false;
-    };
-    if let Some(source) = autoflow.source.as_deref() {
-        return source_matches_issue_ref(source, issue_ref);
-    }
-    entry
-        .repo_ref
-        .as_deref()
-        .is_some_and(|repo_ref| repo_ref_matches_issue_ref(repo_ref, issue_ref))
-}
-
-fn source_matches_issue_ref(source: &str, issue_ref: &IssueRef) -> bool {
-    let Ok(source_ref) = source.parse::<EventSourceRef>() else {
-        return false;
-    };
-    match source_ref {
-        EventSourceRef::Repo { repo } => match issue_ref.tracker {
-            IssueTracker::Github => {
-                repo.platform == Platform::Github
-                    && issue_ref.project == format!("{}/{}", repo.owner, repo.repo)
-            }
-            IssueTracker::Gitlab => {
-                repo.platform == Platform::Gitlab
-                    && issue_ref.project == format!("{}/{}", repo.owner, repo.repo)
-            }
-            IssueTracker::Linear | IssueTracker::Jira => false,
-        },
-        EventSourceRef::TrackerProject {
-            tracker, project, ..
-        } => {
-            tracker == issue_ref.tracker
-                && match tracker {
-                    IssueTracker::Jira => {
-                        project == issue_ref.project
-                            || (!project.contains('/')
-                                && issue_ref
-                                    .project
-                                    .rsplit('/')
-                                    .next()
-                                    .is_some_and(|suffix| suffix == project))
-                    }
-                    IssueTracker::Github | IssueTracker::Gitlab | IssueTracker::Linear => {
-                        project == issue_ref.project
-                    }
-                }
-        }
-    }
-}
-
-fn repo_ref_matches_issue_ref(repo_ref: &str, issue_ref: &IssueRef) -> bool {
-    issue_ref_to_repo_ref(&format_issue_ref(issue_ref))
-        .map(|expected| expected == repo_ref)
-        .unwrap_or(false)
-}
-
-fn resolve_repo_binding_for_issue(
-    issue_ref: &IssueRef,
-    repo: Option<&str>,
-) -> anyhow::Result<String> {
-    let issue_ref_text = format_issue_ref(issue_ref);
-    if let Some(repo) = normalize_repo_filter(repo)? {
-        return Ok(repo);
-    }
-    if let Ok(repo_ref) = issue_ref_to_repo_ref(&issue_ref_text) {
-        return Ok(repo_ref);
-    }
-    let matches = visible_autoflow_matches_for_issue(issue_ref, None)?;
-    let repos = matches
-        .iter()
-        .filter_map(|entry| entry.repo_ref.clone())
-        .collect::<BTreeSet<_>>();
-    match repos.len() {
-        0 => bail!("no visible autoflow is bound to tracker issue `{issue_ref_text}`"),
-        1 => Ok(repos.into_iter().next().expect("one repo binding")),
-        _ => bail!(
-            "multiple repo bindings are visible for tracker issue `{issue_ref_text}`: {}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
-            repos.into_iter().collect::<Vec<_>>().join(", ")
-        ),
-    }
-}
-
-fn issue_ref_for_autoflow(
-    issue_ref: &IssueRef,
-    resolved: &ResolvedAutoflowWorkflow,
-) -> anyhow::Result<IssueRef> {
-    let autoflow = resolved.autoflow()?;
-    let Some(source) = autoflow.source.as_deref() else {
-        return Ok(issue_ref.clone());
-    };
-    if issue_ref.tracker != IssueTracker::Jira || !source_matches_issue_ref(source, issue_ref) {
-        return Ok(issue_ref.clone());
-    }
-    let Ok(EventSourceRef::TrackerProject {
-        tracker, project, ..
-    }) = source.parse::<EventSourceRef>()
-    else {
-        return Ok(issue_ref.clone());
-    };
-    if tracker != IssueTracker::Jira {
-        return Ok(issue_ref.clone());
-    }
-    let mut adjusted = issue_ref.clone();
-    adjusted.project = project;
-    Ok(adjusted)
-}
-
-fn normalize_repo_filter(repo: Option<&str>) -> anyhow::Result<Option<String>> {
-    let Some(repo) = repo else {
-        return Ok(None);
-    };
-    let parsed = crate::run_target::parse_run_target(repo)
-        .map_err(|err| AdminOpError::Invalid(format!("invalid repo filter `{repo}`: {err}")))?;
-    match parsed {
-        crate::run_target::RunTarget::Repo {
-            platform,
-            owner,
-            repo,
-            ..
-        } => Ok(Some(format!("{platform}:{owner}/{repo}"))),
-        _ => bail!("invalid repo filter `{repo}`: expected `<platform>:<owner>/<repo>`"),
-    }
-}
-
-fn filter_visible_autoflows(
-    entries: Vec<VisibleAutoflowWorkflow>,
-    repo_filter: Option<&str>,
-) -> Vec<VisibleAutoflowWorkflow> {
-    match repo_filter {
-        Some(repo_ref) => entries
-            .into_iter()
-            .filter(|entry| entry.repo_ref.as_deref() == Some(repo_ref))
-            .collect(),
-        None => entries,
-    }
-}
-
-fn filter_claims_by_repo(
-    claims: Vec<AutoflowClaimRecord>,
-    repo_filter: Option<&str>,
-) -> Vec<AutoflowClaimRecord> {
-    match repo_filter {
-        Some(repo_ref) => claims
-            .into_iter()
-            .filter(|claim| claim.repo_ref == repo_ref)
-            .collect(),
-        None => claims,
-    }
-}
-
-fn filter_wakes_by_repo(wakes: Vec<WakeRecord>, repo_filter: Option<&str>) -> Vec<WakeRecord> {
-    match repo_filter {
-        Some(repo_ref) => wakes
-            .into_iter()
-            .filter(|wake| wake.repo_ref == repo_ref)
-            .collect(),
-        None => wakes,
-    }
-}
-
-fn wakes_for_issue(wakes: Vec<WakeRecord>, issue_ref: &str) -> Vec<WakeRecord> {
-    wakes
-        .into_iter()
-        .filter(|wake| {
-            wake.entity.kind == WakeEntityKind::Issue && wake.entity.ref_text == issue_ref
-        })
-        .collect()
-}
-
-fn wake_source_name(source: WakeSource) -> &'static str {
-    match source {
-        WakeSource::Manual => "manual",
-        WakeSource::CronPoll => "cron_poll",
-        WakeSource::Webhook => "webhook",
-        WakeSource::AutoflowDispatch => "dispatch",
-        WakeSource::Retry => "retry",
-        WakeSource::ApprovalResume => "approval_resume",
-        WakeSource::Repair => "repair",
-    }
-}
-
+/// An issue ref's claim key: the full form
+/// ([`rupu_autoflow::refs::canonical_issue_ref`]), else a short form
+/// resolved against the working directory's checkout (`42`, `#42`,
+/// `owner/repo#42`).
 fn canonical_autoflow_issue_ref(value: &str) -> anyhow::Result<String> {
-    if let Ok(issue) = parse_issue_ref_text(value) {
-        return Ok(format!(
-            "{}:{}/issues/{}",
-            issue.tracker.as_str(),
-            issue.project,
-            issue.number
-        ));
+    if let Ok(issue_ref) = rupu_autoflow::refs::canonical_issue_ref(value) {
+        return Ok(issue_ref);
     }
     canonical_repo_issue_ref(value)
-}
-
-fn issue_ref_to_repo_ref(issue_ref: &str) -> anyhow::Result<String> {
-    let issue = parse_issue_ref_text(issue_ref)?;
-    match issue.tracker {
-        IssueTracker::Github | IssueTracker::Gitlab => {
-            Ok(format!("{}:{}", issue.tracker, issue.project))
-        }
-        IssueTracker::Linear | IssueTracker::Jira => Err(anyhow!(
-            "tracker issue `{issue_ref}` does not imply a repo binding"
-        )),
-    }
-}
-
-fn format_inputs(inputs: &BTreeMap<String, String>) -> String {
-    if inputs.is_empty() {
-        return "-".into();
-    }
-    inputs
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn describe_wake_source(global: &Path, wake_store: &WakeStore, wake_id: &str) -> String {
-    match wake_store.load(wake_id) {
-        Ok(wake) => {
-            let state = if paths::autoflow_wake_queue_dir(global)
-                .join(format!("{wake_id}.json"))
-                .is_file()
-            {
-                "queued"
-            } else if paths::autoflow_wake_processed_dir(global)
-                .join(format!("{wake_id}.json"))
-                .is_file()
-            {
-                "processed"
-            } else {
-                "unknown"
-            };
-            format!(
-                "{wake_id} [{state}] {} {}",
-                wake_source_name(wake.source),
-                wake.event.id
-            )
-        }
-        Err(error) => format!("{wake_id} (missing: {error})"),
-    }
-}
-
-fn invalid_wake_payload_detail(wake_store: &WakeStore, wake: &WakeRecord) -> Option<String> {
-    let payload_ref = wake.payload_ref.as_ref()?;
-    if !payload_ref.is_file() {
-        return Some(format!(
-            "references missing payload `{}`",
-            payload_ref.display()
-        ));
-    }
-    match wake_store.read_payload(&wake.wake_id) {
-        Ok(_) => None,
-        Err(error) => Some(format!("has unreadable payload: {error}")),
-    }
-}
-
-fn enqueue_issue_wake(
-    wake_store: &WakeStore,
-    source: WakeSource,
-    repo_ref: &str,
-    issue_ref: &str,
-    event_id: &str,
-    not_before: chrono::DateTime<chrono::Utc>,
-) -> anyhow::Result<WakeRecord> {
-    Ok(wake_store.enqueue(WakeEnqueueRequest {
-        source,
-        repo_ref: repo_ref.to_string(),
-        entity: WakeEntity {
-            kind: WakeEntityKind::Issue,
-            ref_text: issue_ref.to_string(),
-        },
-        event: WakeEvent {
-            id: event_id.to_string(),
-            delivery_id: None,
-            dedupe_key: None,
-        },
-        payload: None,
-        received_at: chrono::Utc::now().to_rfc3339(),
-        not_before: not_before.to_rfc3339(),
-    })?)
-}
-
-#[derive(Debug)]
-struct DoctorFinding {
-    scope: String,
-    kind: &'static str,
-    detail: String,
-}
-
-impl DoctorFinding {
-    fn new(scope: impl Into<String>, kind: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            scope: scope.into(),
-            kind,
-            detail: detail.into(),
-        }
-    }
-}
-
-fn visible_autoflows() -> anyhow::Result<Vec<VisibleAutoflowWorkflow>> {
-    let global = paths::global_dir()?;
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
-    let repo_store = RepoRegistryStore {
-        root: paths::repos_dir(&global),
-    };
-    let mut seen = BTreeSet::new();
-    let mut out = Vec::new();
-
-    if let Some(project_root) = &project_root {
-        let cfg = resolve_config_in(&global, Some(project_root), &pwd)?;
-        let repo_ref = cfg.autoflow.repo.clone().or_else(|| {
-            autodetect_repo_from_path(project_root)
-                .ok()
-                .map(|repo| canonical_repo_ref(&repo))
-        });
-        push_visible_workflow_paths(
-            &project_root.join(".rupu/workflows"),
-            "project",
-            Some(project_root),
-            repo_ref.clone(),
-            Some(project_root.clone()),
-            &mut seen,
-            &mut out,
-        )?;
-        push_visible_workflow_paths(
-            &global.join("workflows"),
-            "global",
-            Some(project_root),
-            repo_ref,
-            Some(project_root.clone()),
-            &mut seen,
-            &mut out,
-        )?;
-    } else {
-        let global_cfg = resolve_config(&global, None)?;
-        push_visible_workflow_paths(
-            &global.join("workflows"),
-            "global",
-            None,
-            global_cfg.autoflow.repo.clone(),
-            None,
-            &mut seen,
-            &mut out,
-        )?;
-    }
-
-    for resolved in discover_tick_autoflows(&global, &repo_store)? {
-        let key = visible_autoflow_key(
-            Some(&resolved.repo_ref),
-            &resolved.scope,
-            &resolved.workflow_path,
-        );
-        if !seen.insert(key) {
-            continue;
-        }
-        out.push(VisibleAutoflowWorkflow {
-            scope: resolved.scope,
-            name: resolved.name,
-            workflow_path: resolved.workflow_path,
-            workflow: resolved.workflow,
-            project_root: resolved.project_root,
-            repo_ref: Some(resolved.repo_ref),
-            preferred_checkout: Some(resolved.preferred_checkout),
-        });
-    }
-
-    out.sort_by(|left, right| {
-        left.repo_ref
-            .cmp(&right.repo_ref)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.scope.cmp(&right.scope))
-            .then_with(|| left.workflow_path.cmp(&right.workflow_path))
-    });
-    Ok(out)
-}
-
-fn push_visible_workflow_paths(
-    dir: &Path,
-    scope: &str,
-    preferred_checkout: Option<&Path>,
-    repo_ref: Option<String>,
-    project_root: Option<PathBuf>,
-    seen: &mut BTreeSet<String>,
-    into: &mut Vec<VisibleAutoflowWorkflow>,
-) -> anyhow::Result<()> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in rd {
-        let entry = entry?;
-        let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str());
-        if !matches!(ext, Some("yaml" | "yml")) {
-            continue;
-        }
-        let body = std::fs::read_to_string(&path)?;
-        let workflow = Workflow::parse(&body)?;
-        if !workflow
-            .autoflow
-            .as_ref()
-            .map(|a| a.enabled)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let key = visible_autoflow_key(repo_ref.as_deref(), scope, &path);
-        if !seen.insert(key) {
-            continue;
-        }
-        into.push(VisibleAutoflowWorkflow {
-            scope: scope.to_string(),
-            name: workflow.name.clone(),
-            workflow,
-            workflow_path: path,
-            project_root: project_root.clone(),
-            repo_ref: repo_ref.clone(),
-            preferred_checkout: preferred_checkout.map(Path::to_path_buf),
-        });
-    }
-    Ok(())
-}
-
-fn visible_autoflow_key(repo_ref: Option<&str>, scope: &str, path: &Path) -> String {
-    format!("{}|{}|{}", repo_ref.unwrap_or("-"), scope, path.display())
-}
-
-pub(crate) fn discover_tick_autoflows(
-    global: &Path,
-    repo_store: &RepoRegistryStore,
-) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
-    // Skips are logged by `record_repo_config_skip`; callers that keep an
-    // autoflow history use `discover_tick_autoflows_reporting`.
-    discover_tick_autoflows_reporting(global, repo_store, &mut Vec::new())
-}
-
-/// [`discover_tick_autoflows`], also returning (in `skips`) each tracked
-/// repo left out because its config failed to load — one broken repo (a
-/// dangling customer assignment, a malformed layer) never stops discovery
-/// for the others.
-pub(crate) fn discover_tick_autoflows_reporting(
-    global: &Path,
-    repo_store: &RepoRegistryStore,
-    skips: &mut Vec<RepoConfigSkip>,
-) -> anyhow::Result<Vec<ResolvedAutoflowWorkflow>> {
-    let mut out = Vec::new();
-    let global_cfg = resolve_config(global, None)?;
-    if global_cfg.autoflow.enabled.unwrap_or(true) {
-        if let Some(repo_ref) = global_cfg.autoflow.repo.clone() {
-            if let Some(tracked) = repo_store.load(&repo_ref)? {
-                let preferred_checkout = PathBuf::from(&tracked.preferred_path);
-                let project_root = paths::project_root_for(&preferred_checkout)?
-                    .or_else(|| Some(preferred_checkout.clone()));
-                push_resolved_autoflow_paths(
-                    &global.join("workflows"),
-                    "global",
-                    global,
-                    project_root,
-                    repo_ref,
-                    preferred_checkout,
-                    global_cfg.clone(),
-                    &mut out,
-                )?;
-            } else {
-                warn!(
-                    repo_ref,
-                    "skipping global autoflows because repo is not tracked"
-                );
-            }
-        }
-    }
-
-    for tracked in repo_store.list()? {
-        let preferred_checkout = PathBuf::from(&tracked.preferred_path);
-        if !preferred_checkout.exists() {
-            warn!(path = %preferred_checkout.display(), repo_ref = %tracked.repo_ref, "skipping tracked repo because preferred checkout is missing");
-            continue;
-        }
-        let project_root = paths::project_root_for(&preferred_checkout)?.or_else(|| {
-            preferred_checkout
-                .join(".rupu")
-                .is_dir()
-                .then_some(preferred_checkout.clone())
-        });
-        let Some(project_root) = project_root else {
-            continue;
-        };
-        let cfg = match resolve_config_in(global, Some(&project_root), &preferred_checkout) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                record_repo_config_skip(skips, &tracked.repo_ref, &e);
-                continue;
-            }
-        };
-        if cfg.autoflow.enabled == Some(false) {
-            continue;
-        }
-        push_resolved_autoflow_paths(
-            &project_root.join(".rupu/workflows"),
-            "project",
-            global,
-            Some(project_root),
-            tracked.repo_ref.clone(),
-            preferred_checkout,
-            cfg,
-            &mut out,
-        )?;
-    }
-
-    out.sort_by(|left, right| {
-        left.repo_ref
-            .cmp(&right.repo_ref)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.scope.cmp(&right.scope))
-    });
-    Ok(out)
 }
 
 pub(crate) async fn collect_wake_hints(
@@ -11229,23 +9148,6 @@ pub(crate) async fn execute_autoflow_cycle(
     }
 }
 
-fn resolve_autoflow_permission_mode(
-    mode_override: Option<&str>,
-    config_mode: Option<&str>,
-) -> anyhow::Result<String> {
-    let mode = mode_override
-        .map(ToOwned::to_owned)
-        .or_else(|| config_mode.map(ToOwned::to_owned))
-        .unwrap_or_else(|| "bypass".to_string());
-    match mode.as_str() {
-        "bypass" | "readonly" => Ok(mode),
-        "ask" => {
-            bail!("autoflow does not support `ask` permission mode; use `bypass` or `readonly`")
-        }
-        _ => bail!("invalid autoflow permission mode `{mode}`; expected `bypass` or `readonly`"),
-    }
-}
-
 pub(crate) fn reconcile_claim_from_last_run(
     global: &Path,
     resolved: &ResolvedAutoflowWorkflow,
@@ -11778,16 +9680,6 @@ pub(crate) fn updated_before_tick(
     Ok(updated < tick_started_at)
 }
 
-pub(crate) fn claim_lease_expired(claim: &AutoflowClaimRecord) -> anyhow::Result<bool> {
-    let Some(lease_expires_at) = claim.lease_expires_at.as_deref() else {
-        return Ok(false);
-    };
-    let lease = chrono::DateTime::parse_from_rfc3339(lease_expires_at)
-        .with_context(|| format!("parse lease expiry for `{}`", claim.issue_ref))?
-        .with_timezone(&chrono::Utc);
-    Ok(lease <= chrono::Utc::now())
-}
-
 pub(crate) fn claim_counts_toward_max_active(status: ClaimStatus) -> bool {
     !matches!(status, ClaimStatus::Complete | ClaimStatus::Released)
 }
@@ -11828,51 +9720,6 @@ fn wake_events_match(
             .iter()
             .any(|event_id| rupu_orchestrator::event_matches(pattern, event_id))
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_resolved_autoflow_paths(
-    dir: &Path,
-    scope: &str,
-    global: &Path,
-    project_root: Option<PathBuf>,
-    repo_ref: String,
-    preferred_checkout: PathBuf,
-    cfg: Config,
-    into: &mut Vec<ResolvedAutoflowWorkflow>,
-) -> anyhow::Result<()> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in rd {
-        let entry = entry?;
-        let path = entry.path();
-        let ext = path.extension().and_then(|s| s.to_str());
-        if !matches!(ext, Some("yaml" | "yml")) {
-            continue;
-        }
-        let body = std::fs::read_to_string(&path)?;
-        let workflow = Workflow::parse(&body)?;
-        if !workflow
-            .autoflow
-            .as_ref()
-            .map(|autoflow| autoflow.enabled)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let resolved = resolve_autoflow_from_path(
-            global,
-            path,
-            scope.to_string(),
-            project_root.clone(),
-            repo_ref.clone(),
-            preferred_checkout.clone(),
-            cfg.clone(),
-        )?;
-        into.push(resolved);
-    }
-    Ok(())
 }
 
 pub(crate) fn resolve_autoflow_workflow_for_repo(
@@ -12040,111 +9887,6 @@ pub(crate) async fn execute_pending_dispatch_workflow(
     }
 }
 
-fn resolve_autoflow_workflow_for_issue(
-    global: &Path,
-    name: &str,
-    issue_ref: &IssueRef,
-    repo: Option<&str>,
-) -> anyhow::Result<ResolvedAutoflowWorkflow> {
-    let matches = visible_autoflow_matches_for_issue(issue_ref, repo)?
-        .into_iter()
-        .filter(|entry| entry.name == name)
-        .collect::<Vec<_>>();
-    let entry = match matches.as_slice() {
-        [] => {
-            let issue_ref_text = format_issue_ref(issue_ref);
-            return Err(AdminOpError::NotFound(match repo {
-                Some(repo) => format!(
-                    "no autoflow named `{name}` is visible for issue `{issue_ref_text}` and repo `{repo}`"
-                ),
-                None => format!("no autoflow named `{name}` is visible for issue `{issue_ref_text}`"),
-            })
-            .into());
-        }
-        [entry] => entry.clone(),
-        many => {
-            let mut options = many
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "- {} ({}, {})",
-                        entry.repo_ref.as_deref().unwrap_or("-"),
-                        entry.scope,
-                        entry.workflow_path.display()
-                    )
-                })
-                .collect::<Vec<_>>();
-            options.sort();
-            return Err(AdminOpError::Conflict(format!(
-                "multiple autoflows named `{name}` are visible for issue `{}`:\n{}\npass `--repo <platform>:<owner>/<repo>` to disambiguate",
-                format_issue_ref(issue_ref),
-                options.join("\n")
-            ))
-            .into());
-        }
-    };
-    resolve_visible_autoflow_workflow(global, &entry)
-}
-
-fn resolve_visible_autoflow_workflow(
-    global: &Path,
-    entry: &VisibleAutoflowWorkflow,
-) -> anyhow::Result<ResolvedAutoflowWorkflow> {
-    let repo_ref = entry
-        .repo_ref
-        .clone()
-        .ok_or_else(|| anyhow!("autoflow `{}` is missing a repo binding", entry.name))?;
-    let preferred_checkout = entry
-        .preferred_checkout
-        .clone()
-        .or_else(|| entry.project_root.clone())
-        .ok_or_else(|| anyhow!("autoflow `{}` is missing a preferred checkout", entry.name))?;
-    let cfg = resolve_config_in(global, entry.project_root.as_deref(), &preferred_checkout)?;
-    resolve_autoflow_from_path(
-        global,
-        entry.workflow_path.clone(),
-        entry.scope.clone(),
-        entry.project_root.clone(),
-        repo_ref,
-        preferred_checkout,
-        cfg,
-    )
-}
-
-fn resolve_autoflow_from_path(
-    _global: &Path,
-    workflow_path: PathBuf,
-    scope: String,
-    project_root: Option<PathBuf>,
-    repo_ref: String,
-    preferred_checkout: PathBuf,
-    cfg: Config,
-) -> anyhow::Result<ResolvedAutoflowWorkflow> {
-    let body = std::fs::read_to_string(&workflow_path)?;
-    let workflow = Workflow::parse(&body)?;
-    let enabled = workflow
-        .autoflow
-        .as_ref()
-        .map(|autoflow| autoflow.enabled)
-        .unwrap_or(false);
-    if !enabled {
-        bail!(
-            "workflow `{}` does not declare `autoflow.enabled = true`",
-            workflow.name
-        );
-    }
-    Ok(ResolvedAutoflowWorkflow {
-        scope,
-        name: workflow.name.clone(),
-        workflow,
-        workflow_path,
-        project_root,
-        repo_ref,
-        preferred_checkout,
-        cfg,
-    })
-}
-
 fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Value> {
     let mut value = serde_json::to_value(issue)?;
     if let Some(obj) = value.as_object_mut() {
@@ -12163,55 +9905,6 @@ fn issue_payload(cfg: &Config, issue: &Issue) -> anyhow::Result<serde_json::Valu
         }
     }
     Ok(value)
-}
-
-/// Global + customer + project config for `project_root`, strictly (a
-/// dangling customer assignment is an error), with the customer looked up
-/// from `project_root` itself. With no project this serves no project, so it
-/// reads the global file alone. Prefer [`resolve_config_in`] wherever the
-/// repo's own directory is known.
-fn resolve_config(global: &Path, project_root: Option<&Path>) -> anyhow::Result<Config> {
-    match project_root {
-        Some(root) => resolve_config_in(global, Some(root), root),
-        None => Ok(rupu_config::layer_files_locked(
-            rupu_config::LayerPaths::global_only(&global.join("config.toml")),
-        )?),
-    }
-}
-
-/// [`resolve_config`] with the customer looked up from `run_dir` (a tracked
-/// repo's checkout, the cwd) first — `project_root_for` resolves to `$HOME`
-/// for a repo without its own `.rupu/`, which would miss the repo's
-/// assignment (see [`paths::config_paths`]).
-fn resolve_config_in(
-    global: &Path,
-    project_root: Option<&Path>,
-    run_dir: &Path,
-) -> anyhow::Result<Config> {
-    let cfg_paths = paths::config_paths(global, project_root, run_dir)?;
-    Ok(rupu_config::layer_files_locked(cfg_paths.layers())?)
-}
-
-/// A tracked repo an autoflow tick left out because its config (customer
-/// layer included) failed to load. The tick records each as a
-/// `cycle_failed` event naming the repo, so the skip is visible in the
-/// autoflow history rather than only in a log line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RepoConfigSkip {
-    pub(crate) repo_ref: String,
-    pub(crate) error: String,
-}
-
-fn record_repo_config_skip(skips: &mut Vec<RepoConfigSkip>, repo_ref: &str, error: &anyhow::Error) {
-    let error = format!("{error:#}");
-    warn!(repo_ref, error = %error, "skipping tracked repo this cycle: its config failed to load");
-    let skip = RepoConfigSkip {
-        repo_ref: repo_ref.to_string(),
-        error,
-    };
-    if !skips.contains(&skip) {
-        skips.push(skip);
-    }
 }
 
 pub(crate) fn cleanup_terminal_claims(
@@ -12294,35 +9987,6 @@ fn claim_cleanup_due(
         .with_context(|| format!("parse claim updated_at for `{}`", claim.issue_ref))?
         .with_timezone(&chrono::Utc);
     Ok(updated_at + cleanup_after <= now)
-}
-
-fn cleanup_claim_artifacts(
-    repo_store: &RepoRegistryStore,
-    claim: &AutoflowClaimRecord,
-) -> anyhow::Result<()> {
-    let Some(worktree_path) = claim.worktree_path.as_deref() else {
-        return Ok(());
-    };
-    let worktree_path = PathBuf::from(worktree_path);
-    if !worktree_path.exists() {
-        return Ok(());
-    }
-    let tracked = repo_store
-        .load(&claim.repo_ref)?
-        .ok_or_else(|| anyhow!("repo `{}` is not tracked", claim.repo_ref))?;
-    let preferred_checkout = PathBuf::from(&tracked.preferred_path);
-    let preferred_canonical = preferred_checkout
-        .canonicalize()
-        .unwrap_or_else(|_| preferred_checkout.clone());
-    let worktree_canonical = worktree_path
-        .canonicalize()
-        .unwrap_or_else(|_| worktree_path.clone());
-    if worktree_canonical == preferred_canonical {
-        return Ok(());
-    }
-    remove_issue_worktree(&preferred_checkout, &worktree_path)
-        .with_context(|| format!("remove worktree {}", worktree_path.display()))?;
-    Ok(())
 }
 
 fn build_issue_filter(autoflow: &rupu_orchestrator::Autoflow) -> IssueFilter {
@@ -12425,27 +10089,6 @@ pub(crate) async fn fetch_issue(
         .map_err(anyhow::Error::from)
 }
 
-fn parse_full_issue_target(target: &str) -> anyhow::Result<IssueRef> {
-    match crate::run_target::parse_run_target(target) {
-        Ok(crate::run_target::RunTarget::Issue {
-            tracker,
-            project,
-            number,
-        }) => Ok(IssueRef {
-            tracker,
-            project,
-            number,
-        }),
-        _ => {
-            bail!("autoflow run requires an issue target in `<platform>:<project>/issues/<N>` form")
-        }
-    }
-}
-
-pub(crate) fn parse_issue_ref_text(value: &str) -> anyhow::Result<IssueRef> {
-    IssueRef::parse_full(value).map_err(|e| anyhow!(e))
-}
-
 fn resolved_source_ref_text(resolved: &ResolvedAutoflowWorkflow) -> anyhow::Result<String> {
     Ok(resolved
         .autoflow()?
@@ -12542,13 +10185,6 @@ fn autoflow_poll_source_due(
         Err(_) => return Ok(true),
     };
     Ok(last_polled + parse_duration(interval)? <= now)
-}
-
-fn format_issue_ref(issue_ref: &IssueRef) -> String {
-    format!(
-        "{}:{}/issues/{}",
-        issue_ref.tracker, issue_ref.project, issue_ref.number
-    )
 }
 
 fn issue_display_ref(issue: &Issue) -> String {
@@ -12675,46 +10311,6 @@ fn parse_duration(value: &str) -> anyhow::Result<chrono::Duration> {
     Ok(duration)
 }
 
-fn status_name(status: ClaimStatus) -> &'static str {
-    match status {
-        ClaimStatus::Eligible => "eligible",
-        ClaimStatus::Claimed => "claimed",
-        ClaimStatus::Running => "running",
-        ClaimStatus::AwaitHuman => "await_human",
-        ClaimStatus::AwaitExternal => "await_external",
-        ClaimStatus::RetryBackoff => "retry_backoff",
-        ClaimStatus::Blocked => "blocked",
-        ClaimStatus::Complete => "complete",
-        ClaimStatus::Released => "released",
-    }
-}
-
-fn selected_priority(claim: &AutoflowClaimRecord) -> Option<i32> {
-    claim
-        .contenders
-        .iter()
-        .find(|contender| contender.selected)
-        .map(|contender| contender.priority)
-}
-
-fn next_action_summary(claim: &AutoflowClaimRecord) -> String {
-    if let Some(dispatch) = &claim.pending_dispatch {
-        return format!("dispatch {}", dispatch.workflow);
-    }
-    if let Some(next_retry_at) = &claim.next_retry_at {
-        return format!("retry {next_retry_at}");
-    }
-    match claim.status {
-        ClaimStatus::AwaitHuman => "human approval".into(),
-        ClaimStatus::AwaitExternal => "external change".into(),
-        ClaimStatus::Running => claim
-            .last_run_id
-            .clone()
-            .unwrap_or_else(|| "running".into()),
-        _ => claim.last_run_id.clone().unwrap_or_else(|| "-".into()),
-    }
-}
-
 fn claim_summary(claim: &AutoflowClaimRecord) -> String {
     claim
         .last_summary
@@ -12734,20 +10330,6 @@ fn truncate_for_table(value: &str, max_chars: usize) -> String {
         .take(max_chars.saturating_sub(1))
         .collect::<String>();
     format!("{head}…")
-}
-
-fn format_contenders(contenders: &[AutoflowContender]) -> String {
-    if contenders.is_empty() {
-        return "-".into();
-    }
-    contenders
-        .iter()
-        .map(|contender| {
-            let selected = if contender.selected { "*" } else { "" };
-            format!("{selected}{}[{}]", contender.workflow, contender.priority)
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 #[cfg(test)]
@@ -18805,127 +16387,5 @@ steps:
                 "no repo connector to verify collaborator status must fail closed"
             );
         }
-    }
-
-    fn owned_claim(issue_ref: &str, status: ClaimStatus) -> AutoflowClaimRecord {
-        AutoflowClaimRecord {
-            issue_ref: issue_ref.into(),
-            repo_ref: "github:Section9Labs/rupu".into(),
-            source_ref: None,
-            issue_display_ref: None,
-            issue_title: None,
-            issue_url: None,
-            issue_state_name: None,
-            issue_tracker: None,
-            workflow: "controller".into(),
-            status,
-            worktree_path: None,
-            branch: None,
-            last_run_id: None,
-            last_error: None,
-            last_summary: None,
-            pr_url: None,
-            artifacts: None,
-            artifact_manifest_path: None,
-            next_retry_at: None,
-            claim_owner: None,
-            lease_expires_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
-            pending_dispatch: None,
-            contenders: vec![],
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        }
-    }
-
-    #[test]
-    fn a_claim_another_cycle_owns_is_a_typed_conflict() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = AutoflowClaimStore {
-            root: tmp.path().join("claims"),
-        };
-        let issue_ref = "github:Section9Labs/rupu/issues/42";
-        store
-            .save(&owned_claim(issue_ref, ClaimStatus::AwaitExternal))
-            .unwrap();
-        let err = ensure_manual_run_can_take_claim(&store, issue_ref).unwrap_err();
-        assert!(
-            matches!(
-                err.downcast_ref::<AdminOpError>(),
-                Some(AdminOpError::Conflict(_))
-            ),
-            "{err:#}"
-        );
-    }
-
-    #[test]
-    fn a_dry_run_repair_reports_the_release_and_changes_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path();
-        let issue_ref = "github:Section9Labs/rupu/issues/42";
-        let store = AutoflowClaimStore {
-            root: paths::autoflow_claims_dir(global),
-        };
-        store
-            .save(&owned_claim(issue_ref, ClaimStatus::Blocked))
-            .unwrap();
-
-        let dry = repair_claim(global, issue_ref, true, false, true).unwrap();
-        assert!(dry.dry_run);
-        assert_eq!(
-            dry.repairs,
-            vec![format!("would release claim {issue_ref}")]
-        );
-        assert!(
-            store.load(issue_ref).unwrap().is_some(),
-            "a dry run kept the claim"
-        );
-
-        let done = repair_claim(global, issue_ref, true, false, false).unwrap();
-        assert_eq!(done.repairs, vec![format!("released claim {issue_ref}")]);
-        assert!(
-            store.load(issue_ref).unwrap().is_none(),
-            "the real run released it"
-        );
-    }
-
-    #[test]
-    fn repair_refusals_are_typed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let issue_ref = "github:Section9Labs/rupu/issues/42";
-        let both = repair_claim(tmp.path(), issue_ref, true, true, true).unwrap_err();
-        assert!(matches!(
-            both.downcast_ref::<AdminOpError>(),
-            Some(AdminOpError::Invalid(_))
-        ));
-        let missing = repair_claim(tmp.path(), issue_ref, false, false, true).unwrap_err();
-        assert!(matches!(
-            missing.downcast_ref::<AdminOpError>(),
-            Some(AdminOpError::NotFound(_))
-        ));
-        let bad = repair_claim(tmp.path(), "not an issue", false, false, true).unwrap_err();
-        assert!(matches!(
-            bad.downcast_ref::<AdminOpError>(),
-            Some(AdminOpError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn doctor_reports_a_claim_on_an_untracked_repo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let global = tmp.path();
-        let issue_ref = "github:Section9Labs/rupu/issues/42";
-        AutoflowClaimStore {
-            root: paths::autoflow_claims_dir(global),
-        }
-        .save(&owned_claim(issue_ref, ClaimStatus::AwaitExternal))
-        .unwrap();
-        let report = doctor_json(global, None).unwrap();
-        assert_eq!(report["kind"], "autoflow_doctor");
-        assert_eq!(report["ok"], false);
-        assert_eq!(report["rows"][0]["scope"], issue_ref);
-        assert_eq!(report["rows"][0]["problem"], "missing_repo_binding");
-        assert_eq!(
-            wakes_json(global, None).unwrap(),
-            serde_json::json!({"kind": "autoflow_wakes", "version": 1, "rows": []})
-        );
     }
 }

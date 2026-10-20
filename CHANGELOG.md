@@ -15,6 +15,7 @@
 - **Retry, continue, compact and stop in the CP web UI** (operator MCP Plan 3b, UI-1). A failed, rejected or cancelled run's page has **Retry ▾** (mode, as launched by default, and "Restart interrupted steps"), and so do the Inbox's recent failures; a standalone agent run's transcript page has **Continue** (on another model or provider if you choose); a session's page has **Compact** (with a context window) and **Stop** (confirmed). Each shows a pending state until the run or session record changes.
 
 ### Changed
+- **The autoflow reads, claim repair, the session prune and `cleanup` are libraries.** `rupu autoflow show|explain|doctor|wakes|repair` and `autoflow run`'s checks moved into the new `rupu-autoflow` crate, the session record and the archived-session prune into `rupu_runtime::sessions`, `rupu cleanup` into `rupu_orchestrator::cleanup`, and the usage fold into `rupu_orchestrator`. The CLI and the CP call them directly, so every `/api/autoflows/*` read and every `maintenance.prune` kind now works on any control plane; only the cron tick and starting an autoflow cycle need `rupu cp serve`. CLI output is unchanged.
 - **The CP refuses to create or save an agent or workflow named `generate`, `validate` or `run`** (400): those are routes beside `/api/agents/:name` and `/api/workflows/:name`, so HTTP could never read, save or delete such a definition.
 - **`rupu mcp serve` is deprecated.** It prints a notice and runs `rupu cp serve --no-web` on 127.0.0.1:7878; the stdio transport is gone (`--transport` and `--mode` are ignored).
 
