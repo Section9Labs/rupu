@@ -9,6 +9,7 @@
 //! Spec: `docs/superpowers/specs/2026-05-03-rupu-slice-b2-scm-design.md`.
 
 pub mod account;
+pub mod checkout;
 pub mod client_options;
 pub mod clone;
 pub mod connectors;
@@ -17,6 +18,7 @@ pub mod event_connector;
 pub mod platform;
 pub mod registry;
 pub mod rules;
+pub mod run_target;
 pub mod token;
 pub mod types;
 pub mod weburl;

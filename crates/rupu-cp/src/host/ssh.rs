@@ -66,6 +66,7 @@ pub fn resume_argv(run_id: &str, if_unfinished: bool) -> RunArgv {
         run_id: run_id.to_string(),
         mode: None,
         if_unfinished,
+        restart_interrupted: false,
     })
 }
 
@@ -6975,6 +6976,8 @@ mod tests {
 
         let run_id = conn
             .launch_run(crate::launcher::LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "deploy".into(),
                 inputs: Default::default(),
                 mode: Some("bypass".into()),
@@ -7959,6 +7962,8 @@ mod tests {
         // launch_run maps a failed ssh dispatch to Unreachable.
         let err = conn
             .launch_run(crate::launcher::LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "deploy".into(),
                 inputs: Default::default(),
                 mode: None,
@@ -8098,6 +8103,9 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: None,
                 mode: None,
@@ -8316,6 +8324,9 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "sec".into(),
             prompt: None,
             mode: None,
@@ -9713,6 +9724,9 @@ mod tests {
         let run_id = rt.block_on(async {
             let run_id = conn
                 .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                    model: None,
+                    provider: None,
+                    continue_from: None,
                     codename: None,
                     agent: "reviewer".into(),
                     prompt: Some("go".into()),
@@ -10016,6 +10030,9 @@ mod tests {
 
         let run_id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
@@ -10062,6 +10079,9 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
@@ -10097,6 +10117,9 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: Some("audit".into()),
                 mode: None,
@@ -10132,6 +10155,9 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: Some("enumerate".into()),
             mode: None,
@@ -10161,6 +10187,9 @@ mod tests {
 
     fn skilled_launch(run_id: &str) -> crate::agent_launcher::AgentLaunchRequest {
         crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: Some("enumerate".into()),
             mode: None,
@@ -10190,6 +10219,9 @@ mod tests {
         messaging: LaunchMessaging,
     ) -> crate::agent_launcher::AgentLaunchRequest {
         crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             skills: Vec::new(),
             preload_skills: Vec::new(),
             messaging,
@@ -10453,6 +10485,9 @@ mod tests {
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let err = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: None,
@@ -10479,6 +10514,8 @@ mod tests {
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         conn.launch_run(crate::launcher::LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: "deploy".into(),
             inputs: Default::default(),
             mode: None,

@@ -5,10 +5,11 @@
 //! [`cmd`], and returns an `ExitCode`. The binary's `main.rs` is a
 //! one-line wrapper that calls into here.
 
-pub mod accounts;
+pub use rupu_runtime::accounts;
 pub mod build_info;
 pub mod cmd;
 pub mod cp_agent_launcher;
+pub mod cp_agentiflow_launcher;
 pub mod cp_definition_generator;
 pub mod cp_inventory;
 pub mod cp_launcher;
@@ -27,7 +28,7 @@ pub mod netflow_sink;
 pub mod output;
 pub mod paths;
 pub mod resume;
-pub mod run_target;
+pub use rupu_scm::run_target;
 pub mod standalone_run_metadata;
 /// The embedded `rupu init` samples and the stock fleet (`rupu-templates`).
 pub use rupu_templates as templates;

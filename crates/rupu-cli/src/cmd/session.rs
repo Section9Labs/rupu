@@ -7837,6 +7837,7 @@ fn refuse_newer_turn(
     let customer = session.customer.clone().flatten();
     let error = rupu_agent::record_unstarted_run(
         rupu_agent::UnstartedRun {
+            launch_args: &[],
             transcript_path,
             run_id,
             workspace_id: &session.workspace_id,
@@ -8733,6 +8734,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 let (provider, model) = assembler.provider_model_of(&launch);
                 let error = rupu_agent::record_unstarted_run(
                     rupu_agent::UnstartedRun {
+                        launch_args: &[],
                         transcript_path: &launch.transcript_path,
                         run_id: &launch.run_id,
                         workspace_id: &launch.workspace.id,

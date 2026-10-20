@@ -2,7 +2,8 @@
 
 //! rupu-mcp — the MCP transport over the `rupu-tools` catalog (spec W4).
 //!
-//! [`McpServer`] is the protocol core over pluggable [`ToolSource`]s;
+//! [`McpServer`] is the protocol core over pluggable [`ToolSource`]s (and,
+//! for a server that has them, [`ResourceSource`]s and [`PromptSource`]s);
 //! [`CatalogSource`] serves the catalog through the same permission policy
 //! and tool bodies the agent loop and `action:` workflow steps use
 //! (`rupu_tools::call`). It owns no tools.
@@ -20,6 +21,11 @@ pub mod transport;
 pub use catalog::{CatalogSource, ContextFactory};
 pub use error::{McpError, ServeError};
 pub use filter::ToolFilter;
-pub use server::{negotiate_protocol_version, HandleCx, McpServer, PROTOCOL_VERSIONS};
-pub use source::{CallCx, EmbeddedResource, Progress, ToolDef, ToolHints, ToolResult, ToolSource};
+pub use server::{
+    negotiate_protocol_version, HandleCx, McpServer, Sources, LIST_PAGE, PROTOCOL_VERSIONS,
+};
+pub use source::{
+    CallCx, EmbeddedResource, Progress, PromptArgument, PromptDef, PromptReply, PromptSource,
+    ResourceDef, ResourceSource, ResourceTemplate, ToolDef, ToolHints, ToolResult, ToolSource,
+};
 pub use transport::{decode_line, InProcessTransport, Transport};

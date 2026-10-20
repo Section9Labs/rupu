@@ -10565,6 +10565,7 @@ async fn dispatch_one(
                 .and_then(|m| rupu_tools::PermissionMode::parse(m).ok())
                 .unwrap_or(rupu_tools::PermissionMode::Ask);
             return Err(e.record_unstarted(rupu_agent::UnstartedRun {
+                launch_args: &[],
                 transcript_path: &transcript_path,
                 run_id: &run_id,
                 workspace_id: &workspace_id,
@@ -10609,6 +10610,7 @@ async fn dispatch_one(
         Ok(a) => a,
         Err(e) => {
             return Err(e.record_unstarted(rupu_agent::UnstartedRun {
+                launch_args: &[],
                 transcript_path: &transcript_path,
                 run_id: &run_id,
                 workspace_id: &workspace_id,

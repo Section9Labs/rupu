@@ -34,7 +34,7 @@ pub mod resolver;
 pub mod stranded;
 pub use stranded::detect_stranded_keychain_credentials;
 
-pub use resolver::{CredentialResolver, KeychainResolver};
+pub use resolver::{CredentialResolver, KeychainResolver, SsoPeek};
 
 pub use backend::{AuthBackend, AuthError, ProviderId};
 pub use json_file::JsonFileBackend;

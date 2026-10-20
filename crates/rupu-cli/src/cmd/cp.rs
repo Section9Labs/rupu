@@ -659,6 +659,17 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::new(crate::cp_agent_launcher::SubprocessAgentLauncher { exe: exe.clone() }),
             );
 
+            // Adapter for rupu-cp's AgentiflowLauncher port: the detached
+            // start `rupu agentiflow run --detach` runs, with this binary.
+            let agentiflow_launcher: Option<
+                Arc<dyn rupu_cp::agentiflow_launcher::AgentiflowLauncher>,
+            > = Some(Arc::new(
+                crate::cp_agentiflow_launcher::SubprocessAgentiflowLauncher {
+                    exe: exe.clone(),
+                    global_dir: global_dir.clone(),
+                },
+            ));
+
             // Adapter for rupu-cp's SessionSender port: shells
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
@@ -782,6 +793,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     inventory: Some(inventory),
                     web: !no_web,
                     mcp,
+                    agentiflow_launcher,
                     skill_installer,
                 },
             )
@@ -1205,6 +1217,7 @@ fn resume_control(
             run_id,
             mode,
             if_unfinished: true,
+            restart_interrupted: false,
         },
         other => return Err(format!("unknown resume subcommand `{other}`")),
     }))

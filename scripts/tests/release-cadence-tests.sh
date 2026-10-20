@@ -201,6 +201,14 @@ assert_out "markdown compiled into the binary ships" "crates/rupu-templates/temp
 assert_out "docs/pages ships nothing" "" \
   sh -c "printf 'docs/pages/rupu-archive-keyring.asc\n' | '$SHIP'"
 
+# rupu-cp compiles the top-level docs in (include_str!) and serves them as
+# `rupu://docs/<name>` MCP resources, so a docs-only batch is a release: one
+# skipped would leave the binary serving stale docs. Below a subdirectory
+# (superpowers, pages) nothing is built in.
+assert_out "top-level docs ship" "docs/cp-api.md
+docs/RELEASING.md" \
+  sh -c "printf 'docs/cp-api.md\ndocs/superpowers/plans/x.md\ndocs/pages/index.md\ndocs/RELEASING.md\ndocs/notes.txt\n' | '$SHIP'"
+
 # Release mechanics, not product. Re-publishing after a fix there is what
 # release-beta.yml's `force` input is for.
 assert_out "CI and rulesets ship nothing" "" \
@@ -222,22 +230,23 @@ assert_out "a tests/ directory under src/ ships" "crates/rupu-cli/src/cmd/tests/
 assert_out "a lookalike of tests/ ships" "crates/rupu-cli/testdata/x.json" \
   sh -c "printf 'crates/rupu-cli/testdata/x.json\n' | '$SHIP'"
 
-# #711's own diff: a CI-only change must not cut a beta.
+# #711's own diff, less docs/RELEASING.md (a top-level doc now ships): a
+# CI-only change must not cut a beta.
 assert_out "a CI-only batch ships nothing" "" \
-  sh -c "printf '.github/workflows/release-beta.yml\nCLAUDE.md\ndocs/RELEASING.md\nscripts/shipped-paths.sh\n' | '$SHIP'"
+  sh -c "printf '.github/workflows/release-beta.yml\nCLAUDE.md\nscripts/shipped-paths.sh\n' | '$SHIP'"
 
 assert_out "a lookalike of docs/ ships" "docsite/index.md" \
   sh -c "printf 'docsite/index.md\n' | '$SHIP'"
 
 assert_out "mixed batch keeps only the shipped paths, in order" "Cargo.lock
 crates/rupu-cp/src/lib.rs" \
-  sh -c "printf 'docs/a.md\nCargo.lock\nTODO.md\ncrates/rupu-cp/src/lib.rs\n' | '$SHIP'"
+  sh -c "printf 'docs/superpowers/plans/a.md\nCargo.lock\nTODO.md\ncrates/rupu-cp/src/lib.rs\n' | '$SHIP'"
 
 # `git diff --name-only` output always ends in a newline, but a final
 # unterminated line must not be dropped: dropping it would turn a real
 # change into a "nothing to ship" skip.
 assert_out "unterminated final line is still read" "Cargo.toml" \
-  sh -c "printf 'docs/a.md\nCargo.toml' | '$SHIP'"
+  sh -c "printf 'docs/superpowers/plans/a.md\nCargo.toml' | '$SHIP'"
 
 assert_out "empty input ships nothing" "" \
   sh -c "printf '' | '$SHIP'"
