@@ -25,8 +25,8 @@ pub use budget::{Budget, BudgetEnforcer, BudgetStage, UsageSource};
 pub use collectors::{roster_collector, RosterCollector};
 pub use coverage::{CoverageEvalError, CoverageEvaluator, CoverageOutcome, CoverageTarget};
 pub use def::{
-    load_agentiflow_def, AgentiflowDef, AssetSelector, FindingSelector, Goal, GoalTarget, Pool,
-    RoundConfig, Scope, ScopeRoot, VerifyCheck,
+    load_agentiflow_def, locate_agentiflow_def, AgentiflowDef, AssetSelector, DefLookupError,
+    FindingSelector, Goal, GoalTarget, Pool, RoundConfig, Scope, ScopeRoot, VerifyCheck,
 };
 pub use envelope::{
     Digest, Envelope, EnvelopeConfig, EnvelopeOutcome, LeadDriver, RoundContext, RoundOutcome,

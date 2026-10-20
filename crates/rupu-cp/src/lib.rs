@@ -3,6 +3,7 @@
 //! `serve` is the main entrypoint; wire it from `rupu cp serve`.
 
 pub mod agent_launcher;
+pub mod agentiflow_launcher;
 pub mod api;
 pub mod auth;
 pub mod codename;
@@ -95,6 +96,10 @@ pub struct ServeOpts {
     pub web: bool,
     /// Serve `/mcp` over these options. `None` (`--no-mcp`): `/mcp` is a 404.
     pub mcp: Option<mcp::McpOpts>,
+    /// Optional agentiflow-launcher adapter. rupu-cli's `cp serve` provides
+    /// the detached-start impl; `None` → `POST /api/agentiflows` returns 501.
+    pub agentiflow_launcher:
+        Option<std::sync::Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -261,6 +266,7 @@ pub fn build_state(opts: &ServeOpts) -> state::AppState {
         .with_generator(opts.generator.clone())
         .with_session_mutator(opts.session_mutator.clone())
         .with_transcript_mutator(opts.transcript_mutator.clone())
+        .with_agentiflow_launcher(opts.agentiflow_launcher.clone())
         .with_bind(opts.bind.to_string())
         .with_token_set(opts.token.is_some());
 

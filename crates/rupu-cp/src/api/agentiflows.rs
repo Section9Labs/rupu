@@ -5,6 +5,11 @@
 //! - `GET /api/agentiflows/:id` — one run: its record, the definition snapshot
 //!   it started from, the `events.jsonl` log, and the units (branches) it
 //!   dispatched.
+//! - `POST /api/agentiflows` — launch a run detached, as `rupu agentiflow run
+//!   --detach` does, through the [`crate::agentiflow_launcher`] port
+//!   (`cp serve` only).
+//! - `POST /api/agentiflows/:id/stop` — the graceful stop, or with `now` the
+//!   hard stop `rupu agentiflow stop --now` runs (`cp serve` only).
 //! - `POST /api/agentiflows/:id/steer` — message the lead, or queue a stop
 //!   (`cp serve` only; refused unless its coordinator is alive). A message is
 //!   `POST /api/agentiflows/:id/messages` to the lead (`crate::api::messages`,
@@ -13,8 +18,9 @@
 //! The run-dir layout and `events.jsonl` line shapes are documented on
 //! `rupu_agentiflow::run`'s module docs; the readers here mirror
 //! `rupu-cli`'s `agentiflow list` / `agentiflow status` (`cmd/agentiflow.rs`)
-//! without depending on it. Apart from steering, nothing here writes:
-//! the CP only observes a run the coordinator (or its reaper) owns.
+//! without depending on it. Apart from launching, steering and stopping,
+//! nothing here writes: the CP only observes a run the coordinator (or its
+//! reaper) owns.
 //!
 //! Transcripts are NOT served here. The lead's per-round transcripts
 //! (`lead/transcript.r<N>.jsonl`) and a unit's transcript are plain `.jsonl`
@@ -30,7 +36,7 @@ use crate::{
     state::AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -53,7 +59,10 @@ const MAX_RUN_ID_LEN: usize = 128;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/agentiflows", get(list_agentiflows))
+        .route(
+            "/api/agentiflows",
+            get(list_agentiflows).post(launch_agentiflow),
+        )
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route(
@@ -65,6 +74,7 @@ pub fn routes() -> Router<AppState> {
             get(get_agentiflow_unit_output),
         )
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
+        .route("/api/agentiflows/:id/stop", post(stop_agentiflow))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,17 +1144,7 @@ async fn steer_agentiflow(
     }
     crate::api::config::require_writable_to(&s, "steering an agentiflow")?;
     let run_dir = agentiflow_dir(&s.global_dir).join(&id);
-    let record = match AgentiflowRecord::read(&run_dir) {
-        Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ApiError::not_found(format!("no agentiflow run `{id}`")))
-        }
-        Err(e) => {
-            return Err(ApiError::internal(format!(
-                "agentiflow {id}: agentiflow.json is unreadable: {e}"
-            )))
-        }
-    };
+    let record = read_record(&id, &run_dir)?;
     steerable(&id, &record)?;
     OperatorQueue::new(&run_dir)
         .request_stop()
@@ -1155,6 +1155,233 @@ async fn steer_agentiflow(
 #[derive(Serialize)]
 struct StopQueued {
     queued: bool,
+}
+
+/// `?host=` on the agentiflow writes: only this host (absent or `local`).
+/// Agentiflows have no host transport, so a remote id is a 501.
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct LocalHostQuery {
+    /// Only `local` (or absent): agentiflows run on this control plane's host.
+    #[serde(default)]
+    host: Option<String>,
+}
+
+impl LocalHostQuery {
+    fn require_local(&self, what: &str) -> ApiResult<()> {
+        match self.host.as_deref() {
+            None | Some("local") => Ok(()),
+            Some(h) => Err(ApiError::not_available(format!(
+                "{what} is local-only: host `{h}` can't be reached for it"
+            ))),
+        }
+    }
+}
+
+/// `POST /api/agentiflows` body: what `rupu agentiflow run` takes — the
+/// definition — plus where the run starts, which the CLI takes from its
+/// working directory.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct LaunchRequest {
+    /// The definition's name (`agentiflows/<definition>.yaml`).
+    definition: String,
+    /// `global` | `project`: start the run where this layer's definition is
+    /// the one it loads (with `scope_id`, the project's workspace id for
+    /// `project`). Exclusive with `working_dir`.
+    #[serde(default)]
+    scope_kind: Option<String>,
+    #[serde(default)]
+    scope_id: Option<String>,
+    /// An absolute directory to start the run in (its project, layered
+    /// config and profiles; the lead's workspace). Default: the control
+    /// plane's own working directory.
+    #[serde(default)]
+    working_dir: Option<String>,
+}
+
+/// The directory a launch starts in: the scope's, the body's, or the CP's.
+fn launch_working_dir(s: &AppState, req: &LaunchRequest) -> ApiResult<PathBuf> {
+    match (req.scope_kind.as_deref(), req.working_dir.as_deref()) {
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "scope_kind and working_dir are mutually exclusive — the scope selector determines \
+             the working directory",
+        )),
+        (Some(raw), None) => {
+            let kind: crate::api::repo_scope::ScopeKind = raw.parse().map_err(|_| {
+                ApiError::bad_request(format!(
+                    "unknown scope_kind {raw:?}; expected \"global\" or \"project\""
+                ))
+            })?;
+            crate::api::agentiflow_defs::launch_dir(
+                s,
+                &req.definition,
+                kind,
+                req.scope_id.as_deref(),
+            )
+        }
+        (None, Some(dir)) => {
+            let dir = PathBuf::from(dir);
+            if !dir.is_absolute() || !dir.is_dir() {
+                return Err(ApiError::bad_request(format!(
+                    "working_dir `{}` is not an absolute path to a directory",
+                    dir.display()
+                )));
+            }
+            Ok(dir)
+        }
+        (None, None) => Ok(s.workspace_dir.clone()),
+    }
+}
+
+/// `POST /api/agentiflows` — start a run of `definition` detached, as
+/// `rupu agentiflow run --detach` does, and answer `202 {id, status}` once
+/// the run has recorded itself (`status: started`), or is still starting
+/// after the launcher's wait (`status: pending`, with the `log` its output
+/// goes to). The run id is minted here and handed to the child, which
+/// records the run under it.
+///
+/// Before anything is spawned the definition is looked up from the run's
+/// directory the way the CLI looks it up (404 when absent, 400 when it does
+/// not parse) and checked as the CLI checks it (`AgentiflowDef::check`,
+/// 400). A child that exits before the run starts (a lead agent that does
+/// not load, no credential) is a 400 carrying its log, and leaves nothing
+/// behind. Local only (`?host=<remote>` is a 501); `cp serve` only (501).
+async fn launch_agentiflow(
+    State(s): State<AppState>,
+    Query(q): Query<LocalHostQuery>,
+    Json(req): Json<LaunchRequest>,
+) -> ApiResult<Response> {
+    q.require_local("launching an agentiflow")?;
+    crate::api::config::require_writable_to(&s, "launching an agentiflow")?;
+    let launcher = s.agentiflow_launcher.clone().ok_or_else(|| {
+        ApiError::not_available("launching an agentiflow requires `rupu cp serve`")
+    })?;
+    let working_dir = launch_working_dir(&s, &req)?;
+    let project = rupu_workspace::project_root_for(&working_dir)
+        .map_err(|e| ApiError::bad_request(format!("{}: {e}", working_dir.display())))?
+        .map(|root| root.join(".rupu"));
+    let (_, def) =
+        rupu_agentiflow::locate_agentiflow_def(&s.global_dir, project.as_deref(), &req.definition)
+            .map_err(|e| match e {
+                rupu_agentiflow::DefLookupError::NotFound { .. } => {
+                    ApiError::not_found(e.to_string())
+                }
+                _ => ApiError::bad_request(e.to_string()),
+            })?;
+    def.check(&s.global_dir, Some(&working_dir))
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let id = rupu_agentiflow::new_run_id();
+    let started = launcher
+        .launch(crate::agentiflow_launcher::AgentiflowLaunchRequest {
+            definition: req.definition,
+            run_id: id.clone(),
+            working_dir,
+        })
+        .await
+        .map_err(|e| match e {
+            crate::agentiflow_launcher::AgentiflowLaunchError::NotStarted(_) => {
+                ApiError::bad_request(e.to_string())
+            }
+            crate::agentiflow_launcher::AgentiflowLaunchError::Spawn(_) => {
+                ApiError::internal(e.to_string())
+            }
+        })?;
+    let body = match started {
+        crate::agentiflow_launcher::AgentiflowStart::Started => {
+            serde_json::json!({ "id": id, "status": "started" })
+        }
+        crate::agentiflow_launcher::AgentiflowStart::Pending { log } => {
+            serde_json::json!({ "id": id, "status": "pending", "log": log })
+        }
+    };
+    Ok((axum::http::StatusCode::ACCEPTED, Json(body)).into_response())
+}
+
+/// `POST /api/agentiflows/:id/stop` body.
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct StopRequest {
+    /// The hard stop (`agentiflow stop --now`): signal the coordinator and
+    /// its units now and record the run failed (`operator_stop:now`).
+    /// Without it the stop is graceful: queued for the envelope, which winds
+    /// the run down at the next round boundary.
+    #[serde(default)]
+    now: bool,
+}
+
+/// `POST /api/agentiflows/:id/stop` — stop a running agentiflow.
+///
+/// Graceful (the default, the same stop `steer {stop: true}` queues): `202
+/// {queued: true}` once it is on the control queue; 409 unless a live
+/// coordinator will read it ([`steerable`]). With `now`: the hard stop
+/// `rupu agentiflow stop --now` runs (`rupu_agentiflow::hard_stop`: SIGTERM
+/// the coordinator and every unit still running, SIGKILL what outlives the
+/// grace, record the run failed), answered once it is done with `{stopped:
+/// true, status, stop_reason}`; a run whose coordinator died is closed out
+/// the same way. 409 for a run that is not `running`. Local only, `cp serve`
+/// only.
+async fn stop_agentiflow(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LocalHostQuery>,
+    body: Option<Json<StopRequest>>,
+) -> ApiResult<Response> {
+    q.require_local("stopping an agentiflow")?;
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    crate::api::config::require_writable_to(&s, "stopping an agentiflow")?;
+    let now = body.map(|b| b.0.now).unwrap_or_default();
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    let record = read_record(&id, &run_dir)?;
+    if !now {
+        steerable(&id, &record)?;
+        OperatorQueue::new(&run_dir)
+            .request_stop()
+            .map_err(|e| ApiError::internal(format!("could not queue a stop: {e}")))?;
+        return Ok((
+            axum::http::StatusCode::ACCEPTED,
+            Json(StopQueued { queued: true }),
+        )
+            .into_response());
+    }
+    if record.status != "running" {
+        return Err(ApiError::conflict(format!(
+            "agentiflow `{id}` is not running ({})",
+            record.status
+        )));
+    }
+    let dir = run_dir.clone();
+    let outcome = tokio::task::spawn_blocking(move || rupu_agentiflow::hard_stop(&dir, Utc::now()))
+        .await
+        .map_err(|e| ApiError::internal(format!("the hard stop did not finish: {e}")))?
+        .map_err(|e| ApiError::internal(format!("hard-stop {id}: {e}")))?;
+    match outcome {
+        rupu_agentiflow::HardStopOutcome::Stopped => {
+            let after = read_record(&id, &run_dir)?;
+            Ok(Json(serde_json::json!({
+                "stopped": true,
+                "status": after.status,
+                "stop_reason": after.stop_reason,
+            }))
+            .into_response())
+        }
+        rupu_agentiflow::HardStopOutcome::AlreadyTerminal(status) => Err(ApiError::conflict(
+            format!("agentiflow `{id}` is not running ({status})"),
+        )),
+    }
+}
+
+/// `agentiflow.json` under `run_dir`: 404 when absent, 500 when unreadable.
+fn read_record(id: &str, run_dir: &std::path::Path) -> ApiResult<AgentiflowRecord> {
+    match AgentiflowRecord::read(run_dir) {
+        Ok(r) => Ok(r),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(ApiError::not_found(format!("no agentiflow run `{id}`")))
+        }
+        Err(e) => Err(ApiError::internal(format!(
+            "agentiflow {id}: agentiflow.json is unreadable: {e}"
+        ))),
+    }
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use rupu_agentiflow::{
-    agentiflow_dir, hard_stop, load_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
+    agentiflow_dir, hard_stop, locate_agentiflow_def, new_run_id, run_agentiflow, AgentiflowDef,
     AgentiflowRecord, Budget, CoverageTarget, EnvelopeOutcome, GenerationCapability, GoalTarget,
     HardStopOutcome, LeadInputs, LeadProvider, OperatorQueue, ReapSummary, RunAgentiflowOpts,
 };
@@ -218,18 +218,11 @@ async fn run_cmd(
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     // ---- the definition, validated before anything is built -----------------
-    let def = load_agentiflow_def(&global, project_rupu.as_deref(), def_name)
-        .ok_or_else(|| explain_missing_def(&global, project_rupu.as_deref(), def_name))?;
+    let (_, def) = locate_agentiflow_def(&global, project_rupu.as_deref(), def_name)?;
     // The same overlay-aware registry every other entry point resolves
     // engagement profiles through (`findings_opts::resolve_engagement`):
     // built-ins, then `<global>/profiles`, then `<workspace>/.rupu/profiles`.
-    let registry = rupu_coverage::registry_with_overlay(
-        &global.join("profiles"),
-        &pwd.join(".rupu").join("profiles"),
-    )
-    .map_err(|e| anyhow!("engagement profiles: {e}"))?;
-    let active = def.resolve_profiles(&registry)?;
-    def.validate(&active)?;
+    let active = def.check(&global, Some(&pwd))?;
 
     // ---- the lead agent -------------------------------------------------------
     let spec = rupu_agent::load_agent(&global, project_rupu.as_deref(), &def.lead)
@@ -424,24 +417,8 @@ fn log_tail(log: &Path) -> String {
 }
 
 /// The parent half of `run --detach`: start this binary again as the run,
-/// detached, and return once the run has started, without waiting for it to
-/// finish.
-///
-/// Detached like the CP's launchers and the fleet's unit launcher
-/// (`rupu_launch::Subprocess`), through `rupu_runtime::spawn`: its own process
-/// group (so a Ctrl-C at this terminal or this process exiting does not take the run
-/// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
-/// resolved so the child records the run where the id printed here is looked
-/// for. The child is the process that runs `run_agentiflow`, so the
-/// `runner_pid` it stamps is the detached process: what `stop` and the orphan
-/// reaper signal.
-///
-/// A detached run that cannot start must not look like one that did, so this
-/// is a handshake. The child's stderr goes to `<run dir>/detach.log` (the run
-/// directory is made first; `run_agentiflow` accepts one that exists and
-/// refuses only an existing record), and this process waits for the record to
-/// appear (started: print the id) or for the child to exit without one
-/// (failed: its log is the error, and the record-less directory is removed).
+/// detached ([`start_detached`]), and print the id once the run has started,
+/// without waiting for it to finish.
 async fn spawn_detached(
     def_name: &str,
     name: &str,
@@ -451,40 +428,13 @@ async fn spawn_detached(
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locate the rupu binary to detach")?;
     let run_dir = agentiflow_dir(global).join(run_id);
-    std::fs::create_dir_all(&run_dir).with_context(|| format!("create {}", run_dir.display()))?;
-    let log_path = run_dir.join(DETACH_LOG);
-
-    let mut launch = SpawnSpec::new(&exe, detached_argv(def_name, run_id));
-    launch.env = vec![("RUPU_HOME".into(), global.as_os_str().to_owned())];
-    launch.stdio = SpawnStdio::Log(log_path.clone());
-    launch.keep_child = true;
-    let mut child = match rupu_runtime::spawn::spawn_detached(launch).map(|s| s.child) {
-        Ok(Some(child)) => child,
-        Ok(None) => anyhow::bail!("the detached agentiflow's child was not kept"),
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&run_dir);
-            return Err(anyhow::Error::new(e).context(format!("detach {}", exe.display())));
-        }
-    };
-
-    // `child` is dropped unwaited on every path that returns Ok: this process
-    // exits next, and the child is then reparented, so nothing is left to reap it.
-    match await_startup(&mut child, &run_dir, DETACH_STARTUP_WAIT)
-        .await
-        .context("wait for the detached run to start")?
-    {
-        Startup::Started => {}
-        Startup::Exited(status) => {
-            // Read the log before the directory that holds it goes.
-            let tail = log_tail(&log_path);
-            let _ = std::fs::remove_dir_all(&run_dir);
-            anyhow::bail!("the detached agentiflow exited ({status}) before it started:\n{tail}");
-        }
-        Startup::Pending => eprintln!(
+    match start_detached(&exe, def_name, run_id, global, None).await? {
+        DetachedStart::Started => {}
+        DetachedStart::Pending { log } => eprintln!(
             "agentiflow {name}: run {run_id} had not started after {}s; it is still going in \
              the background. Its output is in {}",
             DETACH_STARTUP_WAIT.as_secs(),
-            log_path.display()
+            log.display()
         ),
     }
 
@@ -499,6 +449,117 @@ async fn spawn_detached(
         _ => println!("agentiflow {name}: run {run_id} (detached)"),
     }
     Ok(())
+}
+
+/// How a detached run was doing when [`start_detached`] stopped waiting.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DetachedStart {
+    /// Its record exists: the run started.
+    Started,
+    /// Neither started nor exited within [`DETACH_STARTUP_WAIT`]; still going,
+    /// its output in `log`.
+    Pending { log: PathBuf },
+}
+
+/// Why [`start_detached`] has no run to show.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DetachError {
+    /// The child could not be spawned.
+    #[error("{0}")]
+    Spawn(String),
+    /// The child exited before it wrote the run's record; its log tail.
+    #[error("the detached agentiflow exited ({status}) before it started:\n{tail}")]
+    Exited {
+        status: std::process::ExitStatus,
+        tail: String,
+    },
+}
+
+/// The detached child of `run --detach`: `exe agentiflow run --run-id <id>
+/// -- <def>` ([`detached_argv`]), started in `cwd` (this process's own when
+/// `None`) with `RUPU_HOME` pinned to `global` and its stderr kept in
+/// `<run dir>/detach.log`, the child kept so it can be watched.
+pub(crate) fn detached_spawn_spec(
+    exe: &Path,
+    def_name: &str,
+    run_id: &str,
+    global: &Path,
+    cwd: Option<&Path>,
+) -> SpawnSpec {
+    let mut launch = SpawnSpec::new(exe, detached_argv(def_name, run_id));
+    launch.env = vec![("RUPU_HOME".into(), global.as_os_str().to_owned())];
+    launch.stdio = SpawnStdio::Log(agentiflow_dir(global).join(run_id).join(DETACH_LOG));
+    launch.keep_child = true;
+    launch.cwd = cwd.map(Path::to_path_buf);
+    launch
+}
+
+/// Start `exe` again as the run of `def_name` under `run_id`, detached, and
+/// return once the run has started (or is still starting after
+/// [`DETACH_STARTUP_WAIT`]). What `run --detach` and the control plane's
+/// `POST /api/agentiflows` both run.
+///
+/// Detached like the CP's launchers and the fleet's unit launcher
+/// (`rupu_launch::Subprocess`), through `rupu_runtime::spawn`: its own process
+/// group (so a Ctrl-C at this terminal or this process exiting does not take the run
+/// down), stdin/stdout null, and `RUPU_HOME` pinned to the home this process
+/// resolved so the child records the run where the id printed here is looked
+/// for. The child is the process that runs `run_agentiflow`, so the
+/// `runner_pid` it stamps is the detached process: what `stop` and the orphan
+/// reaper signal.
+///
+/// A detached run that cannot start must not look like one that did, so this
+/// is a handshake. The child's stderr goes to `<run dir>/detach.log` (the run
+/// directory is made first; `run_agentiflow` accepts one that exists and
+/// refuses only an existing record), and this waits for the record to
+/// appear (started) or for the child to exit without one (failed: its log is
+/// the error, and the record-less directory is removed).
+pub(crate) async fn start_detached(
+    exe: &Path,
+    def_name: &str,
+    run_id: &str,
+    global: &Path,
+    cwd: Option<&Path>,
+) -> Result<DetachedStart, DetachError> {
+    let run_dir = agentiflow_dir(global).join(run_id);
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| DetachError::Spawn(format!("create {}: {e}", run_dir.display())))?;
+    let log_path = run_dir.join(DETACH_LOG);
+
+    let launch = detached_spawn_spec(exe, def_name, run_id, global, cwd);
+    let mut child = match rupu_runtime::spawn::spawn_detached(launch).map(|s| s.child) {
+        Ok(Some(child)) => child,
+        Ok(None) => {
+            return Err(DetachError::Spawn(
+                "the detached agentiflow's child was not kept".into(),
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(DetachError::Spawn(format!("detach {}: {e}", exe.display())));
+        }
+    };
+
+    let startup = await_startup(&mut child, &run_dir, DETACH_STARTUP_WAIT)
+        .await
+        .map_err(|e| DetachError::Spawn(format!("wait for the detached run to start: {e}")))?;
+    let started = match startup {
+        Startup::Started => DetachedStart::Started,
+        Startup::Pending => DetachedStart::Pending { log: log_path },
+        Startup::Exited(status) => {
+            // Read the log before the directory that holds it goes.
+            let tail = log_tail(&log_path);
+            let _ = std::fs::remove_dir_all(&run_dir);
+            return Err(DetachError::Exited { status, tail });
+        }
+    };
+    // Reap the run when it ends, so a long-lived caller (`cp serve`) is not
+    // left holding a zombie whose pid still reads as running. The CLI exits
+    // next, and the child is then reparented.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(started)
 }
 
 /// Everything after the netflow sink exists: the run's assembler, the lead's
@@ -641,44 +702,6 @@ async fn generation_capability(
     rupu_launch::Generation::resolve(resolver, cfg, lead_provider, lead_model, sink)
         .await
         .map_err(|e| anyhow::Error::new(e).context("build the generation provider"))
-}
-
-/// Why `load_agentiflow_def` returned `None`: it folds "no such file" and
-/// "the file does not parse" together, and an operator needs to tell them
-/// apart. Follows the loader's own shadowing (project, then global).
-fn explain_missing_def(global: &Path, project: Option<&Path>, name: &str) -> anyhow::Error {
-    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
-        return anyhow!("`{name}` is not a valid agentiflow name");
-    }
-    let file = format!("{name}.yaml");
-    let candidates: Vec<std::path::PathBuf> = project
-        .map(|p| p.join("agentiflows").join(&file))
-        .into_iter()
-        .chain(std::iter::once(global.join("agentiflows").join(&file)))
-        .collect();
-    for path in &candidates {
-        if path.is_file() {
-            let parsed = std::fs::read_to_string(path)
-                .map_err(anyhow::Error::from)
-                .and_then(|raw| AgentiflowDef::parse_str(&raw).map_err(anyhow::Error::from));
-            return match parsed {
-                Err(e) => anyhow!(
-                    "agentiflow `{name}` ({}) is not loadable: {e}",
-                    path.display()
-                ),
-                Ok(_) => anyhow!(
-                    "agentiflow `{name}` ({}) could not be loaded",
-                    path.display()
-                ),
-            };
-        }
-    }
-    let searched = candidates
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    anyhow!("agentiflow `{name}` not found (looked for {searched})")
 }
 
 fn panic_message(e: tokio::task::JoinError) -> String {
@@ -2104,33 +2127,6 @@ mod tests {
             .stop_reason
             .as_deref()
             .is_some_and(|r| r.starts_with("orphaned: coordinator pid")));
-    }
-
-    #[test]
-    fn a_missing_definition_names_both_places_it_looked() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (global, project) = (tmp.path().join("g"), tmp.path().join("p"));
-        let msg = explain_missing_def(&global, Some(&project), "acme").to_string();
-        assert!(msg.contains("not found"), "{msg}");
-        assert!(msg.contains(&project.join("agentiflows/acme.yaml").display().to_string()));
-        assert!(msg.contains(&global.join("agentiflows/acme.yaml").display().to_string()));
-    }
-
-    #[test]
-    fn a_definition_that_exists_but_does_not_parse_says_so() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write(&tmp.path().join("agentiflows/acme.yaml"), "name: [\n");
-        let msg = explain_missing_def(tmp.path(), None, "acme").to_string();
-        assert!(msg.contains("is not loadable"), "{msg}");
-    }
-
-    #[test]
-    fn a_name_that_could_leave_the_directory_is_refused() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        for bad in ["", "../x", "a/b", "a\\b"] {
-            let msg = explain_missing_def(tmp.path(), None, bad).to_string();
-            assert!(msg.contains("not a valid agentiflow name"), "{bad}: {msg}");
-        }
     }
 
     #[test]
