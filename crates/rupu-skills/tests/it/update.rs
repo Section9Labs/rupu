@@ -620,3 +620,86 @@ fn a_symlinked_record_is_refused_unread() {
         Err(rupu_skills::record::RecordError::NotAFile { .. })
     ));
 }
+
+/// Every file under `dir`, relative, with its bytes: what a preview must
+/// leave exactly as it found it.
+fn snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let rel = p.strip_prefix(dir).unwrap().display().to_string();
+                out.push((rel, fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn preview_says_what_an_install_would_do_and_writes_nothing() {
+    use rupu_skills::install::{preview_install, PreviewStatus};
+    let (repo, dst, f) = setup();
+    write_skill(&repo.path().join("skills"), "xlsx", "xlsx", "v1");
+    write_skill(&repo.path().join("skills"), "pptx", "pptx", "v1");
+    write_skill(&repo.path().join("skills"), "bad", "Not A Name", "v1");
+    let source = gh(None);
+    install_from(
+        &InstallSpec {
+            source: &source,
+            input: "o/skills",
+            selection: Selection::Named(vec!["pdf".into(), "docx".into(), "pptx".into()]),
+            skills_dir: dst.path(),
+            layer: Layer::Global,
+            force: false,
+        },
+        &f,
+    )
+    .unwrap();
+    // The source moves on for pdf; docx is edited where it is installed.
+    write_skill(&repo.path().join("skills"), "pdf", "pdf", "v2");
+    fs::write(dst.path().join("docx/scripts/run.sh"), "echo edited\n").unwrap();
+    let before = snapshot(dst.path());
+
+    let preview = preview_install(&source, &f, dst.path(), Layer::Global).unwrap();
+
+    let got: Vec<(String, PreviewStatus)> = preview
+        .iter()
+        .map(|p| (p.found.name.clone(), p.status))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Not A Name".to_owned(), PreviewStatus::Invalid),
+            ("docx".to_owned(), PreviewStatus::LocallyModified),
+            ("pdf".to_owned(), PreviewStatus::Changed),
+            ("pptx".to_owned(), PreviewStatus::UpToDate),
+            ("xlsx".to_owned(), PreviewStatus::New),
+        ]
+    );
+    assert!(preview[0].reason.as_deref().unwrap().contains("Not A Name"));
+    assert_eq!(
+        preview[1].reason.as_deref(),
+        Some("edited since it was installed")
+    );
+    assert_eq!(snapshot(dst.path()), before);
+}
+
+#[test]
+fn preview_of_a_copy_with_no_record_needs_a_replace() {
+    use rupu_skills::install::{preview_install, PreviewStatus};
+    let (_repo, dst, f) = setup();
+    write_skill(dst.path(), "pdf", "pdf", "hand copied");
+    let preview = preview_install(&gh(None), &f, dst.path(), Layer::Global).unwrap();
+    let pdf = preview.iter().find(|p| p.found.name == "pdf").unwrap();
+    assert_eq!(pdf.status, PreviewStatus::LocallyModified);
+    assert_eq!(
+        pdf.reason.as_deref(),
+        Some("installed without a source record")
+    );
+}

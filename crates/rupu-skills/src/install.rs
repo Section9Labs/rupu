@@ -482,6 +482,96 @@ pub fn list_source(
     Ok(found)
 }
 
+/// What installing a source skill into a layer would do: the CP's install
+/// dry run. Replacing anything other than `New` needs `force`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewStatus {
+    /// Not installed in the layer.
+    New,
+    /// Installed, and the installed copy is the source's.
+    UpToDate,
+    /// Installed as recorded; the source has moved on (an update).
+    Changed,
+    /// Installed, but the copy is not the one its record names (edited,
+    /// no record, or it no longer loads): a replace loses that copy.
+    LocallyModified,
+    /// The source skill can't be installed.
+    Invalid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preview {
+    pub found: Found,
+    pub status: PreviewStatus,
+    /// Why, for `LocallyModified` and `Invalid`.
+    pub reason: Option<String>,
+}
+
+/// Every skill in `source`, with what installing it into `skills_dir`
+/// would do. Reads the source and the layer; writes nothing.
+pub fn preview_install(
+    source: &crate::source::Source,
+    fetcher: &dyn crate::source::Fetch,
+    skills_dir: &Path,
+    layer: Layer,
+) -> Result<Vec<Preview>, InstallError> {
+    Ok(list_source(source, fetcher)?
+        .into_iter()
+        .map(|found| {
+            let (status, reason) = preview_one(&found, skills_dir, layer);
+            Preview {
+                found,
+                status,
+                reason,
+            }
+        })
+        .collect())
+}
+
+fn preview_one(f: &Found, skills_dir: &Path, layer: Layer) -> (PreviewStatus, Option<String>) {
+    use PreviewStatus as P;
+    if let Some(e) = &f.error {
+        return (P::Invalid, Some(format!("{:?}: {e}", f.name)));
+    }
+    let source = match source_hash(&f.path) {
+        Ok((_, hash)) => hash.hex(),
+        Err(e) => return (P::Invalid, Some(e.to_string())),
+    };
+    let dest = skills_dir.join(&f.name);
+    match present(&dest) {
+        Ok(false) => return (P::New, None),
+        Ok(true) => {}
+        Err(e) => return (P::LocallyModified, Some(e.to_string())),
+    }
+    let installed = load_skill(&dest, layer)
+        .map_err(|e| e.to_string())
+        .and_then(|s| s.content_hash().map_err(|e| e.to_string()));
+    let installed = match installed {
+        Ok(hash) => hash.hex(),
+        Err(e) => {
+            return (
+                P::LocallyModified,
+                Some(format!("the installed copy doesn't load: {e}")),
+            )
+        }
+    };
+    if installed == source {
+        return (P::UpToDate, None);
+    }
+    match crate::record::read_record(skills_dir, &f.name) {
+        Ok(None) => (
+            P::LocallyModified,
+            Some("installed without a source record".into()),
+        ),
+        Err(e) => (P::LocallyModified, Some(e.to_string())),
+        Ok(Some(rec)) if rec.content_hash != installed => (
+            P::LocallyModified,
+            Some("edited since it was installed".into()),
+        ),
+        Ok(Some(_)) => (P::Changed, None),
+    }
+}
+
 pub fn install_from(
     spec: &InstallSpec<'_>,
     fetcher: &dyn crate::source::Fetch,

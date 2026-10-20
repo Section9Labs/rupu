@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, ApiError, type ProjectRow, type SkillRow } from '../lib/api';
 import Skills from './Skills';
@@ -69,13 +69,41 @@ describe('Skills list', () => {
     expect(badge).toHaveAttribute('title', 'name "brokn" does not match its directory');
   });
 
-  it('shows how to install skills when none are installed', async () => {
+  it('offers Install skills when none are installed', async () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getSkillsListing').mockResolvedValue(listing([]));
 
     mount();
 
-    expect(await screen.findByText('rupu skill install <source>')).toBeInTheDocument();
+    expect(await screen.findByText('No skills installed')).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'Install skills' })).toHaveLength(2);
+    expect(screen.queryByText('rupu skill install <source>')).not.toBeInTheDocument();
+  });
+
+  it('opens the install dialog and re-reads the list after an install', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([PROJECT]);
+    const getSkills = vi.spyOn(api, 'getSkillsListing').mockResolvedValue(listing([row({})]));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify(
+          body.dry_run
+            ? { dry_run: true, layer: 'global', found: [{ name: 'nmap', rel: '', description: 'd', status: 'new' }] }
+            : { installed: [{ name: 'nmap', layer: 'global', path: '/g', outcome: 'created', content_hash: 'a', tracked: true }], skipped: [] },
+        ),
+      );
+    });
+    mount();
+    await screen.findByText('pdf');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install skills' }));
+    const dialog = screen.getByRole('dialog', { name: 'Install skills' });
+    expect(within(dialog).getByRole('option', { name: 'acme (.rupu/skills)' })).toBeInTheDocument();
+    fireEvent.change(within(dialog).getByLabelText('Source'), { target: { value: '/srv/skills/nmap' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Find skills' }));
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Install 1 skill' }));
+
+    await waitFor(() => expect(getSkills).toHaveBeenCalledTimes(2));
   });
 
   it('a project: term lists that project’s layer and links project rows with ws_id', async () => {

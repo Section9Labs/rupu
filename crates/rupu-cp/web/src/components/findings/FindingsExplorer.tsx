@@ -1,5 +1,5 @@
 // FindingsExplorer — the one findings list: severity tiles, the query bar,
-// export, bulk tagging and the table, over one scope of `GET /api/findings`
+// import, export, bulk tagging and the table, over one scope of `GET /api/findings`
 // (everything, a project `ws_id`, a run `run_id`, and/or a `customer`). The
 // global Findings page, a project's Findings tab, a run's and an agentiflow's
 // all mount it, so they filter, tag and export the same way.
@@ -30,11 +30,13 @@ import { parseQuery } from '../../lib/findingQuery/grammar';
 import { soleValues, withTerm } from '../../lib/findingQuery/shortcut';
 import type { RowSelection } from '../lists/SortableTable';
 import { QueryBar } from '../query/QueryBar';
+import { Button } from '../ui/Button';
 import { EmptyState } from '../ui/EmptyState';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 import { BulkTagBar } from './BulkTagBar';
 import { ExportReportButton } from './ExportReportButton';
+import { ImportFindingsDialog } from './ImportFindingsDialog';
 import { FindingMetrics } from './FindingMetrics';
 import { FindingsTable } from './FindingsTable';
 import { summarizeTagResult } from './tags/tagResult';
@@ -343,6 +345,9 @@ export function FindingsExplorer({ scope, guard, pollMs, exportTitle, exportWsId
                 label="Filter findings"
               />
             </div>
+            {/* Attaches Markdown reports to findings the scope may hold; a run's
+                findings come from that run, so its tab has no import. */}
+            {data && !runId && <ImportReportsButton onImported={() => setReload((n) => n + 1)} />}
             {/* The report covers exactly the rows the query leaves. */}
             {data && (
               <ExportReportButton
@@ -402,6 +407,19 @@ export function FindingsExplorer({ scope, guard, pollMs, exportTitle, exportWsId
             ))}
         </div>
       )}
+    </>
+  );
+}
+
+/** "Import": attach reports written before the full profile (a dry run first). */
+function ImportReportsButton({ onImported }: { onImported: () => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Button variant="secondary" onClick={() => setOpen(true)}>
+        Import
+      </Button>
+      {open && <ImportFindingsDialog onClose={() => setOpen(false)} onImported={onImported} />}
     </>
   );
 }
