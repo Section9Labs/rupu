@@ -428,3 +428,30 @@ async fn run_graph_no_units_or_results_returns_empty_arrays() {
         "workflow.steps should still have 3 entries"
     );
 }
+
+/// A run whose workflow snapshot declares no steps gets an empty graph, not a
+/// 500: `Workflow::parse` refuses `steps: []`, which the handler used to map
+/// to an internal error for the whole run-detail page.
+#[tokio::test]
+async fn run_graph_for_workflow_without_steps_returns_empty_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RunStore::new(tmp.path().join("runs"));
+    let run_id = "run_graph_no_steps_01";
+    store
+        .create(seed_run(run_id), "name: test\nsteps: []\n")
+        .unwrap();
+
+    let addr = spawn_server(tmp.path()).await;
+
+    let resp = reqwest::get(format!("http://{addr}/api/runs/{run_id}/graph"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["run"]["id"], run_id);
+    assert_eq!(body["workflow"]["steps"], serde_json::json!([]));
+    assert_eq!(body["workflow"]["edges"], serde_json::json!([]));
+    assert_eq!(body["step_results"], serde_json::json!([]));
+    assert_eq!(body["units"], serde_json::json!([]));
+}
