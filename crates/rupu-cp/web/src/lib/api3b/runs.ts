@@ -41,6 +41,14 @@ export function isAgentRunRecord(workflowName: string): boolean {
   return workflowName.startsWith('agent:');
 }
 
+/** How long a requested retry may go untaken (its resume marker still on the
+ *  run) before the page says it never started and offers Retry again. */
+export const RETRY_STALL_MS = 60_000;
+
+/** The message for a retry whose resume never took the run. */
+export const RETRY_STALLED_MESSAGE =
+  'The retry was recorded but hasn’t started. Its log is retry.log in the run’s directory.';
+
 /** `POST /api/runs/:id/retry` → 202. */
 export interface RetryResponse {
   run_id: string;

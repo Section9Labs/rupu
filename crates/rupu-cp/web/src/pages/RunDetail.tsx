@@ -31,7 +31,7 @@ import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/ui/Button';
 import { StatusChip } from '../components/ui/StatusChip';
 import { RetryControl, type RetryChoice } from '../components/runops/RetryControl';
-import { asPermissionMode, isAgentRunRecord, isRetryable, runsApi } from '../lib/api3b/runs';
+import { asPermissionMode, isAgentRunRecord, isRetryable, RETRY_STALL_MS, runsApi } from '../lib/api3b/runs';
 import { TabBar, TabButton } from '../components/TabBar';
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
@@ -168,8 +168,6 @@ function eventStepId(ev: RunEvent): string | undefined {
 
 /** How often a requested retry polls the run record for the resume taking it. */
 const RETRY_POLL_MS = 1500;
-/** How long a requested retry may go untaken before the page says so. */
-const RETRY_STALL_MS = 60_000;
 
 export default function RunDetail() {
   const { id = '' } = useParams<{ id: string }>();

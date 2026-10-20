@@ -127,7 +127,13 @@ export function ContinueComposer({
             <Select
               id={providerId}
               value={newProvider}
-              onChange={(e) => setNewProvider(e.target.value)}
+              onChange={(e) => {
+                // Another provider brings its own first model: the run's model
+                // belongs to the old provider. Back to "Same" clears both.
+                const next = e.target.value;
+                setNewProvider(next);
+                setNewModel(next ? (catalog.find((c) => c.provider === next)?.models[0]?.id ?? '') : '');
+              }}
               className="mt-1 w-full text-ui"
             >
               <option value="">{provider ? `Same (${provider})` : 'Same as the original'}</option>

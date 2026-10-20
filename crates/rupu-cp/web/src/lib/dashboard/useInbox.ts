@@ -10,8 +10,10 @@
 // and merges them. The split the screen draws is honest about the backend:
 //   • ACTIONABLE (gates + paused) have a real mutation (approve/reject/resume);
 //   • FAILURES can be retried (local runs, the run's recorded mode), opened or
-//     cleared; a retry is a request, so the row shows it until a reload no
-//     longer lists the run as failed.
+//     cleared; a retry is a request, so the row shows it until the run's
+//     record says the resume took it (its marker consumed, a new failure time,
+//     or the run gone from the failed list), or it outlives RETRY_STALL_MS,
+//     which drops it with a message and offers Retry again.
 //
 // The "stalled run time" headline (sum of how long each actionable item has
 // been waiting) is derived here from the same `since` timestamps, and only ever
@@ -30,7 +32,7 @@ import {
   type RunListRow,
   type RunStatusStr,
 } from '../api';
-import { isAgentRunRecord, runsApi } from '../api3b/runs';
+import { isAgentRunRecord, isRetryable, RETRY_STALL_MS, RETRY_STALLED_MESSAGE, runsApi } from '../api3b/runs';
 import {
   activeSnoozes,
   addDismissed,
@@ -140,6 +142,13 @@ function sinceMs(item: InboxItem): number {
   return item.since ? Date.parse(item.since) : 0;
 }
 
+/** A requested retry: when it was asked for, and the failure time the run
+ *  had then (`InboxItem.since` of a failed row). */
+interface RetryMark {
+  at: number;
+  failedAt: string | null;
+}
+
 export function useInbox(customer?: CustomerScope): UseInbox {
   const [allItems, setAllItems] = useState<InboxItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -147,7 +156,9 @@ export function useInbox(customer?: CustomerScope): UseInbox {
   const [pending, setPending] = useState<Record<string, InboxVerb>>({});
   const [now, setNow] = useState(() => Date.now());
   const [cleared, setCleared] = useState(0);
-  const [retryRequested, setRetryRequested] = useState<Record<string, true>>({});
+  // A requested retry: when it was asked for, and the run's failure time then
+  // (a new one means the retry ran and failed again).
+  const [retryMarks, setRetryMarks] = useState<Record<string, RetryMark>>({});
   const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
 
   // View state (localStorage-backed). `now` at mount prunes lapsed snoozes.
@@ -187,15 +198,11 @@ export function useInbox(customer?: CustomerScope): UseInbox {
           .filter((x): x is InboxItem => x !== null)
           .filter((it, i, arr) => arr.findIndex((o) => o.id === it.id && o.host === it.host) === i);
         setAllItems(merged);
-        // A requested retry is confirmed by the run leaving the failed list.
-        setRetryRequested((prev) => {
+        // A run gone from the failed list was taken by its retry.
+        setRetryMarks((prev) => {
           const stillFailed = new Set(merged.filter((it) => it.kind === 'failed').map((it) => it.id));
-          const next = Object.fromEntries(
-            Object.keys(prev)
-              .filter((id) => stillFailed.has(id))
-              .map((id) => [id, true as const]),
-          );
-          return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+          const kept = Object.entries(prev).filter(([id]) => stillFailed.has(id));
+          return kept.length === Object.keys(prev).length ? prev : Object.fromEntries(kept);
         });
         setError(null);
         setLoading(false);
@@ -278,7 +285,7 @@ export function useInbox(customer?: CustomerScope): UseInbox {
       runsApi.retryRun(item.id, {}).then(
         () => {
           setPending(({ [item.id]: _drop, ...rest }) => rest);
-          setRetryRequested((r) => ({ ...r, [item.id]: true }));
+          setRetryMarks((r) => ({ ...r, [item.id]: { at: Date.now(), failedAt: item.since } }));
           setCleared((c) => c + 1);
         },
         (e: unknown) => {
@@ -290,15 +297,55 @@ export function useInbox(customer?: CustomerScope): UseInbox {
     [],
   );
 
-  // While a retry waits to take its run, reconcile faster than the minute.
-  const anyRetryRequested = Object.keys(retryRequested).length > 0;
+  // While a retry waits to take its run, read each such run's record faster
+  // than the minute: the resume consuming its marker, a new failure time or a
+  // status that isn't retryable confirms it (then the board reloads); one
+  // that outlives RETRY_STALL_MS never started.
+  const marksRef = useRef(retryMarks);
+  marksRef.current = retryMarks;
+  const anyRetryRequested = Object.keys(retryMarks).length > 0;
   useEffect(() => {
     if (!anyRetryRequested) return;
-    const t = setInterval(() => {
-      if (document.visibilityState === 'visible') load();
-    }, RETRY_RECONCILE_MS);
-    return () => clearInterval(t);
+    let cancelled = false;
+    const tick = async () => {
+      if (document.visibilityState !== 'visible') return;
+      const marks = Object.entries(marksRef.current);
+      const reads = await Promise.all(
+        marks.map(([id, mark]) =>
+          api.getRun(id).then(
+            ({ run }) => ({ id, mark, run }),
+            () => ({ id, mark, run: null }),
+          ),
+        ),
+      );
+      if (cancelled) return;
+      const taken: string[] = [];
+      const stalled: string[] = [];
+      for (const { id, mark, run } of reads) {
+        if (run && (!isRetryable(run.status) || !run.resume_requested_at || (run.finished_at ?? run.started_at) !== mark.failedAt)) {
+          taken.push(id);
+        } else if (Date.now() - mark.at > RETRY_STALL_MS) {
+          stalled.push(id);
+        }
+      }
+      if (taken.length + stalled.length === 0) return;
+      const done = new Set([...taken, ...stalled]);
+      setRetryMarks((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => !done.has(id))));
+      if (stalled.length > 0) {
+        setRetryErrors((prev) => ({ ...prev, ...Object.fromEntries(stalled.map((id) => [id, RETRY_STALLED_MESSAGE])) }));
+      }
+      if (taken.length > 0) load();
+    };
+    const t = setInterval(() => void tick(), RETRY_RECONCILE_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
   }, [anyRetryRequested, load]);
+  const retryRequested = useMemo(
+    () => Object.fromEntries(Object.keys(retryMarks).map((id) => [id, true as const])) as Record<string, true>,
+    [retryMarks],
+  );
 
   const snooze = useCallback((item: InboxItem, dur: SnoozeDuration) => {
     const until = snoozeUntil(dur, Date.now());

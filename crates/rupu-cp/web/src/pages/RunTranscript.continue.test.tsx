@@ -50,7 +50,7 @@ function stub(row: AgentRunRow | null) {
   vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
   vi.spyOn(api, 'getModelCatalog').mockResolvedValue([
     { provider: 'anthropic', fetched_at: null, stale: false, models: [{ id: 'claude-opus-5-5', input_tokens: null, output_tokens: null, source: 'live' }, { id: 'claude-sonnet-5-5', input_tokens: null, output_tokens: null, source: 'live' }] },
-    { provider: 'openai', fetched_at: null, stale: false, models: [] },
+    { provider: 'openai', fetched_at: null, stale: false, models: [{ id: 'gpt-6', input_tokens: null, output_tokens: null, source: 'live' }, { id: 'gpt-6-mini', input_tokens: null, output_tokens: null, source: 'live' }] },
   ]);
 }
 
@@ -101,6 +101,22 @@ describe('RunTranscript continue', () => {
     await waitFor(() => expect(cont).toHaveBeenCalled());
   });
 
+  it('a provider chosen alone brings its first model, never the old one', async () => {
+    stub(agentRow());
+    const cont = vi
+      .spyOn(runsApi, 'continueAgentRun')
+      .mockResolvedValue({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
+    renderAt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    const composer = screen.getByRole('region', { name: 'Continue this run' });
+    fireEvent.click(within(composer).getByRole('button', { name: /Model & provider/ }));
+    await within(composer).findByRole('option', { name: 'openai' });
+    fireEvent.change(within(composer).getByLabelText('Provider'), { target: { value: 'openai' } });
+    expect((within(composer).getByLabelText('Model') as HTMLInputElement).value).toBe('gpt-6');
+    fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
+    await waitFor(() => expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: 'gpt-6', provider: 'openai' }));
+  });
+
   it('sends a different model chosen under the disclosure', async () => {
     stub(agentRow());
     const cont = vi
@@ -142,6 +158,24 @@ describe('RunTranscript continue', () => {
 
   it('offers no Continue on a completed run (a continue would only print its answer)', async () => {
     stub(agentRow({ status: 'completed' }));
+    renderAt();
+    await screen.findByRole('heading', { name: /code-reviewer/ });
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
+  });
+
+  it('offers Continue on a run that crashed before recording how it ended (no status)', async () => {
+    stub(agentRow({ status: null }));
+    const cont = vi
+      .spyOn(runsApi, 'continueAgentRun')
+      .mockResolvedValue({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
+    renderAt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue run' }));
+    await waitFor(() => expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: undefined, provider: undefined }));
+  });
+
+  it('offers no Continue on a session turn', async () => {
+    stub(agentRow({ source: 'session', status: null, session_id: 'ses_1' }));
     renderAt();
     await screen.findByRole('heading', { name: /code-reviewer/ });
     expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();

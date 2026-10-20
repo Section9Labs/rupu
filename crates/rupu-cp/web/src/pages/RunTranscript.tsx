@@ -9,7 +9,8 @@
 //
 // A local standalone run's page also heads itself with the run (agent, status,
 // model, from its `/api/runs/agents` row) and, when the run stopped short of
-// finishing (failed, cancelled, interrupted), offers Continue (operator MCP
+// finishing (failed, cancelled, or crashed before recording an end: no
+// status), offers Continue (operator MCP
 // Plan 3b, UI-1, mock §2). A completed run has nothing to continue: the CP's
 // continue takes no prompt, and continuing a finished run only returns its
 // recorded answer.
@@ -31,8 +32,10 @@ import { RunStatusChip } from '../components/ui/RunStatusChip';
 import { ContinueComposer } from '../components/runops/ContinueComposer';
 
 /** Statuses with nothing to continue: still going (the server 409s) or
- *  finished (a continue would only print the recorded answer). */
-const NOT_CONTINUABLE = new Set(['running', 'pending', 'awaiting_approval', 'completed', 'ok']);
+ *  finished (a continue would only print the recorded answer). A standalone
+ *  row is otherwise failed, cancelled or, for a run that crashed before
+ *  recording how it ended, has no status. */
+const NOT_CONTINUABLE = new Set(['running', 'completed']);
 
 /** A standalone run's `/api/runs/agents` row (local only), re-read on demand. */
 function useAgentRunRow(runId: string | null): [AgentRunRow | null, () => void] {
@@ -98,7 +101,8 @@ export default function RunTranscript() {
   const label = path.split('/').filter(Boolean).pop() ?? 'Transcript';
   const childRunId = standaloneId;
   const status = row?.status ?? null;
-  const canContinue = !!row && !!childRunId && status !== null && !NOT_CONTINUABLE.has(status);
+  const canContinue =
+    !!row && row.source === 'standalone' && !!childRunId && (status === null || !NOT_CONTINUABLE.has(status));
 
   return (
     <div className="flex flex-col p-8 gap-4">
@@ -150,7 +154,7 @@ export default function RunTranscript() {
           path={path}
           provider={row?.provider}
           model={row?.model}
-          failed={status === 'failed' || status === 'error'}
+          failed={status === 'failed'}
           onCancel={() => setContinuing(false)}
         />
       )}
