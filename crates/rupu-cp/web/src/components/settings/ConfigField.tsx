@@ -11,27 +11,24 @@ import { createContext, useContext, type ReactNode } from 'react';
 import type { KeyProvenance } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { Chip } from '../ui/Chip';
+import { StatusChip, type ChipTone } from '../ui/StatusChip';
 import { Lock, Unlock } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
-// Provenance badge — which config layer resolved this key's effective value.
+// Provenance badge — which config layer resolved this key's effective value,
+// as the ONE config-origin chip of the visual language (spec §"Chips"): a
+// pale tint of the layer's hue, no dot (the dot is reserved for live status).
 // ---------------------------------------------------------------------------
 
-export const SOURCE_CLASS: Record<KeyProvenance['source'], string> = {
-  global: 'bg-info-bg text-info ring-info/30',
-  // A customer layer sits between global and project (customers spec §2).
-  customer: 'bg-brand-50 text-brand-700 border-brand-100 ring-brand-100',
-  project: 'bg-ok-bg text-ok ring-ok/30',
-  default: 'bg-surface text-ink-mute ring-border',
+const ORIGIN_TONE: Record<KeyProvenance['source'], ChipTone> = {
+  global: 'origin-global',
+  customer: 'origin-customer',
+  project: 'origin-project',
+  default: 'origin-default',
 };
 
 function ProvenanceBadge({ source }: { source: KeyProvenance['source'] }) {
-  return (
-    <Chip className={cn(SOURCE_CLASS[source], 'gap-1')}>
-      <span aria-hidden="true" className="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-80" />
-      {source}
-    </Chip>
-  );
+  return <StatusChip tone={ORIGIN_TONE[source]}>{source}</StatusChip>;
 }
 
 /** Lock-owner chip — which layer's `[policy].lock` pins a key. A customer's

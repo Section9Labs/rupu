@@ -39,6 +39,8 @@ export type ChipTone =
   // config origin
   | 'origin-global'
   | 'origin-project'
+  | 'origin-customer'
+  | 'origin-default'
   // generic
   | 'neutral';
 
@@ -60,6 +62,10 @@ const SEVERITY_TONES: ReadonlySet<ChipTone> = new Set([
 const STATIC_TONES: Partial<Record<ChipTone, ToneStyle>> = {
   'origin-global': { cls: 'bg-info-bg text-info ring-info/30', dot: 'bg-info' },
   'origin-project': { cls: 'bg-ok-bg text-ok ring-ok/30', dot: 'bg-ok' },
+  // A customer config layer sits between global and project — brand-tinted, the
+  // app's shipped provenance convention. `default` is the unset/fallback layer.
+  'origin-customer': { cls: 'bg-brand-50 text-brand-700 ring-brand-100', dot: 'bg-brand-500' },
+  'origin-default': { cls: 'bg-surface text-ink-mute ring-border', dot: 'bg-ink-mute' },
   neutral: { cls: 'bg-surface text-ink-dim ring-border', dot: 'bg-status-pending' },
 };
 
