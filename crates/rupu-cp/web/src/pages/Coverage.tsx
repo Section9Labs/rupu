@@ -11,7 +11,8 @@ import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Skeleton } from '../components/ui/Skeleton';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
@@ -76,21 +77,19 @@ export default function Coverage() {
 
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <div className="flex items-center justify-between gap-4">
-          <h1 className="text-2xl font-semibold text-ink">Coverage</h1>
+      <PageHeader
+        className="mb-6"
+        title="Coverage"
+        subtitle="Assessment activity across all registered projects — how many concern assertions have been recorded per target, and how many findings were raised."
+        actions={
           <Link
             to="/coverage/templates"
-            className="text-xs font-medium text-brand-700 hover:text-brand-500"
+            className="inline-flex items-center rounded-md border border-border bg-panel px-3 py-1.5 text-ui font-medium text-ink transition-colors hover:bg-bg"
           >
             Templates →
           </Link>
-        </div>
-        <p className="mt-1 text-sm text-ink-dim">
-          Assessment activity across all registered projects — how many concern assertions have
-          been recorded per target, and how many findings were raised.
-        </p>
-      </header>
+        }
+      />
 
       <UnscopedNote className="mb-4">
         Coverage can’t be filtered by customer — it shows every customer’s projects.
@@ -99,8 +98,24 @@ export default function Coverage() {
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {targets === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading coverage…" />
+        <div
+          role="status"
+          aria-label="Loading coverage…"
+          className="overflow-hidden rounded-xl border border-border bg-panel"
+        >
+          <span className="sr-only">Loading coverage…</span>
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div
+              key={i}
+              aria-hidden
+              className="flex items-center gap-4 border-t border-border px-4 py-3.5 first:border-t-0"
+            >
+              <Skeleton className="h-4 w-48" />
+              <div className="flex-1" />
+              <Skeleton className="h-4 w-14" />
+              <Skeleton className="h-4 w-14" />
+            </div>
+          ))}
         </div>
       ) : loaded.length === 0 ? (
         <EmptyState

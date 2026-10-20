@@ -12,6 +12,7 @@
 // (400) is cleared with a notice.
 
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
+import { PageHeader } from '../components/ui/PageHeader';
 import { useScopedList } from '../lib/useScopedList';
 
 export default function Findings({ customer: fixedCustomer }: { customer?: string } = {}) {
@@ -20,13 +21,16 @@ export default function Findings({ customer: fixedCustomer }: { customer?: strin
   return (
     <div className={embedded ? undefined : 'p-8'}>
       {!embedded && (
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Findings</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Every finding raised across all registered projects. Filter with the query bar, e.g.{' '}
-          <code className="font-mono text-note">severity&gt;=high tag:needs-poc</code> — press / to focus.
-        </p>
-      </header>
+        <PageHeader
+          className="mb-6"
+          title="Findings"
+          subtitle={
+            <>
+              Every finding raised across all registered projects. Filter with the query bar, e.g.{' '}
+              <code className="font-mono text-note">severity&gt;=high tag:needs-poc</code> — press / to focus.
+            </>
+          }
+        />
       )}
 
       <FindingsExplorer

@@ -4,17 +4,16 @@
 // `code`. Thin page shell over the shared `AssetInventory` view.
 
 import AssetInventory from '../components/agentiflow/AssetInventory';
+import { PageHeader } from '../components/ui/PageHeader';
 
 export default function Assets() {
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Assets</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Everything the fleets have discovered — hosts and services, sites and routes, files — with how deeply each has
-          been examined.
-        </p>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Assets"
+        subtitle="Everything the fleets have discovered — hosts and services, sites and routes, files — with how deeply each has been examined."
+      />
       <AssetInventory />
     </div>
   );
