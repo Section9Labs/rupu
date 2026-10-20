@@ -115,6 +115,10 @@ export type ToolKind =
   | 'subrun'
   | 'coverage'
   | 'ast_grep'
+  | 'board'
+  | 'asset'
+  | 'skill'
+  | 'connector'
   | 'generic';
 
 export interface ToolView {
@@ -401,8 +405,31 @@ function classify(tool: string): ToolKind {
       return 'subrun';
     case 'ast_grep':
       return 'ast_grep';
-    default:
-      return tool.startsWith('coverage.') || tool.startsWith('coverage_') ? 'coverage' : 'generic';
+    // Engagement asset marking (`assets.mark`, legacy alias `asset_mark`).
+    case 'assets.mark':
+    case 'asset_mark':
+      return 'asset';
+    // Skill loading (`skills.load`).
+    case 'skills.load':
+      return 'skill';
+    default: {
+      // The fleet coordination board (`board.claim/release/read/post/
+      // directive/retract`). `board.post` usually folds into a MessageBubble
+      // (its output names a logged `msg_…` id); the rest stay as board cards.
+      if (tool.startsWith('board.')) return 'board';
+      // Coverage ledger tools (`coverage.*`, legacy `coverage_*`).
+      if (tool.startsWith('coverage.') || tool.startsWith('coverage_')) return 'coverage';
+      // SCM / issue-tracker connectors (one view family over all platforms).
+      if (
+        tool.startsWith('scm.') ||
+        tool.startsWith('issues.') ||
+        tool.startsWith('github.') ||
+        tool.startsWith('gitlab.')
+      ) {
+        return 'connector';
+      }
+      return 'generic';
+    }
   }
 }
 
