@@ -22,6 +22,8 @@ use crate::transcript_tail::{read_numbered, NumberedLine};
 pub(super) enum Line {
     Run(NumberedLine<Event>),
     Msg(NumberedLine<LogLine>),
+    /// An agentiflow's `events.jsonl` line, kept as JSON.
+    Flow(NumberedLine<Value>),
 }
 
 impl Line {
@@ -29,6 +31,7 @@ impl Line {
         match self {
             Line::Run(l) => l.id,
             Line::Msg(l) => l.id,
+            Line::Flow(l) => l.id,
         }
     }
 
@@ -36,6 +39,7 @@ impl Line {
         match self {
             Line::Run(l) => l.send,
             Line::Msg(l) => l.send,
+            Line::Flow(l) => l.send,
         }
     }
 }
@@ -46,12 +50,13 @@ pub(super) type Tail = Pin<Box<dyn Stream<Item = (usize, Line)> + Send>>;
 pub(super) enum Feed {
     Run(PathBuf),
     Log(PathBuf),
+    Flow(PathBuf),
 }
 
 impl Feed {
     pub(super) fn path(&self) -> &std::path::Path {
         match self {
-            Feed::Run(p) | Feed::Log(p) => p,
+            Feed::Run(p) | Feed::Log(p) | Feed::Flow(p) => p,
         }
     }
 }
@@ -72,7 +77,7 @@ pub(super) async fn locate(
 ) -> Result<HashMap<String, Located>, String> {
     let mut found: HashMap<String, Located> = HashMap::new();
     for c in watch {
-        if matches!(c.kind, Kind::Messages { .. }) {
+        if !matches!(c.kind, Kind::Settled | Kind::Gate | Kind::Events { .. }) {
             continue;
         }
         let run = c.target.as_str();
@@ -123,8 +128,10 @@ impl WaitSource {
         &self,
         watch: &[Condition],
         located: &HashMap<String, Located>,
+        since: tokio::time::Instant,
         fired: &mut BTreeMap<usize, Value>,
-    ) {
+    ) -> Result<(), String> {
+        super::turns::check(&self.state, watch, since, fired).await?;
         for (i, c) in watch.iter().enumerate() {
             if fired.contains_key(&i) {
                 continue;
@@ -165,6 +172,7 @@ impl WaitSource {
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 
@@ -194,6 +202,7 @@ pub(super) fn matching(
             Some(LogLine::Msg(_)) => serde_json::to_value(l.event.as_ref()?).ok()?,
             Some(LogLine::Seen { .. }) | None => return None,
         },
+        Line::Flow(l) => l.event.clone()?,
     };
     let mut taken = false;
     for &i in conds {
@@ -208,6 +217,13 @@ pub(super) fn matching(
                 Some(LogLine::Msg(m)) => kinds.as_ref().is_none_or(|k| k.contains(&m.kind)),
                 _ => false,
             },
+            (Kind::Agentiflow { types }, Line::Flow(l)) => types.as_ref().is_none_or(|t| {
+                l.event
+                    .as_ref()
+                    .and_then(|e| e.get("kind"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|k| t.iter().any(|x| x == k))
+            }),
             _ => false,
         };
         if takes {
@@ -247,6 +263,14 @@ pub(super) async fn catch_up(
                 tokio::task::spawn_blocking(move || {
                     read_numbered::<LogLine>(&p, after, CATCH_UP_MAX)
                         .map(|(l, last)| (l.into_iter().map(Line::Msg).collect::<Vec<_>>(), last))
+                })
+                .await
+            }
+            Feed::Flow(p) => {
+                let p = p.clone();
+                tokio::task::spawn_blocking(move || {
+                    read_numbered::<Value>(&p, after, CATCH_UP_MAX)
+                        .map(|(l, last)| (l.into_iter().map(Line::Flow).collect::<Vec<_>>(), last))
                 })
                 .await
             }

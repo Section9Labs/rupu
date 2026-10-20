@@ -347,6 +347,37 @@ fn lookup_session_agent_name(
     agent
 }
 
+/// The transcript of standalone agent run `run`: `<global>/transcripts/<run>.jsonl`,
+/// else `<project>/.rupu/transcripts/<run>.jsonl` of a registered workspace.
+/// `run` must be a safe path segment.
+pub(crate) fn agent_run_transcript(
+    global: &std::path::Path,
+    run: &str,
+) -> Option<std::path::PathBuf> {
+    if crate::path_guard::unsafe_segment(run).is_some() {
+        return None;
+    }
+    let file = format!("{run}.jsonl");
+    let at = global.join("transcripts").join(&file);
+    if at.is_file() {
+        return Some(at);
+    }
+    let workspaces = rupu_workspace::WorkspaceStore {
+        root: global.join("workspaces"),
+    }
+    .list()
+    .unwrap_or_default();
+    workspaces
+        .into_iter()
+        .map(|w| {
+            std::path::PathBuf::from(&w.path)
+                .join(".rupu")
+                .join("transcripts")
+                .join(&file)
+        })
+        .find(|p| p.is_file())
+}
+
 /// Load all `*.meta.json` files from `<global>/transcripts/` and convert to
 /// `AgentRunRow`s with `source = "standalone"`.
 ///
@@ -2944,6 +2975,9 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
+        assert_eq!(
+            rows[0]["started_at"],
+            serde_json::json!(day(10).to_rfc3339())
+        );
     }
 }

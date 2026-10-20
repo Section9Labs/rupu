@@ -15,6 +15,9 @@ pub(super) enum Kind {
     Gate,
     Events { types: Option<Vec<String>> },
     Messages { kinds: Option<Vec<MessageKind>> },
+    Agentiflow { types: Option<Vec<String>> },
+    AgentRunEnd,
+    SessionTurn { run: Option<String> },
 }
 
 impl Kind {
@@ -24,12 +27,18 @@ impl Kind {
             Kind::Gate => "run_gate",
             Kind::Events { .. } => "run_events",
             Kind::Messages { .. } => "messages",
+            Kind::Agentiflow { .. } => "agentiflow",
+            Kind::AgentRunEnd => "agent_run_end",
+            Kind::SessionTurn { .. } => "session_turn",
         }
     }
 
     /// Whether it collects lines (rather than watching run state).
     pub(super) fn collects(&self) -> bool {
-        matches!(self, Kind::Events { .. } | Kind::Messages { .. })
+        matches!(
+            self,
+            Kind::Events { .. } | Kind::Messages { .. } | Kind::Agentiflow { .. }
+        )
     }
 }
 
@@ -44,9 +53,10 @@ pub(super) enum CursorValue {
 #[derive(Debug, Clone)]
 pub(super) struct Condition {
     pub(super) kind: Kind,
-    /// The run id, or the message root id.
+    /// The run id, message root id, agentiflow id or session id.
     pub(super) target: String,
-    /// `run:<id>` or `messages:<root>`.
+    /// `run:<id>`, `messages:<root>` or `agentiflow:<id>`; `agent_run:<id>` and
+    /// `session:<id>` for the conditions that tail nothing.
     pub(super) source: String,
 }
 
@@ -106,6 +116,40 @@ pub(super) fn input_schema() -> Value {
                                 "enum": ["post", "direct", "broadcast", "directive", "retract", "operator"]},
                                 "description": "Only these message kinds."},
                             "host": host,
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind", "id"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["agentiflow"],
+                                "description": "New lines of an agentiflow's event log (local only)."},
+                            "id": {"type": "string", "description": "An agentiflow id (`af_…`)."},
+                            "types": {"type": "array", "items": {"type": "string"},
+                                "description": "Only lines of these `kind`s (`round`, `run_stopped`, …)."}
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind", "run"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["agent_run_end"],
+                                "description": "A standalone agent run finished; returns its status and final answer (local only)."},
+                            "run": {"type": "string", "description": "A standalone agent run id."}
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind", "session"],
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["session_turn"],
+                                "description": "A session turn ended (or the session stopped); returns the turn's final answer (local only)."},
+                            "session": {"type": "string", "description": "A session id."},
+                            "run": {"type": "string",
+                                "description": "The turn's run id; default the active turn, else the latest."}
                         }
                     }
                 ]}
@@ -196,27 +240,29 @@ pub(super) fn parse(args: Value) -> Result<Request, String> {
     })
 }
 
+const KINDS: &str =
+    "run_settled, run_gate, run_events, messages, agentiflow, agent_run_end, session_turn";
+
 fn condition(i: usize, c: Value) -> Result<Condition, String> {
     let at = format!("watch[{i}]");
     let kind = c
         .get("kind")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            format!("{at}: `kind` must be one of run_settled, run_gate, run_events, messages")
-        })?
+        .ok_or_else(|| format!("{at}: `kind` must be one of {KINDS}"))?
         .to_string();
     let allowed: &[&str] = match kind.as_str() {
         "run_settled" | "run_gate" => &["kind", "run", "host"],
         "run_events" => &["kind", "run", "types", "host"],
         "messages" => &["kind", "root", "kinds", "host"],
-        other => {
-            return Err(format!(
-                "{at}: unknown kind `{other}` (run_settled, run_gate, run_events, messages)"
-            ))
-        }
+        "agentiflow" => &["kind", "id", "types"],
+        "agent_run_end" => &["kind", "run"],
+        "session_turn" => &["kind", "session", "run"],
+        other => return Err(format!("{at}: unknown kind `{other}` ({KINDS})")),
     };
     let what = format!("{at} (`{kind}`)");
     let mut o = entries(c, allowed, &what)?;
+    // (The local-only kinds don't list `host` among their keys, so a `host`
+    // on them is already an unknown argument.)
     match o.remove("host") {
         None => {}
         Some(Value::String(h)) if h == "local" => {}
@@ -227,7 +273,12 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
         }
         Some(_) => return Err(format!("{what}: `host` must be a string")),
     }
-    let target_key = if kind == "messages" { "root" } else { "run" };
+    let target_key = match kind.as_str() {
+        "messages" => "root",
+        "agentiflow" => "id",
+        "session_turn" => "session",
+        _ => "run",
+    };
     let target = match o.remove(target_key) {
         Some(Value::String(s)) if !s.is_empty() => s,
         _ => return Err(format!("{what}: missing required argument `{target_key}`")),
@@ -250,6 +301,25 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
                 })
                 .transpose()?,
         },
+        "agentiflow" => Kind::Agentiflow {
+            types: o
+                .remove("types")
+                .map(|v| strings(v, "types", &what))
+                .transpose()?,
+        },
+        "agent_run_end" => Kind::AgentRunEnd,
+        "session_turn" => Kind::SessionTurn {
+            run: match o.remove("run") {
+                None => None,
+                Some(Value::String(r)) if !r.is_empty() => {
+                    if let Some(why) = crate::path_guard::unsafe_segment(&r) {
+                        return Err(format!("{what}: `{r}` is not a valid id ({why})"));
+                    }
+                    Some(r)
+                }
+                Some(_) => return Err(format!("{what}: `run` must be a string")),
+            },
+        },
         _ => Kind::Messages {
             kinds: o
                 .remove("kinds")
@@ -267,6 +337,9 @@ fn condition(i: usize, c: Value) -> Result<Condition, String> {
     };
     let source = match kind {
         Kind::Messages { .. } => format!("messages:{target}"),
+        Kind::Agentiflow { .. } => format!("agentiflow:{target}"),
+        Kind::AgentRunEnd => format!("agent_run:{target}"),
+        Kind::SessionTurn { .. } => format!("session:{target}"),
         _ => format!("run:{target}"),
     };
     Ok(Condition {

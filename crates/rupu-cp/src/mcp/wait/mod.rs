@@ -10,6 +10,7 @@
 
 mod local;
 mod parse;
+mod turns;
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -39,6 +40,9 @@ const CATCH_UP_MAX: usize = 1000;
 const RECHECK_EVERY: Duration = Duration::from_secs(1);
 /// The least time between two re-checks a line triggers.
 const RECHECK_MIN_GAP: Duration = Duration::from_millis(200);
+/// How long a run or session turn still appearing is looked for before the
+/// call says it doesn't exist.
+pub(crate) const APPEAR_GRACE: Duration = Duration::from_secs(10);
 
 /// `timeout_ms` as the call's timeout: [`DEFAULT_TIMEOUT`] when absent,
 /// never past [`MAX_TIMEOUT`].
@@ -73,8 +77,8 @@ impl WaitSource {
     }
 }
 
-const DESCRIPTION: &str = "Wait for a run to settle, a gate to park, new run events or new \
-messages. Returns at once when a watched state already holds; otherwise when a condition \
+const DESCRIPTION: &str = "Wait for a run to settle, a gate to park, new run, agentiflow or message \
+lines, a standalone agent run to finish or a session turn to end. Returns at once when a watched state already holds; otherwise when a condition \
 fires, a watched stream has new lines, or the timeout. Pass the returned `cursor` back to \
 resume where the last call left off.";
 
@@ -136,6 +140,16 @@ impl WaitSource {
                         }
                     }
                 }
+                Kind::Agentiflow { .. } => {
+                    let dir =
+                        rupu_agentiflow::agentiflow_dir(&self.state.global_dir).join(&c.target);
+                    if !dir.is_dir() {
+                        return ToolResult::Error(format!("no agentiflow `{}`", c.target));
+                    }
+                    Feed::Flow(dir.join("events.jsonl"))
+                }
+                // Watched by re-checking their state; nothing to tail.
+                Kind::AgentRunEnd | Kind::SessionTurn { .. } => continue,
                 _ => match located.get(&c.target) {
                     Some(Located::Store(store)) => Feed::Run(store.events_path(&c.target)),
                     // Nothing was ever written: only `run_settled` can be
@@ -176,7 +190,13 @@ impl WaitSource {
         // State first, then what is already on disk past the cursor: a run
         // seen settled has written its last line, so the catch-up after it
         // has every event. Either returns at once.
-        self.check_state(&req.watch, &located, &mut got.fired).await;
+        let started = Instant::now();
+        if let Err(e) = self
+            .check_state(&req.watch, &located, started, &mut got.fired)
+            .await
+        {
+            return ToolResult::Error(e);
+        }
         if let Err(e) = catch_up(&req.watch, &feeds, &collects, &by_source, &mut got).await {
             return ToolResult::Error(e);
         }
@@ -205,8 +225,14 @@ impl WaitSource {
                 Feed::Log(p) => Box::pin(
                     NumberedTail::<LogLine>::open(p, after).map(move |l| (i, Line::Msg(l))),
                 ),
+                Feed::Flow(p) => {
+                    Box::pin(NumberedTail::<Value>::open(p, after).map(move |l| (i, Line::Flow(l))))
+                }
             });
         }
+        // Conditions that tail nothing (a run or turn watched by state) leave
+        // no stream to end the wait.
+        let tailing = !tails.is_empty();
         let mut lines = futures_util::stream::select_all(tails);
 
         let deadline = Instant::now() + req.timeout;
@@ -214,7 +240,13 @@ impl WaitSource {
         let mut last_check = Instant::now();
         loop {
             tokio::select! {
-                line = lines.next() => {
+                line = async {
+                    if tailing {
+                        lines.next().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
                     let Some((src, line)) = line else { break };
                     if !line.send() {
                         continue;
@@ -228,7 +260,12 @@ impl WaitSource {
                     }
                     if has_state && last_check.elapsed() >= RECHECK_MIN_GAP {
                         last_check = Instant::now();
-                        self.check_state(&req.watch, &located, &mut got.fired).await;
+                        if let Err(e) = self
+                            .check_state(&req.watch, &located, started, &mut got.fired)
+                            .await
+                        {
+                            return ToolResult::Error(e);
+                        }
                         if !got.fired.is_empty() {
                             break;
                         }
@@ -240,7 +277,12 @@ impl WaitSource {
                     }
                     if has_state {
                         last_check = Instant::now();
-                        self.check_state(&req.watch, &located, &mut got.fired).await;
+                        if let Err(e) = self
+                            .check_state(&req.watch, &located, started, &mut got.fired)
+                            .await
+                        {
+                            return ToolResult::Error(e);
+                        }
                         if !got.fired.is_empty() {
                             break;
                         }

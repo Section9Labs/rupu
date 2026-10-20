@@ -515,3 +515,162 @@ async fn cancelling_a_wait_stops_it() {
     assert!(resp.text().await.unwrap().is_empty());
     assert!(t.elapsed() < Duration::from_secs(10));
 }
+
+// ---- agentiflow, agent_run_end, session_turn ------------------------------
+
+const FLOW: &str = "af_01J9ZQ3K4M5N6P7Q8R9S0T1WAT";
+
+fn transcript(global: &Path, run: &str, answer: &str, status: &str) -> std::path::PathBuf {
+    let dir = global.join("transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{run}.jsonl"));
+    let a = json!({"type": "assistant_message", "data": {"content": answer}});
+    let c = json!({"type": "run_complete", "data": {"run_id": run, "status": status,
+        "total_tokens": 12, "duration_ms": 5}});
+    std::fs::write(&path, format!("{a}\n{c}\n")).unwrap();
+    path
+}
+
+fn session(global: &Path, id: &str, status: &str, active: Option<&str>, runs: Value) {
+    let dir = global.join("sessions").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let v = json!({"session_id": id, "agent_name": "triage", "status": status,
+        "active_run_id": active, "runs": runs});
+    std::fs::write(dir.join("session.json"), serde_json::to_vec(&v).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn agentiflow_lines_are_returned_and_filtered_by_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = rupu_agentiflow::agentiflow_dir(tmp.path()).join(FLOW);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("events.jsonl"),
+        "{\"kind\":\"round\",\"n\":1}\n{\"kind\":\"run_stopped\",\"why\":\"done\"}\n",
+    )
+    .unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agentiflow", "id": FLOW, "types": ["run_stopped"]}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["events"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(s["events"][0]["event"]["why"], "done", "{r}");
+    assert_eq!(s["fired"][0]["detail"]["count"], 1, "{r}");
+    assert_eq!(
+        s["cursor"],
+        json!({ format!("agentiflow:{FLOW}"): 2 }),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn an_ended_agent_run_fires_with_its_final_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    transcript(tmp.path(), "run_a", "done.", "ok");
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_a"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["final_answer"], "done.", "{r}");
+    assert_eq!(d["total_tokens"], 12, "{r}");
+    assert_eq!(d["status"], "ok", "{r}");
+}
+
+#[tokio::test]
+async fn an_agent_run_that_appears_late_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        transcript(&g, "run_late", "late.", "ok");
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_late"}], "timeout_ms": 20000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(
+        r["structuredContent"]["fired"][0]["detail"]["final_answer"], "late.",
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn an_agent_run_that_never_appears_is_an_error_after_the_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_none"}], "timeout_ms": 30000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(12), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains("run_none"), "{r}");
+}
+
+#[tokio::test]
+async fn a_session_turn_fires_with_the_turns_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = transcript(tmp.path(), "run_t", "the answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_A",
+        "running",
+        Some("run_t"),
+        json!([{"run_id": "run_t", "transcript_path": path.to_str().unwrap()}]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_A"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_t", "{r}");
+    assert_eq!(d["final_answer"], "the answer.", "{r}");
+}
+
+#[tokio::test]
+async fn a_session_that_stopped_fires_without_a_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    session(tmp.path(), "ses_B", "stopped", None, json!([]));
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_B"}]}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], Value::Null, "{r}");
+    assert_eq!(d["final_answer"], Value::Null, "{r}");
+    assert_eq!(d["status"], "stopped", "{r}");
+}
+
+#[tokio::test]
+async fn a_host_on_these_conditions_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    for c in [
+        json!({"kind": "agentiflow", "id": FLOW, "host": "local"}),
+        json!({"kind": "agent_run_end", "run": "run_a", "host": "local"}),
+        json!({"kind": "session_turn", "session": "ses_A", "host": "other"}),
+    ] {
+        let r = wait(addr, json!({ "watch": [c] })).await;
+        assert_eq!(r["isError"], json!(true), "{r}");
+        assert!(text_of(&r).contains("host"), "{r}");
+    }
+}
