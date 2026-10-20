@@ -75,10 +75,46 @@ describe('InstallSkillsDialog', () => {
     const nuclei = within(list).getByRole('checkbox', { name: 'nuclei' });
     expect(nuclei).toBeEnabled();
     fireEvent.click(nuclei);
-    fireEvent.click(screen.getByRole('button', { name: 'Install 2 skills' }));
+    const install = screen.getByRole('button', { name: 'Install 2 skills' });
+    // Replacing a copy is destructive: styled danger, and asked first.
+    expect(install.className).toContain('bg-err');
+    fireEvent.click(install);
+
+    expect(screen.getByText(/Replace the installed copy of nuclei\? Its local edits are lost\./)).toBeInTheDocument();
+    expect(bodies(fetchMock)).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Replace and install' }));
 
     await waitFor(() => expect(bodies(fetchMock)).toHaveLength(3));
     expect(bodies(fetchMock)[1]).toEqual({ source: 'example/skills', skills: ['nmap', 'nuclei'], force: true });
+  });
+
+  it('backs out of a replace without installing anything', async () => {
+    const fetchMock = mockServer(() => jsonResponse({ dry_run: true, layer: 'global', found: FOUND }));
+    renderDialog();
+    const list = await find();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Replace locally edited copies' }));
+    fireEvent.click(within(list).getByRole('checkbox', { name: 'nuclei' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install 2 skills' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+
+    expect(screen.queryByText(/Its local edits are lost/)).not.toBeInTheDocument();
+    expect(bodies(fetchMock)).toHaveLength(1);
+  });
+
+  it('installs new skills with one click when nothing would be replaced, even with force on', async () => {
+    const fetchMock = mockServer((_url, body) =>
+      body.dry_run ? jsonResponse({ dry_run: true, layer: 'global', found: FOUND }) : jsonResponse({ installed: [], skipped: [] }),
+    );
+    renderDialog();
+    await find();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Replace locally edited copies' }));
+
+    const install = screen.getByRole('button', { name: 'Install 1 skill' });
+    expect(install.className).not.toContain('bg-err');
+    fireEvent.click(install);
+
+    await waitFor(() => expect(bodies(fetchMock)).toHaveLength(3));
   });
 
   it('unticks the edited copies when the force check is cleared', async () => {

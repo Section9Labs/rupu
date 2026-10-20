@@ -508,14 +508,21 @@ pub struct Preview {
 }
 
 /// Every skill in `source`, with what installing it into `skills_dir`
-/// would do. Reads the source and the layer; writes nothing.
+/// would do. Reads the source and the layer; writes nothing. The fetched
+/// tree is held until every skill is previewed: a git source's clone is a
+/// temp dir its tree owns, gone once the tree drops.
 pub fn preview_install(
     source: &crate::source::Source,
     fetcher: &dyn crate::source::Fetch,
     skills_dir: &Path,
     layer: Layer,
 ) -> Result<Vec<Preview>, InstallError> {
-    Ok(list_source(source, fetcher)?
+    let tree = open(source, fetcher)?;
+    let found = find_skills(&tree.root)?;
+    if found.is_empty() {
+        return Err(InstallError::NoSkill(tree.root.clone()));
+    }
+    let preview = found
         .into_iter()
         .map(|found| {
             let (status, reason) = preview_one(&found, skills_dir, layer);
@@ -525,7 +532,9 @@ pub fn preview_install(
                 reason,
             }
         })
-        .collect())
+        .collect();
+    drop(tree);
+    Ok(preview)
 }
 
 fn preview_one(f: &Found, skills_dir: &Path, layer: Layer) -> (PreviewStatus, Option<String>) {

@@ -3,7 +3,8 @@
 // and a layer; "Find skills" runs the install's dry run, which lists the
 // source's skills with what installing each would do. New ones are ticked.
 // Replacing an installed copy needs "Replace locally edited copies" (the
-// install's `force`). After an install the dialog runs the dry run again, so
+// install's `force`), and installing one asks first: the copy's local edits
+// are lost. After an install the dialog runs the dry run again, so
 // what it shows as installed is what the server now reports, never the POST
 // alone. Rendered by its owner only while open.
 
@@ -57,6 +58,8 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SkillInstallReport | null>(null);
   const sourceHelp = useId();
+  // The install would replace installed copies: asked before it is sent.
+  const [confirming, setConfirming] = useState(false);
 
   const request = { source, ref, project: project || undefined };
 
@@ -65,6 +68,7 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
     set(v);
     setPreview(null);
     setPicked(new Set());
+    setConfirming(false);
     setResult(null);
     setError(null);
   };
@@ -89,6 +93,7 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
 
   async function install() {
     if (!preview || picked.size === 0 || busy) return;
+    setConfirming(false);
     setBusy('installing');
     setError(null);
     try {
@@ -109,6 +114,7 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
 
   function toggleForce(on: boolean) {
     setForce(on);
+    setConfirming(false);
     if (!on && preview) {
       const replace = new Set(preview.found.filter((r) => needsForce(r.status)).map((r) => r.name));
       setPicked((prev) => new Set([...prev].filter((n) => !replace.has(n))));
@@ -116,6 +122,7 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
   }
 
   function toggle(name: string) {
+    setConfirming(false);
     setPicked((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
@@ -125,6 +132,8 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
   }
 
   const target = project ? projects.find((p) => p.ws_id === project) : null;
+  // The ticked skills whose installed copy the install would replace.
+  const replacing = (preview?.found ?? []).filter((r) => picked.has(r.name) && needsForce(r.status)).map((r) => r.name);
 
   return (
     <DialogFrame title="Install skills" onRequestClose={onClose} className="max-w-xl">
@@ -243,6 +252,14 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
         </div>
       )}
 
+      {confirming && (
+        <p className="mt-3 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-note text-err">
+          {replacing.length === 1
+            ? `Replace the installed copy of ${replacing[0]}? Its local edits are lost.`
+            : `Replace the installed copies of ${replacing.join(', ')}? Their local edits are lost.`}
+        </p>
+      )}
+
       {error && (
         <p role="alert" className="mt-3 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-note text-err">
           {error}
@@ -250,17 +267,34 @@ export function InstallSkillsDialog({ projects, onClose, onInstalled }: InstallS
       )}
 
       <div className="mt-5 flex justify-end gap-2">
-        <Button variant="secondary" onClick={onClose}>
-          {result ? 'Close' : 'Cancel'}
-        </Button>
-        {preview ? (
-          <Button variant="solid" disabled={picked.size === 0 || busy !== null} onClick={install}>
-            {busy === 'installing' ? 'Installing…' : `Install ${skills(picked.size)}`}
-          </Button>
+        {confirming ? (
+          <>
+            <Button variant="secondary" onClick={() => setConfirming(false)}>
+              Back
+            </Button>
+            <Button variant="danger" onClick={install}>
+              Replace and install
+            </Button>
+          </>
         ) : (
-          <Button variant="solid" disabled={!source.trim() || busy !== null} onClick={() => find()}>
-            {busy === 'finding' ? 'Finding skills…' : 'Find skills'}
-          </Button>
+          <>
+            <Button variant="secondary" onClick={onClose}>
+              {result ? 'Close' : 'Cancel'}
+            </Button>
+            {preview ? (
+              <Button
+                variant={replacing.length > 0 ? 'danger' : 'solid'}
+                disabled={picked.size === 0 || busy !== null}
+                onClick={() => (replacing.length > 0 ? setConfirming(true) : install())}
+              >
+                {busy === 'installing' ? 'Installing…' : `Install ${skills(picked.size)}`}
+              </Button>
+            ) : (
+              <Button variant="solid" disabled={!source.trim() || busy !== null} onClick={() => find()}>
+                {busy === 'finding' ? 'Finding skills…' : 'Find skills'}
+              </Button>
+            )}
+          </>
         )}
       </div>
     </DialogFrame>

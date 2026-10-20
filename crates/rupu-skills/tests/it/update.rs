@@ -703,3 +703,55 @@ fn preview_of_a_copy_with_no_record_needs_a_replace() {
         Some("installed without a source record")
     );
 }
+
+/// Serves a fresh copy of the repo in its own temp dir, owned by the tree
+/// (as `GitFetcher`'s clone is): it is gone once the tree drops.
+struct GuardedFetch {
+    repo: PathBuf,
+}
+
+impl Fetch for GuardedFetch {
+    fn fetch(&self, _src: &GitSource) -> Result<FetchedTree, SourceError> {
+        let clone = tempfile::tempdir().unwrap();
+        copy_dir(&self.repo, clone.path());
+        Ok(FetchedTree::with_guard(
+            clone.path().to_owned(),
+            Some("c1".into()),
+            clone,
+        ))
+    }
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for e in fs::read_dir(from).unwrap() {
+        let p = e.unwrap().path();
+        let dest = to.join(p.file_name().unwrap());
+        if p.is_dir() {
+            copy_dir(&p, &dest);
+        } else {
+            fs::copy(&p, &dest).unwrap();
+        }
+    }
+}
+
+#[test]
+fn preview_of_a_fetched_tree_reads_it_before_the_clone_is_dropped() {
+    use rupu_skills::install::{preview_install, PreviewStatus};
+    let (repo, dst, _) = setup();
+    let f = GuardedFetch {
+        repo: repo.path().to_owned(),
+    };
+    let preview = preview_install(&gh(None), &f, dst.path(), Layer::Global).unwrap();
+    let got: Vec<(String, PreviewStatus, Option<String>)> = preview
+        .into_iter()
+        .map(|p| (p.found.name, p.status, p.reason))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("docx".to_owned(), PreviewStatus::New, None),
+            ("pdf".to_owned(), PreviewStatus::New, None),
+        ]
+    );
+}
