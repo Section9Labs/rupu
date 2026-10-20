@@ -327,8 +327,10 @@ impl WaitSource {
                 Some(at) => next_check.min(at).min(end),
                 None => next_check.min(end),
             };
-            if reporter.is_some() && next_progress < deadline {
-                wake_at = wake_at.min(next_progress);
+            if let Some(at) =
+                progress_wake(reporter.is_some() && reporting, next_progress, deadline)
+            {
+                wake_at = wake_at.min(at);
             }
             let wake = tokio::select! {
                 line = async {
@@ -421,6 +423,29 @@ impl WaitSource {
             remote.drain(&req.watch, &mut got, deadline).await;
         }
         got.finish(&req.watch)
+    }
+}
+
+/// When the next progress report should wake the loop: only while reports
+/// are still being made (before the deadline) and the next is due before it.
+/// A due time the loop wouldn't act on would wake it again at once.
+fn progress_wake(reporting: bool, next: Instant, deadline: Instant) -> Option<Instant> {
+    (reporting && next < deadline).then_some(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_report_due_past_the_loop_top_deadline_does_not_wake_it() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        assert_eq!(progress_wake(true, now, deadline), Some(now));
+        // Not reporting (the loop top is past the deadline): the stale due
+        // time must not become the wake target.
+        assert_eq!(progress_wake(false, now, deadline), None);
+        assert_eq!(progress_wake(true, deadline, deadline), None);
     }
 }
 
