@@ -353,6 +353,28 @@ describe('buildTranscriptView — tool kinds', () => {
     expect(kindOf('report_finding')).toBe('finding');
     expect(kindOf('something_else')).toBe('generic');
   });
+
+  it('classifies the internal tool families', () => {
+    // board coordination
+    expect(kindOf('board.claim')).toBe('board');
+    expect(kindOf('board.release')).toBe('board');
+    expect(kindOf('board.read')).toBe('board');
+    expect(kindOf('board.post')).toBe('board');
+    expect(kindOf('board.directive')).toBe('board');
+    expect(kindOf('board.retract')).toBe('board');
+    // engagement asset marking (+ legacy alias)
+    expect(kindOf('assets.mark')).toBe('asset');
+    expect(kindOf('asset_mark')).toBe('asset');
+    // skills
+    expect(kindOf('skills.load')).toBe('skill');
+    // SCM / issue connectors, every platform
+    expect(kindOf('scm.repos.get')).toBe('connector');
+    expect(kindOf('scm.prs.create')).toBe('connector');
+    expect(kindOf('issues.get')).toBe('connector');
+    expect(kindOf('issues.comment')).toBe('connector');
+    expect(kindOf('github.workflows_dispatch')).toBe('connector');
+    expect(kindOf('gitlab.pipeline_trigger')).toBe('connector');
+  });
 });
 
 describe('buildTranscriptView — ast_grep tool kind + structured payload', () => {

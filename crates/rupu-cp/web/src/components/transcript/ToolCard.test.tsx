@@ -8,7 +8,7 @@
 import type { ReactElement } from 'react';
 import { it, expect, describe, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
-import { summarizeInput, parseAstGrepText, parseSubrunOutput } from './ToolCard';
+import { summarizeInput, parseAstGrepText, parseSubrunOutput, parseGrepText } from './ToolCard';
 import { SubrunIdentityContext } from './subrunIdentity';
 import ToolCard from './ToolCard';
 import { TranscriptViewProvider } from './TranscriptViewContext';
@@ -1067,4 +1067,28 @@ it('a join card shows each child\'s state, and opens a finished child\'s transcr
   expect(screen.getByText('running')).not.toBeNull();
   screen.getByRole('button', { name: /View sub-run transcript/ }).click();
   expect(opened).toEqual(['/t/a.jsonl']);
+});
+
+describe('parseGrepText', () => {
+  it('groups path:line: matches by file, in first-seen order', () => {
+    const out = [
+      'reports/a.txt:5:serial=9F2F',
+      'reports/b.txt:3:Trying 1.2.3.4:80...',
+      'reports/b.txt:5:Failed to connect',
+    ].join('\n');
+    const groups = parseGrepText(out);
+    expect(groups.map((g) => g.file)).toEqual(['reports/a.txt', 'reports/b.txt']);
+    expect(groups[1].matches).toEqual([
+      { line: 3, text: 'Trying 1.2.3.4:80...' },
+      { line: 5, text: 'Failed to connect' },
+    ]);
+  });
+
+  it('accepts an optional column (path:line:col:)', () => {
+    expect(parseGrepText('f.rs:10:4:let x = 1')[0].matches[0]).toEqual({ line: 10, text: 'let x = 1' });
+  });
+
+  it('returns no groups for non-matching output (triggers the raw fallback)', () => {
+    expect(parseGrepText('just some prose\nwith no file refs')).toEqual([]);
+  });
 });

@@ -38,6 +38,10 @@ import AstTree from './AstTree';
 import DiffView from './DiffView';
 import TerminalBlock from './TerminalBlock';
 import StructuredView from './StructuredView';
+import { parseBoard, BoardSummary, BoardBody, boardAccent } from './BoardCard';
+import { parseAsset, AssetSummary, AssetBody } from './AssetCard';
+import { parseSkill, SkillSummary, SkillBody } from './SkillCard';
+import { parseConnector, ConnectorSummary, ConnectorBody } from './ConnectorCard';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { AgentName } from '../codename/AgentName';
@@ -384,11 +388,20 @@ export function blockedTitle(decision: string | undefined): string {
 function ToolRow({
   tool,
   summary,
+  summaryNode,
+  hideStatus,
   open,
   onToggle,
 }: {
   tool: ToolView;
   summary: string;
+  /** A bespoke summary (chips) for board/asset/skill/connector kinds; when
+   *  set it replaces the plain `summary` string. */
+  summaryNode?: ReactNode;
+  /** When the bespoke summary already carries a tone-coloured outcome chip
+   *  (granted / rejected / created …), the generic ok/error StatusBadge would
+   *  be a redundant second status pill — suppress it. */
+  hideStatus?: boolean;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -406,14 +419,16 @@ function ToolRow({
         <ChevronRight size={11} className="shrink-0 text-ink-mute" />
       )}
       <span className="font-mono text-note font-semibold text-brand-700 shrink-0">{tool.tool}</span>
-      {summary && (
+      {summaryNode ? (
+        summaryNode
+      ) : summary ? (
         <span className="font-mono text-[10.5px] text-ink-dim truncate flex-1 min-w-0">
           {isTerminal ? `$ ${summary}` : summary}
         </span>
-      )}
+      ) : null}
       <span className="shrink-0 ml-auto flex items-center gap-1.5">
         {tool.audit && <AuditBadge audit={tool.audit} />}
-        <StatusBadge tool={tool} />
+        {!hideStatus && <StatusBadge tool={tool} />}
         {tool.durationMs !== undefined && (
           <span className="font-mono text-meta text-ink-mute">{formatDuration(tool.durationMs)}</span>
         )}
@@ -454,35 +469,83 @@ function ReadBody({ tool }: { tool: ToolView }) {
   );
 }
 
-/** grep — split output into mono match lines, show match count in summary */
+/**
+ * Parse ripgrep-style `path:line: text` (or `path:line:col: text`) output into
+ * per-file groups, mirroring the ast_grep grouping so a grep and an ast_grep
+ * read as siblings. Lines that don't match (a context separator, a trailing
+ * blank) are dropped. Pure and exported for unit testing.
+ */
+export function parseGrepText(
+  output: string,
+): { file: string; matches: { line: number; text: string }[] }[] {
+  const byFile = new Map<string, { line: number; text: string }[]>();
+  const order: string[] = [];
+  for (const raw of output.split('\n')) {
+    if (!raw.trim()) continue;
+    const m = raw.match(/^(.*?):(\d+):(?:\d+:)?\s?(.*)$/);
+    if (!m) continue;
+    const [, file, line, text] = m;
+    if (!byFile.has(file)) {
+      byFile.set(file, []);
+      order.push(file);
+    }
+    byFile.get(file)!.push({ line: Number(line), text });
+  }
+  return order.map((file) => ({ file, matches: byFile.get(file)! }));
+}
+
+/** grep — group matches by file (count badge), each as `line  text`. Falls
+ *  back to raw mono lines when the output isn't the `path:line:` shape. */
 function GrepBody({ tool }: { tool: ToolView }) {
   if (tool.error) return null;
   if (!tool.output) return null;
-  const lines = tool.output.split('\n').filter((l) => l.length > 0);
+  const groups = parseGrepText(tool.output);
+  if (groups.length === 0) {
+    const lines = tool.output.split('\n').filter((l) => l.length > 0);
+    return (
+      <div className="px-3 py-2">
+        <p className="text-meta text-ink-mute mb-1">{lines.length} line{lines.length === 1 ? '' : 's'}</p>
+        <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug">
+          {lines.map((line, i) => (
+            <div key={i} className="whitespace-pre-wrap break-all">{line}</div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  const count = groups.reduce((n, g) => n + g.matches.length, 0);
   return (
     <div className="px-3 py-2">
-      {lines.length > 0 && (
-        <p className="text-meta text-ink-mute mb-1">{lines.length} match{lines.length !== 1 ? 'es' : ''}</p>
-      )}
-      <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug space-y-0">
-        {lines.map((line, i) => (
-          <div key={i} className="whitespace-pre">{line}</div>
-        ))}
-      </div>
+      <p className="text-meta text-ink-mute mb-1.5">
+        {count} match{count === 1 ? '' : 'es'} in {groups.length} file{groups.length === 1 ? '' : 's'}
+      </p>
+      {groups.map((g) => (
+        <FileGroup key={g.file} file={g.file} count={g.matches.length}>
+          {g.matches.map((m, i) => (
+            <div key={i} className="flex gap-2 font-mono text-[10.5px] text-ink">
+              <span className="shrink-0 text-ink-mute tabular-nums">{m.line}</span>
+              <span className="min-w-0 whitespace-pre-wrap break-all">{m.text}</span>
+            </div>
+          ))}
+        </FileGroup>
+      ))}
     </div>
   );
 }
 
-/** glob — split output into mono path lines */
+/** glob — mono path list with a count. */
 function GlobBody({ tool }: { tool: ToolView }) {
   if (tool.error) return null;
   if (!tool.output) return null;
   const paths = tool.output.split('\n').filter((l) => l.length > 0);
   return (
     <div className="px-3 py-2">
+      <p className="text-meta text-ink-mute mb-1">
+        {paths.length} path{paths.length === 1 ? '' : 's'}
+      </p>
       <div className="font-mono text-[10.5px] text-ink bg-surface rounded p-2 leading-snug space-y-0">
         {paths.map((p, i) => (
-          <div key={i} className="whitespace-pre">{p}</div>
+          <div key={i} className="whitespace-pre-wrap break-all">{p}</div>
         ))}
       </div>
     </div>
@@ -1132,13 +1195,58 @@ function ToolCardBody({
     return <FindingCard finding={tool.finding} runId={runId} host={host} />;
   }
 
+  // Bespoke summary chips + body for the internal tool families. Parsing is
+  // cheap and pure; building it once here feeds both the row and the body.
+  const board = tool.kind === 'board' ? parseBoard(tool) : null;
+  const asset = tool.kind === 'asset' ? parseAsset(tool) : null;
+  const skill = tool.kind === 'skill' ? parseSkill(tool) : null;
+  const connector = tool.kind === 'connector' ? parseConnector(tool) : null;
+
+  const summaryNode = board ? (
+    <BoardSummary view={board} />
+  ) : asset ? (
+    <AssetSummary view={asset} />
+  ) : skill ? (
+    <SkillSummary view={skill} />
+  ) : connector ? (
+    <ConnectorSummary view={connector} />
+  ) : undefined;
+
+  // asset/connector render the error helpfully in their own body, so the raw
+  // red ErrorBlock would be redundant for them (an authoring mistake, not a
+  // crash). Every other kind still gets the generic ErrorBlock.
+  const selfHandlesError = tool.kind === 'asset' || tool.kind === 'connector';
+  const accent = board ? boardAccent(board) : null;
+
+  // Suppress the generic ok/error StatusBadge when the bespoke summary already
+  // shows a tone-coloured outcome chip (so a rejected asset isn't a red
+  // `rejected` AND a red `error`). A board.read / still-running asset /
+  // connector read has no such chip, so it keeps the badge.
+  const hideStatus = Boolean(
+    (board && board.outcome !== null) ||
+      (asset && (asset.error !== null || asset.effectiveDepth !== null)) ||
+      (connector && (connector.outcome !== null || connector.error !== null)),
+  );
+
   const summary =
     tool.kind === 'terminal' && tool.terminal ? tool.terminal.command : summarizeInput(tool);
   const rowSummary = summary.length > 60 ? summary.slice(0, 57) + '…' : summary;
 
   return (
-    <div className="border border-border rounded-md overflow-hidden my-1 text-[11.5px]">
-      <ToolRow tool={tool} summary={rowSummary} open={open} onToggle={() => setOpen((v) => !v)} />
+    <div
+      className={
+        'border border-border rounded-md overflow-hidden my-1 text-[11.5px]' +
+        (accent ? ' ' + accent : '')
+      }
+    >
+      <ToolRow
+        tool={tool}
+        summary={rowSummary}
+        summaryNode={summaryNode}
+        hideStatus={hideStatus}
+        open={open}
+        onToggle={() => setOpen((v) => !v)}
+      />
 
       {/* The one scroll threshold: an expanded body scrolls only past 32rem. */}
       {open && (
@@ -1168,10 +1276,15 @@ function ToolCardBody({
           )}
           {tool.kind === 'coverage' && <CoverageBody tool={tool} />}
           {tool.kind === 'ast_grep' && <AstGrepBody tool={tool} runId={runId} host={host} />}
+          {board && <BoardBody view={board} />}
+          {asset && <AssetBody view={asset} />}
+          {skill && <SkillBody view={skill} />}
+          {connector && <ConnectorBody view={connector} />}
           {(tool.kind === 'generic' || tool.kind === 'finding') && <GenericBody tool={tool} />}
 
-          {/* Error block — shown when tool.error is set */}
-          {tool.error && <ErrorBlock error={tool.error} />}
+          {/* Error block — shown when tool.error is set, unless the body
+              already renders the error helpfully (asset/connector). */}
+          {tool.error && !selfHandlesError && <ErrorBlock error={tool.error} />}
         </div>
       )}
     </div>
