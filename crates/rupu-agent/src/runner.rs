@@ -898,9 +898,9 @@ pub fn record_unstarted_run(
                 },
             })?;
         }
-        if !run.prompt.message.is_empty() {
+        for content in run.prompt.user_messages() {
             writer.write(&Event::UserMessage {
-                content: run.prompt.message.clone(),
+                content: content.to_string(),
             })?;
         }
         let turn_idx = run.prompt.turn_index_offset;
@@ -1512,8 +1512,16 @@ pub(crate) fn call_sign_line(codename: &str) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 pub struct UserTurn {
     /// The user message. EMPTY means "seed-only": `initial_messages` is a
-    /// complete, ready-to-send conversation and nothing is appended.
+    /// complete, ready-to-send conversation and nothing is appended (unless
+    /// `continue_prompt` is set).
     pub message: String,
+    /// An operator's prompt to a continuation (`rupu run --continue <id>
+    /// <prompt>`, [`crate::continuation::apply_prompted_continuation`]):
+    /// sent after `message` (the continuation note, or nothing) as its own
+    /// user-message event, so both join one user turn through
+    /// [`push_user_turn`] — the rule replay applies to each event. `None` for
+    /// every other run.
+    pub continue_prompt: Option<String>,
     /// Existing conversation state to prepend before `message`. Empty for
     /// one-shot runs.
     pub initial_messages: Vec<Message>,
@@ -1560,6 +1568,15 @@ impl UserTurn {
             message: message.into(),
             ..Self::default()
         }
+    }
+
+    /// The user messages this turn sends, in order: `message`, then
+    /// `continue_prompt` — each a `user_message` event, the empty ones left
+    /// out.
+    pub fn user_messages(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.message.as_str())
+            .chain(self.continue_prompt.as_deref())
+            .filter(|m| !m.is_empty())
     }
 }
 
@@ -2081,7 +2098,7 @@ async fn run_agent_inner(
                 provider: opts.provider_name.clone(),
                 model: opts.model.clone(),
                 permission_mode: opts.permission.mode().as_str().to_string(),
-                user_prompt: opts.prompt.message.clone(),
+                user_prompt: opts.prompt.user_messages().collect::<Vec<_>>().join("\n\n"),
                 concerns: block.clone(),
                 scope_name: resolved_scope.to_string(),
                 workspace_path: opts.workspace_path().to_path_buf(),
@@ -2262,10 +2279,13 @@ async fn run_agent_inner(
     // `push_user_turn`: it becomes a new user turn, or — when the seed ends in
     // a user turn, as after a tool turn — joins that turn rather than creating
     // two consecutive user messages, which providers reject.
-    if !opts.prompt.message.is_empty() {
-        push_user_turn(messages, &opts.prompt.message);
+    //
+    // A continuation's operator prompt (`continue_prompt`) follows as a second
+    // user-message event through the same rule, so it joins the note's turn.
+    for content in opts.prompt.user_messages() {
+        push_user_turn(messages, content);
         writer.write(&Event::UserMessage {
-            content: opts.prompt.message.clone(),
+            content: content.to_string(),
         })?;
     }
     writer.flush()?;
@@ -6492,6 +6512,7 @@ mod pause_tests {
                     operator_loads: Vec::new(),
                     missing_skills: Vec::new(),
                     unseen_messages: Vec::new(),
+                    continue_prompt: None,
                 },
                 provider,
                 limits: rupu_providers::model_limits::ModelLimits::unknown(),

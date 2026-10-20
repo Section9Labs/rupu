@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 // Continue on a standalone agent run's transcript page (operator MCP Plan 3b,
-// UI-1, mock §2): a run that stopped short (failed, cancelled, interrupted)
-// gets Continue, which opens a
-// composer under the transcript with a "Model & provider" disclosure showing
-// the original values. The CP's continue takes no prompt (Plan 3a, package
-// B): it restores every flag of the original launch, and only a different
-// model or provider can be given.
+// UI-1, mock §2): every ended run — completed, failed, cancelled, or crashed
+// before recording an end — gets Continue, which opens a composer under the
+// transcript with an optional prompt and a "Model & provider" disclosure
+// showing the original values. The continuation restores every flag of the
+// original launch. A completed run needs a prompt (without one a continue
+// only reprints its answer); a failed one needs a prompt or another model or
+// provider.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -81,7 +82,9 @@ describe('RunTranscript continue', () => {
     expect(within(composer).getByText(/same as the original: anthropic · claude-opus-5-5/)).toBeInTheDocument();
 
     fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
-    await waitFor(() => expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: undefined, provider: undefined }));
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', { prompt: undefined, model: undefined, provider: undefined }),
+    );
     const link = await screen.findByRole('link', { name: /Continued as run_01JD4Q/ });
     expect(link).toHaveAttribute(
       'href',
@@ -114,7 +117,9 @@ describe('RunTranscript continue', () => {
     fireEvent.change(within(composer).getByLabelText('Provider'), { target: { value: 'openai' } });
     expect((within(composer).getByLabelText('Model') as HTMLInputElement).value).toBe('gpt-6');
     fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
-    await waitFor(() => expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: 'gpt-6', provider: 'openai' }));
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', { prompt: undefined, model: 'gpt-6', provider: 'openai' }),
+    );
   });
 
   it('sends a different model chosen under the disclosure', async () => {
@@ -129,20 +134,70 @@ describe('RunTranscript continue', () => {
     fireEvent.change(within(composer).getByLabelText('Model'), { target: { value: 'claude-sonnet-5-5' } });
     fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
     await waitFor(() =>
-      expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: 'claude-sonnet-5-5', provider: undefined }),
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', {
+        prompt: undefined,
+        model: 'claude-sonnet-5-5',
+        provider: undefined,
+      }),
     );
   });
 
-  it('a failed run continues only on a different model or provider', async () => {
+  it('a failed run continues on a different model or provider', async () => {
     stub(agentRow({ status: 'failed' }));
     renderAt();
     fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
     const composer = screen.getByRole('region', { name: 'Continue this run' });
-    expect(within(composer).getByText(/A failed run continues only on a different model or provider/)).toBeInTheDocument();
+    expect(
+      within(composer).getByText(/A failed run continues with a prompt, or on a different model or provider/),
+    ).toBeInTheDocument();
     expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeDisabled();
     await within(composer).findByRole('option', { name: 'openai' });
     fireEvent.change(within(composer).getByLabelText('Provider'), { target: { value: 'openai' } });
     expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeEnabled();
+  });
+
+  it('a failed run continues on the same model when given a prompt', async () => {
+    stub(agentRow({ status: 'failed' }));
+    const cont = vi
+      .spyOn(runsApi, 'continueAgentRun')
+      .mockResolvedValue({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
+    renderAt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    const composer = screen.getByRole('region', { name: 'Continue this run' });
+    const prompt = within(composer).getByLabelText(/Prompt/);
+    fireEvent.change(prompt, { target: { value: '   ' } });
+    expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeDisabled();
+    fireEvent.change(prompt, { target: { value: 'It is authorised: go ahead.' } });
+    expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeEnabled();
+    fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', {
+        prompt: 'It is authorised: go ahead.',
+        model: undefined,
+        provider: undefined,
+      }),
+    );
+  });
+
+  it('an interrupted run takes an optional prompt, sent as typed', async () => {
+    stub(agentRow({ status: 'cancelled' }));
+    const cont = vi
+      .spyOn(runsApi, 'continueAgentRun')
+      .mockResolvedValue({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
+    renderAt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    const composer = screen.getByRole('region', { name: 'Continue this run' });
+    const prompt = within(composer).getByLabelText(/Prompt/);
+    expect(prompt).toHaveAttribute('placeholder', expect.stringMatching(/optional/i));
+    fireEvent.change(prompt, { target: { value: '/pdf then skip the appendix' } });
+    fireEvent.keyDown(prompt, { key: 'Enter', metaKey: true });
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', {
+        prompt: '/pdf then skip the appendix',
+        model: undefined,
+        provider: undefined,
+      }),
+    );
   });
 
   it('shows a 409 inline', async () => {
@@ -156,11 +211,56 @@ describe('RunTranscript continue', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('run run_01JD2K is still running');
   });
 
-  it('offers no Continue on a completed run (a continue would only print its answer)', async () => {
+  it('a completed run continues only with a prompt (without one it would only reprint its answer)', async () => {
     stub(agentRow({ status: 'completed' }));
+    const cont = vi
+      .spyOn(runsApi, 'continueAgentRun')
+      .mockResolvedValue({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
     renderAt();
-    await screen.findByRole('heading', { name: /code-reviewer/ });
-    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    const composer = screen.getByRole('region', { name: 'Continue this run' });
+    expect(within(composer).getByText(/A finished run needs a prompt/)).toBeInTheDocument();
+    const prompt = within(composer).getByLabelText(/Prompt/);
+    expect(prompt).toBeRequired();
+    expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeDisabled();
+    // ⌘↵ with no prompt sends nothing.
+    fireEvent.keyDown(prompt, { key: 'Enter', metaKey: true });
+    // A different model alone is not enough: the run finished.
+    fireEvent.click(within(composer).getByRole('button', { name: /Model & provider/ }));
+    await within(composer).findByRole('option', { name: 'openai' });
+    fireEvent.change(within(composer).getByLabelText('Provider'), { target: { value: 'openai' } });
+    expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeDisabled();
+    expect(cont).not.toHaveBeenCalled();
+
+    fireEvent.change(prompt, { target: { value: 'Now write the fix.' } });
+    expect(within(composer).getByRole('button', { name: 'Continue run' })).toBeEnabled();
+    fireEvent.keyDown(prompt, { key: 'Enter', ctrlKey: true });
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', {
+        prompt: 'Now write the fix.',
+        model: 'gpt-6',
+        provider: 'openai',
+      }),
+    );
+    expect(await screen.findByRole('link', { name: /Continued as run_01JD4Q/ })).toBeInTheDocument();
+  });
+
+  it('shows the pending state while the continue is sent', async () => {
+    stub(agentRow({ status: 'completed' }));
+    let resolve: (v: { run_id: string; continues: string; host_id: string }) => void = () => {};
+    vi.spyOn(runsApi, 'continueAgentRun').mockReturnValue(
+      new Promise((r) => {
+        resolve = r;
+      }),
+    );
+    renderAt();
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
+    const composer = screen.getByRole('region', { name: 'Continue this run' });
+    fireEvent.change(within(composer).getByLabelText(/Prompt/), { target: { value: 'go on' } });
+    fireEvent.click(within(composer).getByRole('button', { name: 'Continue run' }));
+    expect(await within(composer).findByRole('button', { name: 'Continuing…' })).toBeDisabled();
+    resolve({ run_id: 'run_01JD4Q', continues: 'run_01JD2K', host_id: 'local' });
+    expect(await screen.findByRole('link', { name: /Continued as run_01JD4Q/ })).toBeInTheDocument();
   });
 
   it('offers Continue on a run that crashed before recording how it ended (no status)', async () => {
@@ -171,7 +271,9 @@ describe('RunTranscript continue', () => {
     renderAt();
     fireEvent.click(await screen.findByRole('button', { name: 'Continue' }));
     fireEvent.click(screen.getByRole('button', { name: 'Continue run' }));
-    await waitFor(() => expect(cont).toHaveBeenCalledWith('run_01JD2K', { model: undefined, provider: undefined }));
+    await waitFor(() =>
+      expect(cont).toHaveBeenCalledWith('run_01JD2K', { prompt: undefined, model: undefined, provider: undefined }),
+    );
   });
 
   it('offers no Continue on a session turn', async () => {
@@ -181,11 +283,15 @@ describe('RunTranscript continue', () => {
     expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
   });
 
-  it('offers no Continue while the run is running', async () => {
-    stub(agentRow({ status: 'running' }));
-    renderAt();
-    await screen.findByRole('heading', { name: /code-reviewer/ });
-    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument();
+  it('offers no Continue while the run is live', async () => {
+    for (const status of ['running', 'pending', 'paused', 'awaiting_approval']) {
+      stub(agentRow({ status }));
+      const { unmount } = renderAt();
+      await screen.findByRole('heading', { name: /code-reviewer/ });
+      expect(screen.queryByRole('button', { name: 'Continue' }), status).not.toBeInTheDocument();
+      unmount();
+      vi.restoreAllMocks();
+    }
   });
 
   it('offers no Continue for a remote run', async () => {

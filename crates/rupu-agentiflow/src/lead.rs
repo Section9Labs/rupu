@@ -694,6 +694,7 @@ impl RunAgentLeadDriver {
                 operator_loads: Vec::new(),
                 missing_skills: Vec::new(),
                 unseen_messages: self.unseen_messages.clone(),
+                continue_prompt: None,
             },
             workspace: self.cfg.workspace.clone(),
             // Unattended; the grant is the gate (see the type's docs).

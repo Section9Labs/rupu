@@ -90,8 +90,9 @@ pub struct AgentRun {
     /// Join a message space (`--message-space <dir> --participant <id>`):
     /// a child sharing its parent's, an agentiflow's pool unit (spec F1a §7).
     pub message_space: Option<MessageSpace>,
-    /// `--continue <run id>`: continue that interrupted run of the agent
-    /// instead of starting from a prompt.
+    /// `--continue <run id>`: continue that earlier run of the agent instead
+    /// of starting fresh. With `prompt` set too, the prompt (still ONE
+    /// `--prompt=` element) is what the continuation is told next.
     pub continue_from: Option<String>,
     /// `--model`: the model for this run, over the agent's `model:`.
     pub model: Option<String>,

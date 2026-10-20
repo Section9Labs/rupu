@@ -8,12 +8,10 @@
 // it (spec §3.3). Without it a sub-run opened from a remote run's panel 400s.
 //
 // A local standalone run's page also heads itself with the run (agent, status,
-// model, from its `/api/runs/agents` row) and, when the run stopped short of
-// finishing (failed, cancelled, or crashed before recording an end: no
-// status), offers Continue (operator MCP
-// Plan 3b, UI-1, mock §2). A completed run has nothing to continue: the CP's
-// continue takes no prompt, and continuing a finished run only returns its
-// recorded answer.
+// model, from its `/api/runs/agents` row) and, once the run has ended
+// (completed, failed, cancelled, or crashed before recording an end: no
+// status), offers Continue (operator MCP Plan 3b, UI-1, mock §2). A completed
+// run continues with a prompt, which the composer then requires.
 //
 // Route: /transcript (registered in App.tsx)
 
@@ -31,11 +29,10 @@ import { Button } from '../components/ui/Button';
 import { RunStatusChip } from '../components/ui/RunStatusChip';
 import { ContinueComposer } from '../components/runops/ContinueComposer';
 
-/** Statuses with nothing to continue: still going (the server 409s) or
- *  finished (a continue would only print the recorded answer). A standalone
- *  row is otherwise failed, cancelled or, for a run that crashed before
- *  recording how it ended, has no status. */
-const NOT_CONTINUABLE = new Set(['running', 'completed']);
+/** The ended statuses a standalone run can be continued from. A run with no
+ *  status crashed before recording how it ended, and can be too; any other
+ *  status is a run still going (the server would 409). */
+const CONTINUABLE = new Set(['completed', 'failed', 'cancelled']);
 
 /** A standalone run's `/api/runs/agents` row (local only), re-read on demand. */
 function useAgentRunRow(runId: string | null): [AgentRunRow | null, () => void] {
@@ -102,7 +99,7 @@ export default function RunTranscript() {
   const childRunId = standaloneId;
   const status = row?.status ?? null;
   const canContinue =
-    !!row && row.source === 'standalone' && !!childRunId && (status === null || !NOT_CONTINUABLE.has(status));
+    !!row && row.source === 'standalone' && !!childRunId && (status === null || CONTINUABLE.has(status));
 
   return (
     <div className="flex flex-col p-8 gap-4">
@@ -154,7 +151,7 @@ export default function RunTranscript() {
           path={path}
           provider={row?.provider}
           model={row?.model}
-          failed={status === 'failed'}
+          status={status}
           onCancel={() => setContinuing(false)}
         />
       )}

@@ -1,10 +1,12 @@
 // ContinueComposer — the composer under a standalone agent run's transcript
 // (mock §2). A continuation restores every flag of the original launch, so the
-// composer asks only for what can change: a different model or provider,
-// under a disclosure that names the original ones. The CP's continue takes no
-// prompt (the conversation already holds it; Plan 3a package B), so there is
-// no text box. A failed run is continued only on a different model or
-// provider, as the CLI rules. On success it links to the new run.
+// composer asks only for what can change: an optional prompt (what the run is
+// told next, `rupu run --continue <id> --prompt=…`) and a different model or
+// provider, under a disclosure that names the original ones. The CLI's rules
+// decide what can go: a completed run needs a prompt (without one a continue
+// only reprints its answer); a failed run needs a prompt or another model or
+// provider; an interrupted one needs nothing. On success it links to the new
+// run.
 
 import { useEffect, useId, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -12,7 +14,7 @@ import { ChevronRight } from 'lucide-react';
 import { api, apiErrorMessage, type CatalogProvider } from '../../lib/api';
 import { runsApi, type ContinueResponse } from '../../lib/api3b/runs';
 import { Button } from '../ui/Button';
-import { Input } from '../ui/Input';
+import { Input, inputCls } from '../ui/Input';
 import { Select } from '../ui/Select';
 import { cn } from '../../lib/cn';
 
@@ -28,7 +30,7 @@ export function ContinueComposer({
   path,
   provider,
   model,
-  failed,
+  status,
   onCancel,
 }: {
   runId: string;
@@ -37,10 +39,15 @@ export function ContinueComposer({
   /** The provider and model the run used, when known. */
   provider?: string | null;
   model?: string | null;
-  failed: boolean;
+  /** How the run ended: `completed`, `failed`, or anything else (cancelled,
+   *  or no status for a run that crashed before recording an end). */
+  status: string | null;
   onCancel: () => void;
 }) {
+  const completed = status === 'completed';
+  const failed = status === 'failed';
   const [open, setOpen] = useState(failed);
+  const [prompt, setPrompt] = useState('');
   const [newProvider, setNewProvider] = useState('');
   const [newModel, setNewModel] = useState('');
   const [catalog, setCatalog] = useState<CatalogProvider[]>([]);
@@ -50,6 +57,7 @@ export function ContinueComposer({
   const providerId = useId();
   const modelId = useId();
   const modelsId = useId();
+  const promptId = useId();
   const titleId = useId();
 
   useEffect(() => {
@@ -68,7 +76,10 @@ export function ContinueComposer({
   }, []);
 
   const changed = newProvider.trim() !== '' || newModel.trim() !== '';
-  const blocked = failed && !changed;
+  const prompted = prompt.trim() !== '';
+  // A finished run with no prompt would only reprint its answer; a failed
+  // one with neither a prompt nor another model would be refused.
+  const blocked = (completed && !prompted) || (failed && !prompted && !changed);
   const original = [provider, model].filter(Boolean).join(' · ');
   const modelsFor = catalog.find((c) => c.provider === (newProvider || provider))?.models ?? [];
 
@@ -78,6 +89,7 @@ export function ContinueComposer({
     setError(null);
     try {
       const res = await runsApi.continueAgentRun(runId, {
+        prompt: prompted ? prompt : undefined,
         model: newModel.trim() || undefined,
         provider: newProvider.trim() || undefined,
       });
@@ -114,9 +126,28 @@ export function ContinueComposer({
         Continue this run
       </h2>
       <p className="text-ui text-ink-dim">
-        Picks up where the run stopped, with every flag of its original launch.
-        {failed && ' A failed run continues only on a different model or provider.'}
+        {completed
+          ? 'Carries the finished conversation on, with every flag of its original launch. A finished run needs a prompt: without one, a continue only reprints its answer.'
+          : 'Picks up where the run stopped, with every flag of its original launch.'}
+        {failed && ' A failed run continues with a prompt, or on a different model or provider.'}
       </p>
+
+      <label htmlFor={promptId} className="mt-3 block text-note font-semibold text-ink">
+        Prompt{!completed && <span className="font-normal text-ink-mute"> (optional)</span>}
+      </label>
+      <textarea
+        id={promptId}
+        value={prompt}
+        onChange={(e) => setPrompt(e.target.value)}
+        required={completed}
+        rows={3}
+        placeholder={
+          completed
+            ? 'What should the run do next?'
+            : 'Optional — what to tell the run next. Leave empty to carry on as it was.'
+        }
+        className={cn(inputCls, 'mt-1 max-w-none resize-y text-ui leading-relaxed')}
+      />
 
       {open && (
         <div className="mt-3 grid gap-3 sm:grid-cols-2">

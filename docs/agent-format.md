@@ -941,7 +941,8 @@ was in flight when it stopped, and tells the agent it was interrupted (work
 from that turn may be partially applied, so the agent re-checks before going
 on). The new run's transcript links back to the old one rather than copying
 it. If the run had actually finished, its recorded answer is printed without
-calling the model; a run that failed can't be continued — start it fresh.
+calling the model; a run that failed can't be continued — start it fresh,
+or give the continue a prompt ([Continuing with a prompt](#continuing-with-a-prompt)).
 The run's command is restored too: its repo target and every flag it was
 launched with (mode, model, provider, findings profile, engagement, skills and
 the rest, recorded as `launch_args` on its transcript's `run_start`). A flag
@@ -969,3 +970,33 @@ continuing on. Only a `--model` or `--provider` given on the continue does
 this: the ones a bare `--continue` restores do not. `--model` and `--provider` override the agent's own `model:` /
 `provider:` for any `rupu run`, not only a continuation. A run that failed for
 another reason (max turns, say) still can't be continued this way.
+
+### Continuing with a prompt
+
+A continue can be told something new:
+
+    rupu run <agent> --continue <agent_run_id> "now write the fix"
+    rupu run <agent> --continue <agent_run_id> --prompt "now write the fix"
+
+A positional that parses as a run target is still the target; anything else
+is the prompt. A prompt is new input, so every ended run can take one:
+
+| The run | It is sent |
+| --- | --- |
+| interrupted | the interruption note, then the prompt, in the conversation's trailing user turn |
+| finished | the prompt, as a new user turn after its answer (a real model call) |
+| failed on a provider-side outcome | the "earlier attempt stopped" note, then the prompt, on its own model (or `--model`) |
+| failed for another reason (max turns, say) | the prompt alone, on its own model |
+
+A run whose last turn ends on a tool call with no result still can't be
+continued. With no prompt (or a blank one), nothing changes: the rules above
+stand.
+
+The prompt is never part of the restored command. `--continue` restores the
+original's flags (`launch_args`, which records no prompt) and takes the prompt
+from this command line only. The new run's `launch_args` are the merged
+command, still without the prompt; the prompt is in its transcript, as a
+`user_message` event, and so in the conversation a later `--continue` of that
+run rebuilds. Continuing it again therefore never re-sends the prompt: with no
+new prompt, a finished continuation prints its answer and an interrupted one
+picks up where it stopped.

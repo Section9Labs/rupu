@@ -13,8 +13,8 @@ use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
     AgentRun, AgentiflowRun, AutoflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace,
-    RunArgv, SessionCompact, SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef,
-    WorkflowRun,
+    RunArgv, SessionCompact, SessionSend, SessionStart, SessionWorker, WorkflowControl,
+    WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -176,6 +176,29 @@ fn agent_runs() -> Vec<RunArgv> {
             r.provider = provider.map(str::to_string);
             out.push(RunArgv::Agent(r));
         }
+    }
+    // A continue given a prompt (the CP's optional `prompt`), alone, on
+    // another model, and as a launched child: every prompt shape travels
+    // as ONE `--prompt=` element next to `--continue`.
+    for (i, prompt) in PROMPTS.iter().enumerate() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some(if i % 2 == 0 {
+            "run_01ROUNDTRIP".into()
+        } else {
+            "sub_01ROUNDTRIP".into()
+        });
+        r.prompt = Some(prompt.to_string());
+        r.model = (i % 3 == 1).then(|| "claude-opus-5-5".into());
+        r.provider = (i % 3 == 2).then(|| "openai".into());
+        r.mode = MODES[i % MODES.len()];
+        out.push(RunArgv::Agent(r));
+    }
+    for (i, link) in links().into_iter().enumerate() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some("run_01ROUNDTRIP".into());
+        r.prompt = Some(PROMPTS[i % PROMPTS.len()].into());
+        r.launch = Some(link);
+        out.push(RunArgv::Agent(r));
     }
     // A placed unit continued with its workflow's messaging still set.
     for messaging in messagings() {

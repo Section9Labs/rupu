@@ -161,6 +161,70 @@ async fn a_refused_run_fails_and_continues_on_another_model() {
     );
 }
 
+/// A prompt is new input: a refused run continued with one carries on on
+/// its OWN model (no `--model`), told why the last attempt stopped and then
+/// the prompt, in the one user turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_run_continues_with_a_prompt_on_its_own_model() {
+    let _guard = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "guarded", "maxTurns: 3\n");
+    rupu(dir.path(), MOCK_SCRIPT)
+        .args([
+            "run",
+            "guarded",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_refused",
+            "do the thing",
+        ])
+        .assert()
+        .failure();
+
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"Done after the prompt.","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "guarded",
+        "--run-id",
+        "run_prompted",
+        "--continue",
+        "run_refused",
+        "it is authorised: go ahead",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Done after the prompt."));
+
+    let second = events(&transcript(dir.path(), "run_prompted"));
+    let sent: Vec<&str> = second
+        .iter()
+        .filter(|v| v["type"] == "user_message")
+        .filter_map(|v| v["data"]["content"].as_str())
+        .collect();
+    let [note, prompt] = sent.as_slice() else {
+        panic!("{sent:?}")
+    };
+    assert!(
+        note.contains("A previous attempt at this task stopped (refused"),
+        "{note}"
+    );
+    assert!(note.contains("anthropic/claude-sonnet-4-6"), "{note}");
+    assert_eq!(*prompt, "it is authorised: go ahead");
+    let start = second
+        .iter()
+        .find(|v| v["type"] == "run_start")
+        .expect("run_start");
+    assert_eq!(start["data"]["model"], "claude-sonnet-4-6");
+    assert_eq!(
+        run_record(dir.path(), "run_prompted").status,
+        rupu_orchestrator::RunStatus::Completed
+    );
+}
+
 /// A max-turns bust returns `Ok` from the runner with a failed status: the
 /// run is recorded failed and the command exits non-zero.
 #[tokio::test(flavor = "multi_thread")]

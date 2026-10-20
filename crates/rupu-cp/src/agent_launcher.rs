@@ -80,7 +80,9 @@ pub struct AgentLaunchRequest {
     /// Continue this earlier run of the agent instead of starting fresh —
     /// `rupu run --continue <id>` (a `sub_…` id too). The child restores the
     /// flags the run was launched with; the ones set here replace their
-    /// own. Carries no prompt. A local launch only, as `model`.
+    /// own. `prompt`, when set, is what the continuation is told next
+    /// (`--prompt=`): any ended run then carries on with it. A local launch
+    /// only, as `model`.
     pub continue_from: Option<String>,
 }
 

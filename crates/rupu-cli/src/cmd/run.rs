@@ -138,21 +138,27 @@ pub struct Args {
         conflicts_with = "no_messaging"
     )]
     pub messaging_tools: Vec<String>,
-    /// Continue an interrupted run of this agent from its transcript instead
-    /// of starting fresh: the earlier conversation is rebuilt and the agent
-    /// is told it was interrupted. Every flag and the target the original
-    /// run was launched with are restored (recorded as `RunStart.launch_args`);
-    /// a flag given here replaces only its own setting. A repo target reuses
-    /// the checkout the original run cloned. A run that had already finished
-    /// prints its recorded answer without calling the model. Run it from the
-    /// same directory as the original run. With `--model` or `--provider`, a
-    /// run that failed on a provider-side outcome (a refusal, say) is
-    /// continued too, on that model.
-    #[arg(
-        long = "continue",
-        value_name = "AGENT_RUN_ID",
-        conflicts_with_all = ["prompt", "prompt_flag"]
-    )]
+    /// Continue an earlier run of this agent from its transcript instead
+    /// of starting fresh: the earlier conversation is rebuilt. Every flag and
+    /// the target the original run was launched with are restored (recorded
+    /// as `RunStart.launch_args`); a flag given here replaces only its own
+    /// setting. A repo target reuses the checkout the original run cloned.
+    /// Run it from the same directory as the original run.
+    ///
+    /// With no prompt, an interrupted run is told it was interrupted and
+    /// carries on; a run that had already finished prints its recorded
+    /// answer without calling the model; and a run that failed on a
+    /// provider-side outcome (a refusal, say) is continued only with
+    /// `--model` or `--provider`, on that model.
+    ///
+    /// With a prompt (positional, when it is not a run target, or
+    /// `--prompt`), any ended run continues: an interrupted one gets the
+    /// interruption note and then the prompt, a finished one gets the prompt
+    /// as a new turn, and a failed one continues on the same model too. The
+    /// prompt is never restored from, or recorded in, the launch command: it
+    /// is in the new run's conversation, which a `--continue` of that run
+    /// rebuilds.
+    #[arg(long = "continue", value_name = "AGENT_RUN_ID")]
     pub continue_from: Option<String>,
     /// Model for this run, overriding the agent's `model:` and the config
     /// default.
@@ -309,7 +315,10 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
 /// A `--continue` invocation (`now`) over the command the continued run
 /// recorded: each setting comes from `now` when its command line named it,
 /// else from `recorded`. The run id, `--continue` and the prompt are always
-/// `now`'s (the rebuilt conversation holds the prompt). A setting spelled by
+/// `now`'s: [`launch_argv`] records no prompt, so `recorded` has none, and
+/// the earlier prompts are in the rebuilt conversation. `now`'s positional
+/// prompt words are moved out of `target` first ([`Args::prompt_words_out_of_target`]),
+/// so a prompt never displaces the recorded run target. A setting spelled by
 /// several flags takes them all from one side: the clone destination
 /// (`--into` / `--tmp`), the message space (`--message-space` /
 /// `--participant`), the messaging (`--no-messaging` /
@@ -426,6 +435,41 @@ fn parse_messaging_tool(s: &str) -> Result<String, String> {
 }
 
 impl Args {
+    /// A positional `target` that is not a run target is the prompt's
+    /// leading words (the rule `run_inner` applies when it builds the user
+    /// message): move them into the prompt, ahead of `--prompt` when given
+    /// (else of the positional prompt), and stop counting `target` as named.
+    /// A `--continue` does this before it restores the recorded command, so
+    /// `rupu run a --continue <id> "go on"` keeps the original run target.
+    fn prompt_words_out_of_target(mut self) -> Self {
+        let Some(words) = self
+            .target
+            .take_if(|t| crate::run_target::parse_run_target(t).is_err())
+        else {
+            return self;
+        };
+        let join = |rest: Option<String>| match rest {
+            Some(rest) => format!("{words} {rest}"),
+            None => words.clone(),
+        };
+        if self.prompt_flag.is_some() {
+            self.prompt_flag = Some(join(self.prompt_flag.take()));
+        } else {
+            self.prompt = Some(join(self.prompt.take()));
+        }
+        self.explicit.0.remove("target");
+        self
+    }
+
+    /// The prompt this command gives, when it gives a non-blank one: `--prompt`
+    /// over the positional prompt (after [`Self::prompt_words_out_of_target`]).
+    fn given_prompt(&self) -> Option<&str> {
+        self.prompt_flag
+            .as_deref()
+            .or(self.prompt.as_deref())
+            .filter(|p| !p.trim().is_empty())
+    }
+
     /// The launch's messaging, from `--no-messaging` / `--messaging-tool`.
     pub fn messaging(&self) -> rupu_runtime::argv::LaunchMessaging {
         use rupu_runtime::argv::LaunchMessaging;
@@ -989,6 +1033,11 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         None => Vec::new(),
     };
     let restored = !recorded.is_empty();
+    let args = if args.continue_from.is_some() {
+        args.prompt_words_out_of_target()
+    } else {
+        args
+    };
     let mut args = if restored {
         let prev = args.continue_from.clone().unwrap_or_default();
         let recorded = parse_launch_args(recorded)
@@ -1009,14 +1058,6 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         };
         if carried {
             skills_carried_from = Some(prev);
-        }
-    }
-    if let (Some(prev), Some(target)) = (&args.continue_from, &args.target) {
-        if crate::run_target::parse_run_target(target).is_err() {
-            anyhow::bail!(
-                "--continue {prev} takes no prompt (`{target}` is not a run target): \
-                 the continued conversation already holds it"
-            );
         }
     }
 
@@ -1120,7 +1161,9 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     //
     // With `--model`/`--provider` on this command line, a run that failed on
     // an outcome is continued too (`prepare_recovery_continuation`); the
-    // third element is that outcome, `None` for an interrupted run.
+    // third element is that outcome, `None` for an interrupted run. With a
+    // prompt, any ended run is continued (`prepare_prompted_continuation`).
+    let prompted = args.continue_from.is_some() && args.given_prompt().is_some();
     let mut launch_skills = (args.skills.clone(), args.preload_skills.clone());
     let mut resume_from: Option<ResumeFrom> = match args.continue_from.as_deref().zip(prev_path) {
         None => None,
@@ -1142,49 +1185,59 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             if prev_agent != spec.name {
                 anyhow::bail!("run {prev} was agent `{prev_agent}`, not `{}`", spec.name);
             }
-            let prepared = if args.explicit.has("model") || args.explicit.has("provider") {
-                prepare_recovery_continuation(&prev_path)?
+            if prompted {
+                let prepared = rupu_agent::continuation::prepare_prompted_continuation(&prev_path)?;
+                Some(ResumeFrom::Prompted(prepared))
             } else {
-                prepare_continuation(&prev_path)?
-            };
-            match prepared {
-                Continuation::Finished { output } => {
-                    // This run records nothing, but it is still a
-                    // `rupu run`: start its streams so a coordinator reads
-                    // "nothing recorded", not "host can't stream" (the
-                    // netflow one only for a root — spec 2026-10-14 §N1).
-                    start_coverage_stream(&coverage_stream, &run_id);
-                    if args.run_id.is_some() && args.launch.link().is_none() {
-                        crate::netflow_sink::start_root_stream(&global, &run_id);
+                let prepared = if args.explicit.has("model") || args.explicit.has("provider") {
+                    prepare_recovery_continuation(&prev_path)?
+                } else {
+                    prepare_continuation(&prev_path)?
+                };
+                match prepared {
+                    Continuation::Finished { output } => {
+                        // This run records nothing, but it is still a
+                        // `rupu run`: start its streams so a coordinator reads
+                        // "nothing recorded", not "host can't stream" (the
+                        // netflow one only for a root — spec 2026-10-14 §N1).
+                        start_coverage_stream(&coverage_stream, &run_id);
+                        if args.run_id.is_some() && args.launch.link().is_none() {
+                            crate::netflow_sink::start_root_stream(&global, &run_id);
+                        }
+                        println!("{output}");
+                        eprintln!(
+                            "run {prev} had already finished — printed its recorded answer without calling the model (give a prompt to carry the conversation on)"
+                        );
+                        return Ok(());
                     }
-                    println!("{output}");
-                    eprintln!(
-                        "run {prev} had already finished — printed its recorded answer without calling the model"
-                    );
-                    return Ok(());
+                    Continuation::Failed { error, seeded_from } => {
+                        // A failed continuation's source run may still be
+                        // continuable; name it so the user can.
+                        let source = seeded_from
+                            .as_deref()
+                            .and_then(|p| p.file_stem())
+                            .and_then(|s| s.to_str())
+                            .map(|src| {
+                                format!("; run {src}, which it continued, may still be continued with `--continue {src}`")
+                            })
+                            .unwrap_or_default();
+                        anyhow::bail!(
+                            "run {prev} ended in failure{} — that is not an interruption, so there is nothing to pick up; give it a prompt to carry on, or start a fresh run instead{source}",
+                            error.map(|e| format!(" ({e})")).unwrap_or_default()
+                        )
+                    }
+                    Continuation::Resume {
+                        messages,
+                        seed_source,
+                        stopped_on,
+                        loaded_skills,
+                    } => Some(ResumeFrom::Noted {
+                        messages,
+                        seed_source,
+                        stopped_on,
+                        loaded_skills,
+                    }),
                 }
-                Continuation::Failed { error, seeded_from } => {
-                    // A failed continuation's source run may still be
-                    // continuable; name it so the user can.
-                    let source = seeded_from
-                        .as_deref()
-                        .and_then(|p| p.file_stem())
-                        .and_then(|s| s.to_str())
-                        .map(|src| {
-                            format!("; run {src}, which it continued, may still be continued with `--continue {src}`")
-                        })
-                        .unwrap_or_default();
-                    anyhow::bail!(
-                        "run {prev} ended in failure{} — that is not an interruption, so there is nothing to pick up; start a fresh run instead{source}",
-                        error.map(|e| format!(" ({e})")).unwrap_or_default()
-                    )
-                }
-                Continuation::Resume {
-                    messages,
-                    seed_source,
-                    stopped_on,
-                    loaded_skills,
-                } => Some((messages, seed_source, stopped_on, loaded_skills)),
             }
         }
     };
@@ -1619,9 +1672,25 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         }
         match resume_from.take() {
             None => {}
+            // A continuation the operator gave a prompt: the prompt (with any
+            // skills it invoked) follows the note its prior run's end calls
+            // for, in one user turn.
+            Some(ResumeFrom::Prompted(prepared)) => {
+                rupu_agent::continuation::apply_prompted_continuation(
+                    &mut prompt,
+                    prepared,
+                    &provider_name,
+                    &model_name,
+                );
+            }
             // A failed run continued on another model: the note says why the
             // last attempt stopped and what this one runs on.
-            Some((messages, seed_source, Some(stopped_on), loaded_skills)) => {
+            Some(ResumeFrom::Noted {
+                messages,
+                seed_source,
+                stopped_on: Some(stopped_on),
+                loaded_skills,
+            }) => {
                 let note = rupu_agent::recovery::recovery_retry_note(
                     &stopped_on.title,
                     &provider_name,
@@ -1635,7 +1704,12 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                     note,
                 );
             }
-            Some((messages, seed_source, None, loaded_skills)) => {
+            Some(ResumeFrom::Noted {
+                messages,
+                seed_source,
+                stopped_on: None,
+                loaded_skills,
+            }) => {
                 rupu_agent::continuation::apply_continuation(
                     &mut prompt,
                     messages,
@@ -2086,16 +2160,21 @@ fn launch_flags((skills, preload): &(Vec<String>, Vec<String>)) -> String {
     skills.chain(preload).collect::<Vec<_>>().join(" ")
 }
 
-/// What `rupu run --continue` picks up: the rebuilt conversation, the
-/// transcript it is seeded from, — for a failed run continued on another
-/// model — the outcome it failed on, and the skills the conversation had
-/// loaded.
-type ResumeFrom = (
-    Vec<rupu_providers::types::Message>,
-    std::path::PathBuf,
-    Option<rupu_transcript::OutcomeRecord>,
-    Vec<rupu_agent::LoadedSkill>,
-);
+/// What `rupu run --continue` picks up.
+enum ResumeFrom {
+    /// A continuation with no prompt: the rebuilt conversation, the
+    /// transcript it is seeded from, — for a failed run continued on another
+    /// model — the outcome it failed on, and the skills the conversation had
+    /// loaded. The run is sent only a note.
+    Noted {
+        messages: Vec<rupu_providers::types::Message>,
+        seed_source: std::path::PathBuf,
+        stopped_on: Option<rupu_transcript::OutcomeRecord>,
+        loaded_skills: Vec<rupu_agent::LoadedSkill>,
+    },
+    /// A continuation the operator gave a prompt.
+    Prompted(rupu_agent::continuation::PromptedContinuation),
+}
 
 /// A standalone run that did not do its job: the text recorded as the run's
 /// `error_message` and printed by the command, and the outcome it failed on.
@@ -3047,6 +3126,63 @@ mod continue_restore_tests {
         );
         assert!(off.no_messaging);
         assert!(off.messaging_tools.is_empty());
+    }
+
+    /// A continue's prompt is its own, never the original's (which the
+    /// recorded command doesn't hold), and never displaces the recorded run
+    /// target: a positional that isn't a run target is the prompt. The
+    /// command the continue records holds no prompt either, so a continue of
+    /// it doesn't send it again.
+    #[test]
+    fn a_continues_prompt_is_its_own_and_keeps_the_recorded_target() {
+        for (now, prompt, flag) in [
+            (
+                &["a", "--continue", "run_1", "go on"][..],
+                Some("go on"),
+                None,
+            ),
+            (
+                &["a", "--continue", "run_1", "go", "on"][..],
+                Some("go on"),
+                None,
+            ),
+            (
+                &["a", "--continue", "run_1", "--prompt", "go on"][..],
+                None,
+                Some("go on"),
+            ),
+            (
+                &["a", "--continue", "run_1", "go", "--prompt", "on"][..],
+                None,
+                Some("go on"),
+            ),
+        ] {
+            let now = parse(now).prompt_words_out_of_target();
+            assert!(!now.explicit.has("target"), "{now:?}");
+            let merged = restore_launch(recorded(), now);
+            assert_eq!(merged.target.as_deref(), Some("github:owner/repo"));
+            assert_eq!(merged.prompt.as_deref(), prompt);
+            assert_eq!(merged.prompt_flag.as_deref(), flag);
+            assert_eq!(merged.given_prompt(), Some("go on"));
+            let argv = launch_argv(&merged, "run_2");
+            assert!(!argv.iter().any(|a| a.contains("go")), "{argv:?}");
+            assert_eq!(&argv[..2], ["a", "github:owner/repo"]);
+        }
+        // A run target given on the continue is a target, and replaces the
+        // recorded one.
+        let now = parse(&["a", "--continue", "run_1", "github:o/other", "go on"])
+            .prompt_words_out_of_target();
+        let merged = restore_launch(recorded(), now);
+        assert_eq!(merged.target.as_deref(), Some("github:o/other"));
+        assert_eq!(merged.given_prompt(), Some("go on"));
+        // No prompt, or a blank one: none is given.
+        let bare = restore_launch(recorded(), parse(&["a", "--continue", "run_1"]));
+        assert_eq!(bare.given_prompt(), None);
+        let blank = restore_launch(
+            recorded(),
+            parse(&["a", "--continue", "run_1", "--prompt", " "]),
+        );
+        assert_eq!(blank.given_prompt(), None);
     }
 
     #[test]
