@@ -11,13 +11,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { api, apiErrorMessage, type AgentiflowRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
-import { StatusPill } from '../../components/StatusPill';
+import { RunStatusChip } from '../../components/ui/RunStatusChip';
 import { CrewChip } from '../../components/codename/CrewChip';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
+import { PageHeader } from '../../components/ui/PageHeader';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
-import { Spinner } from '../../components/ui/Spinner';
+import { ListSkeleton } from '../../components/lists/ListSkeleton';
 import { parseCodename } from '../../lib/codename';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
@@ -44,7 +45,7 @@ const COLUMNS: Column<AgentiflowRow>[] = [
     sortValue: (r) => r.status,
     render: (r) => (
       <span className="inline-flex items-center gap-1.5">
-        <StatusPill status={agentiflowPillStatus(r.status)} />
+        <RunStatusChip status={agentiflowPillStatus(r.status)} />
         {r.status === 'running' && r.runner_alive === false && (
           <Badge
             tone="amber"
@@ -181,23 +182,22 @@ export default function AgentiflowRuns() {
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Agentiflow Runs</h1>
-          <p className="mt-1 text-sm text-ink-dim">Goal-directed agent fleets run from this machine.</p>
-        </div>
-        <Button variant="secondary" onClick={() => load()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-          Refresh
-        </Button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Agentiflow Runs"
+        subtitle="Goal-directed agent fleets run from this machine."
+        actions={
+          <Button variant="secondary" onClick={() => load()} className="gap-1.5">
+            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+            Refresh
+          </Button>
+        }
+      />
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {rows === null && loading ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading agentiflows…" />
-        </div>
+        <ListSkeleton label="Loading agentiflows…" />
       ) : rows === null ? null : rows.length === 0 ? (
         <EmptyState
           title="No agentiflow runs yet"

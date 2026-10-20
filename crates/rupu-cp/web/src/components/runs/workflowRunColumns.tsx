@@ -6,7 +6,7 @@
 // Duration → Started. Pages append their own action column.
 
 import type { RunListRow } from '../../lib/api';
-import { StatusPill } from '../StatusPill';
+import { RunStatusChip } from '../ui/RunStatusChip';
 import { CrewChip } from '../codename/CrewChip';
 import { parseCodename } from '../../lib/codename';
 import type { Column } from '../lists/SortableTable';
@@ -54,7 +54,7 @@ export const WORKFLOW_RUN_COLUMNS: Column<RunListRow>[] = [
     fit: true,
     sortable: true,
     sortValue: (r) => r.status,
-    render: (r) => <StatusPill status={r.status} />,
+    render: (r) => <RunStatusChip status={r.status} />,
   },
   {
     key: 'workflow',
