@@ -25,6 +25,7 @@ pub fn routes() -> Router<AppState> {
                 .delete(delete_workflow),
         )
         .route("/api/workflows/:name/run", post(launch_run))
+        .route("/api/workflows/run", post(launch_yaml_run))
         // axum matches static literal segments before dynamic `:name` captures,
         // so this route is reachable and is NOT shadowed by `/api/workflows/:name`.
         .route("/api/workflows/validate", post(validate_workflow))
@@ -497,7 +498,7 @@ async fn write_workflow(
     Query(q): Query<ScopeQuery>,
     Json(body): Json<WorkflowWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    fs_safety::validate_name(&name)?;
+    fs_safety::validate_new_name("workflow", &name)?;
     let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     if wf.name != name {
         return Err(ApiError::bad_request(
@@ -551,7 +552,7 @@ async fn create_workflow(
 ) -> ApiResult<Json<serde_json::Value>> {
     let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let name = wf.name;
-    fs_safety::validate_name(&name)?;
+    fs_safety::validate_new_name("workflow", &name)?;
     if resolve_workflow_scoped(&s, &name).is_some() {
         return Err(ApiError::conflict("workflow already exists"));
     }
@@ -645,6 +646,94 @@ pub(crate) struct LaunchBody {
     scope_kind: Option<String>,
     #[serde(default)]
     scope_id: Option<String>,
+    /// Optional engagement profile ids — `rupu workflow run
+    /// --engagement-profile`, one flag per id; absent/empty = the `code`
+    /// path. The launched run resolves them (an unknown id fails that run).
+    /// Local launches only: a remote host gets a 501.
+    #[serde(default)]
+    engagement_profiles: Vec<String>,
+}
+
+/// Request body for `POST /api/workflows/run`: a workflow given as its YAML
+/// rather than saved under a name.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct LaunchYamlBody {
+    /// The workflow's YAML, as a saved workflow file holds it. Validated
+    /// before anything is written or spawned.
+    yaml: String,
+    #[serde(default)]
+    inputs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    mode: Option<String>,
+    /// The directory to run in (its project layer applies), as for a named
+    /// launch.
+    #[serde(default)]
+    working_dir: Option<String>,
+    /// As [`LaunchBody::engagement_profiles`].
+    #[serde(default)]
+    engagement_profiles: Vec<String>,
+    /// Absent or `"local"`; any other host is a 501 (local-only).
+    #[serde(default)]
+    host: Option<String>,
+}
+
+/// Where a YAML launch's file is kept: `<global>/cp/workflow-launches/`.
+/// The file is the run's source (`run.json`'s `source_path`), so it stays.
+fn yaml_launch_dir(s: &AppState) -> std::path::PathBuf {
+    s.global_dir.join("cp").join("workflow-launches")
+}
+
+/// `POST /api/workflows/run` — launch a workflow that isn't saved under a
+/// name: the YAML is validated (400 with the parser's error), written to
+/// its own file under `<global>/cp/workflow-launches/`, and run with
+/// `rupu workflow run --file` (named by the YAML's `name:`), detached like
+/// a named launch. Returns the new run id and the file. Local-only: a
+/// remote `host` is a 501.
+async fn launch_yaml_run(
+    State(s): State<AppState>,
+    Json(b): Json<LaunchYamlBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(host) = b.host.as_deref().filter(|h| *h != "local") {
+        return Err(ApiError::not_available(format!(
+            "a YAML launch is local-only: host `{host}` has no transport for it"
+        )));
+    }
+    let launcher = s
+        .launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
+    // Everything a launch could refuse is checked before the file is written.
+    let workflow = Workflow::parse(&b.yaml).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
+    let engagement_profiles = crate::api::agents::parse_engagement_profiles(b.engagement_profiles)?;
+    let dir = yaml_launch_dir(&s);
+    let file = dir.join(format!("{}.yaml", ulid::Ulid::new()));
+    let (yaml, path) = (b.yaml, file.clone());
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        fs_safety::write_atomic(&path, yaml.as_bytes())
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::internal(format!("writing {}: {e}", file.display())))?;
+    let req = crate::launcher::LaunchRequest {
+        workflow: workflow.name,
+        inputs: b.inputs,
+        mode: b.mode,
+        target: None,
+        working_dir: b.working_dir,
+        engagement_profiles,
+        file: Some(file.clone()),
+    };
+    match launcher.launch(req).await {
+        Ok(run_id) => Ok(Json(serde_json::json!({
+            "run_id": run_id,
+            "host_id": "local",
+            "file": file.display().to_string(),
+        }))),
+        Err(LaunchError::Invalid(m)) => Err(ApiError::bad_request(m)),
+        Err(LaunchError::Spawn(m)) => Err(ApiError::internal(m)),
+    }
 }
 
 /// Resolve an optional `scope_kind`/`scope_id` selector on [`LaunchBody`] to
@@ -702,11 +791,21 @@ async fn launch_run(
     let mut b = body.map(|j| j.0).unwrap_or_default();
     let host = b.host.as_deref().unwrap_or("local").to_string();
 
+    let engagement_profiles =
+        crate::api::agents::parse_engagement_profiles(std::mem::take(&mut b.engagement_profiles))?;
     if host != "local" {
         // Remote: scope fields, if present, are silently ignored — see this
-        // function's doc comment.
+        // function's doc comment. Engagement profiles are refused: no host
+        // transport carries a workflow run's.
+        if !engagement_profiles.is_empty() {
+            return Err(ApiError::not_available(format!(
+                "engagement_profiles on a workflow launch are local-only: host `{host}` has no transport for them"
+            )));
+        }
         let conn = crate::api::runs::resolve_host(&s, &host)?;
         let req = crate::launcher::LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: name,
             inputs: b.inputs,
             mode: b.mode,
@@ -744,6 +843,8 @@ async fn launch_run(
         .as_ref()
         .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
     let req = crate::launcher::LaunchRequest {
+        engagement_profiles,
+        file: None,
         workflow: name,
         inputs: b.inputs,
         mode: b.mode,
@@ -869,6 +970,7 @@ mod tests {
         let mut inputs = std::collections::BTreeMap::new();
         inputs.insert("repo".to_string(), "acme/widgets".to_string());
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: inputs.clone(),
             mode: Some("bypass".into()),
             target: None,
@@ -899,6 +1001,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -948,6 +1051,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -986,6 +1090,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1017,6 +1122,7 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1048,6 +1154,7 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1092,6 +1199,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1131,6 +1239,7 @@ mod tests {
         std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1165,6 +1274,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,
@@ -1200,6 +1310,7 @@ mod tests {
             .expect("add_host should succeed");
 
         let body = LaunchBody {
+            engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
             target: None,

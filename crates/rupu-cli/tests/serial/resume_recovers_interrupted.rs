@@ -42,6 +42,11 @@ struct Fixture {
 impl Fixture {
     /// `RUPU_HOME` plus a project with a `worker` agent, and the crashed run.
     fn crashed(runner_pid: u32) -> Self {
+        Self::crashed_in(runner_pid, None)
+    }
+
+    /// [`Self::crashed`], for a run launched in `permission_mode`.
+    fn crashed_in(runner_pid: u32, permission_mode: Option<&str>) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let global = tmp.path().join(".rupu");
         let project = tmp.path().join("proj");
@@ -68,6 +73,7 @@ impl Fixture {
             "runner_pid": runner_pid,
             "active_step_id": "only",
             "active_step_agent": "worker",
+            "permission_mode": permission_mode,
         }))
         .unwrap();
         let store = RunStore::new(global.join("runs"));
@@ -126,12 +132,21 @@ impl Fixture {
     /// `rupu workflow resume run_crashed <extra...>`, the provider answering
     /// `answer`.
     fn resume(&self, answer: &str, extra: &[&str]) -> assert_cmd::assert::Assert {
+        let mut args = vec!["--mode", "bypass"];
+        args.extend_from_slice(extra);
+        self.resume_with(answer, &args)
+    }
+
+    /// `rupu workflow resume run_crashed --plain <args...>`, no mode unless
+    /// `args` names one.
+    fn resume_with(&self, answer: &str, args: &[&str]) -> assert_cmd::assert::Assert {
         let script = serde_json::json!([
             { "AssistantText": { "text": answer, "stop": "end_turn" } }
         ])
         .to_string();
-        let mut args = vec!["workflow", "resume", RUN_ID, "--plain", "--mode", "bypass"];
-        args.extend_from_slice(extra);
+        let mut argv = vec!["workflow", "resume", RUN_ID, "--plain"];
+        argv.extend_from_slice(args);
+        let args = argv;
         Command::cargo_bin("rupu")
             .unwrap()
             .current_dir(&self.project)
@@ -271,6 +286,25 @@ async fn resume_restart_interrupted_skips_discovery() {
         fx.store.read_step_results(RUN_ID).unwrap()[0].output,
         "fresh answer"
     );
+}
+
+/// A retry with no `--mode` runs in the run's own launch mode: a run
+/// launched `readonly` comes back `readonly`, never the `ask` default (which,
+/// detached with no prompter, would let its steps write).
+#[tokio::test]
+async fn resume_without_a_mode_keeps_the_runs_launch_mode() {
+    let _guard = ENV_LOCK.lock().await;
+    let fx = Fixture::crashed_in(DEAD_PID, Some("readonly"));
+
+    fx.resume_with("fresh answer", &["--restart-interrupted"])
+        .success();
+
+    let start = fx
+        .resumed_transcript()
+        .into_iter()
+        .find(|v| v["type"] == "run_start")
+        .unwrap();
+    assert_eq!(start["data"]["mode"], "readonly");
 }
 
 /// The reaper only takes over a runner that is dead: a run whose recorded

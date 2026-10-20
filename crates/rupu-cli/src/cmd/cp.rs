@@ -1210,6 +1210,7 @@ fn resume_control(
             run_id,
             mode,
             if_unfinished: true,
+            restart_interrupted: false,
         },
         other => return Err(format!("unknown resume subcommand `{other}`")),
     }))

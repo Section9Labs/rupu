@@ -3495,6 +3495,36 @@ impl RunStore {
     /// worker doesn't strand the resume.
     pub const RESUME_LEASE: chrono::Duration = chrono::Duration::minutes(5);
 
+    /// Record an operator's retry of a finished run (`POST
+    /// /api/runs/:id/retry`) before its `rupu workflow resume` is spawned:
+    /// under the run lock, a run that is `Failed`, `Rejected` or `Cancelled`
+    /// gets the resume marker (`resume_requested_at`, `resume_approver` =
+    /// `actor`, `resume_mode` = `mode`), which the resume's flip to
+    /// `Running` consumes (`mark_resumed`), so a marker still there says the
+    /// retry was asked for and never took the run. The resume worker never
+    /// lists a terminal run, so it leaves the marker to the retry. `Ok(Err)`
+    /// carries the record as it is when it isn't one of those statuses. The
+    /// wait blocks its thread: async callers go through
+    /// [`RunStore::blocking`].
+    pub fn request_retry(
+        &self,
+        run_id: &str,
+        actor: &str,
+        mode: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Result<RunRecord, RunRecord>, RunStoreError> {
+        let _lock = self.lock_run_json(run_id);
+        let record = self.load(run_id)?;
+        if !matches!(
+            record.status,
+            RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled
+        ) {
+            return Ok(Err(record));
+        }
+        self.mark_resume_requested(record, actor, mode, None, now)?;
+        Ok(Ok(self.load(run_id)?))
+    }
+
     /// Web/delegated resume flow (the CP's `POST /api/runs/:id/approve`,
     /// `LocalHostConnector`): the CP records decisions but has no execution
     /// runtime, so a background worker — `rupu cp serve`'s resume worker,

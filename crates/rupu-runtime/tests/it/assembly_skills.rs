@@ -312,6 +312,7 @@ async fn failed_skills_record_the_unstarted_run() {
         Err(e) => e,
     };
     let run_err = err.record_unstarted(rupu_agent::UnstartedRun {
+        launch_args: &[],
         transcript_path: &transcript,
         run_id: "run_unstarted",
         workspace_id: "ws_test",
