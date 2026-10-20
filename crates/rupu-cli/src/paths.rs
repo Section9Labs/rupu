@@ -16,9 +16,11 @@ pub fn global_dir() -> Result<PathBuf> {
 
 /// Walk up from `pwd` looking for the first `.rupu/` directory. Returns
 /// `Some(path)` of the directory containing it, or `None` if not found.
-/// The walk lives in `rupu_workspace` so the CP resolves identically.
+/// The walk lives in `rupu_workspace` so the CP resolves identically; the
+/// error wording is [`rupu_autoflow::paths::project_root_for`]'s, which the
+/// autoflow library resolves with.
 pub fn project_root_for(pwd: &Path) -> Result<Option<PathBuf>> {
-    rupu_workspace::project_root_for(pwd).with_context(|| format!("canonicalize {}", pwd.display()))
+    rupu_autoflow::paths::project_root_for(pwd)
 }
 
 /// Pick the transcripts directory. Project-local when
@@ -51,19 +53,20 @@ pub fn netflow_dir(global: &Path, project_root: Option<&Path>) -> PathBuf {
     rupu_netflow::netflow_dir(global, project_root)
 }
 
-/// Global repo registry directory.
+/// Global repo registry directory ([`rupu_autoflow::paths::repos_dir`]).
 pub fn repos_dir(global: &Path) -> PathBuf {
-    global.join("repos")
+    rupu_autoflow::paths::repos_dir(global)
 }
 
-/// Global session state root.
+/// Global session state root ([`rupu_runtime::sessions::sessions_dir`]).
 pub fn sessions_dir(global: &Path) -> PathBuf {
-    global.join("sessions")
+    rupu_runtime::sessions::sessions_dir(global)
 }
 
-/// Global archived session state root.
+/// Global archived session state root
+/// ([`rupu_runtime::sessions::archived_sessions_dir`]).
 pub fn archived_sessions_dir(global: &Path) -> PathBuf {
-    global.join("sessions-archive")
+    rupu_runtime::sessions::archived_sessions_dir(global)
 }
 
 /// Archive directory nested under a transcript root.
@@ -81,59 +84,61 @@ pub fn project_themes_dir(project_root: &Path) -> PathBuf {
     project_root.join(".rupu/themes")
 }
 
-/// Global autoflow state root.
+/// Global autoflow state root. The `autoflow*_dir` helpers below are
+/// [`rupu_autoflow::paths`]'s, so the CLI and the control plane share one
+/// layout.
 pub fn autoflows_dir(global: &Path) -> PathBuf {
-    global.join("autoflows")
+    rupu_autoflow::paths::autoflows_dir(global)
 }
 
 /// Global autoflow claims directory.
 pub fn autoflow_claims_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("claims")
+    rupu_autoflow::paths::autoflow_claims_dir(global)
 }
 
 /// Global autoflow worktrees directory.
 pub fn autoflow_worktrees_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("worktrees")
+    rupu_autoflow::paths::autoflow_worktrees_dir(global)
 }
 
 /// Global autoflow worker registry directory.
 pub fn autoflow_workers_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("workers")
+    rupu_autoflow::paths::autoflow_workers_dir(global)
 }
 
 /// Global autoflow event cursor directory.
 pub fn autoflow_event_cursors_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("event-cursors")
+    rupu_autoflow::paths::autoflow_event_cursors_dir(global)
 }
 
 /// Global autoflow wake queue root.
 pub fn autoflow_wakes_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("wakes")
+    rupu_autoflow::paths::autoflow_wakes_dir(global)
 }
 
 /// Global autoflow cycle/event history root.
 pub fn autoflow_history_dir(global: &Path) -> PathBuf {
-    autoflows_dir(global).join("history")
+    rupu_autoflow::paths::autoflow_history_dir(global)
 }
 
 /// Global queued autoflow wake-record directory.
 pub fn autoflow_wake_queue_dir(global: &Path) -> PathBuf {
-    autoflow_wakes_dir(global).join("queue")
+    rupu_autoflow::paths::autoflow_wake_queue_dir(global)
 }
 
 /// Global processed autoflow wake-record directory.
 pub fn autoflow_wake_processed_dir(global: &Path) -> PathBuf {
-    autoflow_wakes_dir(global).join("processed")
+    rupu_autoflow::paths::autoflow_wake_processed_dir(global)
 }
 
 /// Global autoflow wake payload directory.
 pub fn autoflow_wake_payloads_dir(global: &Path) -> PathBuf {
-    autoflow_wakes_dir(global).join("payloads")
+    rupu_autoflow::paths::autoflow_wake_payloads_dir(global)
 }
 
 /// Global autoflow wake dedupe marker directory.
 pub fn autoflow_wake_dedupe_dir(global: &Path) -> PathBuf {
-    autoflow_wakes_dir(global).join("dedupe")
+    rupu_autoflow::paths::autoflow_wake_dedupe_dir(global)
 }
 
 /// Convenience: ensure a directory exists. Used to lazily create

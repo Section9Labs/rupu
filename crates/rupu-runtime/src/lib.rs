@@ -18,6 +18,7 @@ pub mod provider_factory;
 pub mod retention;
 mod run_envelope;
 pub mod services;
+pub mod sessions;
 pub mod spawn;
 pub mod standalone_run_metadata;
 pub mod usage_ledger;

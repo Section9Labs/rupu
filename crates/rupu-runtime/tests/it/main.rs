@@ -24,5 +24,6 @@ mod no_hand_built_run_opts;
 mod oauth_refresh_persists;
 mod oauth_refresh_tracking;
 mod provider_resolution;
+mod sessions;
 mod support;
 mod sync_provider_build;

@@ -465,6 +465,30 @@ async fn retry_refuses_what_isnt_finished_or_failed() {
     }
 }
 
+/// A standalone agent run's record (`agent:<name>`) sits in the run store
+/// beside workflow runs, so it lists as a failed run, but `workflow resume`
+/// can't run it: a retry is refused (409, pointing at continue) and records
+/// nothing, rather than a 202 whose resume dies on the missing workflow.
+#[tokio::test]
+async fn retry_refuses_a_standalone_agent_run() {
+    let (addr, tmp, rec) = spawn_launch().await;
+    const AGENT_FAILED: &str = "run_01J9ZQ3K4M5N6P7Q8R9AGFAIL";
+    let store = RunStore::new(tmp.path().join("runs"));
+    let mut run = super::sse::seed_run(AGENT_FAILED, RunStatus::Failed);
+    run.workflow_name = "agent:scout".into();
+    store.create(run, "").unwrap();
+
+    let (status, err) = post(addr, &format!("/api/runs/{AGENT_FAILED}/retry"), json!({})).await;
+    assert_eq!(status, 409, "{err}");
+    assert!(err.to_string().contains("continue"), "{err}");
+    assert!(rec.retries.lock().unwrap().is_empty());
+    assert!(store
+        .load(AGENT_FAILED)
+        .unwrap()
+        .resume_requested_at
+        .is_none());
+}
+
 // ── launch body gaps ────────────────────────────────────────────────────────
 
 #[tokio::test]

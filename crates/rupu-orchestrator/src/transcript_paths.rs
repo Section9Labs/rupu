@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Component, Path, PathBuf};
 
-use rupu_orchestrator::{executor::Event, runs::RunStore};
+use crate::{executor::Event, runs::RunStore};
 
 /// Every transcript path a mirrored run's own artifacts claim (§3.4):
 /// step-result rows and their items, unit checkpoints, `StepWorking` /
@@ -159,8 +159,8 @@ pub fn is_complete(cache: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rupu_orchestrator::runs::{ItemResultRecord, StepKind, StepResultRecord, UnitCheckpoint};
-    use rupu_orchestrator::{RunRecord, RunStatus};
+    use crate::runs::{ItemResultRecord, StepKind, StepResultRecord, UnitCheckpoint};
+    use crate::{RunRecord, RunStatus};
     use std::io::Write as _;
 
     fn store() -> (RunStore, tempfile::TempDir) {

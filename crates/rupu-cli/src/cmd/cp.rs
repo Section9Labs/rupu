@@ -711,10 +711,9 @@ pub async fn handle(action: Action) -> ExitCode {
                 crate::cp_transcript_mutator::SubprocessTranscriptMutator { exe: exe.clone() },
             ));
 
-            // Adapter for rupu-cp's AdminOps port: the autoflow, cron and
-            // prune endpoints run the CLI's own functions in process
-            // (`rupu autoflow run` detached), single-flighting the cron tick
-            // with the loop above.
+            // Adapter for rupu-cp's AdminOps port: the cron tick (the CLI's
+            // own, single-flighted with the loop above) and an autoflow cycle
+            // (`rupu autoflow run`, detached).
             let admin_ops: Arc<dyn rupu_cp::admin_ops::AdminOps> =
                 Arc::new(crate::cp_admin_ops::CliAdminOps {
                     exe: exe.clone(),

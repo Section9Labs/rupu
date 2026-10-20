@@ -1,17 +1,13 @@
-//! `cp serve` adapter for rupu-cp's `AdminOps` port: the operations whose
-//! logic still lives in this crate. The cron tick runs the CLI's own tick
-//! under the `RUPU_HOME` tick lock; an autoflow cycle is started as a
-//! detached `rupu autoflow run` child (W6's `RunArgv`). The autoflow reads,
-//! repair and the session prunes call the functions `rupu autoflow
-//! show|explain|doctor|wakes|repair`, `rupu session prune` and `rupu
-//! cleanup` run, and answer with the JSON report each command prints under
-//! `--format json`, until their extraction into libraries.
+//! `cp serve` adapter for rupu-cp's `AdminOps` port: the two operations
+//! that can't be a library call. The cron tick runs the CLI's own tick
+//! (the workflow runtime) under the `RUPU_HOME` tick lock; an autoflow cycle
+//! is started as a detached `rupu autoflow run` child (W6's `RunArgv`). The
+//! control plane serves everything else from the libraries.
 
 use std::path::PathBuf;
 
 use rupu_cp::admin_ops::{
-    AdminOpError, AdminOps, AutoflowRunRequest, CronTickOutcome, CronTickRequest, PruneKind,
-    PruneRequest, RepairRequest,
+    AdminOpError, AdminOps, AutoflowRunRequest, CronTickOutcome, CronTickRequest,
 };
 use rupu_runtime::argv::{AutoflowRun, RunArgv};
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec, SpawnStdio};
@@ -22,26 +18,6 @@ use serde_json::{json, Value};
 pub struct CliAdminOps {
     pub exe: PathBuf,
     pub global: PathBuf,
-}
-
-/// The typed refusal a CLI function raised (anywhere in the chain), else a
-/// failure carrying the whole message.
-fn classify(e: anyhow::Error) -> AdminOpError {
-    e.chain()
-        .find_map(|cause| cause.downcast_ref::<AdminOpError>().cloned())
-        .unwrap_or_else(|| AdminOpError::Failed(format!("{e:#}")))
-}
-
-/// Run a synchronous CLI function on the blocking pool.
-async fn blocking<T, F>(f: F) -> Result<T, AdminOpError>
-where
-    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| AdminOpError::Failed(format!("task panicked: {e}")))?
-        .map_err(classify)
 }
 
 /// The detached `rupu autoflow run` for `req`, its stderr kept in `log` so
@@ -72,58 +48,7 @@ pub(crate) fn autoflow_run_spec(
 
 #[async_trait::async_trait]
 impl AdminOps for CliAdminOps {
-    async fn autoflow_show(&self, name: &str, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        let (name, repo) = (name.to_string(), repo.map(str::to_string));
-        blocking(move || crate::cmd::autoflow::show_json(&name, repo.as_deref())).await
-    }
-
-    async fn autoflow_explain(
-        &self,
-        issue_ref: &str,
-        repo: Option<&str>,
-    ) -> Result<Value, AdminOpError> {
-        let (issue_ref, repo) = (issue_ref.to_string(), repo.map(str::to_string));
-        blocking(move || crate::cmd::autoflow::explain_json(&issue_ref, repo.as_deref())).await
-    }
-
-    async fn autoflow_doctor(&self, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        let (global, repo) = (self.global.clone(), repo.map(str::to_string));
-        blocking(move || crate::cmd::autoflow::doctor_json(&global, repo.as_deref())).await
-    }
-
-    async fn autoflow_wakes(&self, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        let (global, repo) = (self.global.clone(), repo.map(str::to_string));
-        blocking(move || crate::cmd::autoflow::wakes_json(&global, repo.as_deref())).await
-    }
-
-    async fn autoflow_repair(&self, req: RepairRequest) -> Result<Value, AdminOpError> {
-        let global = self.global.clone();
-        blocking(move || {
-            let outcome = crate::cmd::autoflow::repair_claim(
-                &global,
-                &req.issue_ref,
-                req.release,
-                req.requeue,
-                req.dry_run,
-            )?;
-            Ok(serde_json::to_value(outcome)?)
-        })
-        .await
-    }
-
     async fn autoflow_run(&self, req: AutoflowRunRequest) -> Result<Value, AdminOpError> {
-        let global = self.global.clone();
-        let check = req.clone();
-        blocking(move || {
-            crate::cmd::autoflow::run_precheck(
-                &global,
-                &check.name,
-                &check.issue,
-                check.repo.as_deref(),
-                check.mode.as_deref(),
-            )
-        })
-        .await?;
         let logs = self.global.join("autoflows").join("launches");
         std::fs::create_dir_all(&logs)
             .map_err(|e| AdminOpError::Failed(format!("creating {}: {e}", logs.display())))?;
@@ -146,7 +71,7 @@ impl AdminOps for CliAdminOps {
                 found.push(fire)
             })
             .await
-            .map_err(classify)?;
+            .map_err(|e| AdminOpError::Failed(format!("{e:#}")))?;
             return Ok(CronTickOutcome::DryRun(json!({
                 "kind": "cron_tick",
                 "version": 1,
@@ -170,24 +95,6 @@ impl AdminOps for CliAdminOps {
             }
         });
         Ok(CronTickOutcome::Started)
-    }
-
-    async fn prune_sessions(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
-        blocking(move || {
-            let older = req.older_than.as_deref();
-            match req.kind {
-                PruneKind::Sessions => Ok(serde_json::to_value(
-                    crate::cmd::session::prune_report(older, req.dry_run)?,
-                )?),
-                PruneKind::Cleanup => crate::cmd::cleanup::cleanup_json(older, req.dry_run),
-                other => Err(AdminOpError::Invalid(format!(
-                    "the control plane prunes `{}` itself",
-                    other.as_str()
-                ))
-                .into()),
-            }
-        })
-        .await
     }
 }
 
@@ -269,13 +176,5 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AdminOpError::Conflict(_)), "{err:?}");
         drop(held);
-    }
-
-    #[test]
-    fn a_typed_refusal_survives_context() {
-        let e = anyhow::Error::from(AdminOpError::NotFound("no claim".into())).context("repair");
-        assert_eq!(classify(e), AdminOpError::NotFound("no claim".into()));
-        let e = anyhow::anyhow!("disk on fire");
-        assert_eq!(classify(e), AdminOpError::Failed("disk on fire".into()));
     }
 }

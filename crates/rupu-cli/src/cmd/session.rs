@@ -1,5 +1,4 @@
 use crate::cmd::completers::{active_session_ids, archived_session_ids, session_ids};
-use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::run::{
     canonicalize_if_exists, resolve_clone_dest, standalone_issue_ref, standalone_repo_ref,
     standalone_workspace_strategy,
@@ -40,15 +39,15 @@ use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternate
 use crossterm::{execute, queue};
 use rupu_agent::{load_agent, resolve_mode};
 use rupu_config::PricingConfig;
-use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
-use rupu_providers::types::{
-    ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed, StreamEvent,
-    ThinkingDisplay,
-};
-use rupu_providers::AuthMode;
+use rupu_providers::types::{Message, StreamEvent};
 use rupu_runtime::argv::{RunArgv, SessionWorker};
 use rupu_runtime::provider_factory;
 use rupu_runtime::services::session_compaction as compaction;
+use rupu_runtime::sessions::{
+    archived_sessions_dir, delete_session_owned_artifacts, load_sessions_in_scope,
+    parse_session_record, session_dir, session_record_path, sessions_dir, SessionPruneReport,
+    SessionRecord, SessionRunRecord, SessionScope, SessionStatus, StoredSession,
+};
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use rupu_runtime::WorkerKind;
 use rupu_tools::PermissionMode;
@@ -56,7 +55,7 @@ use rupu_transcript::{
     Event as TranscriptEvent, FileEditKind, JsonlReader, JsonlWriter, RunMode, RunStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -273,25 +272,12 @@ pub struct RunWorkerArgs {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SessionStatus {
-    Idle,
-    Running,
-    Failed,
-    Stopped,
+/// The palette status a [`SessionStatus`] shows as in the session views.
+trait SessionStatusUi {
+    fn ui_status(self) -> crate::output::palette::Status;
 }
 
-impl SessionStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Running => "running",
-            Self::Failed => "failed",
-            Self::Stopped => "stopped",
-        }
-    }
-
+impl SessionStatusUi for SessionStatus {
     fn ui_status(self) -> crate::output::palette::Status {
         match self {
             Self::Idle => crate::output::palette::Status::Skipped,
@@ -300,12 +286,6 @@ impl SessionStatus {
             Self::Stopped => crate::output::palette::Status::Awaiting,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionScope {
-    Active,
-    Archived,
 }
 
 enum AttachExit {
@@ -345,39 +325,6 @@ enum SessionInput {
 enum AttachControl {
     Continue,
     Exit(AttachExit),
-}
-
-impl SessionScope {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Archived => "archived",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionRunRecord {
-    run_id: String,
-    prompt: String,
-    transcript_path: PathBuf,
-    started_at: DateTime<Utc>,
-    #[serde(default)]
-    completed_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    status: Option<RunStatus>,
-    #[serde(default)]
-    total_tokens_in: u64,
-    #[serde(default)]
-    total_tokens_out: u64,
-    #[serde(default)]
-    total_tokens_cached: u64,
-    #[serde(default)]
-    duration_ms: u64,
-    #[serde(default)]
-    pid: Option<u32>,
-    #[serde(default)]
-    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,265 +369,6 @@ impl SessionTurnRequest {
             prompt: self.prompt.clone(),
             operator_skills: self.operator_skills.clone(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionRecord {
-    version: u32,
-    session_id: String,
-    agent_name: String,
-    /// `crew/role` — one identity across every turn (spec §3). `None` for
-    /// sessions created before codenames; readers use `derive_legacy`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    codename: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    provider_name: String,
-    #[serde(default)]
-    auth_mode: Option<AuthMode>,
-    model: String,
-    agent_system_prompt: String,
-    #[serde(default)]
-    agent_tools: Option<Vec<String>>,
-    /// The agent's `messaging:` key (spec F1d D4), frozen with its tools.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    messaging: Option<bool>,
-    max_turns: u32,
-    permission_mode: String,
-    no_stream: bool,
-    #[serde(default)]
-    anthropic_oauth_prefix: Option<bool>,
-    #[serde(default)]
-    anthropic_prompt_cache: Option<bool>,
-    #[serde(default)]
-    effort: Option<ThinkingLevel>,
-    #[serde(default)]
-    thinking_display: Option<ThinkingDisplay>,
-    #[serde(default)]
-    context_window: Option<ContextWindow>,
-    #[serde(default)]
-    output_format: Option<ProviderOutputFormat>,
-    #[serde(default)]
-    output_schema: Option<serde_json::Value>,
-    #[serde(default)]
-    anthropic_task_budget: Option<u32>,
-    #[serde(default)]
-    anthropic_context_management: Option<ContextManagement>,
-    #[serde(default)]
-    anthropic_speed: Option<Speed>,
-    #[serde(default)]
-    dispatchable_agents: Option<Vec<String>>,
-    #[serde(default)]
-    dispatchable_workflows: Option<Vec<String>>,
-    /// The session agent's `findingsProfile` frontmatter, snapshotted at
-    /// session creation like the other agent-spec fields above. Absent ⇒
-    /// `full`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    findings_profile: Option<rupu_coverage::FindingProfile>,
-    /// The engagement profile ids `session start --engagement-profile`
-    /// selected; every turn re-resolves them against the workspace. Empty =
-    /// the `code` path (and every session that predates the field).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    engagement_profiles: Vec<String>,
-    workspace_id: String,
-    workspace_path: PathBuf,
-    #[serde(default)]
-    project_root: Option<PathBuf>,
-    /// The directory `session start` ran in — the customer lookup's
-    /// `run_dir` for every turn, so a session on a cloned target keeps the
-    /// customer of the directory it was started from. Absent on sessions
-    /// that predate it: those look the customer up from `workspace_path`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    launch_dir: Option<PathBuf>,
-    /// The customer the session's directory is assigned to (`rupu
-    /// customer`), as of its latest turn: each turn re-resolves it, so
-    /// a reassignment mid-session shows here while every transcript keeps
-    /// the customer it ran under. Tri-state (`rupu_transcript::recorded`):
-    /// `None` = the key is absent (a session that predates customers),
-    /// `Some(None)` = recorded "no customer" (written as `null`).
-    #[serde(
-        default,
-        deserialize_with = "rupu_transcript::recorded::deserialize",
-        skip_serializing_if = "Option::is_none"
-    )]
-    customer: rupu_transcript::RecordedField,
-    transcripts_dir: PathBuf,
-    #[serde(default)]
-    repo_ref: Option<String>,
-    #[serde(default)]
-    issue_ref: Option<String>,
-    #[serde(default)]
-    target: Option<String>,
-    #[serde(default)]
-    workspace_strategy: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    status: SessionStatus,
-    #[serde(default)]
-    active_run_id: Option<String>,
-    #[serde(default)]
-    active_transcript_path: Option<PathBuf>,
-    #[serde(default)]
-    active_pid: Option<u32>,
-    #[serde(default)]
-    worker_pid: Option<u32>,
-    /// Unix mtime (secs) of the `rupu` binary that spawned the current worker.
-    /// On the next turn we compare it to the running binary's mtime; if the
-    /// binary is newer the worker is stale (running old code) and is restarted
-    /// so a freshly-installed build takes effect without a manual stop.
-    #[serde(default)]
-    worker_binary_mtime: Option<i64>,
-    #[serde(default)]
-    last_run_id: Option<String>,
-    #[serde(default)]
-    last_transcript_path: Option<PathBuf>,
-    #[serde(default)]
-    last_error: Option<String>,
-    #[serde(default)]
-    total_turns: u32,
-    #[serde(default)]
-    total_tokens_in: u64,
-    #[serde(default)]
-    total_tokens_out: u64,
-    #[serde(default)]
-    total_tokens_cached: u64,
-    #[serde(default)]
-    message_history: Vec<Message>,
-    #[serde(default)]
-    runs: Vec<SessionRunRecord>,
-    /// Coverage concerns block resolved from the agent's frontmatter at
-    /// session start. When `Some`, each turn runs with the coverage
-    /// harness active (target_id derived from `(workspace, session_id)`).
-    #[serde(default)]
-    concerns: Option<rupu_coverage::ConcernsBlock>,
-    /// Optional agent pin for the per-request output-token cap, captured from
-    /// `spec.max_tokens` at session start. When set it overrides the cap
-    /// discovered from the provider's model list; when neither is known,
-    /// Anthropic gets 8192 and other providers get no cap.
-    #[serde(default)]
-    max_tokens: Option<u32>,
-    /// Agent pin for the input limit (`contextWindowTokens`), captured from
-    /// the spec at session start. Overrides the discovered limit (`resolve`
-    /// applies pins first); compaction and the gauge read
-    /// `effective_context_window()`.
-    #[serde(default)]
-    context_window_tokens: Option<u32>,
-    /// Agent pin for the compaction percentage (`compactAtPercent`), captured
-    /// from the spec at session start; read through
-    /// `effective_compact_at_percent()`.
-    #[serde(default)]
-    compact_at_percent: Option<u8>,
-    /// Limits resolved on the session's first turn (spec 2026-09-30 §6.5),
-    /// including any limit learned from an overflow error. Reused on every
-    /// later turn; never refetched mid-session.
-    #[serde(default)]
-    model_limits: Option<rupu_providers::model_limits::ModelLimits>,
-    /// Path of a transcript whose replay-reconstruction equals
-    /// `message_history` byte-exact — the ONLY legitimate source for
-    /// `seed_source` when starting the next turn (spec §3 seed dedup
-    /// rule). Set ONLY at the single point where `message_history` is
-    /// replaced with a successful turn's `final_messages`; cleared to
-    /// `None` at every other mutation of `message_history` (compaction,
-    /// in both the offline CLI and worker pseudo-turn paths) so a turn
-    /// whose transcript does NOT reconstruct to the current history can
-    /// never be referenced. Distinct from `last_transcript_path`, which
-    /// is a UX pointer updated unconditionally (including on failed/
-    /// stopped/crashed turns) and must never be used to derive a seed.
-    #[serde(default)]
-    history_source_transcript: Option<PathBuf>,
-    /// The session's skills, frozen by `session start` (spec 2026-10-12
-    /// §5.1): exactly the skills every turn is given, whatever is installed
-    /// later. Empty for a session with none, and for every session that
-    /// predates skills.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    skill_index: Vec<rupu_skills::FrozenSkill>,
-    /// The skills section `session start` rendered: sent as it is on every
-    /// turn, so each turn's system prompt is the first's. `None` when the
-    /// session has no skills section.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    skill_prompt: Option<String>,
-    /// The skills the conversation has loaded, most recently loaded last,
-    /// as the latest turn ended: the next turn starts with them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    loaded_skills: Vec<rupu_agent::LoadedSkill>,
-    /// Messages in `message_history` no model call saw (the latest turn
-    /// failed first): the next turn's first call writes their receipts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    unseen_messages: Vec<String>,
-}
-
-impl SessionRecord {
-    /// The newest record version this rupu reads. A record is written at
-    /// [`Self::written_version`].
-    const VERSION: u32 = 3;
-
-    /// The lowest version a rupu must understand to keep the record whole on
-    /// its next write: 3 for an agent's `messaging: false`, 2 for skills,
-    /// else 1, so older rupus keep reading what they can't damage.
-    fn written_version(&self) -> u32 {
-        let skills = !self.skill_index.is_empty()
-            || self.skill_prompt.is_some()
-            || !self.loaded_skills.is_empty();
-        if self.messaging == Some(false) {
-            3
-        } else if skills {
-            2
-        } else {
-            1
-        }
-    }
-
-    /// The input limit compaction and the gauge use: the stored resolved value
-    /// (which already reflects the agent pin — `resolve` applies pins first —
-    /// and any limit learned from an overflow error), else the agent pin.
-    fn effective_context_window(&self) -> Option<u32> {
-        self.model_limits
-            .as_ref()
-            .and_then(|l| l.input.tokens)
-            // A 0 pin is no limit (`resolve` ignores it too).
-            .or(self.context_window_tokens.filter(|n| *n > 0))
-    }
-
-    /// The compact-at percentage compaction uses: the stored value when the
-    /// stored limits actually resolved something (it already reflects the
-    /// pin — `resolve` applies pins first), else the agent pin, else the
-    /// default. Unresolved stored limits (`ModelLimits::unknown()`, a
-    /// transient first-turn failure) carry only the default percentage, which
-    /// must not outrank a pin.
-    fn effective_compact_at_percent(&self) -> u8 {
-        self.model_limits
-            .as_ref()
-            .filter(|l| !l.is_unresolved())
-            .map(|l| l.compact_at_percent)
-            .or(self.compact_at_percent)
-            .unwrap_or(rupu_providers::model_limits::DEFAULT_COMPACT_AT_PERCENT)
-    }
-
-    /// The input-token threshold manual compaction keeps the history under:
-    /// the same `ModelLimits::compact_threshold` a run compacts at (spec
-    /// 2026-09-30 §6.4, headroom rule included), built from the session's
-    /// effective limits — the stored resolved limits, else the agent pins —
-    /// with `window_override` (`session compact --window`) replacing the input
-    /// side. `None` when no input limit is known or pinned.
-    fn compaction_threshold(&self, window_override: Option<u32>) -> Option<u64> {
-        use rupu_providers::model_limits::{Limit, LimitSource, ModelLimits};
-        let input = window_override.or(self.effective_context_window())?;
-        let mut limits = match &self.model_limits {
-            Some(l) if !l.is_unresolved() => l.clone(),
-            stored => {
-                let mut l = ModelLimits::from_pins(None, self.max_tokens.filter(|n| *n > 0), None);
-                if let Some(stored) = stored {
-                    l.output_shares_context = stored.output_shares_context;
-                }
-                l
-            }
-        };
-        if limits.input.tokens != Some(input) {
-            limits.input = Limit::new(input, LimitSource::Agent);
-        }
-        limits.compact_at_percent = self.effective_compact_at_percent();
-        limits.compact_threshold()
     }
 }
 
@@ -785,15 +473,6 @@ struct SessionShowOutput {
 }
 
 #[derive(Serialize)]
-pub(crate) struct SessionPruneRow {
-    session_id: String,
-    scope: String,
-    status: String,
-    updated_at: String,
-    action: String,
-}
-
-#[derive(Serialize)]
 struct SessionPruneCsvRow {
     session_id: String,
     scope: String,
@@ -802,25 +481,9 @@ struct SessionPruneCsvRow {
     action: String,
 }
 
-#[derive(Serialize)]
-pub(crate) struct SessionPruneReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<SessionPruneRow>,
-}
-
 struct SessionPruneOutput {
     report: SessionPruneReport,
     csv_rows: Vec<SessionPruneCsvRow>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PrunedSession {
-    pub session_id: String,
-    pub scope: String,
-    pub status: String,
-    pub updated_at: String,
-    pub action: String,
 }
 
 impl CollectionOutput for SessionListOutput {
@@ -1591,14 +1254,14 @@ async fn show(
 /// and compaction calls included — labeled by the turn's run.
 ///
 /// The same labelled set and the same fold
-/// ([`rupu_cp::usage::transcripts_usage`]'s `points`) as `rupu-cp`'s local
+/// ([`rupu_orchestrator::usage_summary::transcripts_usage`]'s `points`) as `rupu-cp`'s local
 /// `/api/sessions/:id/usage-timeline` branch, so a remote session's chart
 /// cannot silently disagree with a local one. A turn whose transcript is
 /// missing contributes no points rather than failing the whole series.
 fn build_session_usage_timeline(
     global: &Path,
     session_id: &str,
-) -> anyhow::Result<Vec<rupu_cp::usage::TurnPoint>> {
+) -> anyhow::Result<Vec<rupu_orchestrator::usage_summary::TurnPoint>> {
     let (session, _scope) = read_session(global, session_id)?;
     let run_store = rupu_orchestrator::RunStore::new(global.join("runs"));
     let labeled: Vec<(String, PathBuf)> = session
@@ -1606,21 +1269,21 @@ fn build_session_usage_timeline(
         .iter()
         .filter(|r| r.transcript_path.is_file())
         .flat_map(|r| {
-            rupu_cp::usage_sources::with_dispatch_children(
+            rupu_orchestrator::usage_summary::with_dispatch_children(
                 &run_store,
                 &r.run_id,
                 &r.transcript_path,
             )
         })
         .collect();
-    Ok(rupu_cp::usage::transcripts_usage(&labeled).points.clone())
+    Ok(rupu_orchestrator::usage_summary::transcripts_usage(&labeled).points.clone())
 }
 
 #[derive(Serialize)]
 struct SessionUsageTimelineReport {
     kind: &'static str,
     version: u8,
-    rows: Vec<rupu_cp::usage::TurnPoint>,
+    rows: Vec<rupu_orchestrator::usage_summary::TurnPoint>,
 }
 
 #[derive(Serialize)]
@@ -7104,7 +6767,13 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
 }
 
 async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::Result<()> {
-    let report = prune_report(args.older_than.as_deref(), args.dry_run)?;
+    let global = paths::global_dir()?;
+    let report = rupu_runtime::sessions::prune_report(
+        &global,
+        args.older_than.as_deref(),
+        args.dry_run,
+        &mut |warning| eprintln!("{warning}"),
+    )?;
     let csv_rows = report
         .rows
         .iter()
@@ -7118,74 +6787,6 @@ async fn prune(args: PruneArgs, global_format: Option<OutputFormat>) -> anyhow::
         .collect();
     let output = SessionPruneOutput { report, csv_rows };
     report::emit_collection(global_format, &output)
-}
-
-/// `rupu session prune`'s report, sorted by session id: what the command
-/// prints and what the control plane's `POST /api/maintenance/prune {kind:
-/// sessions}` answers.
-pub(crate) fn prune_report(
-    older_than: Option<&str>,
-    dry_run: bool,
-) -> anyhow::Result<SessionPruneReport> {
-    let mut pruned = prune_archived_sessions(older_than, dry_run)?;
-    pruned.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    Ok(SessionPruneReport {
-        kind: "session_prune",
-        version: 1,
-        rows: pruned
-            .into_iter()
-            .map(|row| SessionPruneRow {
-                session_id: row.session_id,
-                scope: row.scope,
-                status: row.status,
-                updated_at: row.updated_at,
-                action: row.action,
-            })
-            .collect(),
-    })
-}
-
-pub(crate) fn prune_archived_sessions(
-    older_than: Option<&str>,
-    dry_run: bool,
-) -> anyhow::Result<Vec<PrunedSession>> {
-    let global = paths::global_dir()?;
-    let cutoff = session_prune_cutoff(older_than, &global)?;
-    let mut rows = Vec::new();
-    for stored in load_sessions_in_scope(&global, SessionScope::Archived)? {
-        if stored.record().updated_at > cutoff {
-            continue;
-        }
-        let session = match stored {
-            StoredSession::Current(session) => session,
-            newer => {
-                if let Some(warning) = newer.newer_warning() {
-                    eprintln!("{warning}");
-                }
-                continue;
-            }
-        };
-        rows.push(PrunedSession {
-            session_id: session.session_id.clone(),
-            scope: SessionScope::Archived.as_str().to_string(),
-            status: session.status.as_str().to_string(),
-            updated_at: session.updated_at.to_rfc3339(),
-            action: if dry_run {
-                "would_delete".into()
-            } else {
-                "deleted".into()
-            },
-        });
-        if !dry_run {
-            delete_session_owned_artifacts(&session)?;
-            let dir = session_dir(&global, SessionScope::Archived, &session.session_id);
-            if dir.exists() {
-                fs::remove_dir_all(&dir)
-                    .with_context(|| format!("remove session dir {}", dir.display()))?;
-            }
-        }
-    }
-    Ok(rows)
 }
 
 async fn stop(session_id: &str) -> anyhow::Result<()> {
@@ -9048,18 +8649,6 @@ fn reconcile_stale_session(session: &mut SessionRecord) -> bool {
     true
 }
 
-fn session_dir(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
-    match scope {
-        SessionScope::Active => paths::sessions_dir(global),
-        SessionScope::Archived => paths::archived_sessions_dir(global),
-    }
-    .join(session_id)
-}
-
-fn session_record_path(global: &Path, scope: SessionScope, session_id: &str) -> PathBuf {
-    session_dir(global, scope, session_id).join("session.json")
-}
-
 /// Appends to `session_id`'s frozen set the operator's invocations this
 /// turn gives (`given`, the turn's set), so later turns may load them and
 /// read their files; one the set holds already, in the same layer, is
@@ -9427,70 +9016,13 @@ fn read_session(global: &Path, fragment: &str) -> anyhow::Result<(SessionRecord,
     Ok((parse_session_record(&bytes)?, scope))
 }
 
-/// A session record this rupu understands: one a newer rupu wrote may hold
-/// fields this one would drop when it writes the record back.
-fn parse_session_record(bytes: &[u8]) -> anyhow::Result<SessionRecord> {
-    match parse_stored_session(bytes)? {
-        StoredSession::Current(record) => Ok(record),
-        StoredSession::Newer { .. } => {
-            anyhow::bail!("this session was written by a newer rupu; upgrade rupu to continue it")
-        }
-    }
-}
-
-/// A session record as it sits on disk.
-enum StoredSession {
-    /// One this rupu reads and may write back.
-    Current(SessionRecord),
-    /// One a newer rupu wrote: it may be shown, never written back, and
-    /// what it owns may be named in fields this rupu doesn't know.
-    Newer { version: u32, record: SessionRecord },
-}
-
-impl StoredSession {
-    /// The warning a listing prints for a record it can only show.
-    fn newer_warning(&self) -> Option<String> {
-        match self {
-            StoredSession::Current(_) => None,
-            StoredSession::Newer { version, record } => Some(format!(
-                "warning: session {} was written by a newer rupu (record version {version}); \
-                 upgrade rupu to manage it",
-                record.session_id
-            )),
-        }
-    }
-
-    fn record(&self) -> &SessionRecord {
-        match self {
-            StoredSession::Current(record) => record,
-            StoredSession::Newer { record, .. } => record,
-        }
-    }
-}
-
-/// The one parse of a session record: its version decides whether this
-/// rupu may write it back.
-fn parse_stored_session(bytes: &[u8]) -> anyhow::Result<StoredSession> {
-    #[derive(Deserialize)]
-    struct Versioned {
-        version: u32,
-    }
-    let Versioned { version } = serde_json::from_slice(bytes)?;
-    let record = serde_json::from_slice(bytes)?;
-    Ok(if version <= SessionRecord::VERSION {
-        StoredSession::Current(record)
-    } else {
-        StoredSession::Newer { version, record }
-    })
-}
-
 /// Session directory names in one scope. Reads directory entries only —
 /// no `session.json` parsing — so resolution stays cheap as history
 /// grows.
 fn session_ids_in_scope(global: &Path, scope: SessionScope) -> anyhow::Result<Vec<String>> {
     let dir = match scope {
-        SessionScope::Active => paths::sessions_dir(global),
-        SessionScope::Archived => paths::archived_sessions_dir(global),
+        SessionScope::Active => sessions_dir(global),
+        SessionScope::Archived => archived_sessions_dir(global),
     };
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -9576,33 +9108,6 @@ fn resolve_session_fragment(
     }
 }
 
-fn load_sessions_in_scope(
-    global: &Path,
-    scope: SessionScope,
-) -> anyhow::Result<Vec<StoredSession>> {
-    let dir = match scope {
-        SessionScope::Active => paths::sessions_dir(global),
-        SessionScope::Archived => paths::archived_sessions_dir(global),
-    };
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path().join("session.json");
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = fs::read(&path)?;
-        out.push(
-            parse_stored_session(&bytes)
-                .with_context(|| format!("read session record {}", path.display()))?,
-        );
-    }
-    Ok(out)
-}
-
 fn move_session_scope(
     global: &Path,
     session_id: &str,
@@ -9664,27 +9169,6 @@ fn move_session_owned_transcripts(
     Ok(())
 }
 
-fn delete_session_owned_artifacts(session: &SessionRecord) -> anyhow::Result<()> {
-    let active_root = session.transcripts_dir.clone();
-    let archived_root = paths::archived_transcripts_dir(&active_root);
-    let mut seen = HashSet::new();
-    for run in &session.runs {
-        if !seen.insert(run.run_id.clone()) {
-            continue;
-        }
-        let active_path = active_root.join(format!("{}.jsonl", run.run_id));
-        let archived_path = archived_root.join(format!("{}.jsonl", run.run_id));
-        let active_meta = metadata_path_for_run(&active_root, &run.run_id);
-        let archived_meta = metadata_path_for_run(&archived_root, &run.run_id);
-        remove_file_if_exists(&run.transcript_path)?;
-        remove_file_if_exists(&active_path)?;
-        remove_file_if_exists(&archived_path)?;
-        remove_file_if_exists(&active_meta)?;
-        remove_file_if_exists(&archived_meta)?;
-    }
-    Ok(())
-}
-
 fn transcript_path_for_scope(
     session: &SessionRecord,
     run_id: &str,
@@ -9711,36 +9195,6 @@ fn move_if_exists(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn session_prune_cutoff(
-    older_than: Option<&str>,
-    global: &Path,
-) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    // A bad `--older-than` is the caller's (400 over the control plane); a
-    // bad or unreadable `[storage]` value is the configuration's (500).
-    let retention = match older_than {
-        Some(value) => parse_retention_duration(value)
-            .map_err(|e| rupu_cp::admin_ops::AdminOpError::Invalid(format!("{e:#}")))?,
-        None => {
-            let path = global.join("config.toml");
-            let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
-            let value = cfg
-                .storage
-                .archived_session_retention
-                .unwrap_or_else(|| "30d".to_string());
-            parse_retention_duration(&value)
-                .map_err(|e| rupu_cp::admin_ops::AdminOpError::Failed(format!("{e:#}")))?
-        }
-    };
-    Ok(Utc::now() - retention)
-}
-
 // Process liveness/termination live in `rupu_orchestrator::runs`: one
 // `kill(2)`-backed implementation, no subprocess, and a single place where
 // the "never signal ourselves" rule is enforced (the guard below used to
@@ -9756,6 +9210,7 @@ mod skills_tests;
 mod tests {
     use super::*;
     use clap::Parser;
+    use rupu_providers::model_tier::ThinkingLevel;
 
     /// Write a session whose runs point at transcripts carrying `usage`
     /// events, and return `(global_dir, session_id)`.
@@ -9846,7 +9301,7 @@ mod tests {
     /// counter runs globally across the session's runs in recorded order —
     /// the same contract `rupu-cp`'s local `/api/sessions/:id/usage-timeline`
     /// branch produces, since both fold through
-    /// `rupu_cp::usage::transcripts_usage`.
+    /// `rupu_orchestrator::usage_summary::transcripts_usage`.
     #[test]
     fn session_usage_timeline_emits_one_point_per_turn_labeled_by_run() {
         let tmp = tempfile::tempdir().unwrap();
