@@ -10,11 +10,13 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Chip } from '../components/ui/Chip';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
-import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { EnabledChip } from './AutoflowsDefs';
 import UsageBarChart from '../components/charts/UsageBarChart';
@@ -127,28 +129,24 @@ export default function Workflows() {
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Workflows</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Workflow definitions discovered across this control plane — open one to inspect its steps
-            and raw YAML.
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} className="shrink-0 gap-1.5">
-          <Plus size={14} />
-          New workflow
-        </Button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Workflows"
+        subtitle="Workflow definitions discovered across this control plane — open one to inspect its steps and raw YAML."
+        actions={
+          <Button variant="solid" onClick={() => setCreateOpen(true)} className="gap-1.5">
+            <Plus size={14} />
+            New workflow
+          </Button>
+        }
+      />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       <UnscopedNote className="mb-4">Run counts and spend here cover every customer.</UnscopedNote>
 
       {workflows === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading workflows…" />
-        </div>
+        <ListSkeleton label="Loading workflows…" />
       ) : all.length === 0 ? (
         <EmptyState
           icon={<WorkflowIcon size={20} />}
@@ -363,8 +361,10 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
                   ))}
                 </select>
                 <Button
+                  variant="solid"
                   onClick={() => void generate()}
                   disabled={generating || !description.trim()}
+                  className="gap-1.5"
                 >
                   <Sparkles size={14} />
                   {generating ? 'Generating…' : 'Generate'}
@@ -391,7 +391,7 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
           <Button variant="secondary" onClick={onClose} disabled={creating}>
             Cancel
           </Button>
-          <Button onClick={create} disabled={creating}>
+          <Button variant="solid" onClick={create} disabled={creating}>
             {creating ? 'Creating…' : 'Create'}
           </Button>
         </div>
@@ -406,11 +406,7 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
  *  which reuses `AutoflowsDefs.tsx`'s `EnabledChip` so the two lists agree
  *  on how that state looks. */
 function AutoflowBadge() {
-  return (
-    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
-      Autoflow
-    </span>
-  );
+  return <Chip className="bg-brand-50 text-brand-700 ring-brand-100">Autoflow</Chip>;
 }
 
 function workflowColumns(
@@ -525,14 +521,9 @@ function workflowColumns(
             e.stopPropagation();
           }}
         >
-          <button
-            type="button"
-            onClick={() => onRun(w.name)}
-            aria-label={`Run ${w.name}`}
-            className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
-          >
+          <Button variant="ring" onClick={() => onRun(w.name)} aria-label={`Run ${w.name}`}>
             Run
-          </button>
+          </Button>
           {w.autoflow_enabled !== null &&
             w.autoflow_enabled !== undefined &&
             (w.autoflow_enabled ? (

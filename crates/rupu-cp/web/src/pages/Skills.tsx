@@ -8,9 +8,10 @@ import { api, apiErrorMessage, type ProjectRow, type SkillRow } from '../lib/api
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Badge } from '../components/ui/Badge';
+import { PageHeader } from '../components/ui/PageHeader';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { ScopeChip } from '../components/ScopeChip';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { SKILL_FIELDS, skillsProject } from '../lib/query/lists/skills';
@@ -86,13 +87,16 @@ export default function Skills() {
 
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Skills</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Skills installed on this control plane — globally, and in a project named with{' '}
-          <span className="font-mono">project:</span>.
-        </p>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Skills"
+        subtitle={
+          <>
+            Skills installed on this control plane — globally, and in a project named with{' '}
+            <span className="font-mono">project:</span>.
+          </>
+        }
+      />
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
@@ -128,9 +132,7 @@ export default function Skills() {
       />
 
       {skills === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading skills…" />
-        </div>
+        <ListSkeleton label="Loading skills…" />
       ) : all.length === 0 && !q.trim() ? (
         error ? null : (
           <EmptyState

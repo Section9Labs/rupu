@@ -10,15 +10,16 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Chip } from '../components/ui/Chip';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
-import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
-import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { AGENT_FIELDS } from '../lib/query/lists/agents';
@@ -119,31 +120,24 @@ export default function Agents() {
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Agents</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Agent files discovered across this control plane — provider, model, and the system prompt
-            each one runs with.
-          </p>
-        </div>
-        <Button
-          onClick={() => navigate('/agents/new')}
-          className="shrink-0 gap-1.5"
-        >
-          <Plus size={14} />
-          New agent
-        </Button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Agents"
+        subtitle="Agent files discovered across this control plane — provider, model, and the system prompt each one runs with."
+        actions={
+          <Button variant="solid" onClick={() => navigate('/agents/new')} className="gap-1.5">
+            <Plus size={14} />
+            New agent
+          </Button>
+        }
+      />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       <UnscopedNote className="mb-4">Run counts and spend here cover every customer.</UnscopedNote>
 
       {agents === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading agents…" />
-        </div>
+        <ListSkeleton label="Loading agents…" />
       ) : all.length === 0 ? (
         <EmptyState
           icon={<Sparkles size={20} />}
@@ -255,14 +249,9 @@ function agentActionColumn(
           e.stopPropagation();
         }}
       >
-        <button
-          type="button"
-          onClick={() => onRun(a.name)}
-          aria-label={`Run ${a.name}`}
-          className="inline-flex items-center rounded-md border border-brand-600 bg-panel px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-50"
-        >
+        <Button variant="ring" onClick={() => onRun(a.name)} aria-label={`Run ${a.name}`}>
           Run
-        </button>
+        </Button>
         <Button
           variant="ring"
           onClick={() => void onSession(a.name)}
@@ -367,15 +356,6 @@ const AGENT_BASE_COLUMNS: Column<AgentSummary>[] = [
   },
 ];
 
-function MetaChip({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-surface text-ink-mute ring-border',
-        className,
-      )}
-    >
-      {children}
-    </span>
-  );
+function MetaChip({ children }: { children: React.ReactNode }) {
+  return <Chip className="bg-surface text-ink-mute ring-border">{children}</Chip>;
 }

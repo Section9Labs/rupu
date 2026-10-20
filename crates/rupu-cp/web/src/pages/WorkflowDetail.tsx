@@ -5,16 +5,22 @@
 // so we narrow each field we read defensively.
 
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Trash2 } from 'lucide-react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { Trash2 } from 'lucide-react';
 import yaml from 'js-yaml';
 import { api, ApiError, scopeSelectorFor, type AgentSummary, type WorkflowDetail } from '../lib/api';
 import { ScopeChip } from '../components/ScopeChip';
 import LauncherSheet from '../components/LauncherSheet';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Chip } from '../components/ui/Chip';
+import { StatusChip } from '../components/ui/StatusChip';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { yamlToGraph, validateGraph } from '../lib/workflowGraph';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
+
+const BACK = { label: 'Workflows', to: '/workflows' };
 
 // Lazy so the @xyflow/react canvas + CodeMirror (and the rest of the visual
 // editor) stay out of the main bundle — only fetched once the page mounts.
@@ -298,10 +304,8 @@ export default function WorkflowDetailPage() {
   if (error) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
+        <PageHeader back={BACK} title="Workflow" />
+        <ErrorBanner className="mt-4">{error}</ErrorBanner>
       </div>
     );
   }
@@ -309,8 +313,8 @@ export default function WorkflowDetailPage() {
   if (!detail) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4"><Spinner label="Loading…" /></div>
+        <PageHeader back={BACK} title="Workflow" />
+        <div className="mt-6"><Spinner label="Loading…" /></div>
       </div>
     );
   }
@@ -332,23 +336,22 @@ export default function WorkflowDetailPage() {
 
   return (
     <div className="p-8">
-      <BackLink />
-
-      <header className="mt-3">
-        <div className="flex flex-wrap items-start gap-2">
-          <h1 className="text-2xl font-semibold text-ink break-all">{wfName}</h1>
-          {scope && <ScopeChip scope={scope} />}
-          {autoflow && (
-            <span className="inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-violet-50 text-violet-700 ring-violet-200">
-              Autoflow
-            </span>
-          )}
-          <div className="ml-auto flex items-center gap-2">
+      {/* `DELETE /api/workflows/:name` resolves project-aware
+       *  (global-then-registered-projects — see `resolve_workflow_scoped` in
+       *  `rupu-cp/src/api/workflows.rs`), the SAME layer walk this page's
+       *  `getWorkflow` load uses, so it always removes the exact file being
+       *  shown here — safe for every scope. `remove()`'s confirm dialog names
+       *  the resolved scope before the operator confirms. */}
+      <PageHeader
+        back={BACK}
+        title={wfName}
+        actions={
+          <>
             <ValidityBadge validity={validity} />
             <Button variant="secondary" onClick={revertDraft} disabled={revertDisabled}>
               Revert
             </Button>
-            <Button onClick={save} disabled={saveDisabled}>
+            <Button variant="solid" onClick={save} disabled={saveDisabled}>
               {saving ? 'Saving…' : 'Save'}
             </Button>
             {autoflow &&
@@ -372,13 +375,6 @@ export default function WorkflowDetailPage() {
                   {autoflowPending ? 'Working…' : 'Resume'}
                 </Button>
               ))}
-            {/* `DELETE /api/workflows/:name` resolves project-aware
-             *  (global-then-registered-projects — see
-             *  `resolve_workflow_scoped` in `rupu-cp/src/api/workflows.rs`),
-             *  the SAME layer walk this page's `getWorkflow` load uses, so
-             *  it always removes the exact file being shown here — safe for
-             *  every scope. `remove()`'s confirm dialog names the resolved
-             *  scope before the operator confirms. */}
             <Button
               variant="danger-outline"
               onClick={remove}
@@ -389,39 +385,45 @@ export default function WorkflowDetailPage() {
               <Trash2 size={14} />
               Delete
             </Button>
-            <Button onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
+            <Button variant="secondary" onClick={() => setLauncherOpen(true)} aria-label={`Run ${wfName}`}>
               Run
             </Button>
-          </div>
-        </div>
-        {saveError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-err">
-            {saveError}
-          </p>
-        )}
-        {deleteError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-err">
-            {deleteError}
-          </p>
-        )}
-        {autoflowReadOnly && (
-          <p role="alert" className="mt-2 text-ui font-medium text-warn">
-            This is a read-only deploy — enabling/disabling an autoflow requires{' '}
-            <code className="font-mono">rupu cp serve</code>.
-          </p>
-        )}
-        {autoflowError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-err">
-            {autoflowError}
-          </p>
-        )}
-        {description && (
-          <p className="mt-2 text-sm text-ink-dim leading-snug">{description}</p>
-        )}
-        {autoflow?.trigger && (
-          <p className="mt-1 text-xs text-ink-mute font-mono break-all">{autoflow.trigger}</p>
-        )}
-      </header>
+          </>
+        }
+      />
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {scope && <ScopeChip scope={scope} />}
+        {autoflow && <Chip className="bg-brand-50 text-brand-700 ring-brand-100">Autoflow</Chip>}
+      </div>
+
+      {saveError && (
+        <p role="alert" className="mt-2 text-ui font-medium text-err">
+          {saveError}
+        </p>
+      )}
+      {deleteError && (
+        <p role="alert" className="mt-2 text-ui font-medium text-err">
+          {deleteError}
+        </p>
+      )}
+      {autoflowReadOnly && (
+        <p role="alert" className="mt-2 text-ui font-medium text-warn">
+          This is a read-only deploy — enabling/disabling an autoflow requires{' '}
+          <code className="font-mono">rupu cp serve</code>.
+        </p>
+      )}
+      {autoflowError && (
+        <p role="alert" className="mt-2 text-ui font-medium text-err">
+          {autoflowError}
+        </p>
+      )}
+      {description && (
+        <p className="mt-2 text-sm text-ink-dim leading-snug">{description}</p>
+      )}
+      {autoflow?.trigger && (
+        <p className="mt-1 text-xs text-ink-mute font-mono break-all">{autoflow.trigger}</p>
+      )}
 
       <UnscopedNote className="mt-4">Runs and spend on this page cover every customer.</UnscopedNote>
 
@@ -458,30 +460,11 @@ export default function WorkflowDetailPage() {
 function ValidityBadge({ validity }: { validity: { ok: boolean; error?: string } | null }) {
   if (!validity) return null;
   if (validity.ok) {
-    return (
-      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-ok-bg text-ok ring-ok/30">
-        ✓ valid
-      </span>
-    );
+    return <StatusChip tone="completed">valid</StatusChip>;
   }
   return (
-    <span
-      className="inline-flex max-w-[20rem] items-center truncate rounded-full px-2 py-0.5 text-note font-medium ring-1 bg-err-bg text-err ring-err/30"
-      title={validity.error}
-    >
-      ✕ {validity.error ?? 'invalid'}
-    </span>
-  );
-}
-
-function BackLink() {
-  return (
-    <Link
-      to="/workflows"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Workflows
-    </Link>
+    <StatusChip tone="failed" title={validity.error} className="max-w-[20rem] truncate">
+      {validity.error ?? 'invalid'}
+    </StatusChip>
   );
 }

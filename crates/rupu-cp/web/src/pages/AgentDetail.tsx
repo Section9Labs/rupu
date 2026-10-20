@@ -3,15 +3,17 @@
 // highlighting. Route: /agents/:name
 
 import { useEffect, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
-import { ArrowLeft, Pencil, Trash2 } from 'lucide-react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { Pencil, Trash2 } from 'lucide-react';
 import { api, scopeSelectorFor, skillNamesOf, type AgentDetail } from '../lib/api';
-import { cn } from '../lib/cn';
 import CodeHighlight from '../components/CodeHighlight';
 import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import AgentLauncherSheet from '../components/AgentLauncherSheet';
 import AgentUsageTimeline from '../components/agent/AgentUsageTimeline';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Chip } from '../components/ui/Chip';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
@@ -138,10 +140,8 @@ export default function AgentDetailPage() {
   if (error) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {error}
-        </div>
+        <PageHeader back={{ label: 'Agents', to: '/agents' }} title="Agent" />
+        <ErrorBanner className="mt-4">{error}</ErrorBanner>
       </div>
     );
   }
@@ -149,28 +149,25 @@ export default function AgentDetailPage() {
   if (!agent) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4"><Spinner label="Loading…" /></div>
+        <PageHeader back={{ label: 'Agents', to: '/agents' }} title="Agent" />
+        <div className="mt-6"><Spinner label="Loading…" /></div>
       </div>
     );
   }
 
   return (
     <div className="p-8">
-      <BackLink />
-
-      <header className="mt-3">
-        <div className="flex flex-wrap items-start gap-2">
-          <h1 className="text-2xl font-semibold text-ink break-all">{agent.name}</h1>
-          {agent.scope && <ScopeChip scope={agent.scope} />}
-          <div className="ml-auto flex items-center gap-2">
-            {/* `DELETE /api/agents/:name` resolves project-aware (global-
-             *  then-registered-projects, by file stem — see
-             *  `resolve_agent_scoped` in `rupu-cp/src/api/agents.rs`), the
-             *  SAME layer walk this page's `getAgent` load uses, so it
-             *  always removes the exact file being shown here — safe for
-             *  every scope. `remove()`'s confirm dialog names the resolved
-             *  scope before the operator confirms. */}
+      {/* `DELETE /api/agents/:name` resolves project-aware (global-
+       *  then-registered-projects, by file stem — see `resolve_agent_scoped`
+       *  in `rupu-cp/src/api/agents.rs`), the SAME layer walk this page's
+       *  `getAgent` load uses, so it always removes the exact file being shown
+       *  here — safe for every scope. `remove()`'s confirm dialog names the
+       *  resolved scope before the operator confirms. */}
+      <PageHeader
+        back={{ label: 'Agents', to: '/agents' }}
+        title={agent.name}
+        actions={
+          <>
             <Button
               variant="danger-outline"
               onClick={remove}
@@ -180,37 +177,37 @@ export default function AgentDetailPage() {
               <Trash2 size={14} />
               Delete
             </Button>
-            <Button onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
+            <Button variant="solid" onClick={() => setRunOpen(true)} aria-label={`Run ${agent.name}`}>
               Run
             </Button>
-          </div>
-        </div>
-        {deleteError && (
-          <p role="alert" className="mt-2 text-ui font-medium text-err">
-            {deleteError}
-          </p>
+          </>
+        }
+      />
+
+      {deleteError && (
+        <p role="alert" className="mt-2 text-ui font-medium text-err">
+          {deleteError}
+        </p>
+      )}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {agent.scope && <ScopeChip scope={agent.scope} />}
+        {agent.provider && <MetaChip>{agent.provider}</MetaChip>}
+        {agent.model && <MetaChip>{agent.model}</MetaChip>}
+        {agent.effort && <MetaChip>effort: {agent.effort}</MetaChip>}
+        {typeof agent.max_tokens === 'number' && (
+          <MetaChip>max_tokens: {agent.max_tokens.toLocaleString()}</MetaChip>
         )}
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          {agent.provider && <MetaChip>{agent.provider}</MetaChip>}
-          {agent.model && <MetaChip>{agent.model}</MetaChip>}
-          {agent.effort && <MetaChip>effort: {agent.effort}</MetaChip>}
-          {typeof agent.max_tokens === 'number' && (
-            <MetaChip>max_tokens: {agent.max_tokens.toLocaleString()}</MetaChip>
-          )}
-        </div>
-        {agent.description && (
-          <p className="mt-2 text-sm text-ink-dim leading-snug">{agent.description}</p>
-        )}
-        {agent.load_error && (
-          <div
-            role="alert"
-            className="mt-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
-          >
-            <span className="font-semibold">This agent can't be launched: </span>
-            {agent.load_error}
-          </div>
-        )}
-      </header>
+      </div>
+      {agent.description && (
+        <p className="mt-2 text-sm text-ink-dim leading-snug">{agent.description}</p>
+      )}
+      {agent.load_error && (
+        <ErrorBanner className="mt-3">
+          <span className="font-semibold">This agent can't be launched: </span>
+          {agent.load_error}
+        </ErrorBanner>
+      )}
 
       <UnscopedNote className="mt-4">Runs and spend on this page cover every customer.</UnscopedNote>
 
@@ -266,25 +263,5 @@ export default function AgentDetailPage() {
 }
 
 function MetaChip({ children }: { children: React.ReactNode }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1 bg-surface text-ink-mute ring-border',
-      )}
-    >
-      {children}
-    </span>
-  );
-}
-
-function BackLink() {
-  return (
-    <Link
-      to="/agents"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Agents
-    </Link>
-  );
+  return <Chip className="bg-surface text-ink-mute ring-border">{children}</Chip>;
 }
