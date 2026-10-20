@@ -37,6 +37,17 @@ describe('Button', () => {
     expect(screen.getByRole('button', { name: 'X' }).className).toMatch(expected);
   });
 
+  it('solid variant: neutral high-contrast primary (bg-ink/text-bg), not brand purple', () => {
+    render(<Button variant="solid">Save</Button>);
+    const btn = screen.getByRole('button', { name: 'Save' });
+    expect(btn.className).toMatch(/\bbg-ink\b/);
+    expect(btn.className).toMatch(/\btext-bg\b/);
+    expect(btn.className).not.toMatch(/bg-brand/);
+    // Shares the standard shape (rounded-md + size padding), unlike the compact idioms.
+    expect(btn.className).toMatch(/rounded-md/);
+    expect(btn.className).toMatch(/px-3/);
+  });
+
   it('ring variant: compact ring-bordered pill, no rounded-md/size padding', () => {
     render(<Button variant="ring">Archive</Button>);
     const btn = screen.getByRole('button', { name: 'Archive' });

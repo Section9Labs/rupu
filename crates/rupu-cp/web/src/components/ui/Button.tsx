@@ -15,6 +15,7 @@ import { cn } from '../../lib/cn';
 
 export type ButtonVariant =
   | 'primary'
+  | 'solid'
   | 'secondary'
   | 'ghost'
   | 'danger'
@@ -26,6 +27,14 @@ export type ButtonSize = 'sm' | 'md';
 
 const VARIANT_CLS: Record<ButtonVariant, string> = {
   primary: 'bg-brand-600 hover:bg-brand-700 text-white',
+  // The common-visual-language primary (spec §"Page header"): a neutral,
+  // near-white/high-contrast solid — NOT brand purple, which the language
+  // reserves for data/identity and never for a chrome button. Theme-correct
+  // via tokens: light → near-black button + near-white text; dark → the
+  // reverse. One `solid` primary per view; `secondary`/`ghost` sit beside it.
+  // Kept distinct from `primary`(brand) so screens not yet migrated to the
+  // language keep their current look until the app-wide swap (follow-up).
+  solid: 'bg-ink hover:bg-ink/90 text-bg',
   secondary: 'border border-border bg-panel hover:bg-bg text-ink',
   ghost: 'hover:bg-bg text-ink-dim',
   // Destructive: filled for the committed action, outline for the lighter one

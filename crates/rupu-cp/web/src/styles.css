@@ -1299,3 +1299,46 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
    `EditorView.theme()` rides the same `themeClasses` CM stamps onto the
    tooltip container, so it can actually tie/beat the base theme; see
    cmTooltips.ts's header comment for the full specificity accounting. */
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Living stacked-area chart (components/ui/Chart.tsx). Draw-in riser, a
+ * breathing now-pulse, and an interruptible hover crosshair. All token-based
+ * (colors come from the component via inline `rgb(var(--c-*))`); this file owns
+ * only the motion. Every rule is disabled under prefers-reduced-motion.
+ * ────────────────────────────────────────────────────────────────────────── */
+.cp-chart-riser {
+  transform: scaleY(0);
+  transform-origin: bottom;
+  transform-box: fill-box;
+}
+.cp-chart-riser.cp-in {
+  transform: scaleY(1);
+  transition: transform 900ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.cp-chart-now {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: cp-chart-ring 2.4s cubic-bezier(0.23, 1, 0.32, 1) infinite;
+}
+@keyframes cp-chart-ring {
+  0% { transform: scale(0.55); opacity: 0.9; }
+  70%, 100% { transform: scale(2.6); opacity: 0; }
+}
+.cp-chart-cross {
+  transition: transform 90ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .cp-chart-riser,
+  .cp-chart-riser.cp-in {
+    transform: none !important;
+    transition: none !important;
+  }
+  /* Drop the expanding ring; the solid "now" dot stays as a static marker. */
+  .cp-chart-now {
+    animation: none !important;
+    opacity: 0 !important;
+  }
+  .cp-chart-cross {
+    transition: none !important;
+  }
+}
