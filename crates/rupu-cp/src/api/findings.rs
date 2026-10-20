@@ -1800,6 +1800,10 @@ const MAX_EXPORT_TITLE_CHARS: usize = 200;
 /// Query of `GET /api/findings/:id/export`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExportQuery {
+    /// `md` | `html` | `pdf`.
+    // Required (the handler refuses a request without it); an `Option` so
+    // that refusal is the handler's 400, not an extractor's.
+    #[schemars(required)]
     format: Option<String>,
     /// Single-finding export only: see [`FindingWsQuery`].
     #[serde(default)]
@@ -1812,6 +1816,9 @@ pub(crate) struct ExportQuery {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExportBody {
+    /// `md` | `html` | `pdf`.
+    // Required, as `ExportQuery::format` is.
+    #[schemars(required)]
     format: Option<String>,
     title: Option<String>,
     /// Only these finding ids (which also opts summary findings in).
