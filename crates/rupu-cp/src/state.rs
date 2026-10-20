@@ -113,8 +113,9 @@ pub struct AppState {
     /// `/api/skills/install|update`). Defaults to `None`; rupu-cli's `cp
     /// serve` installs `GitFetcher` via [`AppState::with_skill_installer`].
     pub skill_installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
-    /// The autoflow / cron / maintenance operations port (rupu-cli's
-    /// `cp serve` provides it). `None` → those endpoints return 501.
+    /// The cron-tick and autoflow-cycle port (rupu-cli's `cp serve`
+    /// provides it). `None` → `POST /api/cron/tick` and
+    /// `POST /api/autoflows/:name/run` return 501.
     pub admin_ops: Option<Arc<dyn crate::admin_ops::AdminOps>>,
 }
 

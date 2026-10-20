@@ -55,6 +55,12 @@ impl StandaloneRunMetadata {
     pub const VERSION: u32 = 1;
 }
 
+/// `<transcripts dir>/archive`: where `rupu transcript archive` (and a
+/// session's archive) moves a transcript and its metadata.
+pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
+    transcripts_dir.join("archive")
+}
+
 pub fn metadata_path_for_run(transcripts_dir: &Path, run_id: &str) -> PathBuf {
     transcripts_dir.join(format!("{run_id}.meta.json"))
 }

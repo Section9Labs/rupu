@@ -12,6 +12,7 @@
 
 pub mod archived_transcripts;
 pub mod catalog;
+pub mod cleanup;
 pub mod codenames;
 pub mod cron_schedule;
 pub mod cron_triggers;
@@ -27,7 +28,10 @@ pub mod step_factory;
 pub mod templates;
 #[doc(hidden)]
 pub mod testing;
+pub mod transcript_paths;
+pub mod usage_index;
 pub mod usage_ledger;
+pub mod usage_summary;
 pub mod workflow;
 pub mod workflow_runtime;
 

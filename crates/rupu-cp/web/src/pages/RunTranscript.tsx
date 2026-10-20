@@ -7,9 +7,17 @@
 // needs `run` to authorize a not-yet-mirrored path against the run that claims
 // it (spec §3.3). Without it a sub-run opened from a remote run's panel 400s.
 //
+// A local standalone run's page also heads itself with the run (agent, status,
+// model, from its `/api/runs/agents` row) and, when the run stopped short of
+// finishing (failed, cancelled, or crashed before recording an end: no
+// status), offers Continue (operator MCP
+// Plan 3b, UI-1, mock §2). A completed run has nothing to continue: the CP's
+// continue takes no prompt, and continuing a finished run only returns its
+// recorded answer.
+//
 // Route: /transcript (registered in App.tsx)
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useSearchParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, ChevronDown, ChevronRight } from 'lucide-react';
 import TranscriptPanel from '../components/TranscriptPanel';
@@ -18,6 +26,42 @@ import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { msgHash, parseMsgHash } from '../lib/messages';
 import { useMessageSpace } from '../lib/useMessageSpace';
+import { api, type AgentRunRow, type RunStatusStr } from '../lib/api';
+import { Button } from '../components/ui/Button';
+import { RunStatusChip } from '../components/ui/RunStatusChip';
+import { ContinueComposer } from '../components/runops/ContinueComposer';
+
+/** Statuses with nothing to continue: still going (the server 409s) or
+ *  finished (a continue would only print the recorded answer). A standalone
+ *  row is otherwise failed, cancelled or, for a run that crashed before
+ *  recording how it ended, has no status. */
+const NOT_CONTINUABLE = new Set(['running', 'completed']);
+
+/** A standalone run's `/api/runs/agents` row (local only), re-read on demand. */
+function useAgentRunRow(runId: string | null): [AgentRunRow | null, () => void] {
+  const [row, setRow] = useState<AgentRunRow | null>(null);
+  const [gen, setGen] = useState(0);
+  useEffect(() => {
+    setRow(null);
+  }, [runId]);
+  useEffect(() => {
+    if (!runId) return;
+    let cancelled = false;
+    api
+      .getAgentRuns({ q: `id:${runId}`, limit: 5 })
+      .then((rows) => {
+        if (!cancelled) setRow(rows.find((r) => r.run_id === runId) ?? null);
+      })
+      .catch(() => {
+        /* no row → the page heads itself with the file name */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, gen]);
+  const reload = useCallback(() => setGen((g) => g + 1), []);
+  return [row, reload];
+}
 
 /** The run id a standalone run's transcript (`<transcripts>/<run_id>.jsonl`)
  *  is named after, or `null` for any other transcript. */
@@ -35,6 +79,11 @@ export default function RunTranscript() {
   const live = liveParam === '1' || liveParam === 'true';
   const host = searchParams.get('host') ?? undefined;
   const run = searchParams.get('run') ?? undefined;
+  const local = !host || host === 'local';
+  const standaloneId = path ? transcriptRunId(path) : null;
+  const [row, reloadRow] = useAgentRunRow(local ? standaloneId : null);
+  const [continuing, setContinuing] = useState(false);
+  useEffect(() => setContinuing(false), [path]);
 
   if (!path) {
     return (
@@ -50,28 +99,64 @@ export default function RunTranscript() {
   // Derive a display label from the path: show the last path segment (filename)
   // so the header reads something meaningful even without a separate run_id param.
   const label = path.split('/').filter(Boolean).pop() ?? 'Transcript';
-  const childRunId = transcriptRunId(path);
+  const childRunId = standaloneId;
+  const status = row?.status ?? null;
+  const canContinue =
+    !!row && row.source === 'standalone' && !!childRunId && (status === null || !NOT_CONTINUABLE.has(status));
 
   return (
     <div className="flex flex-col p-8 gap-4">
       <BackButton navigate={navigate} />
 
-      <header>
-        <h1 className="text-xl font-semibold text-ink font-mono break-all">{label}</h1>
-        <p className="mt-0.5 text-note text-ink-dim font-mono truncate" title={path}>
-          {path}
-        </p>
+      <header className="flex items-start gap-4">
+        <div className="min-w-0 flex-1">
+          {row?.agent ? (
+            <>
+              <h1 className="flex flex-wrap items-center gap-2.5 text-xl font-semibold text-ink">
+                <span className="break-all">{row.agent}</span>
+                {status && <RunStatusChip status={status as RunStatusStr} />}
+              </h1>
+              <p className="mt-0.5 flex flex-wrap gap-x-1.5 text-note text-ink-dim">
+                <span className="font-mono">{row.run_id}</span>
+                {row.codename && <span>· {row.codename}</span>}
+                {row.model && <span>· {row.model}</span>}
+              </p>
+            </>
+          ) : (
+            <h1 className="text-xl font-semibold text-ink font-mono break-all">{label}</h1>
+          )}
+          <p className="mt-0.5 text-note text-ink-mute font-mono truncate" title={path}>
+            {path}
+          </p>
+        </div>
+        {canContinue && !continuing && (
+          <Button variant="solid" className="shrink-0" onClick={() => setContinuing(true)}>
+            Continue
+          </Button>
+        )}
       </header>
 
       {/* The children ledger is local-only: no section for a remote run. */}
       {childRunId && (!host || host === 'local') && <ChildrenSection runId={childRunId} />}
 
       {childRunId ? (
-        <StandaloneRun runId={childRunId} path={path} live={live} host={host} run={run} />
+        <StandaloneRun runId={childRunId} path={path} live={live} host={host} run={run} onComplete={reloadRow} />
       ) : (
         <div className="flex-1 min-h-0">
           <TranscriptPanel path={path} live={live} host={host} runId={run} />
         </div>
+      )}
+
+      {canContinue && continuing && childRunId && (
+        <ContinueComposer
+          key={childRunId}
+          runId={childRunId}
+          path={path}
+          provider={row?.provider}
+          model={row?.model}
+          failed={status === 'failed'}
+          onCancel={() => setContinuing(false)}
+        />
       )}
     </div>
   );
@@ -79,7 +164,22 @@ export default function RunTranscript() {
 
 /** A standalone run's transcript, with its message space (spec F1c §3.3)
  *  in a collapsible section above it once the run has one. */
-function StandaloneRun({ runId, path, live, host, run }: { runId: string; path: string; live: boolean; host?: string; run?: string }) {
+function StandaloneRun({
+  runId,
+  path,
+  live,
+  host,
+  run,
+  onComplete,
+}: {
+  runId: string;
+  path: string;
+  live: boolean;
+  host?: string;
+  run?: string;
+  /** The live run ended: re-read its row so Continue can appear. */
+  onComplete?: () => void;
+}) {
   const { hash, search } = useLocation();
   const navigate = useNavigate();
   const [open, setOpen] = useState(() => parseMsgHash(hash) !== null);
@@ -122,7 +222,7 @@ function StandaloneRun({ runId, path, live, host, run }: { runId: string; path: 
       )}
       <div className="flex-1 min-h-0">
         <MessageLinksContext.Provider value={present ? links : {}}>
-          <TranscriptPanel path={path} live={live} host={host} runId={run} />
+          <TranscriptPanel path={path} live={live} host={host} runId={run} onComplete={onComplete} />
         </MessageLinksContext.Provider>
       </div>
     </>
