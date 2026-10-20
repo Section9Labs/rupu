@@ -94,7 +94,7 @@ pub struct SourceLine {
     pub text: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SourceQuery {
     /// Path relative to the resolved run's `workspace_path`.
     pub path: String,
@@ -446,7 +446,7 @@ impl AstResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AstQuery {
     /// Path relative to the resolved run's `workspace_path`.
     pub path: String,

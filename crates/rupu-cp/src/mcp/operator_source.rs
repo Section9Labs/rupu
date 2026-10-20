@@ -161,9 +161,16 @@ fn input_schema(op: &OpSpec) -> Value {
         );
         required.push(p.to_string());
     }
-    let (q, _) = lift((op.query)());
+    let (q, q_required) = lift((op.query)());
     for (k, v) in q {
         props.entry(k).or_insert(v);
+    }
+    // A query field the handler requires (`runs.source`'s `path`) is as
+    // required here as a path parameter.
+    for r in q_required {
+        if !required.contains(&r) {
+            required.push(r);
+        }
     }
     let (b, b_required) = lift((op.body)());
     for (k, v) in b {

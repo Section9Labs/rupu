@@ -94,8 +94,8 @@ fn canonicalize_existing_prefix(p: &Path) -> Option<PathBuf> {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct PathQ {
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct PathQ {
     path: String,
     /// When present and not `"local"`, serve from / through the named host.
     #[serde(default)]

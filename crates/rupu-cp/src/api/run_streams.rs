@@ -800,8 +800,8 @@ fn collect_and_sort_local_agent_runs(global_dir: &std::path::Path) -> Vec<AgentR
     local_rows
 }
 
-#[derive(Deserialize, Default)]
-struct AgentRunsQuery {
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct AgentRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -1089,8 +1089,8 @@ async fn list_agent_runs(
 // Autoflow runs — /api/runs/autoflows
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct AutoflowRunsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowRunsQuery {
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -1278,8 +1278,8 @@ async fn list_autoflow_runs(
 // Autoflow events — /api/runs/autoflows/events
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct AutoflowEventsQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowEventsQuery {
     // Flat fields — same serde_urlencoded reason as above.
     offset: Option<usize>,
     limit: Option<usize>,

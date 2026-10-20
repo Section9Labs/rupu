@@ -1338,8 +1338,8 @@ pub fn query_run_detail(
 
 /// Query params for `GET /api/runs`: offset/limit paging plus an optional
 /// `?host=<id>` to scope to a single host (omitting fans out across all hosts).
-#[derive(serde::Deserialize, Default)]
-struct RunsListQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct RunsListQuery {
     offset: Option<usize>,
     limit: Option<usize>,
     /// When present, restrict to this host only; absent → fan-out all hosts.
@@ -2309,7 +2309,7 @@ async fn get_run_usage_timeline(
 /// Query for `GET /api/runs/:id/usage`: the optional `?host=` plus the
 /// client's incremental cursor (`since` = how many points it holds, `epoch` =
 /// the series epoch they came from).
-#[derive(Debug, serde::Deserialize, Default)]
+#[derive(Debug, serde::Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct RunUsageQuery {
     #[serde(default)]
     pub(crate) host: Option<String>,
@@ -2317,6 +2317,7 @@ pub(crate) struct RunUsageQuery {
     pub(crate) since: Option<usize>,
     /// Accepts the string form the server emits (see [`RunUsageResponse::epoch`]).
     #[serde(default, deserialize_with = "de_opt_u64_from_str")]
+    #[schemars(with = "Option<String>")]
     pub(crate) epoch: Option<u64>,
 }
 
@@ -2707,8 +2708,8 @@ async fn delete_run(
 
 /// Optional `?kind=<workflow|…>` filter for `GET /api/runs/archived`.
 /// Absent → return all archived runs (backward-compatible).
-#[derive(serde::Deserialize, Default)]
-struct ArchivedQuery {
+#[derive(serde::Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct ArchivedQuery {
     #[serde(default)]
     kind: Option<String>,
 }

@@ -1,7 +1,7 @@
 //! The runs operator tools: workflow run lists, details and run control.
 
 use super::{op, OpSpec};
-use crate::api::runs;
+use crate::api::{autoflow_runs, events, run_streams, runs, source, transcript, transcripts};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -46,5 +46,165 @@ pub(super) fn ops() -> Vec<OpSpec> {
         .query::<runs::RunControlQuery>()
         .body::<runs::CancelBody>()
         .destructive(),
+        op(
+            "runs.list_all",
+            Method::GET,
+            "/api/runs",
+            "List every orchestrator run on any host, whatever started it (by hand, an event, cron or an autoflow).\n\nPage with `offset`/`limit`; `host` restricts to one host (absent fans out), `customer` is a slug or `none`. Not standalone agent runs (see agent_runs.list); for hand-started runs only, see runs.list. Returns a JSON array of run rows.",
+        )
+        .query::<runs::RunsListQuery>(),
+        op(
+            "runs.archived",
+            Method::GET,
+            "/api/runs/archived",
+            "List archived workflow runs on this host, newest first.\n\n`kind=workflow` keeps only hand-started runs. Returns a JSON array of run rows.",
+        )
+        .query::<runs::ArchivedQuery>(),
+        op(
+            "runs.delete",
+            Method::DELETE,
+            "/api/runs/:id",
+            "Delete a workflow run and its records for good.\n\n`id` is the run id; `host` picks a remote host. A run that has not finished is refused with HTTP 409. Returns `{ok, id, deleted}`.",
+        )
+        .query::<runs::RunControlQuery>(),
+        op(
+            "runs.archive",
+            Method::POST,
+            "/api/runs/:id/archive",
+            "Archive a finished workflow run, moving it out of the active lists.\n\n`id` is the run id; `host` picks a remote host. A run that has not finished is refused with HTTP 409. Undo with runs.restore.",
+        )
+        .query::<runs::RunControlQuery>(),
+        op(
+            "runs.restore",
+            Method::POST,
+            "/api/runs/:id/restore",
+            "Restore an archived workflow run to the active lists.\n\n`id` is the run id; `host` picks a remote host.",
+        )
+        .query::<runs::RunControlQuery>(),
+        op(
+            "runs.pause",
+            Method::POST,
+            "/api/runs/:id/pause",
+            "Pause a running workflow run.\n\n`id` is the run id; `host` picks a remote host. The pause travels by signal to the run's process, so a 200 means it was recorded, not that the run has stopped; read runs.get for the status. Undo with runs.resume.",
+        )
+        .query::<runs::RunControlQuery>(),
+        op(
+            "runs.resume",
+            Method::POST,
+            "/api/runs/:id/resume",
+            "Resume a paused workflow run, continuing what it left mid-flight.\n\n`id` is the run id; `host` picks a remote host. Any run that is not paused is refused with HTTP 409. The resume is picked up by a worker, so a 200 means it was requested, not that the run is running.",
+        )
+        .query::<runs::RunControlQuery>()
+        .open_world(),
+        op(
+            "runs.graph",
+            Method::GET,
+            "/api/runs/:id/graph",
+            "Get a workflow run's step graph with each node's live state.\n\n`id` is the run id; `host` picks a remote host. Returns the nodes, edges and per-step status.",
+        )
+        .query::<runs::RunDetailQuery>(),
+        op(
+            "runs.children",
+            Method::GET,
+            "/api/runs/:id/children",
+            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns the children with handle, kind, status and tokens.",
+        ),
+        op(
+            "runs.usage",
+            Method::GET,
+            "/api/runs/:id/usage",
+            "Get a workflow run's live token and cost usage.\n\n`id` is the run id; `host` picks a remote host. `since` and `epoch` (both from a previous answer) return only the points after the ones you hold. Returns the summary, per-step usage and the point series.",
+        )
+        .query::<runs::RunUsageQuery>(),
+        op(
+            "runs.usage_timeline",
+            Method::GET,
+            "/api/runs/:id/usage-timeline",
+            "Get a workflow run's usage over time, one series per step.\n\n`id` is the run id; `host` picks a remote host. Returns the timeline points labeled by step.",
+        )
+        .query::<runs::RunDetailQuery>(),
+        op(
+            "runs.source",
+            Method::GET,
+            "/api/runs/:id/source",
+            "Read a window of a source file in the run's workspace.\n\n`id` is the run id; `path` is relative to the run's workspace; `line` (1-based, default 1) and `context` (lines either side, default 20) pick the window. Local runs only. Returns the lines and the file's total line count.",
+        )
+        .query::<source::SourceQuery>(),
+        op(
+            "runs.ast",
+            Method::GET,
+            "/api/runs/:id/ast",
+            "Get the syntax-tree node at a position in a file of the run's workspace.\n\n`id` is the run id; `path` is relative to the run's workspace; `line` and `col` (1-based, default 1) pick the position. Local runs only. Returns the enclosing node and its kind.",
+        )
+        .query::<source::AstQuery>(),
+        op(
+            "runs.autoflow",
+            Method::GET,
+            "/api/runs/:id/autoflow",
+            "Get the autoflow cycle and issue that started a workflow run.\n\n`id` is the run id. Returns the cycle, claim and prior cycles for the same issue; HTTP 404 for a run no autoflow started.",
+        ),
+        op(
+            "agent_runs.list",
+            Method::GET,
+            "/api/runs/agents",
+            "List agent runs (standalone and workflow-step), newest first.\n\nFilter with `q` (e.g. `source:standalone`), `lifecycle` (active|completed|failed), `since`/`until`, `host` (`local`, a host id, or absent for all), `customer`; page with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Not workflow runs (see runs.list). Returns a JSON array of agent run rows.",
+        )
+        .query::<run_streams::AgentRunsQuery>(),
+        op(
+            "transcripts.get",
+            Method::GET,
+            "/api/transcript",
+            "Read one run or session transcript as events.\n\n`path` is the transcript file (from a run or session row); `host` picks a remote host, and `run` (the run that recorded `path`) is needed for a remote transcript not yet mirrored. Returns the transcript's events; `partial` is set when a remote host could not be reached to finish collecting.",
+        )
+        .query::<transcript::PathQ>(),
+        op(
+            "transcripts.archive",
+            Method::POST,
+            "/api/transcripts/:id/archive",
+            "Archive a standalone agent run's transcript.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` archives a run whose recorded process id looks alive (a reused pid).",
+        )
+        .query::<transcripts::TranscriptHostQuery>(),
+        op(
+            "transcripts.delete",
+            Method::DELETE,
+            "/api/transcripts/:id",
+            "Delete a standalone agent run's transcript for good.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` deletes a run whose recorded process id looks alive (a reused pid).",
+        )
+        .query::<transcripts::TranscriptHostQuery>(),
+        op(
+            "events.recent",
+            Method::GET,
+            "/api/events",
+            "List recent workflow events across runs, newest first (the history behind the live feed).\n\n`limit` pages (default 200); `q` filters with the query line (`run:`, `project:`, `workflow:` and more). To continue, pass the last row's `ts`, `run_id` and `pos` as `before_ts`, `before_run` and `before_pos`. Returns an array of events, each with `ts` and `pos`.",
+        )
+        .query::<events::RecentEventsQuery>(),
+        op(
+            "autoflow_runs.list",
+            Method::GET,
+            "/api/runs/autoflows/runs",
+            "List runs started by autoflows, newest first.\n\nFilter with `q`, `lifecycle` (active|completed|failed), `since`/`until`, `host`, `customer`; page with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Returns a JSON array of run rows.",
+        )
+        .query::<autoflow_runs::AutoflowRunsQuery>(),
+        op(
+            "autoflow_runs.problems",
+            Method::GET,
+            "/api/runs/autoflows/problems",
+            "List autoflow cycles that failed before they could name a workflow, seen in the last hour.\n\n`host` restricts to one host. Returns the problems with their last error.",
+        )
+        .query::<autoflow_runs::ProblemsQuery>(),
+        op(
+            "autoflow_runs.cycles",
+            Method::GET,
+            "/api/runs/autoflows",
+            "List autoflow cycle records (the per-poll history), newest first.\n\n`host` is `local`, a host id, or absent for all; `since`/`until` bound the time; page with `offset`/`limit`. Returns a JSON array of cycles.",
+        )
+        .query::<run_streams::AutoflowRunsQuery>(),
+        op(
+            "autoflow_runs.events",
+            Method::GET,
+            "/api/runs/autoflows/events",
+            "List autoflow cycle events (claimed, dispatched, failed and so on), newest first.\n\n`host` is `local`, a host id, or absent for all; `since`/`until` bound the time; page with `offset`/`limit`. Returns a JSON array of events.",
+        )
+        .query::<run_streams::AutoflowEventsQuery>(),
     ]
 }

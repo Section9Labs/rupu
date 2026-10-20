@@ -403,8 +403,8 @@ impl rupu_cp::launcher::RunLauncher for NoopLauncher {
     }
 }
 
-const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
-const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+pub(super) const OP_RUN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
+pub(super) const OP_SESSION: &str = "ses_01J9ZQ3K4M5N6P7Q8R9S0T1OPS";
 
 /// A writable CP with one run and one live session, serving `/mcp`.
 async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
@@ -413,7 +413,7 @@ async fn spawn_operator() -> (std::net::SocketAddr, tempfile::TempDir) {
 
 /// [`spawn_operator`] with `seed` run over its global dir first, and
 /// `catalog` as the catalog source.
-async fn spawn_operator_with(
+pub(super) async fn spawn_operator_with(
     seed: impl FnOnce(&std::path::Path),
     catalog: Option<Arc<dyn ToolSource>>,
 ) -> (std::net::SocketAddr, tempfile::TempDir) {

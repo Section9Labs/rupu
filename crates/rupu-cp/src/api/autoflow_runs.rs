@@ -323,7 +323,7 @@ pub fn routes() -> Router<AppState> {
 
 /// `GET /api/runs/autoflows/runs`'s parameters: `/api/runs/workflows`'s
 /// (`q` on [`crate::query::autoflow_runs::FIELDS`]).
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AutoflowRunsQuery {
     // Flat, not a flattened `PageQuery` — see `WorkflowRunsQuery`.
     offset: Option<usize>,
@@ -793,7 +793,7 @@ async fn list_autoflow_run_rows(
 }
 
 /// `GET /api/runs/autoflows/problems`'s parameters.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProblemsQuery {
     /// One host; absent → every registered host.
     #[serde(default)]
