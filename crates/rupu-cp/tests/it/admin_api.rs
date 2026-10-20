@@ -510,6 +510,17 @@ async fn a_bare_issue_number_is_refused_before_the_library() {
     assert!(ops.calls().is_empty(), "{:?}", ops.calls());
 }
 
+/// `(status, error)` of a default (no `older_than`) dry-run prune of
+/// `transcripts`, `sessions` and `cleanup`, in that order.
+async fn prune_errors(addr: SocketAddr) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    for kind in ["transcripts", "sessions", "cleanup"] {
+        let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": kind})).await;
+        out.push((status, error_of(&body)));
+    }
+    out
+}
+
 fn backdate(path: &std::path::Path, days: u64) {
     let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400))
@@ -547,24 +558,65 @@ async fn netflow_and_transcript_prunes_run_their_libraries() {
 
     // A bad argument is the caller's 400; a bad configured retention is a
     // 500 configuration error.
-    for kind in ["netflow", "transcripts", "sessions", "cleanup"] {
-        let (status, _) = post(
+    assert_eq!(
+        post(
+            addr,
+            "/api/maintenance/prune",
+            json!({"kind": "netflow", "older_than": "soon"}),
+        )
+        .await
+        .0,
+        400
+    );
+    let soon = "invalid duration `soon`: invalid digit found in string";
+    for kind in ["transcripts", "sessions", "cleanup"] {
+        let (status, body) = post(
             addr,
             "/api/maintenance/prune",
             json!({"kind": kind, "older_than": "soon"}),
         )
         .await;
-        assert_eq!(status, 400, "{kind}");
+        assert_eq!((status, error_of(&body)), (400, soon.into()), "{kind}");
     }
+    assert_eq!(prune_errors(addr).await, vec![(200, String::new()); 3]);
     std::fs::write(
         tmp.path().join("config.toml"),
         "[storage]\narchived_transcript_retention = \"soon\"\narchived_session_retention = \"later\"\n",
     )
     .unwrap();
-    for kind in ["transcripts", "sessions", "cleanup"] {
-        let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": kind})).await;
-        assert_eq!(status, 500, "{kind}: {body}");
-    }
+    // The messages the CLI-backed port gave: the session prune's and
+    // cleanup's own retention refusal unprefixed, the transcript prune's
+    // `config: …`.
+    let later = "invalid duration `later`: invalid digit found in string";
+    assert_eq!(
+        prune_errors(addr).await,
+        vec![
+            (500, format!("config: {soon}")),
+            (500, later.to_string()),
+            (500, later.to_string()),
+        ]
+    );
+    // A cleanup failure past the session stage names its stage.
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[storage]\narchived_transcript_retention = \"soon\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        prune_errors(addr).await[2],
+        (500, format!("cleanup archived transcripts: {soon}"))
+    );
+    // An unreadable config is the session prune's failure, and cleanup's
+    // under its stage, as `rupu cleanup` printed it.
+    std::fs::write(tmp.path().join("config.toml"), "[storage\n").unwrap();
+    let errors = prune_errors(addr).await;
+    let (status, unreadable) = errors[1].clone();
+    assert_eq!(status, 500);
+    assert!(!unreadable.is_empty());
+    assert_eq!(
+        errors[2],
+        (500, format!("cleanup archived sessions: {unreadable}"))
+    );
     assert!(ops.calls().is_empty(), "no prune reached the port");
 }
 

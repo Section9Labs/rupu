@@ -52,13 +52,38 @@ impl PruneKind {
     }
 }
 
-/// A prune's failure as its status: a bad `older_than` is the caller's
+/// A transcript prune's failure as its status: a bad `older_than` is the caller's
 /// 400; a bad configured retention, or a failed read or delete, a 500.
 fn prune_error(e: PruneError) -> ApiError {
     match e {
         PruneError::InvalidRetention(e) => ApiError::bad_request(e.to_string()),
         PruneError::Config(m) => ApiError::internal(format!("config: {m}")),
         PruneError::Failed(m) => ApiError::internal(m),
+    }
+}
+
+/// A session prune's failure as the status and message `rupu session
+/// prune` gave the control plane before it was a library: a bad
+/// `older_than` is a 400, anything else a 500, each with the prune's own
+/// message.
+fn session_prune_error(e: PruneError) -> ApiError {
+    match e {
+        PruneError::InvalidRetention(e) => ApiError::bad_request(e.to_string()),
+        PruneError::Config(m) | PruneError::Failed(m) => ApiError::internal(m),
+    }
+}
+
+/// A cleanup's failure, as `rupu cleanup` gave it: a retention the session
+/// stage refused (a bad `older_than`: 400, a bad configured
+/// `[storage].archived_session_retention`: 500) with its message alone;
+/// anything else a 500 naming its stage over the error
+/// (`cleanup archived sessions: …`), as the CLI prints it.
+fn cleanup_error(e: cleanup::CleanupError) -> ApiError {
+    let sessions_stage = e.stage == "cleanup archived sessions";
+    match &e.source {
+        PruneError::InvalidRetention(r) if sessions_stage => ApiError::bad_request(r.to_string()),
+        PruneError::Config(m) if sessions_stage => ApiError::internal(m.clone()),
+        _ => ApiError::internal(format!("{:#}", anyhow::Error::new(e))),
     }
 }
 
@@ -132,7 +157,7 @@ async fn prune(
                 )
             })
             .await?
-            .map_err(prune_error)?;
+            .map_err(session_prune_error)?;
             (json!(report), Vec::new())
         }
         PruneKind::Cleanup => {
@@ -147,7 +172,7 @@ async fn prune(
                 )
             })
             .await?
-            .map_err(|e| prune_error(e.source))?;
+            .map_err(cleanup_error)?;
             (json!(report), Vec::new())
         }
         PruneKind::Netflow => {

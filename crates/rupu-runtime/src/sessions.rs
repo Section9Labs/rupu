@@ -486,9 +486,10 @@ pub fn remove_file_if_exists(path: &Path) -> anyhow::Result<()> {
 
 /// The cutoff of a session prune: now minus `older_than`, else minus the
 /// global `[storage].archived_session_retention` (default `30d`). A bad
-/// `older_than` is the caller's ([`PruneError::InvalidRetention`]); a bad or
-/// unreadable `[storage]` value is the configuration's
-/// ([`PruneError::Config`]).
+/// `older_than` is the caller's ([`PruneError::InvalidRetention`]); a bad
+/// `[storage]` value is the configuration's ([`PruneError::Config`]); a
+/// global config that can't be read is a [`PruneError::Failed`] carrying
+/// its whole chain.
 pub fn session_prune_cutoff(
     older_than: Option<&str>,
     global: &Path,
@@ -498,7 +499,7 @@ pub fn session_prune_cutoff(
         None => {
             let path = global.join("config.toml");
             let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))
-                .map_err(|e| PruneError::Config(format!("{:#}", anyhow::Error::new(e))))?;
+                .map_err(|e| failed(anyhow::Error::new(e)))?;
             let value = cfg
                 .storage
                 .archived_session_retention

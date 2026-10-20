@@ -13,8 +13,10 @@ pub enum PruneError {
     /// The caller's `--older-than` / `older_than` is not a duration.
     #[error(transparent)]
     InvalidRetention(#[from] RetentionError),
-    /// The configured retention (`[storage]`) could not be read or is not a
-    /// duration: a configuration problem, not the caller's.
+    /// The configured retention (`[storage]`) is not a duration — or, for
+    /// the transcript prune, the config could not be read: a configuration
+    /// problem, not the caller's. (The session prune reports an unreadable
+    /// config as [`Self::Failed`], as `rupu session prune` always has.)
     #[error("{0}")]
     Config(String),
     /// Reading or deleting failed.
