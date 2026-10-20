@@ -787,3 +787,35 @@ async fn a_fast_turn_between_rechecks_still_fires() {
     assert_eq!(d["run_id"], "run_fast", "{r}");
     assert_eq!(d["final_answer"], "fast answer.", "{r}");
 }
+
+#[tokio::test]
+async fn an_active_turn_that_finishes_and_clears_active_run_id_still_fires() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tpath = dir.join("run_R.jsonl");
+    let entry = json!({"run_id": "run_R", "transcript_path": tpath.to_str().unwrap()});
+    session(
+        tmp.path(),
+        "ses_R",
+        "running",
+        Some("run_R"),
+        json!([entry.clone()]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let g = tmp.path().to_path_buf();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        transcript(&g, "run_R", "R answer.", "ok");
+        session(&g, "ses_R", "idle", None, json!([entry]));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_R"}], "timeout_ms": 10000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_R", "{r}");
+    assert_eq!(d["final_answer"], "R answer.", "{r}");
+}

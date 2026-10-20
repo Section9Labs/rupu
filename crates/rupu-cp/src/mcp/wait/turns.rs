@@ -22,6 +22,9 @@ pub(super) struct Turns {
     /// session had when the call first looked. The turn waited for is the
     /// first one recorded at or past that index.
     first_new: BTreeMap<usize, usize>,
+    /// Per such condition: the turn first determined as the target, kept for
+    /// the rest of the call (the worker clears `active_run_id` when it ends).
+    pinned: BTreeMap<usize, String>,
 }
 
 impl Turns {
@@ -29,6 +32,7 @@ impl Turns {
         Self {
             since: Instant::now(),
             first_new: BTreeMap::new(),
+            pinned: BTreeMap::new(),
         }
     }
 }
@@ -69,11 +73,15 @@ pub(super) async fn check(
             Kind::SessionTurn { run } => {
                 let run = run.clone();
                 let base = memo.first_new.get(&i).copied();
-                let (probe, seen) = tokio::task::spawn_blocking(move || {
-                    session_turn(&global, &target, run.as_deref(), base)
+                let pin = memo.pinned.get(&i).cloned();
+                let (probe, seen, pinned) = tokio::task::spawn_blocking(move || {
+                    session_turn(&global, &target, run.as_deref(), base, pin)
                 })
                 .await
                 .map_err(joined)??;
+                if let Some(p) = pinned {
+                    memo.pinned.entry(i).or_insert(p);
+                }
                 if let Some(n) = seen {
                     memo.first_new.entry(i).or_insert(n);
                 }
@@ -132,7 +140,8 @@ fn session_turn(
     session: &str,
     run: Option<&str>,
     base: Option<usize>,
-) -> Result<(Probe, Option<usize>), String> {
+    pin: Option<String>,
+) -> Result<(Probe, Option<usize>, Option<String>), String> {
     let mut dto = None;
     for dir in ["sessions", "sessions-archive"] {
         if let Some(d) = crate::api::sessions::load_session_file(&global.join(dir).join(session))
@@ -143,7 +152,11 @@ fn session_turn(
         }
     }
     let Some(dto) = dto else {
-        return Ok((Probe::Missing(format!("no session `{session}`")), None));
+        return Ok((
+            Probe::Missing(format!("no session `{session}`")),
+            None,
+            None,
+        ));
     };
     let turns = dto.turns();
     // `idle` is a session's resting state between turns, not an end.
@@ -155,6 +168,8 @@ fn session_turn(
     let first_new = base.unwrap_or(turns.len());
     let turn = match run {
         Some(r) => Some(r.to_string()),
+        // Once a target was determined it stays the target.
+        None if pin.is_some() => pin,
         None => dto
             .active_run_id()
             .map(str::to_string)
@@ -166,6 +181,7 @@ fn session_turn(
         return Ok((
             Probe::Missing(format!("no turn `{r}` in session `{session}`")),
             Some(first_new),
+            None,
         ));
     }
     let path: Option<PathBuf> = turn.as_deref().and_then(|r| {
@@ -179,7 +195,7 @@ fn session_turn(
     });
     let end = path.as_deref().and_then(run_end);
     if end.is_none() && !ended {
-        return Ok((Probe::Pending, Some(first_new)));
+        return Ok((Probe::Pending, Some(first_new), turn));
     }
     let error = end
         .as_ref()
@@ -192,5 +208,5 @@ fn session_turn(
         "final_answer": path.as_deref().and_then(rupu_transcript::final_answer),
         "error": error,
     }));
-    Ok((fired, Some(first_new)))
+    Ok((fired, Some(first_new), turn))
 }
