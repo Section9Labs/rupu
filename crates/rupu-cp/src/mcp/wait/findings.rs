@@ -7,10 +7,11 @@
 //! [`query_findings`], [`list_row`]). A tag change on an older finding
 //! appends no finding line, so it fires nothing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use rupu_coverage::{CoveragePaths, FindingRecord};
+use rupu_transcript::JsonlCursor;
 use serde_json::Value;
 
 use super::parse::{Condition, Kind};
@@ -20,7 +21,6 @@ use crate::api::findings::{
     store_for, FindingOut,
 };
 use crate::state::AppState;
-use crate::transcript_tail::{count_numbered, read_numbered};
 
 /// One ledger being read.
 struct Src {
@@ -28,8 +28,15 @@ struct Src {
     ws_path: PathBuf,
     target: String,
     path: PathBuf,
-    /// The last line read.
+    /// The last line handed out (the cursor).
     next: u64,
+    /// Where the next read of the file resumes, and the number of the last
+    /// non-blank line it read (the numbering `read_numbered` uses).
+    reader: JsonlCursor,
+    seq: u64,
+    /// Lines read but not handed out yet ([`CATCH_UP_MAX`] go per poll); an
+    /// unparseable line is `None`.
+    pending: VecDeque<(u64, Option<FindingRecord>)>,
     /// Lines at or before this one were there when the call began; a
     /// condition without a `run` skips them.
     baseline: u64,
@@ -42,6 +49,9 @@ pub(super) struct Findings {
     /// Whether the first poll happened: a ledger found later is read from
     /// its first line.
     polled: bool,
+    /// Workspaces whose targets could not be listed on the first poll: when
+    /// they are listed, their ledgers count as existing, not created later.
+    pending_first: HashSet<String>,
 }
 
 /// Refuse a `project` that isn't a registered workspace.
@@ -157,34 +167,49 @@ fn poll_blocking(
     for w in workspaces.iter().filter(|w| covers(&w.id)) {
         let wp = std::path::Path::new(&w.path);
         let Ok(targets) = rupu_coverage::discover_targets(wp) else {
+            if first {
+                memo.pending_first.insert(w.id.clone());
+            }
             continue;
         };
+        // Ledgers that existed when the call began (or were first listed
+        // after a failed first listing) start at their end.
+        let existing = first || memo.pending_first.remove(&w.id);
         for t in targets {
             let source = format!("findings:{}/{}", w.id, t.target_id);
             if memo.sources.contains_key(&source) {
                 continue;
             }
             let path = CoveragePaths::new(wp, &t.target_id).findings;
-            let (next, baseline) = match cursor_in.get(&source) {
-                Some(&n) => (n, 0),
-                None if !first => (0, 0),
-                None => {
-                    let end = count_numbered(&path).unwrap_or(0);
-                    (if any_run { 0 } else { end }, end)
-                }
+            let given = cursor_in.get(&source).copied();
+            // Lines up to `skip` are counted, not kept.
+            let skip = match given {
+                Some(n) => n,
+                None if !existing || any_run => 0,
+                None => u64::MAX,
             };
-            cursor_out.insert(source.clone(), next);
-            memo.sources.insert(
-                source,
-                Src {
-                    ws_id: w.id.clone(),
-                    ws_path: wp.to_path_buf(),
-                    target: t.target_id,
-                    path,
-                    next,
-                    baseline,
-                },
-            );
+            let mut src = Src {
+                ws_id: w.id.clone(),
+                ws_path: wp.to_path_buf(),
+                target: t.target_id,
+                path,
+                next: 0,
+                reader: JsonlCursor::new(),
+                seq: 0,
+                pending: VecDeque::new(),
+                baseline: 0,
+            };
+            read_new(&mut src, skip).map_err(|e| format!("reading {source}: {e}"))?;
+            if skip == u64::MAX {
+                src.next = src.seq;
+            } else {
+                src.next = skip;
+            }
+            if existing && given.is_none() {
+                src.baseline = src.seq;
+            }
+            cursor_out.insert(source.clone(), src.next);
+            memo.sources.insert(source, src);
         }
     }
 
@@ -193,15 +218,22 @@ fn poll_blocking(
     let mut tag_events: HashMap<PathBuf, Vec<rupu_coverage::TagEvent>> = HashMap::new();
     let mut web_hosts = None;
     for (source, src) in memo.sources.iter_mut() {
-        let (lines, last) = read_numbered::<FindingRecord>(&src.path, src.next, CATCH_UP_MAX)
-            .map_err(|e| format!("reading {source}: {e}"))?;
-        if last > src.next {
-            src.next = last;
-            cursor_out.insert(source.clone(), last);
+        read_new(src, src.next).map_err(|e| format!("reading {source}: {e}"))?;
+        let take = src.pending.len().min(CATCH_UP_MAX);
+        let taken: Vec<(u64, Option<FindingRecord>)> = src.pending.drain(..take).collect();
+        // The cursor moves past what was handed out; with nothing held back
+        // it is the end of what was read.
+        let reached = taken
+            .last()
+            .map_or(src.next, |(id, _)| *id)
+            .max(if src.pending.is_empty() { src.seq } else { 0 });
+        if reached > src.next {
+            src.next = reached;
+            cursor_out.insert(source.clone(), reached);
         }
-        let (ids, mut records): (Vec<u64>, Vec<FindingRecord>) = lines
+        let (ids, mut records): (Vec<u64>, Vec<FindingRecord>) = taken
             .into_iter()
-            .filter_map(|l| l.event.map(|r| (l.id, r)))
+            .filter_map(|(id, r)| r.map(|r| (id, r)))
             .unzip();
         if records.is_empty() {
             continue;
@@ -224,6 +256,13 @@ fn poll_blocking(
     }
     if fresh.is_empty() {
         return Ok((vec![], cursor_out, BTreeMap::new()));
+    }
+    // Each row's project assignment, as the list reads it: an unreadable
+    // one fails the call rather than state a false "no customer".
+    let mut lookup =
+        crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(global));
+    for f in &mut fresh {
+        f.out.customer = lookup.assigned(&f.out.ws_id).map_err(|e| e.1)?;
     }
     let mut outs: Vec<FindingOut> = fresh.iter().map(|f| f.out.clone()).collect();
     join_workflow_names(store, &mut outs);
@@ -278,4 +317,41 @@ fn poll_blocking(
         .map(|((source, line), event)| serde_json::json!({"source": source, "id": line, "event": event}))
         .collect();
     Ok((events, cursor_out, counts))
+}
+
+/// Read what `src`'s file gained since the last read into `src.pending`,
+/// numbering every non-blank line; lines at or before `skip` are counted
+/// only. A file that shrank or was replaced (`rupu findings import` rewrites
+/// the ledger) is read again from its first line, skipping what was already
+/// handed out.
+fn read_new(src: &mut Src, skip: u64) -> std::io::Result<()> {
+    use std::cell::{Cell, RefCell};
+    let seq = Cell::new(src.seq);
+    let skip = Cell::new(skip);
+    let handed = src.next;
+    let fresh: RefCell<Vec<(u64, Option<FindingRecord>)>> = RefCell::new(Vec::new());
+    let cleared = Cell::new(false);
+    let path = src.path.clone();
+    src.reader.drain_with(
+        &path,
+        || {
+            seq.set(0);
+            skip.set(handed);
+            cleared.set(true);
+        },
+        |l| {
+            seq.set(seq.get() + 1);
+            if seq.get() > skip.get() {
+                fresh
+                    .borrow_mut()
+                    .push((seq.get(), serde_json::from_str::<FindingRecord>(l).ok()));
+            }
+        },
+    )?;
+    if cleared.get() {
+        src.pending.clear();
+    }
+    src.seq = seq.get();
+    src.pending.extend(fresh.into_inner());
+    Ok(())
 }

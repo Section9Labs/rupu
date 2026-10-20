@@ -1075,3 +1075,50 @@ async fn the_cursor_resumes_per_ledger() {
         "{r}"
     );
 }
+
+#[tokio::test]
+async fn a_wait_row_matches_the_list_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = register(tmp.path(), "ws1");
+    let store = rupu_workspace::CustomerStore::new(tmp.path());
+    store
+        .create(
+            "acme",
+            &rupu_workspace::NewCustomer {
+                name: "ACME".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .assign("acme", rupu_workspace::ProjectRef::Id("ws1"))
+        .unwrap();
+    record(&repo, "t1", finding("fnd_old", "run_a", Severity::Low));
+    let addr = spawn(tmp.path()).await;
+    let r2 = repo.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        record(&r2, "t1", finding("fnd_new", "run_a", Severity::High));
+    });
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "findings"}], "timeout_ms": 8000}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let row = r["structuredContent"]["events"][0]["event"].clone();
+    assert_eq!(row["customer"], "acme", "{r}");
+    let list: Value = reqwest::get(format!("http://{addr}/api/findings"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = list["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == "fnd_new")
+        .unwrap();
+    assert_eq!(&row, listed);
+}

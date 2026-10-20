@@ -13,19 +13,11 @@ use super::clamp_timeout;
 pub(super) enum Kind {
     Settled,
     Gate,
-    Events {
-        types: Option<Vec<String>>,
-    },
-    Messages {
-        kinds: Option<Vec<MessageKind>>,
-    },
-    Agentiflow {
-        types: Option<Vec<String>>,
-    },
+    Events { types: Option<Vec<String>> },
+    Messages { kinds: Option<Vec<MessageKind>> },
+    Agentiflow { types: Option<Vec<String>> },
     AgentRunEnd,
-    SessionTurn {
-        run: Option<String>,
-    },
+    SessionTurn { run: Option<String> },
     /// New finding records in the coverage ledgers of the scoped workspaces.
     Findings {
         project: Option<String>,
