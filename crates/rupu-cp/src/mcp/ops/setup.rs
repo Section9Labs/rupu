@@ -30,7 +30,8 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Initialise a directory as a rupu project: `.rupu/` skeleton, config, gitignore entries.\n\n`path` must be an absolute, existing directory; `with_samples` adds the curated agent and workflow samples; `force` re-runs on an initialised project, overwriting samples (never `config.toml`). Returns `{root, created, skipped, overwrote, files}`; `HTTP 409` when already initialised without `force`.",
         )
         .query::<fleet::LocalQuery>()
-        .body::<fleet::InitBody>(),
+        .body::<fleet::InitBody>()
+        .destructive(),
         op(
             "engagement_profiles.list",
             Method::GET,

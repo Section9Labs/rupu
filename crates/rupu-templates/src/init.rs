@@ -31,6 +31,25 @@ pub fn init_project(root: &Path, with_samples: bool, force: bool) -> std::io::Re
     Ok(report)
 }
 
+/// The `created`, `skipped`, `overwrote` counts `rupu init`'s summary line
+/// prints: as [`WriteReport`]'s, except that `.gitignore` is listed but never
+/// counted (`rupu init` has always counted only the skeleton, the netflow
+/// directory and the samples).
+pub fn summary_counts(report: &WriteReport) -> (usize, usize, usize) {
+    let counted = |action: FileAction| {
+        report
+            .files
+            .iter()
+            .filter(|f| f.action == action && f.path != ".gitignore")
+            .count()
+    };
+    (
+        counted(FileAction::Created),
+        counted(FileAction::Skipped),
+        counted(FileAction::Overwrote),
+    )
+}
+
 // config.toml does NOT honor `force` — overwriting a customized config is a
 // worse footgun than re-seeding agent templates.
 fn create_skeleton(root: &Path, report: &mut WriteReport) -> std::io::Result<()> {
@@ -128,6 +147,9 @@ mod tests {
         assert!(root.join(".rupu/agents").is_dir());
         assert!(root.join(".rupu/netflow").is_dir());
         assert_eq!(first.skipped(), 0, "{first:?}");
+        // The CLI's summary leaves the created `.gitignore` out, as it always has.
+        assert_eq!(first.created(), MANIFEST.len() + 3);
+        assert_eq!(summary_counts(&first), (MANIFEST.len() + 2, 0, 0));
         assert_eq!(
             first.files[0],
             FileWrite {

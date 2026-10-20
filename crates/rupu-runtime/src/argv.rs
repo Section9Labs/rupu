@@ -336,12 +336,15 @@ pub struct SessionWorker {
     pub session_id: String,
 }
 
-/// `rupu session compact <session_id> [--window <tokens>]`.
+/// `rupu session compact <session_id> [--window <tokens>] [--compaction-id <id>]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCompact {
     pub session_id: String,
     /// `--window`: the context-window size to size the compaction against.
     pub window: Option<u32>,
+    /// `--compaction-id` (hidden): the compaction the CP recorded before
+    /// starting this one, which it takes over.
+    pub compaction_id: Option<String>,
 }
 
 /// `rupu agentiflow run --run-id <id> -- <definition>`.
@@ -613,6 +616,7 @@ impl RunArgv {
                 if let Some(w) = c.window {
                     a.flag_value("--window", &w.to_string());
                 }
+                a.opt_flag_value("--compaction-id", c.compaction_id.as_deref());
                 // `--` keeps an id starting with `-` from being read as a flag.
                 a.push("--");
                 a.push(&c.session_id);

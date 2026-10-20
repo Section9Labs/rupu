@@ -5050,6 +5050,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "fs2",
  "futures-util",
  "hex",
  "httpmock",

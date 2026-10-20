@@ -42,15 +42,18 @@ pub enum SessionMutateError {
 pub trait SessionMutator: Send + Sync {
     async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError>;
 
-    /// Start `rupu session compact <id> [--window <window>]` detached, its
-    /// stderr to `log`, and return once it has started: the compaction
-    /// itself is a model call and lands in the session record when it ends.
+    /// Start `rupu session compact <id> [--window <window>] --compaction-id
+    /// <compaction_id>` detached, its output to `log`, and return the child's
+    /// pid once it has started: the compaction itself is a model call and
+    /// lands in the session record when it ends. The caller has already
+    /// recorded `compaction_id` (`rupu_runtime::services::session_compaction`).
     async fn compact(
         &self,
         id: &str,
+        compaction_id: &str,
         window: Option<u32>,
         log: &std::path::Path,
-    ) -> Result<(), SessionMutateError>;
+    ) -> Result<u32, SessionMutateError>;
 }
 
 #[cfg(test)]
@@ -70,10 +73,11 @@ mod tests {
         async fn compact(
             &self,
             _id: &str,
+            _compaction_id: &str,
             _window: Option<u32>,
             _log: &std::path::Path,
-        ) -> Result<(), SessionMutateError> {
-            Ok(())
+        ) -> Result<u32, SessionMutateError> {
+            Ok(0)
         }
     }
 

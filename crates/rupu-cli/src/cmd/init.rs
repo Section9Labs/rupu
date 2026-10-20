@@ -55,12 +55,8 @@ fn init_inner(args: InitArgs) -> anyhow::Result<()> {
     for f in &report.files {
         println!("{}", f.line());
     }
-    println!(
-        "init: created {}, skipped {}, overwrote {}",
-        report.created(),
-        report.skipped(),
-        report.overwrote()
-    );
+    let (created, skipped, overwrote) = rupu_templates::init::summary_counts(&report);
+    println!("init: created {created}, skipped {skipped}, overwrote {overwrote}");
     if args.git {
         maybe_git_init(root)?;
     }

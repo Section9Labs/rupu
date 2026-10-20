@@ -37,14 +37,35 @@ impl SessionMutator for RecordingMutator {
     async fn compact(
         &self,
         id: &str,
+        compaction_id: &str,
         window: Option<u32>,
         log: &Path,
-    ) -> Result<(), SessionMutateError> {
+    ) -> Result<u32, SessionMutateError> {
+        assert!(compaction_id.starts_with("cmp_"), "{compaction_id}");
         self.0
             .lock()
             .unwrap()
             .push(format!("compact {id} {window:?} {}", log.display()));
-        Ok(())
+        // No child: pid 0 is never alive, so the handed-over marker is stale.
+        Ok(0)
+    }
+}
+
+/// Records every send as `"send <session id>"`.
+#[derive(Default)]
+pub(super) struct RecordingSender(pub Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl rupu_cp::session_sender::SessionSender for RecordingSender {
+    async fn send(
+        &self,
+        req: rupu_cp::session_sender::SendMessageRequest,
+    ) -> Result<String, rupu_cp::session_sender::SendError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("send {}", req.session_id));
+        Ok("run_sent".into())
     }
 }
 
@@ -70,6 +91,7 @@ pub(super) struct Setup {
     /// A directory holding one valid skill, `demo-skill`.
     pub skill_src: PathBuf,
     pub mutator: Arc<RecordingMutator>,
+    pub sender: Arc<RecordingSender>,
     _tmp: tempfile::TempDir,
 }
 
@@ -118,8 +140,10 @@ pub(super) async fn spawn_setup(writable: bool, installer: bool) -> Setup {
     .unwrap();
 
     let mutator = Arc::new(RecordingMutator::default());
+    let sender = Arc::new(RecordingSender::default());
     let mut state = rupu_cp::state::AppState::new(global.clone(), Default::default())
-        .with_session_mutator(Some(mutator.clone()));
+        .with_session_mutator(Some(mutator.clone()))
+        .with_session_sender(Some(sender.clone()));
     if writable {
         state = state.with_launcher(Some(Arc::new(NoopLauncher)));
     }
@@ -153,6 +177,7 @@ pub(super) async fn spawn_setup(writable: bool, installer: bool) -> Setup {
         project,
         skill_src,
         mutator,
+        sender,
         _tmp: tmp,
     }
 }

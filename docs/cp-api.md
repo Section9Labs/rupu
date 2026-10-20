@@ -296,7 +296,7 @@ none, and a body that isn't the expected JSON is a 400.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/sessions` | Sessions, most recently updated first. | `offset`, `limit`, `scope` (`active` / `archived`), `host`, `since`, `until`, `customer`, `q`, `facets`. |
-| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. |
+| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. A local session also carries `compacting` (a compaction is running), `compaction` (its marker `{id, pid, pid_start, started_at}`, else null) and `last_compaction` (see `compact`). |
 | GET | `/api/sessions/:id/runs` | The session's turns for the chat view (`SessionRunRow`). | `host`. |
 | GET | `/api/sessions/:id/usage-timeline` | Tokens per model call. | `host`. |
 | POST | `/api/sessions/:id/send` | Send a prompt as the next turn, or invoke skills in it. | `host`. Body `{prompt?, skills?}` → `{run_id, host_id}`; watch the turn with `/api/transcript/stream`. `skills` (skill entries) become `rupu session send --skill`; the prompt may be empty when a skill is given. 400 with neither, a malformed or wildcard entry, or a skill the session can't take (unknown, ambiguous, held from the other layer; the body is the CLI's message); 404 unknown session; 409 session stopped; 501 without `cp serve`. A remote host that does not advertise `session.skills` refuses a send with skills: 501, "upgrade rupu there", and nothing reaches it. |
@@ -304,7 +304,7 @@ none, and a body that isn't the expected JSON is a 400.
 | POST | `/api/sessions/:id/restore` | Restore an archived session. | `host`. |
 | DELETE | `/api/sessions/:id` | Delete a session. | `host`. |
 | POST | `/api/sessions/:id/stop` | Stop a session (`rupu session stop`): end its worker and running turn, mark it stopped. | Local only (`host` other than `local` is 501). → `{ok, id}` once the record says stopped. 404 unknown session; 409 archived; 501 without `cp serve`. A later send reactivates it. |
-| POST | `/api/sessions/:id/compact` | Compact the stored conversation now (`rupu session compact`). | Local only. Body `{window?}` (tokens to size against, in place of the session's own). Started detached: 202 `{ok, id, log}`; the history is rewritten when it ends, a failure is written to `log` (`<session dir>/compact.log`). 404 unknown; 409 a turn is running or the session is archived; 501 without `cp serve`. |
+| POST | `/api/sessions/:id/compact` | Compact the stored conversation now (`rupu session compact`). | Local only. Body `{window?}` (tokens to size against, in place of the session's own). Recorded first: a marker (`<session dir>/compaction.json`, under `session.lock`) names the CP, then the child it starts, and while that process lives `send`, `stop`, `archive`, `DELETE` and another `compact` answer 409 (a marker whose process is gone is stale and cleared). Started detached: 202 `{ok, id, compaction_id, log}`. The child writes the compacted history only if the session record is unchanged since it read it (else it discards the summary); how it ended is `last_compaction` `{id, outcome: compacted\|nothing_to_compact\|discarded\|failed, detail, finished_at}` on the session detail, and errors are in `log` (`<session dir>/compact.log`). `rupu session compact` in a terminal takes the same marker. 404 unknown; 409 a turn or a compaction is running, or the session is archived; 501 without `cp serve`. |
 
 Start a session with `POST /api/agents/:name/session`.
 

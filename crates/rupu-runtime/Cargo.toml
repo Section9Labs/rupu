@@ -24,6 +24,7 @@ async-trait.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 
 # In-workspace (needed by provider_factory)
 rupu-providers = { path = "../rupu-providers" }

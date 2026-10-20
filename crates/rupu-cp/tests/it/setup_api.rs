@@ -63,7 +63,12 @@ async fn compact_starts_detached_with_a_log_and_refuses_a_running_turn() {
     .await;
     assert_eq!(st, 202, "{v}");
     let log = s.global.join("sessions").join(LIVE).join("compact.log");
-    assert_eq!(v, json!({"ok": true, "id": LIVE, "log": log}));
+    let cid = v["compaction_id"].as_str().unwrap().to_string();
+    assert!(cid.starts_with("cmp_"), "{v}");
+    assert_eq!(
+        v,
+        json!({"ok": true, "id": LIVE, "compaction_id": cid, "log": log})
+    );
     assert_eq!(
         *s.mutator.0.lock().unwrap(),
         vec![format!("compact {LIVE} Some(200000) {}", log.display())]
@@ -117,6 +122,100 @@ async fn a_malformed_optional_body_is_refused_not_ignored() {
     }
     assert!(s.mutator.0.lock().unwrap().is_empty());
     assert!(!s.global.join("agents").exists());
+}
+
+/// Mark `LIVE` as being compacted by `pid` (this test process: alive).
+fn compacting(s: &Setup, pid: u32, start: Option<u64>) {
+    rupu_runtime::services::session_compaction::begin(
+        &s.global.join("sessions").join(LIVE),
+        "cmp_01J9ZQ3K4M5N6P7Q8R9S0T1LIV",
+        pid,
+        start,
+        rupu_launch::proc::process_alive,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_live_compaction_refuses_every_session_write_and_shows_in_the_detail() {
+    let s = spawn_setup(true, true).await;
+    compacting(&s, std::process::id(), rupu_launch::proc::own_start_stamp());
+    let (_, v) = http_get(s.addr, &format!("/api/sessions/{LIVE}")).await;
+    assert_eq!(v["compacting"], true, "{v}");
+    assert_eq!(v["compaction"]["pid"], std::process::id(), "{v}");
+
+    for (path, body) in [
+        (
+            format!("/api/sessions/{LIVE}/send"),
+            json!({"prompt": "hi"}),
+        ),
+        (format!("/api/sessions/{LIVE}/stop"), json!({})),
+        (format!("/api/sessions/{LIVE}/archive"), json!({})),
+        (format!("/api/sessions/{LIVE}/compact"), json!({})),
+    ] {
+        let (st, v) = post(&s, &path, body).await;
+        assert_eq!(st, 409, "{path}: {v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("is being compacted"),
+            "{v}"
+        );
+    }
+    let r = reqwest::Client::new()
+        .delete(format!("http://{}/api/sessions/{LIVE}", s.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    // Nothing reached a port.
+    assert!(s.mutator.0.lock().unwrap().is_empty());
+    assert!(s.sender.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_stale_compaction_marker_refuses_nothing() {
+    let s = spawn_setup(true, true).await;
+    // pid 0 is never a live process: the marker is stale and cleared.
+    compacting(&s, 0, None);
+    let (_, v) = http_get(s.addr, &format!("/api/sessions/{LIVE}")).await;
+    assert_eq!(v["compacting"], false, "{v}");
+    assert_eq!(v["compaction"], Value::Null, "{v}");
+    assert!(!s
+        .global
+        .join("sessions")
+        .join(LIVE)
+        .join("compaction.json")
+        .exists());
+    let (st, v) = post(
+        &s,
+        &format!("/api/sessions/{LIVE}/send"),
+        json!({"prompt": "hi"}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(
+        post(&s, &format!("/api/sessions/{LIVE}/stop"), json!({}))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(*s.sender.0.lock().unwrap(), vec![format!("send {LIVE}")]);
+}
+
+#[tokio::test]
+async fn a_finished_compactions_marker_does_not_refuse_the_next() {
+    let s = spawn_setup(true, true).await;
+    let dir = s.global.join("sessions").join(LIVE);
+    // Two compactions back to back: the stub's child (pid 0) is gone at once,
+    // so the second is not refused.
+    for _ in 0..2 {
+        let (st, v) = post(&s, &format!("/api/sessions/{LIVE}/compact"), json!({})).await;
+        assert_eq!(st, 202, "{v}");
+    }
+    assert_eq!(
+        rupu_runtime::services::session_compaction::live(&dir, rupu_launch::proc::process_alive)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]

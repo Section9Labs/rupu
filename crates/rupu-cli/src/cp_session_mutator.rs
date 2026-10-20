@@ -52,6 +52,7 @@ pub(crate) fn classify_failure(action: SessionAction, stderr: &str) -> SessionMu
         || s.contains("requires --force")
         || s.contains("while the worker is still running")
         || s.contains("does not support archived sessions")
+        || s.contains("is being compacted")
     {
         SessionMutateError::Invalid(stderr.trim().to_string())
     } else {
@@ -90,11 +91,12 @@ impl SessionMutator for SubprocessSessionMutator {
     async fn compact(
         &self,
         id: &str,
+        compaction_id: &str,
         window: Option<u32>,
         log: &Path,
-    ) -> Result<(), SessionMutateError> {
-        spawn_detached(compact_spec(&self.exe, id, window, log))
-            .map(|_| ())
+    ) -> Result<u32, SessionMutateError> {
+        spawn_detached(compact_spec(&self.exe, id, compaction_id, window, log))
+            .map(|s| s.pid)
             .map_err(|e| SessionMutateError::Failed {
                 action: "compact",
                 message: e.to_string(),
@@ -102,13 +104,22 @@ impl SessionMutator for SubprocessSessionMutator {
     }
 }
 
-/// `rupu session compact <id> [--window <window>]`, its stderr to `log`.
-pub(crate) fn compact_spec(exe: &Path, id: &str, window: Option<u32>, log: &Path) -> SpawnSpec {
+/// `rupu session compact <id> [--window <window>] --compaction-id
+/// <compaction_id>`, its stderr to `log` (its outcome is also recorded in the
+/// session's `compaction.result.json`).
+pub(crate) fn compact_spec(
+    exe: &Path,
+    id: &str,
+    compaction_id: &str,
+    window: Option<u32>,
+    log: &Path,
+) -> SpawnSpec {
     let mut spec = SpawnSpec::new(
         exe,
         RunArgv::SessionCompact(SessionCompact {
             session_id: id.to_string(),
             window,
+            compaction_id: Some(compaction_id.to_string()),
         }),
     );
     spec.stdio = SpawnStdio::Log(log.to_path_buf());
@@ -144,19 +155,43 @@ mod tests {
         let spec = compact_spec(
             Path::new("/bin/rupu"),
             "ses_abc",
+            "cmp_1",
             Some(200_000),
             Path::new("/s/compact.log"),
         );
         assert_eq!(
             spec.argv.to_args(),
-            ["session", "compact", "--window", "200000", "--", "ses_abc"]
-                .map(std::ffi::OsString::from)
+            [
+                "session",
+                "compact",
+                "--window",
+                "200000",
+                "--compaction-id",
+                "cmp_1",
+                "--",
+                "ses_abc"
+            ]
+            .map(std::ffi::OsString::from)
         );
         assert_eq!(spec.stdio, SpawnStdio::Log("/s/compact.log".into()));
-        let bare = compact_spec(Path::new("/bin/rupu"), "ses_abc", None, Path::new("/l"));
+        let bare = compact_spec(
+            Path::new("/bin/rupu"),
+            "ses_abc",
+            "cmp_2",
+            None,
+            Path::new("/l"),
+        );
         assert_eq!(
             bare.argv.to_args(),
-            ["session", "compact", "--", "ses_abc"].map(std::ffi::OsString::from)
+            [
+                "session",
+                "compact",
+                "--compaction-id",
+                "cmp_2",
+                "--",
+                "ses_abc"
+            ]
+            .map(std::ffi::OsString::from)
         );
     }
 

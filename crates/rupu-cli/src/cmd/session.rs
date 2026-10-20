@@ -48,6 +48,7 @@ use rupu_providers::types::{
 use rupu_providers::AuthMode;
 use rupu_runtime::argv::{RunArgv, SessionWorker};
 use rupu_runtime::provider_factory;
+use rupu_runtime::services::session_compaction as compaction;
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
 use rupu_runtime::WorkerKind;
 use rupu_tools::PermissionMode;
@@ -136,6 +137,10 @@ pub enum Action {
         /// created before that field existed.
         #[arg(long)]
         window: Option<u32>,
+        /// The compaction id the control plane recorded before starting
+        /// this command, so it takes over that marker rather than refusing it.
+        #[arg(long, hide = true)]
+        compaction_id: Option<String>,
     },
     #[command(name = "_worker", hide = true)]
     RunWorker(RunWorkerArgs),
@@ -1367,7 +1372,11 @@ pub async fn handle(
         Action::Send(args) => send(args).await,
         Action::Attach { session_id, view } => attach(&session_id, view).await,
         Action::Stop { session_id } => stop(&session_id).await,
-        Action::Compact { session_id, window } => compact(&session_id, window).await,
+        Action::Compact {
+            session_id,
+            window,
+            compaction_id,
+        } => compact(&session_id, window, compaction_id).await,
         Action::RunWorker(args) => run_worker(args).await,
         Action::RunTurn(args) => run_turn(args).await,
     };
@@ -1923,6 +1932,7 @@ async fn send(args: SendArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_active_scope(scope, "session send")?;
+    ensure_not_compacting(&global, scope, &session.session_id)?;
     if reconcile_stale_session(&mut session) {
         write_session(&global, scope, &session)?;
     }
@@ -7036,6 +7046,7 @@ async fn archive(session_id: &str) -> anyhow::Result<()> {
     if scope == SessionScope::Archived {
         anyhow::bail!("session {session_id} is already archived");
     }
+    ensure_not_compacting(&global, scope, &session.session_id)?;
     if reconcile_stale_session(&mut session) {
         write_session(&global, scope, &session)?;
     }
@@ -7077,6 +7088,7 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
     }
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
+    ensure_not_compacting(&global, scope, &session.session_id)?;
     if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
         write_session(&global, scope, &session)?;
     }
@@ -7226,10 +7238,70 @@ fn compaction_usage_event(
     }
 }
 
-async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Result<()> {
+/// Refuse a command that would write the session while a compaction of it
+/// runs (`rupu_runtime::services::session_compaction`).
+fn ensure_not_compacting(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let dir = session_dir(global, scope, session_id);
+    if let Some(m) = compaction::live(&dir, rupu_launch::proc::process_alive)? {
+        anyhow::bail!(compaction::busy_message(session_id, &m));
+    }
+    Ok(())
+}
+
+/// `rupu session compact`: record the compaction (taking over the marker
+/// the CP recorded as `compaction_id`), run it, then record how it ended.
+/// Another live compaction of the session refuses it.
+async fn compact(
+    session_id: &str,
+    window_override: Option<u32>,
+    compaction_id: Option<String>,
+) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
-    let (mut session, scope) = read_session(&global, session_id)?;
+    let (session, scope) = read_session(&global, session_id)?;
     ensure_active_scope(scope, "session compact")?;
+    let session_id = session.session_id.as_str();
+    let dir = session_dir(&global, scope, session_id);
+    let id = compaction_id.unwrap_or_else(compaction::new_id);
+    if let compaction::Begin::Busy(m) = compaction::begin(
+        &dir,
+        &id,
+        std::process::id(),
+        rupu_launch::proc::own_start_stamp(),
+        rupu_launch::proc::process_alive,
+    )? {
+        anyhow::bail!(compaction::busy_message(session_id, &m));
+    }
+    let result = compact_recorded(&global, scope, session_id, window_override).await;
+    let (outcome, detail) = match &result {
+        Ok((outcome, detail)) => (*outcome, detail.clone()),
+        Err(e) => (compaction::Outcome::Failed, format!("{e:#}")),
+    };
+    println!("{detail}");
+    if let Err(e) = compaction::end(&dir, &id, Some((outcome, detail))) {
+        tracing::warn!(session = session_id, error = %e, "could not record the compaction's end");
+    }
+    result.map(|_| ())
+}
+
+/// The compaction itself, with its marker held: the record is read now (no
+/// other command writes the session while the marker is live), and the
+/// compacted history is written only if the record is still byte-for-byte
+/// what was read, under the session lock — else it is discarded.
+async fn compact_recorded(
+    global: &Path,
+    scope: SessionScope,
+    session_id: &str,
+    window_override: Option<u32>,
+) -> anyhow::Result<(compaction::Outcome, String)> {
+    let global = global.to_path_buf();
+    let record_path = session_record_path(&global, scope, session_id);
+    let read_bytes = fs::read(&record_path)
+        .with_context(|| format!("read session record {}", record_path.display()))?;
+    let mut session = parse_session_record(&read_bytes)?;
 
     if session.status == SessionStatus::Running {
         anyhow::bail!(
@@ -7250,11 +7322,12 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
         })?;
 
     if session.message_history.len() < 4 {
-        println!(
-            "nothing to compact: session {} has fewer than 4 messages in history",
-            session_id
-        );
-        return Ok(());
+        return Ok((
+            compaction::Outcome::NothingToCompact,
+            format!(
+                "nothing to compact: session {session_id} has fewer than 4 messages in history"
+            ),
+        ));
     }
 
     // Derive last_input_tokens from the most recent run, or fall back to a
@@ -7377,14 +7450,26 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             // transcript.
             session.history_source_transcript = None;
             session.updated_at = Utc::now();
-            write_session(&global, scope, &session)?;
-            println!(
-                "compacted session {session_id}: summarized {summarized} messages, history {before} → {after} messages"
-            );
+            if !commit_if_unchanged(&global, scope, &session, &read_bytes)? {
+                return Ok((
+                    compaction::Outcome::Discarded,
+                    format!(
+                        "compaction of session {session_id} discarded: the session changed while \
+                         it was summarized (its spend is still recorded)"
+                    ),
+                ));
+            }
+            Ok((
+                compaction::Outcome::Compacted,
+                format!(
+                    "compacted session {session_id}: summarized {summarized} messages, history {before} → {after} messages"
+                ),
+            ))
         }
-        Ok(None) => {
-            println!("nothing to compact: history is too short or already compact");
-        }
+        Ok(None) => Ok((
+            compaction::Outcome::NothingToCompact,
+            "nothing to compact: history is too short or already compact".to_string(),
+        )),
         Err(e) => {
             // A rejected summary was still billed: record its spend the same
             // way a successful compaction's is, then surface the reason.
@@ -7399,8 +7484,29 @@ async fn compact(session_id: &str, window_override: Option<u32>) -> anyhow::Resu
             anyhow::bail!("compaction failed: {e}");
         }
     }
+}
 
-    Ok(())
+/// Write `session` over its record only if the record on disk is still
+/// `read_bytes` — what the caller read before a long operation — checked and
+/// written under the session lock. `false` (nothing written) when anything
+/// changed or removed it meanwhile.
+fn commit_if_unchanged(
+    global: &Path,
+    scope: SessionScope,
+    session: &SessionRecord,
+    read_bytes: &[u8],
+) -> anyhow::Result<bool> {
+    let dir = session_dir(global, scope, &session.session_id);
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let _lock = compaction::SessionLock::acquire(&dir)?;
+    let now = fs::read(session_record_path(global, scope, &session.session_id)).ok();
+    if now.as_deref() != Some(read_bytes) {
+        return Ok(false);
+    }
+    write_session(global, scope, session)?;
+    Ok(true)
 }
 
 /// Record an offline `rupu session compact`'s summariser spend. That command
@@ -7478,6 +7584,7 @@ fn leave_session_space(global: &Path, scope: SessionScope, session_id: &str, sta
 fn stop_session_in_place(global: &Path, session_id: &str) -> anyhow::Result<()> {
     let (mut session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session stop")?;
+    ensure_not_compacting(global, scope, &session.session_id)?;
     if reconcile_stale_session(&mut session) {
         write_session(global, scope, &session)?;
     }
@@ -12809,7 +12916,7 @@ mod tests {
         with_mock_home(
             &global,
             SUMMARY_SCRIPT,
-            compact(&record.session_id, Some(1000)),
+            compact(&record.session_id, Some(1000), None),
         )
         .await
         .expect("compact completes");
@@ -12869,7 +12976,7 @@ mod tests {
         let err = with_mock_home(
             &global,
             REFUSED_SUMMARY_SCRIPT,
-            compact(&record.session_id, Some(1000)),
+            compact(&record.session_id, Some(1000), None),
         )
         .await
         .expect_err("a refused summary fails the compaction");
@@ -12889,6 +12996,105 @@ mod tests {
             history_len,
             "history untouched"
         );
+    }
+
+    /// A compaction whose session changed under it writes nothing: the
+    /// record a turn (or a stop) wrote meanwhile stays.
+    #[test]
+    fn a_compaction_commit_over_a_changed_record_is_discarded() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, record) = idle_dense_session(&tmp, "ses_compact_stale1");
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let path = session_record_path(&global, SessionScope::Active, &record.session_id);
+        let read = fs::read(&path).unwrap();
+        let mut compacted = record.clone();
+        compacted.message_history.truncate(1);
+
+        let mut turned = record.clone();
+        turned.total_turns += 1;
+        write_session(&global, SessionScope::Active, &turned).unwrap();
+        let after_turn = fs::read(&path).unwrap();
+        assert!(!commit_if_unchanged(&global, SessionScope::Active, &compacted, &read).unwrap());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            after_turn,
+            "the turn's record stays"
+        );
+
+        // Unchanged since it was read: written.
+        assert!(
+            commit_if_unchanged(&global, SessionScope::Active, &compacted, &after_turn).unwrap()
+        );
+        let (now, _) = read_session(&global, &record.session_id).unwrap();
+        assert_eq!(now.message_history.len(), 1);
+    }
+
+    /// While a live compaction holds the session, every command that would
+    /// write it refuses, and another compaction too; once its process is
+    /// gone the marker is stale and nothing is refused.
+    #[tokio::test]
+    async fn a_live_compaction_refuses_writers_and_a_stale_one_does_not() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, record) = idle_dense_session(&tmp, "ses_compact_busy01");
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let dir = session_dir(&global, SessionScope::Active, &record.session_id);
+        compaction::begin(
+            &dir,
+            "cmp_other",
+            std::process::id(),
+            rupu_launch::proc::own_start_stamp(),
+            rupu_launch::proc::process_alive,
+        )
+        .unwrap();
+        let busy = |r: anyhow::Result<()>| {
+            let e = r.expect_err("refused while compacting").to_string();
+            assert!(e.contains("is being compacted"), "{e}");
+        };
+        busy(stop_session_in_place(&global, &record.session_id));
+        busy(ensure_not_compacting(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ));
+        busy(
+            with_mock_home(
+                &global,
+                SUMMARY_SCRIPT,
+                compact(&record.session_id, Some(1000), None),
+            )
+            .await,
+        );
+        let (unchanged, _) = read_session(&global, &record.session_id).unwrap();
+        assert_eq!(unchanged.status, record.status);
+
+        // A marker whose process is gone: `pid` 0 is never alive.
+        compaction::end(&dir, "cmp_other", None).unwrap();
+        compaction::begin(&dir, "cmp_dead", 0, None, |_, _| true).unwrap();
+        ensure_not_compacting(&global, SessionScope::Active, &record.session_id)
+            .expect("a stale marker refuses nothing");
+        stop_session_in_place(&global, &record.session_id).expect("stop goes through");
+    }
+
+    /// The compaction records how it ended and clears its marker.
+    #[tokio::test]
+    async fn a_compaction_records_its_outcome_and_clears_its_marker() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let (global, record) = idle_dense_session(&tmp, "ses_compact_done01");
+        write_session(&global, SessionScope::Active, &record).expect("write session");
+        let dir = session_dir(&global, SessionScope::Active, &record.session_id);
+        with_mock_home(
+            &global,
+            SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000), Some("cmp_given".into())),
+        )
+        .await
+        .expect("compact completes");
+        assert_eq!(compaction::live(&dir, |_, _| true).unwrap(), None);
+        let r = compaction::last_result(&dir).expect("a result");
+        assert_eq!(r.id, "cmp_given");
+        assert_eq!(r.outcome, compaction::Outcome::Compacted, "{r:?}");
     }
 
     /// Same for the worker's compact pseudo-run: the rejected summary's spend
@@ -13426,7 +13632,7 @@ mod tests {
             r#"[{ "AssistantText": { "text": "Summary of prior work.", "stop": "end_turn", "input_tokens": 500, "output_tokens": 10 } }]"#,
         );
 
-        let compact_result = compact(&record.session_id, Some(1000)).await;
+        let compact_result = compact(&record.session_id, Some(1000), None).await;
         compact_result.expect("compact completes");
 
         let (after_compact, _) =

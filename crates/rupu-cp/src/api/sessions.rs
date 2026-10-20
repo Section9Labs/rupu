@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rupu_runtime::services::session_compaction as compaction;
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
@@ -898,6 +899,18 @@ async fn get_session(
                 serde_json::json!(who.derived),
             );
         }
+        let (live, last) = {
+            let dir = dir.clone();
+            crate::api::runs::blocking(move || {
+                let live = compaction::live(&dir, rupu_launch::proc::process_alive)
+                    .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))?;
+                Ok((live, compaction::last_result(&dir)))
+            })
+            .await?
+        };
+        map.insert("compacting".to_string(), serde_json::json!(live.is_some()));
+        map.insert("compaction".to_string(), serde_json::json!(live));
+        map.insert("last_compaction".to_string(), serde_json::json!(last));
     }
     crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
     Ok(Json(val))
@@ -1227,6 +1240,7 @@ async fn send_session(
             }
             None => return Err(ApiError::not_found(format!("session {id} not found"))),
         }
+        refuse_while_compacting(&s, &id).await?;
     } else {
         return Err(ApiError::not_found(format!("session {id} not found")));
     }
@@ -1291,6 +1305,7 @@ async fn archive_session(
             .map_err(map_host_session_mutate_err)?;
         return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
+    refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
 }
 
@@ -1327,6 +1342,7 @@ async fn delete_session(
             .map_err(map_host_session_mutate_err)?;
         return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
     }
+    refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
 }
 
@@ -1352,6 +1368,21 @@ fn active_session(s: &AppState, id: &str, command: &str) -> ApiResult<SessionDto
     Err(ApiError::not_found(format!("session {id} not found")))
 }
 
+/// 409 while a compaction of the local session `id` runs: the command would
+/// write the session under it (`rupu_runtime::services::session_compaction`).
+async fn refuse_while_compacting(s: &AppState, id: &str) -> ApiResult<()> {
+    let dir = s.global_dir.join("sessions").join(id);
+    let live = crate::api::runs::blocking(move || {
+        compaction::live(&dir, rupu_launch::proc::process_alive)
+            .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))
+    })
+    .await?;
+    match live {
+        Some(m) => Err(ApiError::conflict(compaction::busy_message(id, &m))),
+        None => Ok(()),
+    }
+}
+
 /// `POST /api/sessions/:id/stop`: `rupu session stop <id>` — ends the
 /// session's worker and its running turn, and marks the session stopped.
 /// Answers `{ok, id}` once the session record says stopped.
@@ -1364,6 +1395,7 @@ async fn stop_session(
     crate::api::fleet::require_local(q.host.as_deref(), "stopping a session")?;
     crate::api::config::require_writable_to(&s, "stopping a session")?;
     active_session(&s, &id, "session stop")?;
+    refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Stop).await
 }
 
@@ -1377,10 +1409,14 @@ pub(crate) struct CompactBody {
 }
 
 /// `POST /api/sessions/:id/compact {window?}`: `rupu session compact`,
-/// started detached (it summarizes older turns with a model call). 202
-/// `{ok, id, log}` once it has started — the compacted history lands in the
-/// session record when it ends, and a failure is in `log`. 409 while a turn
-/// is running.
+/// started detached (it summarizes older turns with a model call). The
+/// compaction is recorded first — a marker under the session lock naming
+/// this process, then the child it starts — so send, stop, archive, delete
+/// and another compact answer 409 while it runs, and the child writes its
+/// result only if the session is unchanged. 202 `{ok, id, compaction_id,
+/// log}` once it has started; `GET /api/sessions/:id` shows `compacting`
+/// and, when it ends, `last_compaction`. 409 while a turn or another
+/// compaction is running.
 async fn compact_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -1401,19 +1437,48 @@ async fn compact_session(
         .session_mutator
         .clone()
         .ok_or_else(|| ApiError::not_available("compacting a session requires `rupu cp serve`"))?;
-    let log = s.global_dir.join("sessions").join(&id).join("compact.log");
-    m.compact(&id, window, &log).await.map_err(|e| match e {
-        crate::session_mutator::SessionMutateError::NotFound(_) => {
-            ApiError::not_found(format!("session {id} not found"))
+    let dir = s.global_dir.join("sessions").join(&id);
+    let log = dir.join("compact.log");
+    let cid = compaction::new_id();
+    let record = |pid: u32, start: Option<u64>| {
+        let (dir, cid) = (dir.clone(), cid.clone());
+        crate::api::runs::blocking(move || {
+            compaction::begin(&dir, &cid, pid, start, rupu_launch::proc::process_alive)
+                .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))
+        })
+    };
+    if let compaction::Begin::Busy(m) =
+        record(std::process::id(), rupu_launch::proc::own_start_stamp()).await?
+    {
+        return Err(ApiError::conflict(compaction::busy_message(&id, &m)));
+    }
+    let pid = match m.compact(&id, &cid, window, &log).await {
+        Ok(pid) => pid,
+        Err(e) => {
+            let err = match e {
+                crate::session_mutator::SessionMutateError::NotFound(_) => {
+                    ApiError::not_found(format!("session {id} not found"))
+                }
+                crate::session_mutator::SessionMutateError::Invalid(msg) => ApiError::conflict(msg),
+                crate::session_mutator::SessionMutateError::Failed { message, .. } => {
+                    ApiError::internal(message)
+                }
+            };
+            let (dir, cid, why) = (dir.clone(), cid.clone(), err.1.clone());
+            crate::api::runs::blocking(move || {
+                compaction::end(&dir, &cid, Some((compaction::Outcome::Failed, why)))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            })
+            .await?;
+            return Err(err);
         }
-        crate::session_mutator::SessionMutateError::Invalid(msg) => ApiError::conflict(msg),
-        crate::session_mutator::SessionMutateError::Failed { message, .. } => {
-            ApiError::internal(message)
-        }
-    })?;
+    };
+    // Hand the marker to the child (it takes it over itself too, whichever
+    // comes first); once the child is gone the marker is stale.
+    record(pid, rupu_launch::proc::start_stamp(pid)).await?;
     Ok((
         axum::http::StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "ok": true, "id": id, "log": log })),
+        Json(serde_json::json!({ "ok": true, "id": id, "compaction_id": cid, "log": log })),
     ))
 }
 
@@ -1962,10 +2027,11 @@ pub(crate) mod tests {
         async fn compact(
             &self,
             _id: &str,
+            _compaction_id: &str,
             _window: Option<u32>,
             _log: &std::path::Path,
-        ) -> Result<(), SessionMutateError> {
-            Ok(())
+        ) -> Result<u32, SessionMutateError> {
+            Ok(0)
         }
     }
 

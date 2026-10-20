@@ -569,10 +569,11 @@ impl rupu_cp::session_mutator::SessionMutator for StubSessionMutator {
     async fn compact(
         &self,
         _id: &str,
+        _compaction_id: &str,
         _window: Option<u32>,
         _log: &std::path::Path,
-    ) -> Result<(), rupu_cp::session_mutator::SessionMutateError> {
-        Ok(())
+    ) -> Result<u32, rupu_cp::session_mutator::SessionMutateError> {
+        Ok(0)
     }
 }
 
