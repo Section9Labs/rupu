@@ -4,18 +4,22 @@
 //! gates are polled through `get_run`, and a remote message space through
 //! `list_messages` from the id of the last message seen (a string cursor).
 //!
-//! Requests go out in rounds: the first at the call's start, then one every
-//! [`REMOTE_POLL`] (or at once when an `end` frame needs its run's status).
-//! A round is an owned future the wait loop polls beside its other sources,
-//! so a slow host delays nothing else; within it, each host's requests go
-//! one after another (at most one in flight per host), and only one round is
-//! in flight at a time. A stream is its host's long-lived connection, not a
-//! poll; one that ends without its `end` frame is reopened from its cursor at
-//! the next round, silently when the reopen succeeds. The first request for a
-//! source failing fails the call; a later failure is retried next round and
-//! reported in the result's `warnings`. The first round may run up to
-//! [`FIRST_ROUND_BUDGET`] past a shorter timeout (a `timeout_ms: 0` peek), and
-//! holds back a result something else fired by at most that.
+//! Requests go out in rounds, per host: each host's first round at the
+//! call's start, then one every [`REMOTE_POLL`] (or at once when an `end`
+//! frame needs its run's status). A host has at most one round in flight, and
+//! within it its requests go one after another; hosts' rounds are independent
+//! owned futures the wait loop polls beside its other sources, each applied as
+//! it lands, so a slow or hung host delays neither the local sources nor
+//! another host. A stream is its host's long-lived connection, not a poll; one
+//! that ends without its `end` frame is reopened from its cursor at that
+//! host's next round, silently when the reopen succeeds.
+//!
+//! A failure in a host's first round fails the call; a later failure is
+//! retried at its next round and reported in the result's `warnings`. A first
+//! round may run up to [`FIRST_ROUND_BUDGET`] past a shorter timeout (a
+//! `timeout_ms: 0` peek). Once something fired, a host whose first round is
+//! still out holds the result back by at most that much from the call's
+//! start; past it, only that host's sources are named in `warnings`.
 
 use std::future::Future;
 use std::io;
@@ -24,7 +28,8 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
-use futures_util::Stream;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{Stream, StreamExt as _};
 use rupu_fleet::{LogLine, MessageKind};
 use rupu_runtime::services::operator::{MessagesView, ViewQuery};
 use serde_json::{json, Value};
@@ -59,6 +64,12 @@ type Frames = Pin<Box<dyn Stream<Item = io::Result<RunFrame>> + Send>>;
 struct Host {
     id: String,
     conn: Arc<dyn HostConnector>,
+    /// A round of its is in flight.
+    busy: bool,
+    /// Its first round answered.
+    answered: bool,
+    /// When its next poll round is due.
+    next_poll: Instant,
 }
 
 /// A remote run's event stream, read for the `run_events` and `run_settled`
@@ -101,6 +112,19 @@ pub(super) struct Remote {
     msgs: Vec<MsgSrc>,
     /// Where the next look for a frame starts, so no stream starves another.
     turn: usize,
+    /// The hosts' rounds in flight, at most one per host.
+    inflight: FuturesUnordered<HostRound>,
+}
+
+/// One host's round in flight: the host, then its answers.
+type HostRound = Pin<Box<dyn Future<Output = (usize, Vec<Answer>)> + Send>>;
+
+/// What the remote side has for the wait loop.
+pub(super) enum RemoteWake {
+    /// A stream yielded (its source's index), or ended (`None`).
+    Frame(usize, Option<io::Result<RunFrame>>),
+    /// A host's round landed.
+    Round(usize, Vec<Answer>),
 }
 
 enum Ask {
@@ -126,15 +150,12 @@ enum Ask {
 
 /// Which requests a round makes.
 #[derive(Clone, Copy, PartialEq)]
-pub(super) enum RoundKind {
+enum RoundKind {
     /// Reopen streams, poll gates and spaces, and ask the statuses owed.
     All,
     /// Only the statuses owed.
     Status,
 }
-
-/// A round in flight: its answers, once every host has given them.
-pub(super) type Round = Pin<Box<dyn Future<Output = Vec<Answer>> + Send>>;
 
 /// Why a request gave no answer.
 pub(super) enum Fail {
@@ -160,6 +181,7 @@ impl Remote {
             gates: Vec::new(),
             msgs: Vec::new(),
             turn: 0,
+            inflight: FuturesUnordered::new(),
         };
         for c in watch {
             let Some(host_id) = &c.host else { continue };
@@ -176,6 +198,9 @@ impl Remote {
                     r.hosts.push(Host {
                         id: host_id.clone(),
                         conn,
+                        busy: false,
+                        answered: false,
+                        next_poll: Instant::now(),
                     });
                     r.hosts.len() - 1
                 }
@@ -235,28 +260,75 @@ impl Remote {
         Ok(r)
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.hosts.is_empty()
+    /// Every host's first round, each bounded by `first_by`.
+    pub(super) fn start(&mut self, watch: &[Condition], got: &Got, first_by: Instant) {
+        for h in 0..self.hosts.len() {
+            self.hosts[h].next_poll = Instant::now() + REMOTE_POLL;
+            if !self.launch(h, watch, got, first_by, RoundKind::All) {
+                self.hosts[h].answered = true;
+            }
+        }
     }
 
-    /// An `end` frame left `run_settled` conditions waiting for a status.
-    pub(super) fn owes_status(&self) -> bool {
-        self.runs.iter().any(|s| s.needs_status)
+    /// Start each idle host's round that is due: its poll round every
+    /// [`REMOTE_POLL`], else the statuses its `end` frames owe.
+    pub(super) fn schedule(&mut self, watch: &[Condition], got: &Got, deadline: Instant) {
+        let now = Instant::now();
+        for h in 0..self.hosts.len() {
+            if self.hosts[h].busy {
+                continue;
+            }
+            if now >= self.hosts[h].next_poll {
+                self.hosts[h].next_poll = now + REMOTE_POLL;
+                self.launch(h, watch, got, deadline, RoundKind::All);
+            } else if self.runs.iter().any(|s| s.host == h && s.needs_status) {
+                self.launch(h, watch, got, deadline, RoundKind::Status);
+            }
+        }
     }
 
-    /// The next round's requests as an owned future, each bounded by
-    /// `deadline`; `None` when there is nothing to ask.
-    pub(super) fn round(
-        &self,
+    /// When the next idle host's poll round is due.
+    pub(super) fn next_poll_at(&self) -> Option<Instant> {
+        self.hosts
+            .iter()
+            .filter(|h| !h.busy)
+            .map(|h| h.next_poll)
+            .min()
+    }
+
+    /// A host's first round is still out.
+    pub(super) fn first_pending(&self) -> bool {
+        self.hosts.iter().any(|h| !h.answered)
+    }
+
+    /// Host `h`'s round of `kind` in flight, its requests bounded by
+    /// `deadline`; `false` when it has nothing to ask.
+    fn launch(
+        &mut self,
+        h: usize,
         watch: &[Condition],
         got: &Got,
         deadline: Instant,
         kind: RoundKind,
-    ) -> Option<Round> {
-        let mut asks: Vec<Vec<Ask>> = self.hosts.iter().map(|_| Vec::new()).collect();
-        for (src, s) in self.runs.iter().enumerate() {
+    ) -> bool {
+        let asks = self.asks_for(h, watch, got, kind);
+        if asks.is_empty() {
+            return false;
+        }
+        let conn = Arc::clone(&self.hosts[h].conn);
+        self.hosts[h].busy = true;
+        self.inflight.push(Box::pin(async move {
+            (h, ask_host(conn, asks, deadline).await)
+        }));
+        true
+    }
+
+    /// Host `h`'s requests for a round of `kind`.
+    fn asks_for(&self, h: usize, watch: &[Condition], got: &Got, kind: RoundKind) -> Vec<Ask> {
+        let mut asks = Vec::new();
+        for (src, s) in self.runs.iter().enumerate().filter(|(_, s)| s.host == h) {
             if s.needs_status {
-                asks[s.host].push(Ask::Status {
+                asks.push(Ask::Status {
                     src,
                     run: s.run.clone(),
                 });
@@ -266,7 +338,7 @@ impl Remote {
                 } else {
                     NO_EVENTS
                 };
-                asks[s.host].push(Ask::Open {
+                asks.push(Ask::Open {
                     src,
                     run: s.run.clone(),
                     after,
@@ -274,21 +346,21 @@ impl Remote {
             }
         }
         if kind == RoundKind::All {
-            for (src, s) in self.gates.iter().enumerate() {
+            for (src, s) in self.gates.iter().enumerate().filter(|(_, s)| s.host == h) {
                 let pending = watch.iter().enumerate().any(|(i, c)| {
                     c.source == s.source
                         && matches!(c.kind, Kind::Gate)
                         && !got.fired.contains_key(&i)
                 });
                 if pending {
-                    asks[s.host].push(Ask::Gate {
+                    asks.push(Ask::Gate {
                         src,
                         run: s.run.clone(),
                     });
                 }
             }
-            for (src, s) in self.msgs.iter().enumerate() {
-                asks[s.host].push(Ask::Msgs {
+            for (src, s) in self.msgs.iter().enumerate().filter(|(_, s)| s.host == h) {
+                asks.push(Ask::Msgs {
                     src,
                     root: s.root.clone(),
                     q: ViewQuery {
@@ -299,28 +371,27 @@ impl Remote {
                 });
             }
         }
-        if asks.iter().all(Vec::is_empty) {
-            return None;
-        }
-        // Hosts side by side; each host's requests one after another.
-        let hosts: Vec<_> = self
-            .hosts
-            .iter()
-            .zip(asks)
-            .map(|(h, asks)| ask_host(Arc::clone(&h.conn), asks, deadline))
-            .collect();
-        Some(Box::pin(async move {
-            futures_util::future::join_all(hosts)
-                .await
-                .into_iter()
-                .flatten()
-                .collect()
-        }))
+        asks
+    }
+
+    /// Take host `h`'s round: on its first round any failure is the call's
+    /// error; later, a warning.
+    pub(super) fn landed(
+        &mut self,
+        h: usize,
+        answers: Vec<Answer>,
+        watch: &[Condition],
+        got: &mut Got,
+    ) -> Result<(), String> {
+        let host = &mut self.hosts[h];
+        host.busy = false;
+        let first = !std::mem::replace(&mut host.answered, true);
+        self.apply(answers, watch, got, first)
     }
 
     /// Take a round's answers. On the `first` round any failure is the call's
     /// error; later, a warning.
-    pub(super) fn apply(
+    fn apply(
         &mut self,
         answers: Vec<Answer>,
         watch: &[Condition],
@@ -403,60 +474,91 @@ impl Remote {
         Ok(())
     }
 
-    /// The first round, once something else fired: its answers (any failure
-    /// the call's error) if they come by `cut`; else it is dropped, so a slow
-    /// host holds the result back by at most [`FIRST_ROUND_BUDGET`], and every
-    /// remote source is named in `warnings`.
+    /// The hosts' first rounds still out, once something else fired: taken
+    /// as they land (a failure the call's error) until `cut`. A host that
+    /// hasn't answered by then has its sources named in `warnings`.
     pub(super) async fn settle_first(
         &mut self,
-        round: Option<Round>,
         cut: Instant,
+        deadline: Instant,
         watch: &[Condition],
         got: &mut Got,
     ) -> Result<(), String> {
-        let Some(round) = round else { return Ok(()) };
-        match tokio::time::timeout_at(cut, round).await {
-            Ok(answers) => self.apply(answers, watch, got, true),
-            Err(_) => {
-                let sources = self
-                    .runs
-                    .iter()
-                    .map(|s| &s.source)
-                    .chain(self.gates.iter().map(|s| &s.source))
-                    .chain(self.msgs.iter().map(|s| &s.source));
-                for source in sources {
-                    got.warnings.entry(source.clone()).or_insert_with(|| {
-                        format!("no first answer within {} s", FIRST_ROUND_BUDGET.as_secs())
-                    });
-                }
-                Ok(())
+        while self.first_pending() {
+            match tokio::time::timeout_at(cut, self.next()).await {
+                Ok(RemoteWake::Round(h, answers)) => self.landed(h, answers, watch, got)?,
+                Ok(RemoteWake::Frame(i, item)) => self.on_frame(i, item, watch, got),
+                Err(_) => break,
             }
         }
+        let why = if cut >= deadline || Instant::now() >= deadline {
+            "no answer before the call's timeout".to_string()
+        } else {
+            format!("no first answer within {} s", FIRST_ROUND_BUDGET.as_secs())
+        };
+        for (h, host) in self.hosts.iter().enumerate() {
+            if host.answered {
+                continue;
+            }
+            let sources = self
+                .runs
+                .iter()
+                .filter(|s| s.host == h)
+                .map(|s| &s.source)
+                .chain(self.gates.iter().filter(|s| s.host == h).map(|s| &s.source))
+                .chain(self.msgs.iter().filter(|s| s.host == h).map(|s| &s.source));
+            for source in sources {
+                got.warnings
+                    .entry(source.clone())
+                    .or_insert_with(|| why.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// The next frame of any open stream, or the next host round to land.
+    /// Pending while there is neither.
+    pub(super) fn next(&mut self) -> impl Future<Output = RemoteWake> + Send + '_ {
+        std::future::poll_fn(move |cx| {
+            if let Poll::Ready((i, item)) = self.poll_frame(cx) {
+                return Poll::Ready(RemoteWake::Frame(i, item));
+            }
+            match self.inflight.poll_next_unpin(cx) {
+                Poll::Ready(Some((h, answers))) => Poll::Ready(RemoteWake::Round(h, answers)),
+                // Empty: a round pushed later is polled on the next call.
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            }
+        })
     }
 
     /// The next frame of any open stream, with the index of its source;
     /// `None` when that stream ended. Pending while no stream is open.
-    pub(super) fn next_frame(
+    fn next_frame(
         &mut self,
     ) -> impl Future<Output = (usize, Option<io::Result<RunFrame>>)> + Send + '_ {
-        std::future::poll_fn(move |cx| {
-            let n = self.runs.len();
-            for k in 0..n {
-                let i = (self.turn + k) % n;
-                if let Some(s) = self.runs[i].stream.as_mut() {
-                    if let Poll::Ready(item) = s.as_mut().poll_next(cx) {
-                        self.turn = (i + 1) % n;
-                        return Poll::Ready((i, item));
-                    }
+        std::future::poll_fn(move |cx| self.poll_frame(cx))
+    }
+
+    fn poll_frame(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<(usize, Option<io::Result<RunFrame>>)> {
+        let n = self.runs.len();
+        for k in 0..n {
+            let i = (self.turn + k) % n;
+            if let Some(s) = self.runs[i].stream.as_mut() {
+                if let Poll::Ready(item) = s.as_mut().poll_next(cx) {
+                    self.turn = (i + 1) % n;
+                    return Poll::Ready((i, item));
                 }
             }
-            Poll::Pending
-        })
+        }
+        Poll::Pending
     }
 
     /// Take what source `i`'s stream yielded: an event its `run_events`
     /// conditions want; its `end`, which owes its `run_settled` conditions a
-    /// status ([`Self::owes_status`]); or its end without one, broken or not,
+    /// status (its host's next round asks); or its end without one, broken or not,
     /// which the next round reopens (a warning only if that fails).
     pub(super) fn on_frame(
         &mut self,
@@ -530,8 +632,14 @@ impl Remote {
                 Err(_) => break,
             }
         }
-        if let Some(round) = self.round(watch, got, deadline, RoundKind::Status) {
-            let answers = round.await;
+        // The statuses its `end` frames owe, from each idle host.
+        let rounds: Vec<_> = (0..self.hosts.len())
+            .filter(|&h| !self.hosts[h].busy)
+            .map(|h| (h, self.asks_for(h, watch, got, RoundKind::Status)))
+            .filter(|(_, asks)| !asks.is_empty())
+            .map(|(h, asks)| ask_host(Arc::clone(&self.hosts[h].conn), asks, deadline))
+            .collect();
+        for answers in futures_util::future::join_all(rounds).await {
             // Never an error past the first round.
             let _ = self.apply(answers, watch, got, false);
         }

@@ -49,9 +49,10 @@ impl RunFrame {
     }
 }
 
-/// The most a run event stream may buffer without completing a line: past
-/// it, [`parse_run_frames`] yields an error and stops. (The buffer then holds
-/// at most this plus one chunk.)
+/// The most a run event stream may hold without completing a frame — the
+/// fields read so far plus the line being completed: past it,
+/// [`parse_run_frames`] yields an error and stops. (It then holds at most
+/// this plus one chunk.)
 pub const MAX_FRAME_BUFFER: usize = 16 * 1024 * 1024;
 
 /// The frames of a run event stream as [`RunFrame::to_sse_bytes`] writes them
@@ -59,8 +60,8 @@ pub const MAX_FRAME_BUFFER: usize = 16 * 1024 * 1024;
 /// Partial frames across chunks are buffered; a line ends at `\n`, `\r\n` or
 /// a bare `\r`. An unknown event name is skipped, as is an event frame
 /// without a numeric `id`. A byte-stream error is yielded, and ends the
-/// stream, as does buffering more than [`MAX_FRAME_BUFFER`] without a line
-/// ending; the end of the bytes ends it too, dropping a frame left
+/// stream, as does holding more than [`MAX_FRAME_BUFFER`] of a frame not yet
+/// complete; the end of the bytes ends it too, dropping a frame left
 /// incomplete.
 pub fn parse_run_frames(
     bytes: crate::host::connector::EventByteStream,
@@ -85,23 +86,18 @@ pub fn parse_run_frames(
                 if let Some(frame) = frame {
                     return Some((Ok(frame), st));
                 }
+                // A field line: the frame's fields grew.
+                if st.fields() > MAX_FRAME_BUFFER {
+                    return Some((st.over_cap(), st));
+                }
             }
             if st.eof {
                 return None;
             }
             // Every complete line is read: what is left is one line still
             // being completed.
-            if st.buf.len() - st.pos > MAX_FRAME_BUFFER {
-                st.done = true;
-                return Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "the event stream sent over {MAX_FRAME_BUFFER} bytes without a line ending"
-                        ),
-                    )),
-                    st,
-                ));
+            if st.fields() + (st.buf.len() - st.pos) > MAX_FRAME_BUFFER {
+                return Some((st.over_cap(), st));
             }
             match st.bytes.next().await {
                 Some(Ok(chunk)) => {
@@ -142,6 +138,22 @@ struct FrameReader {
 }
 
 impl FrameReader {
+    /// The size of the fields of the frame being read.
+    fn fields(&self) -> usize {
+        self.event.len()
+            + self.id.as_ref().map_or(0, String::len)
+            + self.data.as_ref().map_or(0, String::len)
+    }
+
+    /// The error that ends a stream past [`MAX_FRAME_BUFFER`].
+    fn over_cap(&mut self) -> std::io::Result<RunFrame> {
+        self.done = true;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("the event stream sent a frame of over {MAX_FRAME_BUFFER} bytes"),
+        ))
+    }
+
     /// The frame a blank line completes, if it is one we serve.
     fn dispatch(&mut self) -> Option<RunFrame> {
         let event = std::mem::take(&mut self.event);
@@ -845,6 +857,19 @@ mod tests {
             id,
             json: json.into(),
         }
+    }
+
+    #[tokio::test]
+    async fn data_lines_past_the_cap_without_a_blank_line_are_an_error() {
+        let line = format!("data: {}\n", "x".repeat(1024 * 1024));
+        let mut chunk = b"id: 1\ndata: {}\n\nid: 2\n".to_vec();
+        for _ in 0..(MAX_FRAME_BUFFER / (1024 * 1024) + 1) {
+            chunk.extend_from_slice(line.as_bytes());
+        }
+        let (frames, err) = frames_of(vec![chunk, b"\n".to_vec()]).await;
+        assert_eq!(frames, vec![ev(1, "{}")]);
+        let err = err.expect("the cap ends the stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

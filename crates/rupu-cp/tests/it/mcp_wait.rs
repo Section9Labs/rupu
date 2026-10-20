@@ -1727,4 +1727,89 @@ async fn a_hung_first_round_holds_a_fired_result_back_at_most_5s() {
         json!([format!("run:run_other@{host}: no first answer within 5 s")]),
         "{r}"
     );
+
+    // Past the call's own timeout, the warning says so.
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_settled", "run": RUN},
+                         {"kind": "run_gate", "run": "run_other", "host": host}],
+               "timeout_ms": 0}),
+    )
+    .await;
+    assert_eq!(
+        r["structuredContent"]["warnings"],
+        json!([format!(
+            "run:run_other@{host}: no answer before the call's timeout"
+        )]),
+        "{r}"
+    );
+}
+
+/// A coordinator with a healthy peer and a hung one (accepts, never
+/// answers) registered; its address and the two host ids.
+async fn spawn_with_healthy_and_hung(
+    global: &Path,
+    healthy: &Peer,
+) -> (SocketAddr, String, String) {
+    let (hung_url, _) = fake_peer(|_, _| Reply::Hold(String::new())).await;
+    let state = state_of(global);
+    let ok = state.hosts.add_host("healthy", &healthy.url, None).unwrap();
+    let hung = state.hosts.add_host("hung", &hung_url, None).unwrap();
+    (serve(state).await, ok.id, hung.id)
+}
+
+/// Hosts' rounds are independent: a hung host holds up neither another
+/// host's events nor its own warning's accuracy (only the hung host is
+/// named).
+#[tokio::test]
+async fn a_hung_host_does_not_hold_up_another_host() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    seed(remote.path(), RunStatus::Running);
+    append_step(remote.path(), "one");
+    append_step(remote.path(), "two");
+    let peer = Peer::start(remote.path());
+    let (addr, ok, hung) = spawn_with_healthy_and_hung(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_events", "run": RUN, "host": ok},
+                         {"kind": "run_gate", "run": "run_other", "host": hung}],
+               "timeout_ms": 15_000}),
+    )
+    .await;
+    // Held back by the hung host's first round for at most 5 s.
+    assert!(t.elapsed() < Duration::from_secs(7), "{:?}", t.elapsed());
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(ids(&r), vec![1, 2], "{r}");
+    let s = &r["structuredContent"];
+    assert_eq!(s["cursor"], json!({ format!("run:{RUN}@{ok}"): 2 }), "{r}");
+    assert_eq!(
+        s["warnings"],
+        json!([format!("run:run_other@{hung}: no first answer within 5 s")]),
+        "{r}"
+    );
+}
+
+/// A healthy host's first-round failure is still the call's error while
+/// another host hangs.
+#[tokio::test]
+async fn a_hosts_first_round_error_is_not_lost_beside_a_hung_host() {
+    let (coord, remote) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let peer = Peer::start(remote.path());
+    let (addr, ok, hung) = spawn_with_healthy_and_hung(coord.path(), &peer).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "run_gate", "run": "run_nope", "host": ok},
+                         {"kind": "run_gate", "run": "run_other", "host": hung}],
+               "timeout_ms": 15_000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert_eq!(
+        text_of(&r),
+        format!("no run `run_nope` on host `{ok}`"),
+        "{r}"
+    );
 }

@@ -31,7 +31,7 @@ use crate::transcript_tail::{count_numbered, NumberedTail};
 
 use local::{catch_up, locate, matching, Feed, Line, Located, Tail};
 use parse::{input_schema, parse, Condition, CursorValue, Kind, Request};
-use remote::{Remote, Round, RoundKind, FIRST_ROUND_BUDGET, REMOTE_POLL};
+use remote::{Remote, RemoteWake, FIRST_ROUND_BUDGET};
 
 /// The timeout when a call names none.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(30_000);
@@ -85,9 +85,11 @@ const DESCRIPTION: &str =
     "Wait for a run to settle, a gate to park, new run, agentiflow or message \
 lines, a standalone agent run to finish, a session turn to end or new finding records to be recorded \
 (a tag change on an older finding is not one). Returns at once when a watched \
-state already holds (except a remote `run_settled`, which fires once the host's event stream ends, \
-about 2 s after the run's last event); otherwise when a condition fires, a watched stream has new lines, or the \
-timeout. For `session_turn` pass the `run` id `sessions.send` returned; without it the call waits \
+state already holds, with two exceptions: a remote `run_settled` fires once the host's event \
+stream ends, about 2 s after the run's last event; and a call watching a remote host waits up to \
+5 s from its start for that host's first answer, even when something already fired. Otherwise \
+it returns when a condition fires, a watched stream has new lines, or the timeout. For \
+`session_turn` pass the `run` id `sessions.send` returned; without it the call waits \
 for the session's active turn, or the next one if it is idle. An error in any one condition (a \
 run, session or turn that doesn't appear within 10 s) fails the whole call. Pass the returned \
 `cursor` back to resume where the last call left off. With `host`, a run's events come from that \
@@ -241,7 +243,7 @@ impl WaitSource {
         let mut ledgers = findings::Findings::default();
         let first_cut = Instant::now() + FIRST_ROUND_BUDGET;
         let first_by = deadline.max(first_cut);
-        let mut round: Option<Round> = remote.round(&req.watch, &got, first_by, RoundKind::All);
+        remote.start(&req.watch, &got, first_by);
         if let Err(e) = self
             .check(&req.watch, &located, (&mut started, &mut ledgers), &mut got)
             .await
@@ -253,7 +255,7 @@ impl WaitSource {
         }
         if got.any() {
             if let Err(e) = remote
-                .settle_first(round.take(), first_cut, &req.watch, &mut got)
+                .settle_first(first_cut, deadline, &req.watch, &mut got)
                 .await
             {
                 return ToolResult::Error(e);
@@ -261,8 +263,8 @@ impl WaitSource {
             remote.drain(&req.watch, &mut got, deadline).await;
             return got.finish(&req.watch);
         }
-        // Otherwise it stays in flight in the loop below, beside the tails.
-        let mut first_pending = round.is_some();
+        // Otherwise the first rounds stay in flight in the loop below, beside
+        // the tails.
 
         let mut tails: Vec<Tail> = Vec::new();
         for (i, (source, feed)) in feeds.iter().enumerate() {
@@ -296,29 +298,21 @@ impl WaitSource {
         let mut lines = futures_util::stream::select_all(tails);
 
         let mut next_check = Instant::now() + RECHECK_EVERY;
-        let mut next_poll = Instant::now() + REMOTE_POLL;
-        // `round` is the remote round in flight: one at a time, polled beside
-        // the other sources so a slow host holds up nothing else.
         let mut last_check = Instant::now();
         loop {
-            if round.is_none() && !remote.is_empty() {
-                let now = Instant::now();
-                let kind = if now >= next_poll {
-                    next_poll = now + REMOTE_POLL;
-                    Some(RoundKind::All)
-                } else {
-                    remote.owes_status().then_some(RoundKind::Status)
-                };
-                if let Some(kind) = kind {
-                    round = remote.round(&req.watch, &got, deadline, kind);
-                }
-            }
-            // Past the deadline, only the first round's answer is waited for.
-            let end = if first_pending { first_by } else { deadline };
-            let wake_at = if remote.is_empty() || round.is_some() {
-                next_check.min(end)
+            // Each idle host's round that is due goes out; the hosts' rounds
+            // are polled beside the other sources, so a slow host holds up
+            // nothing else.
+            remote.schedule(&req.watch, &got, deadline);
+            // Past the deadline, only a first round's answer is waited for.
+            let end = if remote.first_pending() {
+                first_by
             } else {
-                next_check.min(next_poll).min(end)
+                deadline
+            };
+            let wake_at = match remote.next_poll_at() {
+                Some(at) => next_check.min(at).min(end),
+                None => next_check.min(end),
             };
             let wake = tokio::select! {
                 line = async {
@@ -328,13 +322,7 @@ impl WaitSource {
                         std::future::pending().await
                     }
                 } => Wake::Line(line),
-                (src, frame) = remote.next_frame() => Wake::Frame(src, frame),
-                answers = async {
-                    match round.as_mut() {
-                        Some(r) => r.await,
-                        None => std::future::pending().await,
-                    }
-                } => Wake::Round(answers),
+                remote_wake = remote.next() => Wake::Remote(remote_wake),
                 _ = tokio::time::sleep_until(wake_at) => Wake::Tick,
             };
             match wake {
@@ -363,24 +351,22 @@ impl WaitSource {
                         }
                     }
                 }
-                Wake::Frame(src, frame) => {
+                Wake::Remote(RemoteWake::Frame(src, frame)) => {
                     remote.on_frame(src, frame, &req.watch, &mut got);
                     if got.any() {
                         break;
                     }
                 }
-                Wake::Round(answers) => {
-                    round = None;
-                    let first = std::mem::take(&mut first_pending);
-                    if let Err(e) = remote.apply(answers, &req.watch, &mut got, first) {
+                Wake::Remote(RemoteWake::Round(host, answers)) => {
+                    if let Err(e) = remote.landed(host, answers, &req.watch, &mut got) {
                         return ToolResult::Error(e);
                     }
-                    if got.any() || Instant::now() >= deadline {
+                    if got.any() || (Instant::now() >= deadline && !remote.first_pending()) {
                         break;
                     }
                 }
                 Wake::Tick => {
-                    if Instant::now() >= if first_pending { first_by } else { deadline } {
+                    if Instant::now() >= end {
                         break;
                     }
                     if Instant::now() >= next_check {
@@ -402,14 +388,12 @@ impl WaitSource {
             }
         }
         drop(lines);
-        // A local line fired before the first round answered.
-        if first_pending {
-            if let Err(e) = remote
-                .settle_first(round.take(), first_cut, &req.watch, &mut got)
-                .await
-            {
-                return ToolResult::Error(e);
-            }
+        // Something fired before every host's first round answered.
+        if let Err(e) = remote
+            .settle_first(first_cut, deadline, &req.watch, &mut got)
+            .await
+        {
+            return ToolResult::Error(e);
         }
 
         // Something fired: return the lines on disk past the cursor with it,
@@ -429,8 +413,7 @@ impl WaitSource {
 #[allow(clippy::large_enum_variant)]
 enum Wake {
     Line(Option<(usize, Line)>),
-    Frame(usize, Option<std::io::Result<crate::sse::RunFrame>>),
-    Round(Vec<remote::Answer>),
+    Remote(RemoteWake),
     Tick,
 }
 
