@@ -18,8 +18,8 @@ use axum::{
     Json, Router,
 };
 use rupu_orchestrator::{
-    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges,
-    StepResultRecord, Workflow,
+    executor::Event, runs::RunStore, workflow_edges, workflow_has_explicit_edges, StepResultRecord,
+    Workflow, WorkflowParseError,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashSet};
@@ -90,11 +90,21 @@ fn build_run_graph_json(
     // from this endpoint). Synthesize a single-node DAG instead so the page
     // renders. The `yaml.trim().is_empty()` arm is a defensive fallback for
     // any empty snapshot, not only the `agent:` prefix.
+    //
+    // A snapshot that declares `steps: []` is refused by `Workflow::parse`
+    // (`WorkflowParseError::Empty`); it has nothing to draw, so it is an empty
+    // graph rather than a 500.
     let dag = if run.workflow_name.starts_with("agent:") || yaml.trim().is_empty() {
         agent_run_dag(&run.workflow_name)
     } else {
-        let wf = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
-        to_step_dag(&wf)
+        match Workflow::parse(&yaml) {
+            Ok(wf) => to_step_dag(&wf),
+            Err(WorkflowParseError::Empty) => StepDag {
+                steps: vec![],
+                edges: vec![],
+            },
+            Err(e) => return Err(ApiError::internal(e.to_string())),
+        }
     };
 
     // 4. Step results and unit checkpoints — missing files = empty vecs.
