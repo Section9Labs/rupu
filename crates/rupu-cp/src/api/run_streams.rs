@@ -2975,9 +2975,6 @@ mod tests {
         .expect("ok");
 
         assert_eq!(rows.len(), 1, "only the Aug 10 cycle falls in range");
-        assert_eq!(
-            rows[0]["started_at"],
-            serde_json::json!(day(10).to_rfc3339())
-        );
+        assert_eq!(rows[0]["started_at"], serde_json::json!(day(10).to_rfc3339()));
     }
 }

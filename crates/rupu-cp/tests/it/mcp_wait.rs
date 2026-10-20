@@ -674,3 +674,80 @@ async fn a_host_on_these_conditions_is_refused() {
         assert!(text_of(&r).contains("host"), "{r}");
     }
 }
+
+#[tokio::test]
+async fn an_idle_session_without_run_does_not_fire_on_an_old_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_I",
+        "idle",
+        None,
+        json!([{"run_id": "run_old", "transcript_path": path.to_str().unwrap()}]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_I"}], "timeout_ms": 1500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+}
+
+#[tokio::test]
+async fn session_turn_with_an_explicit_run_fires_on_that_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = transcript(tmp.path(), "run_old", "old answer.", "ok");
+    let new = transcript(tmp.path(), "run_new", "new answer.", "ok");
+    session(
+        tmp.path(),
+        "ses_E",
+        "idle",
+        None,
+        json!([
+            {"run_id": "run_old", "transcript_path": old.to_str().unwrap()},
+            {"run_id": "run_new", "transcript_path": new.to_str().unwrap()}
+        ]),
+    );
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_E", "run": "run_old"}]}),
+    )
+    .await;
+    let d = &r["structuredContent"]["fired"][0]["detail"];
+    assert_eq!(d["run_id"], "run_old", "{r}");
+    assert_eq!(d["final_answer"], "old answer.", "{r}");
+}
+
+#[tokio::test]
+async fn an_unknown_run_on_a_session_is_an_error_after_the_grace() {
+    let tmp = tempfile::tempdir().unwrap();
+    session(tmp.path(), "ses_U", "idle", None, json!([]));
+    let addr = spawn(tmp.path()).await;
+    let t = Instant::now();
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "session_turn", "session": "ses_U", "run": "run_nope"}],
+            "timeout_ms": 30000}),
+    )
+    .await;
+    assert!(t.elapsed() < Duration::from_secs(12), "{:?}", t.elapsed());
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains("run_nope"), "{r}");
+}
+
+#[tokio::test]
+async fn a_timeout_shorter_than_the_grace_times_out_cleanly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let addr = spawn(tmp.path()).await;
+    let r = wait(
+        addr,
+        json!({"watch": [{"kind": "agent_run_end", "run": "run_none"}], "timeout_ms": 1500}),
+    )
+    .await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    assert_eq!(r["structuredContent"]["timed_out"], true, "{r}");
+}

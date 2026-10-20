@@ -77,10 +77,14 @@ impl WaitSource {
     }
 }
 
-const DESCRIPTION: &str = "Wait for a run to settle, a gate to park, new run, agentiflow or message \
-lines, a standalone agent run to finish or a session turn to end. Returns at once when a watched state already holds; otherwise when a condition \
-fires, a watched stream has new lines, or the timeout. Pass the returned `cursor` back to \
-resume where the last call left off.";
+const DESCRIPTION: &str =
+    "Wait for a run to settle, a gate to park, new run, agentiflow or message \
+lines, a standalone agent run to finish or a session turn to end. Returns at once when a watched \
+state already holds; otherwise when a condition fires, a watched stream has new lines, or the \
+timeout. For `session_turn` pass the `run` id `sessions.send` returned; without it the call waits \
+for the session's active turn, or the next one if it is idle. An error in any one condition (a \
+run, session or turn that doesn't appear within 10 s) fails the whole call. Pass the returned \
+`cursor` back to resume where the last call left off.";
 
 #[async_trait]
 impl ToolSource for WaitSource {

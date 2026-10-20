@@ -146,10 +146,10 @@ pub(super) fn input_schema() -> Value {
                         "required": ["kind", "session"],
                         "properties": {
                             "kind": {"type": "string", "enum": ["session_turn"],
-                                "description": "A session turn ended (or the session stopped); returns the turn's final answer (local only)."},
+                                "description": "A session turn ended, or the session stopped or failed; returns the turn's final answer (local only)."},
                             "session": {"type": "string", "description": "A session id."},
                             "run": {"type": "string",
-                                "description": "The turn's run id; default the active turn, else the latest."}
+                                "description": "The turn's run id (what `sessions.send` returned). Without it: the active turn, else the next one to start."}
                         }
                     }
                 ]}

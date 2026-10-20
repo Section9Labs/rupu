@@ -111,13 +111,13 @@ fn session_turn(global: &Path, session: &str, run: Option<&str>) -> Result<Probe
         return Ok(Probe::Missing(format!("no session `{session}`")));
     };
     let turns = dto.turns();
-    let stopped = dto.status_word() != "running";
+    // `idle` is a session's resting state between turns, not an end.
+    let ended = matches!(dto.status_word().as_str(), "stopped" | "failed");
+    // The turn watched: the one named, else the active one. With neither
+    // (idle), the next turn to become active — never an older, finished one.
     let turn = match run {
         Some(r) => Some(r.to_string()),
-        None => dto
-            .active_run_id()
-            .map(str::to_string)
-            .or_else(|| turns.last().map(|(r, _)| r.clone())),
+        None => dto.active_run_id().map(str::to_string),
     };
     // The turn may not be in `runs[]` yet while it is the active one.
     let known = |r: &str| dto.active_run_id() == Some(r) || turns.iter().any(|(t, _)| t == r);
@@ -136,7 +136,7 @@ fn session_turn(global: &Path, session: &str, run: Option<&str>) -> Result<Probe
             .or_else(|| crate::api::run_streams::agent_run_transcript(global, r))
     });
     let end = path.as_deref().and_then(run_end);
-    if end.is_none() && !stopped {
+    if end.is_none() && !ended {
         return Ok(Probe::Pending);
     }
     let error = end
