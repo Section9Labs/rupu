@@ -30,6 +30,7 @@ import { msgHash, parseMsgHash } from '../lib/messages';
 import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
+import { useFlowStop } from '../components/agentiflow/useFlowStop';
 import TranscriptBrowser, { type Selection as TranscriptSelection } from '../components/agentiflow/TranscriptBrowser';
 import AgentiflowEventFeed from '../components/agentiflow/AgentiflowEventFeed';
 import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
@@ -122,6 +123,13 @@ export default function AgentiflowDetail() {
   }, [load]);
 
   const running = detail?.record.status === 'running';
+  const stopControls = useFlowStop({
+    id,
+    running,
+    coordinatorGone: detail?.record.runner_alive === false,
+    liveUnits: detail?.units.filter((u) => u.status.state === 'running').length ?? 0,
+    reload: () => void load(true),
+  });
   useEffect(() => {
     if (!running) return;
     const t = setInterval(() => void load(true), POLL_MS);
@@ -244,11 +252,15 @@ export default function AgentiflowDetail() {
             )}
             {def?.description && <p className="mt-2 max-w-3xl text-sm text-ink-dim">{def.description}</p>}
           </div>
-          <Button variant="secondary" onClick={() => void load(false)} className="shrink-0 gap-1.5">
-            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-            Refresh
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            {stopControls.buttons}
+            <Button variant="secondary" onClick={() => void load(false)} className="gap-1.5">
+              <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+              Refresh
+            </Button>
+          </div>
         </header>
+        {stopControls.panel && <div className="mt-3 max-w-3xl">{stopControls.panel}</div>}
       </div>
 
       {error && <ErrorBanner>{error}</ErrorBanner>}

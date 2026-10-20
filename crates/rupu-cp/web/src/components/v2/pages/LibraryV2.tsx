@@ -7,6 +7,7 @@ import { Composite } from './Composite';
 
 const Agents = lazy(() => import('../../../pages/Agents'));
 const Workflows = lazy(() => import('../../../pages/Workflows'));
+const AgentiflowDefs = lazy(() => import('../../../pages/AgentiflowDefs'));
 const AutoflowsDefs = lazy(() => import('../../../pages/AutoflowsDefs'));
 const Skills = lazy(() => import('../../../pages/Skills'));
 
@@ -18,6 +19,7 @@ export default function LibraryV2() {
       tabs={[
         { value: 'agents', label: 'agents', element: <Agents /> },
         { value: 'workflows', label: 'workflows', element: <Workflows /> },
+        { value: 'agentiflows', label: 'agentiflows', element: <AgentiflowDefs /> },
         { value: 'autoflows', label: 'autoflows', element: <AutoflowsDefs /> },
         { value: 'skills', label: 'skills', element: <Skills /> },
       ]}

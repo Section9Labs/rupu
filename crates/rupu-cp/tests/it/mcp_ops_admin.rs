@@ -1,12 +1,13 @@
 //! The operations-admin operator tools (Plan 3a, package E): the autoflow
-//! operations, cron and maintenance, over the `admin_api` recording stub.
+//! operations, cron and maintenance, over a seeded `RUPU_HOME` and the
+//! `admin_api` recording stub (the cron tick and the cycle spawn).
 
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
-use super::admin_api::{Call, NoopLauncher, StubOps};
+use super::admin_api::{seed_autoflow, seed_claim, Call, NoopLauncher, StubOps, ISSUE};
 use super::mcp::{assert_required_args, call_tool, json_of, rpc, text_of};
-use rupu_cp::admin_ops::{AdminOps, CronTickRequest, RepairRequest};
+use rupu_cp::admin_ops::{AdminOps, CronTickRequest};
 use rupu_cp::mcp::McpOpts;
 use rupu_cp::server::{router_with, RouterOpts};
 use serde_json::{json, Value};
@@ -22,6 +23,7 @@ async fn spawn(ops: Arc<StubOps>) -> (SocketAddr, tempfile::TempDir) {
             // Never the test process's cwd (the rupu checkout's `.rupu/`).
             .with_workspace_dir(tmp.path().into())
             .with_admin_ops(Some(ops as Arc<dyn AdminOps>));
+    seed_autoflow(tmp.path());
     let server = rupu_cp::mcp::build_server(
         &state,
         &McpOpts {
@@ -121,7 +123,7 @@ async fn admin_reads_answer_what_the_api_answers() {
 #[tokio::test]
 async fn admin_writes_record_through_the_mcp() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(Arc::clone(&ops)).await;
+    let (addr, tmp) = spawn(Arc::clone(&ops)).await;
 
     let r = call_tool(
         addr,
@@ -135,40 +137,42 @@ async fn admin_writes_record_through_the_mcp() {
     let r = call_tool(addr, "cron.tick", json!({})).await;
     assert_eq!(json_of(&r), json!({"started": true, "dry_run": false}));
 
+    // A repair on another issue's claim queues its wake, on disk.
+    let claimed = "github:acme/widgets/issues/41";
+    seed_claim(tmp.path(), claimed);
     let r = call_tool(
         addr,
         "claims.repair",
-        json!({"issue_ref": "github:acme/widgets/issues/42", "requeue": true, "dry_run": false}),
+        json!({"issue_ref": claimed, "requeue": true, "dry_run": false}),
     )
     .await;
+    assert!(!is_error(&r), "{}", text_of(&r));
     assert_eq!(json_of(&r)["dry_run"], json!(false));
+    let repair = json_of(&r)["repairs"][0].as_str().unwrap().to_string();
+    let wake_id = repair.strip_prefix("queued repair wake ").unwrap();
+    assert!(
+        tmp.path()
+            .join(format!("autoflows/wakes/queue/{wake_id}.json"))
+            .is_file(),
+        "{repair}"
+    );
 
     let r = call_tool(
         addr,
         "autoflows.run",
-        json!({"name": "fix-issues", "issue": "github:acme/widgets/issues/42"}),
+        json!({"name": "fix-issues", "issue": ISSUE}),
     )
     .await;
+    assert!(!is_error(&r), "{}", text_of(&r));
     assert_eq!(json_of(&r)["started"], json!(true));
 
     let calls = ops.calls();
-    assert_eq!(
-        calls[..2],
-        [
-            Call::Tick(CronTickRequest::default()),
-            Call::Repair(RepairRequest {
-                issue_ref: "github:acme/widgets/issues/42".into(),
-                release: false,
-                requeue: true,
-                dry_run: false,
-            }),
-        ]
-    );
-    assert!(matches!(&calls[2], Call::Run(r) if r.name == "fix-issues"));
+    assert_eq!(calls[0], Call::Tick(CronTickRequest::default()));
+    assert!(matches!(&calls[1], Call::Run(r) if r.name == "fix-issues"));
     assert_eq!(
         calls.len(),
-        3,
-        "the netflow prune ran its library, not the port"
+        2,
+        "the prune and the repair ran their libraries, not the port"
     );
 }
 

@@ -72,3 +72,8 @@ describe('sidebarNavV2', () => {
     expect(badges['/usage']).toBeUndefined();
   });
 });
+
+it('the v1 Build group lists the agentiflow definitions after Workflows', () => {
+  const build = findGroup('build');
+  expect(build.items.map((i) => i.to)).toEqual(['/agents', '/workflows', '/agentiflows/defs', '/autoflows', '/skills']);
+});

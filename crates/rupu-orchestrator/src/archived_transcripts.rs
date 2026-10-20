@@ -5,7 +5,9 @@
 
 use crate::runs::RunStore;
 use chrono::{DateTime, Utc};
-use rupu_runtime::retention::{parse_retention_duration, RetentionError};
+use rupu_runtime::retention::parse_retention_duration;
+pub use rupu_runtime::retention::PruneError;
+pub use rupu_runtime::standalone_run_metadata::archived_transcripts_dir;
 use rupu_runtime::standalone_run_metadata::{
     metadata_path_for_run, read_metadata, StandaloneRunMetadata,
 };
@@ -13,32 +15,6 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-/// Why a prune could not run.
-#[derive(Debug, thiserror::Error)]
-pub enum PruneError {
-    /// The caller's `--older-than` / `older_than` is not a duration.
-    #[error(transparent)]
-    InvalidRetention(#[from] RetentionError),
-    /// The configured retention (`[storage]`) could not be read or is not a
-    /// duration: a configuration problem, not the caller's.
-    #[error("{0}")]
-    Config(String),
-    /// Reading or deleting failed.
-    #[error("{0}")]
-    Failed(String),
-}
-
-impl From<std::io::Error> for PruneError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Failed(e.to_string())
-    }
-}
-
-/// `<transcripts dir>/archive`.
-pub fn archived_transcripts_dir(transcripts_dir: &Path) -> PathBuf {
-    transcripts_dir.join("archive")
-}
 
 /// `rupu run` writes its coverage stream to `<global>/runs/<run_id>/` from the
 /// moment it starts — and, when a coordinator launched it, its netflow

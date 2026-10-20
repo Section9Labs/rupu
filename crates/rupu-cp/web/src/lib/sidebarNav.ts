@@ -79,6 +79,7 @@ export const sidebarNav: NavSection[] = [
     id: 'build', label: 'Build', items: [
       { to: '/agents',    label: 'Agents',    icon: Sparkles, enabled: true },
       { to: '/workflows', label: 'Workflows', icon: Workflow, enabled: true },
+      { to: '/agentiflows/defs', label: 'Agentiflows', icon: Orbit, enabled: true },
       { to: '/autoflows', label: 'Autoflows', icon: Repeat,   enabled: true },
       { to: '/skills',    label: 'Skills',    icon: BookOpen, enabled: true },
     ],

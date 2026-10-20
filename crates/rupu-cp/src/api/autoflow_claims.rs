@@ -4,8 +4,8 @@
 //! - `GET  /api/autoflows/claims`         — list tracked autoflow claims.
 //! - `POST /api/autoflows/claims/release` — delete a claim (release the issue).
 //! - `POST /api/autoflows/claims/requeue` — enqueue a manual wake for an issue.
-//! - `POST /api/autoflows/claims/repair`  — `rupu autoflow repair` (through the
-//!   `AdminOps` port).
+//! - `POST /api/autoflows/claims/repair`  — `rupu autoflow repair`
+//!   (`rupu_autoflow::repair_claim`).
 //!
 //! Issue refs embed `/` and `:` (e.g. `github:Section9Labs/rupu/issues/42`),
 //! so they travel in the JSON body rather than a path segment.
@@ -299,21 +299,24 @@ async fn repair_claim(
     State(s): State<AppState>,
     Query(q): Query<crate::admin_ops::HostQuery>,
     Json(body): Json<RepairBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Json<rupu_autoflow::RepairOutcome>> {
     crate::admin_ops::local_only(q.host.as_deref(), "repairing an autoflow claim")?;
     if !body.dry_run {
         crate::api::config::require_writable_to(&s, "repairing an autoflow claim")?;
     }
-    let ops = crate::admin_ops::ops(&s, "repairing an autoflow claim")?;
-    Ok(Json(
-        ops.autoflow_repair(crate::admin_ops::RepairRequest {
-            issue_ref: crate::admin_ops::full_issue_ref(&body.issue_ref)?,
-            release: body.release,
-            requeue: body.requeue,
-            dry_run: body.dry_run,
-        })
-        .await?,
-    ))
+    let issue_ref = crate::admin_ops::full_issue_ref(&body.issue_ref)?;
+    let global = s.global_dir.clone();
+    let outcome = crate::admin_ops::blocking(move || {
+        rupu_autoflow::repair_claim(
+            &global,
+            &issue_ref,
+            body.release,
+            body.requeue,
+            body.dry_run,
+        )
+    })
+    .await?;
+    Ok(Json(outcome))
 }
 
 #[cfg(test)]

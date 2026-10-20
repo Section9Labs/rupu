@@ -2780,7 +2780,7 @@ async fn runs(
 }
 
 /// One run's usage rows (by provider, model, agent) from the shared usage
-/// fold ([`rupu_cp::usage::run_usage`]): every usage-ledger row — fan-out
+/// fold ([`rupu_orchestrator::usage_summary::run_usage`]): every usage-ledger row — fan-out
 /// units, panelists and dispatched sub-agents included, running steps
 /// too — plus a fold of any known transcript without ledger rows (legacy
 /// runs, remote mirrors). The same definition the control plane serves,
@@ -2790,7 +2790,9 @@ fn aggregate_run_usage_from_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
 ) -> Vec<rupu_transcript::UsageRow> {
-    rupu_cp::usage::run_usage(store, run_id).rows.clone()
+    rupu_orchestrator::usage_summary::run_usage(store, run_id)
+        .rows
+        .clone()
 }
 
 fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {

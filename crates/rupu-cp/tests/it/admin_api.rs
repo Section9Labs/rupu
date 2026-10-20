@@ -1,33 +1,28 @@
 //! The autoflow, cron and maintenance endpoints (operator MCP Plan 3a,
-//! package E). The cron listings and the transcript / netflow prunes run
-//! their libraries over the test's `RUPU_HOME`; the rest reach a recording
-//! `AdminOps` stub with the request they were given. Every endpoint maps
-//! refusals onto 400 / 404 / 409 / 500, refuses a remote `host` with a 501,
-//! and a write needs `cp serve`'s write gate.
+//! package E). The autoflow reads, repair, the run precheck, the cron
+//! listings and every prune run their libraries over the test's
+//! `RUPU_HOME`; only a cron tick and the spawn of an autoflow cycle reach
+//! the recording `AdminOps` stub. Every endpoint maps refusals onto
+//! 400 / 404 / 409 / 500, refuses a remote `host` with a 501, and a write
+//! needs `cp serve`'s write gate.
 
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
 use async_trait::async_trait;
 use rupu_cp::admin_ops::{
-    AdminOpError, AdminOps, AutoflowRunRequest, CronTickOutcome, CronTickRequest, PruneKind,
-    PruneRequest, RepairRequest,
+    AdminOpError, AdminOps, AutoflowRunRequest, CronTickOutcome, CronTickRequest,
 };
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// What the stub was asked, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Call {
-    Show(String, Option<String>),
-    Explain(String, Option<String>),
-    Doctor(Option<String>),
-    Wakes(Option<String>),
-    Repair(RepairRequest),
     Run(AutoflowRunRequest),
     Tick(CronTickRequest),
-    Prune(PruneRequest),
 }
 
 /// Answers each call with a canned report, or with `refuse` when set.
@@ -57,38 +52,6 @@ impl StubOps {
 
 #[async_trait]
 impl AdminOps for StubOps {
-    async fn autoflow_show(&self, name: &str, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::Show(name.into(), repo.map(Into::into)),
-            json!({"kind": "autoflow_show", "version": 1, "item": {"name": name}}),
-        )
-    }
-    async fn autoflow_explain(
-        &self,
-        issue_ref: &str,
-        repo: Option<&str>,
-    ) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::Explain(issue_ref.into(), repo.map(Into::into)),
-            json!({"kind": "autoflow_explain", "version": 1, "item": {"issue": issue_ref, "status": "unclaimed"}}),
-        )
-    }
-    async fn autoflow_doctor(&self, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::Doctor(repo.map(Into::into)),
-            json!({"kind": "autoflow_doctor", "version": 1, "ok": true, "rows": []}),
-        )
-    }
-    async fn autoflow_wakes(&self, repo: Option<&str>) -> Result<Value, AdminOpError> {
-        self.answer(
-            Call::Wakes(repo.map(Into::into)),
-            json!({"kind": "autoflow_wakes", "version": 1, "rows": []}),
-        )
-    }
-    async fn autoflow_repair(&self, req: RepairRequest) -> Result<Value, AdminOpError> {
-        let report = json!({"issue_ref": req.issue_ref, "dry_run": req.dry_run, "repairs": []});
-        self.answer(Call::Repair(req), report)
-    }
     async fn autoflow_run(&self, req: AutoflowRunRequest) -> Result<Value, AdminOpError> {
         let report = json!({"started": true, "name": req.name, "issue": req.issue});
         self.answer(Call::Run(req), report)
@@ -101,11 +64,6 @@ impl AdminOps for StubOps {
         } else {
             CronTickOutcome::Started
         })
-    }
-    async fn prune_sessions(&self, req: PruneRequest) -> Result<Value, AdminOpError> {
-        let report =
-            json!({"kind": "session_prune", "version": 1, "rows": [{"session_id": "ses_1"}]});
-        self.answer(Call::Prune(req), report)
     }
 }
 
@@ -121,6 +79,87 @@ impl rupu_cp::launcher::RunLauncher for NoopLauncher {
     }
 }
 
+/// The issue every seeded autoflow sees.
+pub(super) const ISSUE: &str = "github:acme/widgets/issues/42";
+
+const FIX_ISSUES: &str = "name: fix-issues\nautoflow:\n  enabled: true\n  priority: 7\nsteps:\n  - id: decide\n    agent: echo\n    actions: []\n    prompt: hi\n";
+
+/// Track `github:acme/widgets` at a checkout whose project layer holds the
+/// `fix-issues` autoflow: what `rupu repos track` + a project's
+/// `.rupu/workflows/` give a tick, and the control plane sees.
+pub(super) fn seed_autoflow(global: &Path) {
+    let checkout = global.join("checkouts/widgets");
+    let workflows = checkout.join(".rupu/workflows");
+    std::fs::create_dir_all(&workflows).unwrap();
+    std::fs::write(workflows.join("fix-issues.yaml"), FIX_ISSUES).unwrap();
+    rupu_workspace::RepoRegistryStore {
+        root: global.join("repos"),
+    }
+    .upsert("github:acme/widgets", &checkout, None, None)
+    .unwrap();
+}
+
+/// An owned claim on `issue_ref` (another cycle holds it for an hour).
+pub(super) fn seed_claim(global: &Path, issue_ref: &str) {
+    let now = chrono::Utc::now();
+    rupu_workspace::AutoflowClaimStore {
+        root: global.join("autoflows/claims"),
+    }
+    .save(&rupu_workspace::AutoflowClaimRecord {
+        issue_ref: issue_ref.into(),
+        repo_ref: "github:acme/widgets".into(),
+        source_ref: None,
+        issue_display_ref: None,
+        issue_title: None,
+        issue_url: None,
+        issue_state_name: None,
+        issue_tracker: None,
+        workflow: "fix-issues".into(),
+        status: rupu_workspace::ClaimStatus::AwaitExternal,
+        worktree_path: None,
+        branch: None,
+        last_run_id: None,
+        last_error: None,
+        last_summary: None,
+        pr_url: None,
+        artifacts: None,
+        artifact_manifest_path: None,
+        next_retry_at: None,
+        claim_owner: None,
+        lease_expires_at: Some((now + chrono::Duration::hours(1)).to_rfc3339()),
+        pending_dispatch: None,
+        contenders: vec![],
+        updated_at: now.to_rfc3339(),
+    })
+    .unwrap();
+}
+
+/// An archived session last updated `days` ago.
+fn seed_archived_session(global: &Path, id: &str, days: i64) -> std::path::PathBuf {
+    let dir = global.join("sessions-archive").join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let at = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let record = json!({
+        "version": 1,
+        "session_id": id,
+        "agent_name": "a",
+        "provider_name": "anthropic",
+        "model": "m",
+        "agent_system_prompt": "",
+        "max_turns": 1,
+        "permission_mode": "readonly",
+        "no_stream": true,
+        "workspace_id": "ws",
+        "workspace_path": global,
+        "transcripts_dir": global.join("transcripts"),
+        "created_at": at,
+        "updated_at": at,
+        "status": "idle",
+    });
+    std::fs::write(dir.join("session.json"), record.to_string()).unwrap();
+    dir
+}
+
 /// A CP over a fresh `RUPU_HOME`: `writable` installs `cp serve`'s write
 /// gate (a launcher), `ops` the port.
 async fn spawn(writable: bool, ops: Option<Arc<StubOps>>) -> (SocketAddr, tempfile::TempDir) {
@@ -128,7 +167,7 @@ async fn spawn(writable: bool, ops: Option<Arc<StubOps>>) -> (SocketAddr, tempfi
     let mut state =
         rupu_cp::state::AppState::new(tmp.path().into(), rupu_config::PricingConfig::default())
             // Never the test process's cwd: that is the rupu checkout, whose
-            // `.rupu/` a prune would otherwise reach.
+            // `.rupu/` a prune or an autoflow read would otherwise reach.
             .with_workspace_dir(tmp.path().into())
             .with_admin_ops(ops.map(|o| o as Arc<dyn AdminOps>));
     if writable {
@@ -162,32 +201,44 @@ fn error_of(v: &Value) -> String {
     v["error"].as_str().unwrap_or_default().to_string()
 }
 
+/// The reads answer the reports the CLI prints with `--format json`, from
+/// the library, with no port.
 #[tokio::test]
-async fn autoflow_reads_reach_the_port_with_their_arguments() {
-    let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+async fn autoflow_reads_answer_from_the_library() {
+    let (addr, tmp) = spawn(true, None).await;
+    seed_autoflow(tmp.path());
 
     let (status, body) = get(addr, "/api/autoflows/fix-issues?repo=github:acme/widgets").await;
-    assert_eq!((status, &body["kind"]), (200, &json!("autoflow_show")));
-    let (status, _) = get(
-        addr,
-        "/api/autoflows/explain?issue_ref=github:acme/widgets/issues/42",
-    )
-    .await;
-    assert_eq!(status, 200);
-    let (status, body) = get(addr, "/api/autoflows/doctor").await;
-    assert_eq!((status, &body["ok"]), (200, &json!(true)));
-    let (status, _) = get(addr, "/api/autoflows/wakes?repo=github:acme/widgets").await;
-    assert_eq!(status, 200);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kind"], "autoflow_show");
+    assert_eq!(body["item"]["name"], "fix-issues");
+    assert_eq!(body["item"]["scope"], "project");
+    assert_eq!(body["item"]["repo"], "github:acme/widgets");
+    assert_eq!(body["item"]["priority"], 7);
+    assert_eq!(body["item"]["body"], FIX_ISSUES);
 
+    let (status, body) = get(addr, &format!("/api/autoflows/explain?issue_ref={ISSUE}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kind"], "autoflow_explain");
+    assert_eq!(body["item"]["status"], "unclaimed");
+    assert_eq!(body["item"]["candidate_workflows"], json!(["fix-issues"]));
+
+    seed_claim(tmp.path(), ISSUE);
+    let (status, body) = get(addr, &format!("/api/autoflows/explain?issue_ref={ISSUE}")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["item"]["status"], "await_external");
+    assert_eq!(body["item"]["claim"]["workflow"], "fix-issues");
+
+    let (status, body) = get(addr, "/api/autoflows/doctor").await;
+    assert_eq!((status, &body["kind"]), (200, &json!("autoflow_doctor")));
+    assert_eq!(body["ok"], true, "{body}");
+    let (status, body) = get(addr, "/api/autoflows/wakes?repo=github:acme/widgets").await;
     assert_eq!(
-        ops.calls(),
-        vec![
-            Call::Show("fix-issues".into(), Some("github:acme/widgets".into())),
-            Call::Explain("github:acme/widgets/issues/42".into(), None),
-            Call::Doctor(None),
-            Call::Wakes(Some("github:acme/widgets".into())),
-        ]
+        (status, body),
+        (
+            200,
+            json!({"kind": "autoflow_wakes", "version": 1, "rows": []})
+        )
     );
 }
 
@@ -209,25 +260,78 @@ async fn the_name_route_does_not_shadow_its_literal_siblings() {
     assert_eq!((status, claims), (200, json!([])));
     // `explain` without its issue is the query's 400, not a show of `explain`.
     assert_eq!(get(addr, "/api/autoflows/explain").await.0, 400);
-    assert_eq!(ops.calls(), vec![Call::Doctor(None), Call::Wakes(None)]);
+    assert!(ops.calls().is_empty());
+}
+
+#[tokio::test]
+async fn library_refusals_become_their_statuses() {
+    let ops = Arc::new(StubOps::default());
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    seed_autoflow(tmp.path());
+
+    let (status, body) = get(addr, "/api/autoflows/nope").await;
+    assert_eq!(
+        (status, error_of(&body)),
+        (404, "no autoflow named `nope` is visible".into())
+    );
+    let (status, body) = get(addr, "/api/autoflows/doctor?repo=not-a-repo").await;
+    assert_eq!(status, 400, "{body}");
+    assert!(error_of(&body).contains("invalid repo filter"), "{body}");
+
+    // Another cycle's claim: the run precheck's 409, before the port.
+    seed_claim(tmp.path(), ISSUE);
+    let (status, body) = post(
+        addr,
+        "/api/autoflows/fix-issues/run",
+        json!({"issue": ISSUE}),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(error_of(&body).contains("owned autoflow claim"), "{body}");
+    let (status, body) = post(
+        addr,
+        "/api/autoflows/fix-issues/run",
+        json!({"issue": "github:acme/widgets/issues/43", "mode": "ask"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(error_of(&body).contains("`ask`"), "{body}");
+    let (status, _) = post(
+        addr,
+        "/api/autoflows/nope/run",
+        json!({"issue": "github:acme/widgets/issues/43"}),
+    )
+    .await;
+    assert_eq!(status, 404);
+    // No claim to repair.
+    let (status, _) = post(
+        addr,
+        "/api/autoflows/claims/repair",
+        json!({"issue_ref": "github:acme/widgets/issues/9"}),
+    )
+    .await;
+    assert_eq!(status, 404);
+    assert!(ops.calls().is_empty(), "{:?}", ops.calls());
 }
 
 #[tokio::test]
 async fn the_ports_refusals_become_their_statuses() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    seed_autoflow(tmp.path());
     for (refusal, status) in [
-        (AdminOpError::Invalid("bad ref".into()), 400),
-        (AdminOpError::NotFound("no autoflow named `x`".into()), 404),
-        (
-            AdminOpError::Conflict("several autoflows named `x`".into()),
-            409,
-        ),
+        (AdminOpError::Invalid("bad mode".into()), 400),
+        (AdminOpError::Conflict("already running".into()), 409),
         (AdminOpError::Failed("disk".into()), 500),
     ] {
         let message = refusal.to_string();
         ops.refuse_with(refusal);
-        let (got, body) = get(addr, "/api/autoflows/x").await;
+        let (got, body) = post(
+            addr,
+            "/api/autoflows/fix-issues/run",
+            json!({"issue": ISSUE}),
+        )
+        .await;
         assert_eq!((got, error_of(&body)), (status, message));
     }
 }
@@ -269,33 +373,32 @@ async fn every_endpoint_is_local_only() {
     }
     // `local` is this control plane.
     assert_eq!(get(addr, "/api/autoflows/doctor?host=local").await.0, 200);
-    assert_eq!(ops.calls(), vec![Call::Doctor(None)]);
+    assert!(ops.calls().is_empty());
 }
 
 #[tokio::test]
-async fn without_the_port_only_the_cli_backed_operations_are_501() {
+async fn without_the_port_only_the_tick_and_the_cycle_spawn_are_501() {
     let (addr, tmp) = spawn(true, None).await;
-    for path in [
-        "/api/autoflows/x",
-        "/api/autoflows/doctor",
-        "/api/autoflows/wakes",
+    seed_autoflow(tmp.path());
+    for (path, body) in [
+        ("/api/autoflows/fix-issues/run", json!({"issue": ISSUE})),
+        ("/api/cron/tick", json!({})),
     ] {
-        let (status, body) = get(addr, path).await;
+        let (status, answer) = post(addr, path, body).await;
         assert_eq!(status, 501, "{path}");
         assert!(
-            error_of(&body).contains("requires `rupu cp serve`"),
-            "{body}"
+            error_of(&answer).contains("requires `rupu cp serve`"),
+            "{answer}"
         );
     }
-    let (status, _) = post(addr, "/api/maintenance/prune", json!({"kind": "sessions"})).await;
-    assert_eq!(status, 501);
-    let (status, _) = post(addr, "/api/cron/tick", json!({})).await;
-    assert_eq!(status, 501);
 
-    // The listings and the library prunes need no port.
+    // Everything else is a library call.
+    assert_eq!(get(addr, "/api/autoflows/fix-issues").await.0, 200);
+    assert_eq!(get(addr, "/api/autoflows/doctor").await.0, 200);
+    assert_eq!(get(addr, "/api/autoflows/wakes").await.0, 200);
     assert_eq!(get(addr, "/api/cron").await.0, 200);
     assert_eq!(get(addr, "/api/cron/events").await.0, 200);
-    for kind in ["transcripts", "netflow"] {
+    for kind in ["transcripts", "sessions", "netflow", "cleanup"] {
         let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": kind})).await;
         assert_eq!(
             (status, &body["dry_run"]),
@@ -303,41 +406,30 @@ async fn without_the_port_only_the_cli_backed_operations_are_501() {
             "{kind}: {body}"
         );
     }
-    drop(tmp);
 }
 
 #[tokio::test]
-async fn an_autoflow_run_is_accepted_and_reaches_the_port() {
+async fn an_autoflow_run_is_prechecked_then_reaches_the_port() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    seed_autoflow(tmp.path());
     let (status, body) = post(
         addr,
         "/api/autoflows/fix-issues/run",
-        json!({"issue": "github:acme/widgets/issues/42", "mode": "readonly"}),
+        json!({"issue": ISSUE, "mode": "readonly"}),
     )
     .await;
-    assert_eq!(status, 202);
+    assert_eq!(status, 202, "{body}");
     assert_eq!(body["started"], true);
     assert_eq!(
         ops.calls(),
         vec![Call::Run(AutoflowRunRequest {
             name: "fix-issues".into(),
-            issue: "github:acme/widgets/issues/42".into(),
+            issue: ISSUE.into(),
             repo: None,
             mode: Some("readonly".into()),
         })]
     );
-
-    ops.refuse_with(AdminOpError::Conflict(
-        "already has an active autoflow cycle".into(),
-    ));
-    let (status, _) = post(
-        addr,
-        "/api/autoflows/fix-issues/run",
-        json!({"issue": "github:acme/widgets/issues/42"}),
-    )
-    .await;
-    assert_eq!(status, 409);
     // The issue is required.
     let (status, _) = post(addr, "/api/autoflows/fix-issues/run", json!({})).await;
     assert_eq!(status, 422);
@@ -346,16 +438,21 @@ async fn an_autoflow_run_is_accepted_and_reaches_the_port() {
 #[tokio::test]
 async fn writes_need_cp_serve_but_dry_runs_do_not() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(false, Some(Arc::clone(&ops))).await;
-    let issue = json!({"issue": "github:acme/widgets/issues/42"});
-    assert_eq!(post(addr, "/api/autoflows/x/run", issue).await.0, 501);
-    let repair = json!({"issue_ref": "github:acme/widgets/issues/42", "dry_run": false});
+    let (addr, tmp) = spawn(false, Some(Arc::clone(&ops))).await;
+    seed_autoflow(tmp.path());
+    seed_claim(tmp.path(), ISSUE);
+    let issue = json!({"issue": "github:acme/widgets/issues/43"});
+    assert_eq!(
+        post(addr, "/api/autoflows/fix-issues/run", issue).await.0,
+        501
+    );
+    let repair = json!({"issue_ref": ISSUE, "dry_run": false});
     assert_eq!(
         post(addr, "/api/autoflows/claims/repair", repair).await.0,
         501
     );
     assert_eq!(post(addr, "/api/cron/tick", json!({})).await.0, 501);
-    for kind in ["netflow", "transcripts", "sessions"] {
+    for kind in ["netflow", "transcripts", "sessions", "cleanup"] {
         let prune = json!({"kind": kind, "dry_run": false});
         assert_eq!(
             post(addr, "/api/maintenance/prune", prune).await.0,
@@ -366,7 +463,7 @@ async fn writes_need_cp_serve_but_dry_runs_do_not() {
     assert!(ops.calls().is_empty(), "no write reached the port");
 
     // Dry runs change nothing, so they need no write gate.
-    let repair = json!({"issue_ref": "github:acme/widgets/issues/42"});
+    let repair = json!({"issue_ref": ISSUE});
     assert_eq!(
         post(addr, "/api/autoflows/claims/repair", repair).await.0,
         200
@@ -379,30 +476,49 @@ async fn writes_need_cp_serve_but_dry_runs_do_not() {
     );
     let prune = json!({"kind": "sessions"});
     assert_eq!(post(addr, "/api/maintenance/prune", prune).await.0, 200);
-    assert_eq!(ops.calls().len(), 3);
+    assert_eq!(ops.calls().len(), 1, "only the tick is the port's");
 }
 
 /// A bare `42` / `#42` would resolve against `cp serve`'s working directory
 /// in the CLI's parser, so the API takes only the full form.
 #[tokio::test]
-async fn a_bare_issue_number_is_refused_before_the_port() {
+async fn a_bare_issue_number_is_refused_before_the_library() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    seed_autoflow(tmp.path());
     for bare in ["42", "%2342", "acme/widgets%2342"] {
         let (status, body) = get(addr, &format!("/api/autoflows/explain?issue_ref={bare}")).await;
         assert_eq!(status, 400, "{bare}: {body}");
         assert!(error_of(&body).contains("full"), "{body}");
     }
-    let (status, _) = post(
+    let (status, body) = post(
         addr,
         "/api/autoflows/claims/repair",
         json!({"issue_ref": "42", "release": true, "dry_run": false}),
     )
     .await;
     assert_eq!(status, 400);
-    let (status, _) = post(addr, "/api/autoflows/fix/run", json!({"issue": "#42"})).await;
+    assert!(error_of(&body).contains("full"), "{body}");
+    let (status, body) = post(
+        addr,
+        "/api/autoflows/fix-issues/run",
+        json!({"issue": "#42"}),
+    )
+    .await;
     assert_eq!(status, 400);
+    assert!(error_of(&body).contains("full"), "{body}");
     assert!(ops.calls().is_empty(), "{:?}", ops.calls());
+}
+
+/// `(status, error)` of a default (no `older_than`) dry-run prune of
+/// `transcripts`, `sessions` and `cleanup`, in that order.
+async fn prune_errors(addr: SocketAddr) -> Vec<(u16, String)> {
+    let mut out = Vec::new();
+    for kind in ["transcripts", "sessions", "cleanup"] {
+        let (status, body) = post(addr, "/api/maintenance/prune", json!({"kind": kind})).await;
+        out.push((status, error_of(&body)));
+    }
+    out
 }
 
 fn backdate(path: &std::path::Path, days: u64) {
@@ -442,93 +558,142 @@ async fn netflow_and_transcript_prunes_run_their_libraries() {
 
     // A bad argument is the caller's 400; a bad configured retention is a
     // 500 configuration error.
-    let (status, _) = post(
-        addr,
-        "/api/maintenance/prune",
-        json!({"kind": "netflow", "older_than": "soon"}),
+    assert_eq!(
+        post(
+            addr,
+            "/api/maintenance/prune",
+            json!({"kind": "netflow", "older_than": "soon"}),
+        )
+        .await
+        .0,
+        400
+    );
+    let soon = "invalid duration `soon`: invalid digit found in string";
+    for kind in ["transcripts", "sessions", "cleanup"] {
+        let (status, body) = post(
+            addr,
+            "/api/maintenance/prune",
+            json!({"kind": kind, "older_than": "soon"}),
+        )
+        .await;
+        assert_eq!((status, error_of(&body)), (400, soon.into()), "{kind}");
+    }
+    assert_eq!(prune_errors(addr).await, vec![(200, String::new()); 3]);
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[storage]\narchived_transcript_retention = \"soon\"\narchived_session_retention = \"later\"\n",
     )
-    .await;
-    assert_eq!(status, 400);
-    let (status, _) = post(
-        addr,
-        "/api/maintenance/prune",
-        json!({"kind": "transcripts", "older_than": "soon"}),
-    )
-    .await;
-    assert_eq!(status, 400);
+    .unwrap();
+    // The messages the CLI-backed port gave: the session prune's and
+    // cleanup's own retention refusal unprefixed, the transcript prune's
+    // `config: …`.
+    let later = "invalid duration `later`: invalid digit found in string";
+    assert_eq!(
+        prune_errors(addr).await,
+        vec![
+            (500, format!("config: {soon}")),
+            (500, later.to_string()),
+            (500, later.to_string()),
+        ]
+    );
+    // A cleanup failure past the session stage names its stage.
     std::fs::write(
         tmp.path().join("config.toml"),
         "[storage]\narchived_transcript_retention = \"soon\"\n",
     )
     .unwrap();
-    let (status, body) = post(
-        addr,
-        "/api/maintenance/prune",
-        json!({"kind": "transcripts"}),
-    )
-    .await;
-    assert_eq!(status, 500, "{body}");
-    assert!(ops.calls().is_empty(), "no library prune reached the port");
+    assert_eq!(
+        prune_errors(addr).await[2],
+        (500, format!("cleanup archived transcripts: {soon}"))
+    );
+    // An unreadable config is the session prune's failure, and cleanup's
+    // under its stage, as `rupu cleanup` printed it.
+    std::fs::write(tmp.path().join("config.toml"), "[storage\n").unwrap();
+    let errors = prune_errors(addr).await;
+    let (status, unreadable) = errors[1].clone();
+    assert_eq!(status, 500);
+    assert!(!unreadable.is_empty());
+    assert_eq!(
+        errors[2],
+        (500, format!("cleanup archived sessions: {unreadable}"))
+    );
+    assert!(ops.calls().is_empty(), "no prune reached the port");
 }
 
 #[tokio::test]
 async fn repair_and_prune_default_to_a_dry_run() {
     let ops = Arc::new(StubOps::default());
-    let (addr, _tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    let (addr, tmp) = spawn(true, Some(Arc::clone(&ops))).await;
+    seed_claim(tmp.path(), ISSUE);
     let (status, body) = post(
         addr,
         "/api/autoflows/claims/repair",
-        json!({"issue_ref": "github:acme/widgets/issues/42", "release": true}),
+        json!({"issue_ref": ISSUE, "release": true}),
     )
     .await;
-    assert_eq!((status, &body["dry_run"]), (200, &json!(true)));
+    assert_eq!(
+        (status, body),
+        (
+            200,
+            json!({"issue_ref": ISSUE, "dry_run": true, "repairs": [format!("would release claim {ISSUE}")]})
+        )
+    );
+    assert!(
+        tmp.path()
+            .join("autoflows/claims")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some(),
+        "a dry run kept the claim"
+    );
+    let (status, body) = post(
+        addr,
+        "/api/autoflows/claims/repair",
+        json!({"issue_ref": ISSUE, "release": true, "requeue": true}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+
+    let old = seed_archived_session(tmp.path(), "ses_old", 10);
+    let recent = seed_archived_session(tmp.path(), "ses_recent", 1);
     let (status, body) = post(
         addr,
         "/api/maintenance/prune",
         json!({"kind": "sessions", "older_than": "7d"}),
     )
     .await;
-    assert_eq!(status, 200);
-    assert_eq!(
-        body,
-        json!({"kind": "sessions", "dry_run": true, "would_remove": [{"session_id": "ses_1"}], "errors": []})
-    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kind"], "sessions");
+    assert_eq!(body["dry_run"], true);
+    assert_eq!(body["would_remove"][0]["session_id"], "ses_old");
+    assert_eq!(body["would_remove"][0]["action"], "would_delete");
+    assert_eq!(body["would_remove"].as_array().unwrap().len(), 1);
+    assert!(old.exists(), "a dry run deletes nothing");
+
     let (status, body) = post(
         addr,
         "/api/maintenance/prune",
-        json!({"kind": "cleanup", "dry_run": false}),
+        json!({"kind": "cleanup", "older_than": "7d", "dry_run": false}),
     )
     .await;
+    assert_eq!(status, 200, "{body}");
     assert_eq!(
-        (status, &body["removed"][0]["session_id"]),
-        (200, &json!("ses_1"))
+        body["removed"],
+        json!([{
+            "kind": "session",
+            "id": "ses_old",
+            "scope": "archived",
+            "retained_at": body["removed"][0]["retained_at"],
+            "action": "deleted",
+            "detail": "status idle",
+        }])
     );
-    assert_eq!(
-        ops.calls(),
-        vec![
-            Call::Repair(RepairRequest {
-                issue_ref: "github:acme/widgets/issues/42".into(),
-                release: true,
-                requeue: false,
-                dry_run: true,
-            }),
-            Call::Prune(PruneRequest {
-                kind: PruneKind::Sessions,
-                older_than: Some("7d".into()),
-                dry_run: true,
-            }),
-            Call::Prune(PruneRequest {
-                kind: PruneKind::Cleanup,
-                older_than: None,
-                dry_run: false,
-            }),
-        ]
-    );
+    assert!(!old.exists() && recent.exists());
 
-    // An unknown kind is the body's 422; the port's refusal its status.
+    // An unknown kind is the body's 422.
     let (status, _) = post(addr, "/api/maintenance/prune", json!({"kind": "logs"})).await;
     assert_eq!(status, 422);
-    ops.refuse_with(AdminOpError::Invalid("invalid duration `x`".into()));
     let (status, body) = post(
         addr,
         "/api/maintenance/prune",
@@ -537,8 +702,12 @@ async fn repair_and_prune_default_to_a_dry_run() {
     .await;
     assert_eq!(
         (status, error_of(&body)),
-        (400, "invalid duration `x`".into())
+        (
+            400,
+            "invalid duration `x`: cannot parse integer from empty string".into()
+        )
     );
+    assert!(ops.calls().is_empty());
 }
 
 const CRON_WF: &str = "name: nightly\ntrigger:\n  on: cron\n  cron: \"0 4 * * *\"\nsteps:\n  - id: one\n    agent: a\n    actions: []\n    prompt: hi\n";
