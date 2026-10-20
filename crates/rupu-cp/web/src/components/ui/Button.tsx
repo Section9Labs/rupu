@@ -15,6 +15,7 @@ import { cn } from '../../lib/cn';
 
 export type ButtonVariant =
   | 'primary'
+  | 'solid'
   | 'secondary'
   | 'ghost'
   | 'danger'
@@ -26,6 +27,14 @@ export type ButtonSize = 'sm' | 'md';
 
 const VARIANT_CLS: Record<ButtonVariant, string> = {
   primary: 'bg-brand-600 hover:bg-brand-700 text-white',
+  // The common-visual-language primary (spec §"Page header"): a neutral,
+  // near-white/high-contrast solid — NOT brand purple, which the language
+  // reserves for data/identity and never for a chrome button. Theme-correct
+  // via tokens: light → near-black button + near-white text; dark → the
+  // reverse. One `solid` primary per view; `secondary`/`ghost` sit beside it.
+  // Kept distinct from `primary`(brand) so screens not yet migrated to the
+  // language keep their current look until the app-wide swap (follow-up).
+  solid: 'bg-ink hover:bg-ink/90 text-bg',
   secondary: 'border border-border bg-panel hover:bg-bg text-ink',
   ghost: 'hover:bg-bg text-ink-dim',
   // Destructive: filled for the committed action, outline for the lighter one
@@ -70,9 +79,16 @@ export function Button({
     <button
       type={type ?? 'button'}
       className={cn(
-        'inline-flex items-center justify-center font-medium transition-colors',
+        // Press feedback (emil-design-eng): a pressable element scales a hair on
+        // :active so the UI feels like it heard the tap. Transform-only, so it's
+        // GPU-cheap and needs no reduced-motion guard (a 2% press is not motion
+        // sickness). The bare text `link` variant is exempt — scaling text reads
+        // as a glitch, not feedback.
+        'inline-flex items-center justify-center font-medium',
+        'transition-[color,background-color,border-color,transform,box-shadow] duration-150 ease-out',
+        variant !== 'link' && 'active:scale-[0.98]',
         'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-1',
-        'disabled:cursor-not-allowed disabled:opacity-60',
+        'disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100',
         !compact && 'rounded-md',
         VARIANT_CLS[variant],
         !compact && SIZE_CLS[size],
