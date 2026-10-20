@@ -563,3 +563,53 @@ fn continue_accepts_a_clone_destination() {
         .success();
     }
 }
+
+/// A run whose provider never built (no credentials) records its command
+/// too, so continuing it — on another provider, say, once one is set up —
+/// restores its flags: here `--mode bypass`, without which a non-tty run
+/// would refuse to start in `ask` mode.
+#[test]
+fn continue_restores_the_command_of_a_run_that_never_started() {
+    let dir = tempfile::tempdir().unwrap();
+    make_agent(dir.path(), "hello");
+    let mut first = Command::cargo_bin("rupu").unwrap();
+    first
+        .current_dir(dir.path())
+        .env("RUPU_HOME", dir.path().join(".rupu"))
+        .env_remove("RUPU_MOCK_PROVIDER_SCRIPT")
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .args([
+            "run",
+            "hello",
+            "--mode",
+            "bypass",
+            "--run-id",
+            "run_unstarted",
+            "say hi",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(
+        run_start(dir.path(), "run_unstarted")["launch_args"],
+        serde_json::json!(["hello", "--run-id=run_unstarted", "--mode=bypass"])
+    );
+
+    rupu(
+        dir.path(),
+        r#"[{"AssistantText":{"text":"continued answer","stop":"end_turn"}}]"#,
+    )
+    .args([
+        "run",
+        "hello",
+        "--run-id",
+        "run_after",
+        "--continue",
+        "run_unstarted",
+        "--provider",
+        "anthropic",
+    ])
+    .assert()
+    .success();
+    assert_eq!(run_start(dir.path(), "run_after")["mode"], "bypass");
+}

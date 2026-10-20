@@ -4,6 +4,7 @@
 //! below, not as a new `tests/*.rs` — `rupu-cli`'s `tests/it/test_layout.rs`
 //! enforces this.
 
+mod agentiflow_api;
 mod agentiflows;
 mod ast;
 mod auth;
@@ -28,17 +29,20 @@ mod host_reads;
 mod host_registry;
 mod host_run_netflow;
 mod hosts_api;
+mod launch_api;
 mod launch_preview;
 mod mcp;
 mod mcp_ops_agentiflows;
 mod mcp_ops_definitions;
 mod mcp_ops_findings;
+mod mcp_ops_launch;
 mod mcp_ops_findings_extra;
 mod mcp_ops_fleet;
 mod mcp_ops_projects;
 mod mcp_ops_observe;
 mod mcp_ops_runs;
 mod mcp_ops_sessions;
+mod mcp_resources;
 mod mcp_routes;
 mod mcp_wait;
 mod legacy_codenames;

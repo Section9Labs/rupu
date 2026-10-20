@@ -185,6 +185,30 @@ impl AgentiflowDef {
             .map_err(|e| crate::error::AgentiflowError::UnknownProfile(e.to_string()))
     }
 
+    /// What `rupu agentiflow run` checks before it builds anything: the
+    /// engagement profiles resolved through the overlay-aware registry every
+    /// entry point uses (built-ins, then `<global>/profiles`, then
+    /// `<workspace>/.rupu/profiles`), then [`Self::validate`] against them.
+    /// `workspace` is the directory the run starts in; `None` checks against
+    /// the built-in and global profiles only.
+    pub fn check(
+        &self,
+        global: &Path,
+        workspace: Option<&Path>,
+    ) -> Result<rupu_coverage::ActiveSet, crate::error::AgentiflowError> {
+        let global_profiles = global.join("profiles");
+        // With no workspace the global directory stands in for the project
+        // one: discovering it twice gives the same profiles.
+        let project_profiles = workspace
+            .map(|w| w.join(".rupu").join("profiles"))
+            .unwrap_or_else(|| global_profiles.clone());
+        let registry = rupu_coverage::registry_with_overlay(&global_profiles, &project_profiles)
+            .map_err(|e| crate::error::AgentiflowError::Profiles(e.to_string()))?;
+        let active = self.resolve_profiles(&registry)?;
+        self.validate(&active)?;
+        Ok(active)
+    }
+
     /// Fail-closed validation against the resolved profile set: the scope
     /// must be authorized, there must be something to steer toward, the lead
     /// must be in the pool, every goal predicate must be well-formed and name
@@ -457,21 +481,71 @@ impl AgentiflowDef {
 /// `None` when the id is not a bare stem (empty, or contains `/`, `\` or
 /// `..`: no path traversal), when no `<id>.yaml` file exists in either scope,
 /// or when the file does not parse as an [`AgentiflowDef`]. Only `.yaml`.
+/// [`locate_agentiflow_def`] says which of those it was.
 pub fn load_agentiflow_def(
     global: &Path,
     project: Option<&Path>,
     id: &str,
 ) -> Option<AgentiflowDef> {
+    locate_agentiflow_def(global, project, id)
+        .ok()
+        .map(|(_, def)| def)
+}
+
+/// Why [`locate_agentiflow_def`] found no definition.
+#[derive(Debug, thiserror::Error)]
+pub enum DefLookupError {
+    /// The name could leave the definitions directory.
+    #[error("`{0}` is not a valid agentiflow name")]
+    InvalidName(String),
+    /// No `<name>.yaml` in either scope.
+    #[error("agentiflow `{name}` not found (looked for {searched})")]
+    NotFound { name: String, searched: String },
+    /// The file that shadows the rest does not read or parse.
+    #[error("agentiflow `{name}` ({}) is not loadable: {error}", path.display())]
+    Unloadable {
+        name: String,
+        path: std::path::PathBuf,
+        error: String,
+    },
+}
+
+/// [`load_agentiflow_def`], saying where the definition came from or why
+/// there is none: the project file shadows the global one whether or not it
+/// parses.
+pub fn locate_agentiflow_def(
+    global: &Path,
+    project: Option<&Path>,
+    id: &str,
+) -> Result<(std::path::PathBuf, AgentiflowDef), DefLookupError> {
     if id.is_empty() || id.contains(['/', '\\']) || id.contains("..") {
-        return None;
+        return Err(DefLookupError::InvalidName(id.to_string()));
     }
     let file = format!("{id}.yaml");
-    let path = project
+    let candidates: Vec<std::path::PathBuf> = project
         .map(|p| p.join("agentiflows").join(&file))
-        .filter(|p| p.is_file())
-        .or_else(|| Some(global.join("agentiflows").join(&file)).filter(|p| p.is_file()))?;
-    let raw = std::fs::read_to_string(&path).ok()?;
-    AgentiflowDef::parse_str(&raw).ok()
+        .into_iter()
+        .chain(std::iter::once(global.join("agentiflows").join(&file)))
+        .collect();
+    let Some(path) = candidates.iter().find(|p| p.is_file()) else {
+        let searched = candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DefLookupError::NotFound {
+            name: id.to_string(),
+            searched,
+        });
+    };
+    let unloadable = |error: String| DefLookupError::Unloadable {
+        name: id.to_string(),
+        path: path.clone(),
+        error,
+    };
+    let raw = std::fs::read_to_string(path).map_err(|e| unloadable(e.to_string()))?;
+    let def = AgentiflowDef::parse_str(&raw).map_err(|e| unloadable(e.to_string()))?;
+    Ok((path.clone(), def))
 }
 
 #[cfg(test)]
@@ -1077,5 +1151,82 @@ trigger: manual
             bad.resolve_profiles(&registry),
             Err(crate::error::AgentiflowError::UnknownProfile(_))
         ));
+    }
+
+    fn write(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn a_missing_definition_names_both_places_it_looked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, project) = (tmp.path().join("g"), tmp.path().join("p"));
+        let err = locate_agentiflow_def(&global, Some(&project), "acme").unwrap_err();
+        assert!(matches!(err, DefLookupError::NotFound { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "{msg}");
+        assert!(msg.contains(&project.join("agentiflows/acme.yaml").display().to_string()));
+        assert!(msg.contains(&global.join("agentiflows/acme.yaml").display().to_string()));
+    }
+
+    #[test]
+    fn a_definition_that_exists_but_does_not_parse_says_so() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write(&tmp.path().join("agentiflows/acme.yaml"), "name: [\n");
+        let err = locate_agentiflow_def(tmp.path(), None, "acme").unwrap_err();
+        assert!(matches!(err, DefLookupError::Unloadable { .. }), "{err:?}");
+        assert!(err.to_string().contains("is not loadable"), "{err}");
+    }
+
+    #[test]
+    fn a_broken_project_definition_shadows_the_global_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, project) = (tmp.path().join("g"), tmp.path().join("p"));
+        write(&global.join("agentiflows/acme.yaml"), SAMPLE);
+        write(&project.join("agentiflows/acme.yaml"), "name: [\n");
+        let err = locate_agentiflow_def(&global, Some(&project), "acme").unwrap_err();
+        assert!(
+            matches!(err, DefLookupError::Unloadable { ref path, .. } if path.starts_with(&project))
+        );
+        let (path, def) = locate_agentiflow_def(&global, None, "acme").unwrap();
+        assert_eq!(path, global.join("agentiflows/acme.yaml"));
+        assert_eq!(def.name, "acme-pentest");
+    }
+
+    #[test]
+    fn a_name_that_could_leave_the_directory_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for bad in ["", "../x", "a/b", "a\\b"] {
+            let msg = locate_agentiflow_def(tmp.path(), None, bad)
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("not a valid agentiflow name"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn check_resolves_overlay_profiles_and_validates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let def = AgentiflowDef::parse_str(SAMPLE).unwrap();
+        def.check(tmp.path(), None).unwrap();
+        def.check(tmp.path(), Some(&tmp.path().join("ws"))).unwrap();
+
+        let mut unauthorized = def.clone();
+        unauthorized.scope.authorized = false;
+        let err = unauthorized.check(tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("scope.authorized"), "{err}");
+
+        // A profile file that does not parse fails the registry closed.
+        write(&tmp.path().join("profiles/broken.toml"), "not [ toml");
+        let err = def.check(tmp.path(), None).unwrap_err();
+        assert!(
+            matches!(err, crate::error::AgentiflowError::Profiles(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().starts_with("engagement profiles: "),
+            "{err}"
+        );
     }
 }

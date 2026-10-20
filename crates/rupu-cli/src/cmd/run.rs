@@ -1705,6 +1705,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 prompt: &launch.prompt,
                 launch_skills: &launch.overrides.skills,
                 launch_preload_skills: &launch.overrides.preload_skills,
+                launch_args: &launch.overrides.launch_args,
             })),
             (None, None) => assembler.assemble(launch).await.map_err(|e| e.into_run_error()),
             (None, Some(e)) => Err(match (e.into_run_error(), &skills_carried_from) {

@@ -3830,7 +3830,12 @@ pub(crate) async fn resume_run(
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
-    let permission_mode = rupu_tools::PermissionMode::parse(mode.unwrap_or("ask"))?;
+    // The run's own launch mode unless one is given: a retried `readonly`
+    // run stays `readonly` (the CP's resume worker passes the web resume's
+    // mode explicitly). `resume_decided` reads it the same way.
+    let permission_mode = rupu_tools::PermissionMode::parse(
+        mode.or(record.permission_mode.as_deref()).unwrap_or("ask"),
+    )?;
 
     // Hoisted above the dispatcher build (was created a few lines further
     // down, right before `opts`) so the sub-agent dispatcher can be handed a

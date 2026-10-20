@@ -1278,6 +1278,9 @@ mod launch_agent_tests {
         );
         let id = conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: None,
                 mode: None,
@@ -1315,6 +1318,9 @@ mod launch_agent_tests {
             tmp.path().to_path_buf(),
         );
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,
@@ -1357,6 +1363,9 @@ mod launch_agent_tests {
             tmp.path().to_path_buf(),
         );
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,
@@ -1404,6 +1413,9 @@ mod launch_agent_tests {
                 tmp.path().to_path_buf(),
             );
             conn.launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "recon".into(),
                 prompt: None,
                 mode: None,
@@ -1474,6 +1486,9 @@ mod launch_agent_tests {
             }],
         };
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,

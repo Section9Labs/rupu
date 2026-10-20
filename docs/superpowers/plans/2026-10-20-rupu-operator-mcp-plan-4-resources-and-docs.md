@@ -17,7 +17,7 @@
   - `resources/read {uri}`, which returns `contents: [{uri, mimeType, text}]`
   - `prompts/list`
   - `prompts/get {name, arguments?}`
-- Only the shapes common to protocol versions 2025-03-26 and later are used. An unknown URI or prompt is a JSON-RPC error with code `-32602` that names it.
+- Only the shapes common to protocol versions 2025-03-26 and later are used. An unknown URI is the resources spec's `-32002` with `data: {uri}`; an unknown prompt or a bad argument is `-32602` naming it.
 - A `ResourceSource` / `PromptSource` trait sits next to the existing tool `Source`, so `rupu-mcp` stays free of `rupu-cp` knowledge. The CP provides the implementations.
 
 ### Resources (`crates/rupu-cp/src/mcp/resources.rs`)
@@ -41,11 +41,13 @@ The prompts are `author-agent`, `author-workflow`, `author-agentiflow` and `tria
 - plus `resource` links to the matching docs and schemas;
 - plus a `project` argument for `triage-findings`, which names the `findings.list` query to start from.
 
+The links are deliberately `rupu://…` lines in the message text, not embedded `resource` or `resource_link` content. Embedding would put the full docs (5–73 KB each) into every prompt. `resource_link` content arrived in 2025-06-18, and the HTTP server keeps no per-session protocol version to gate it on.
+
 ### Tests (`crates/rupu-cp/tests/it/mcp_resources.rs`)
 
 - `resources/list` names every URI above, and each one reads back non-empty with its MIME type.
 - `rupu://docs/cp-api` equals `docs/cp-api.md` byte for byte.
-- An unknown URI gets `-32602`.
+- An unknown URI gets `-32002` with `data: {uri}`.
 - The prompts list, and `prompts/get` for each, returns resource links that resolve.
 - `initialize` advertises `resources` and `prompts` on `/mcp`.
 

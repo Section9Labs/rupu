@@ -1333,6 +1333,7 @@ async fn a_paused_parents_workflow_child_is_resumed_by_the_run_that_continues_it
             run_id: h.run_id.clone(),
             mode: Some(PermissionMode::Bypass),
             if_unfinished: false,
+            restart_interrupted: false,
         })
     );
     assert_eq!(
@@ -1967,6 +1968,7 @@ async fn a_workflow_child_failing_of_its_parents_stop_is_interrupted_and_continu
             run_id: h.run_id.clone(),
             mode: Some(PermissionMode::Bypass),
             if_unfinished: false,
+            restart_interrupted: false,
         })
     );
 }

@@ -823,6 +823,10 @@ pub struct UnstartedRun<'a> {
     /// The launch's own skill entries, as written (`RunStart.launch_skills`).
     pub launch_skills: &'a [String],
     pub launch_preload_skills: &'a [String],
+    /// The run's own `rupu run` arguments (`RunStart.launch_args`), so a
+    /// `--continue` of it restores them; empty for the sites that have no
+    /// command of their own (workflow steps, sessions).
+    pub launch_args: &'a [String],
 }
 
 /// Record a run that never started — no provider was built, so nothing was
@@ -869,9 +873,7 @@ pub fn record_unstarted_run(
             customer: Some(run.customer.map(str::to_string)),
             launch_skills: run.launch_skills.to_vec(),
             launch_preload_skills: run.launch_preload_skills.to_vec(),
-            // Only `rupu run` records its arguments; the sites that record an
-            // unstarted run (workflow steps, sessions) have none.
-            launch_args: Vec::new(),
+            launch_args: run.launch_args.to_vec(),
         })?;
         writer.write(&Event::Notice {
             kind: "model_limits".into(),
