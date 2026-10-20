@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { FindingWorkspace } from '../lib/findingWorkspace';
+import { useBackTo, type BackTo } from '../lib/backLink';
 import { api, apiErrorMessage, type FindingDetail as Detail, type FindingExportFormat } from '../lib/api';
 import { saveBlob } from '../lib/download';
 import { completeness, UNREADABLE_REPORT_NOTE } from '../lib/findingReport';
@@ -35,9 +36,16 @@ const RAIL: [string, string][] = [
   ['s-refs', 'References'], ['s-tags', 'Tags'], ['s-prov', 'Provenance'],
 ];
 
+const FINDINGS_LIST: BackTo = { to: '/findings', label: 'Findings' };
+
+/** Returns to the page the report was opened from (a project's Findings tab,
+ *  a run, a flow), or to the findings list when it was opened directly. */
 function BackLink() {
+  const back = useBackTo(FINDINGS_LIST);
   return (
-    <Link to="/findings" className="inline-block text-ui text-ink-mute hover:text-ink hover:underline">← Findings</Link>
+    <Link to={back.to} state={back.state} className="inline-block text-ui text-ink-mute hover:text-ink hover:underline">
+      ← {back.label}
+    </Link>
   );
 }
 

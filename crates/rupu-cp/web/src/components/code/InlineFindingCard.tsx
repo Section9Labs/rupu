@@ -24,7 +24,6 @@
  */
 
 import { useEffect, useId, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { api, apiErrorMessage, type FindingDetail, type FindingOut, type FindingRecord } from '../../lib/api';
 import { isSentinel, sentinelLabel, UNREADABLE_REPORT_NOTE } from '../../lib/findingReport';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
@@ -35,7 +34,8 @@ import ReplicationSteps from '../findings/report/ReplicationSteps';
 import DiffView from '../transcript/DiffView';
 import Markdown from '../transcript/Markdown';
 import { Spinner } from '../ui/Spinner';
-import { FindingWorkspace, findingPath } from '../../lib/findingWorkspace';
+import { FindingWorkspace } from '../../lib/findingWorkspace';
+import { ReportLink } from '../findings/ReportLink';
 
 const TABS = ['Root cause', 'Call chain', 'Evidence', 'Patch', 'Repro'] as const;
 type Tab = (typeof TABS)[number];
@@ -240,12 +240,13 @@ export default function InlineFindingCard({ finding, stale }: InlineFindingCardP
               ) : (
                 <Spinner size="sm" label="Loading report…" className="text-ui" />
               )}
-              <Link
-                to={findingPath(finding.id, (finding as Partial<FindingOut>).ws_id)}
+              <ReportLink
+                id={finding.id}
+                wsId={(finding as Partial<FindingOut>).ws_id}
                 className="mt-2 inline-block text-note text-brand-700 hover:underline"
               >
                 Open full report →
-              </Link>
+              </ReportLink>
             </div>
           )}
           {permalink && (

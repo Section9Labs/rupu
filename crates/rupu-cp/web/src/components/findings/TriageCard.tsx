@@ -3,10 +3,9 @@
 // a glance, with a link to the full `/findings/:id` report page. Renders from
 // the list row's `report_summary` only — the report body is not on list rows.
 
-import { Link } from 'react-router-dom';
 import Markdown from '../transcript/Markdown';
 import type { FindingRecord } from '../../lib/api';
-import { findingPath } from '../../lib/findingWorkspace';
+import { ReportLink } from './ReportLink';
 
 /** `wsId`: the finding's workspace when the row itself doesn't carry one
  *  (coverage-detail rows), so the report link names it. */
@@ -45,12 +44,13 @@ export default function TriageCard({ finding, wsId }: { finding: FindingRecord; 
           {s.has_poc && <> · PoC attached</>}
           {s.verification_status && <> · verification: {s.verification_status}</>}
         </p>
-        <Link
-          to={findingPath(finding.id, (finding as { ws_id?: string }).ws_id ?? wsId)}
+        <ReportLink
+          id={finding.id}
+          wsId={(finding as { ws_id?: string }).ws_id ?? wsId}
           className="inline-block rounded-md bg-brand-50 px-2.5 py-1 text-ui font-medium text-brand-700 hover:bg-brand-100"
         >
           Open full report →
-        </Link>
+        </ReportLink>
       </div>
     </div>
   );
