@@ -52,7 +52,7 @@ function Row({
       <Link to={href} className="min-w-0 truncate hover:underline">
         <AgentName codename={item.codename} derived={item.codenameDerived} showCrew />
       </Link>
-      <span className="min-w-0 flex-1 truncate text-note text-ink-mute">
+      <span className="min-w-0 flex-1 truncate text-note text-ink-dim">
         {item.workflowName} · {sinceLabel(item, now)}
       </span>
 

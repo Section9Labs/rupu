@@ -79,9 +79,16 @@ export function Button({
     <button
       type={type ?? 'button'}
       className={cn(
-        'inline-flex items-center justify-center font-medium transition-colors',
+        // Press feedback (emil-design-eng): a pressable element scales a hair on
+        // :active so the UI feels like it heard the tap. Transform-only, so it's
+        // GPU-cheap and needs no reduced-motion guard (a 2% press is not motion
+        // sickness). The bare text `link` variant is exempt — scaling text reads
+        // as a glitch, not feedback.
+        'inline-flex items-center justify-center font-medium',
+        'transition-[color,background-color,border-color,transform,box-shadow] duration-150 ease-out',
+        variant !== 'link' && 'active:scale-[0.98]',
         'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-1',
-        'disabled:cursor-not-allowed disabled:opacity-60',
+        'disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100',
         !compact && 'rounded-md',
         VARIANT_CLS[variant],
         !compact && SIZE_CLS[size],

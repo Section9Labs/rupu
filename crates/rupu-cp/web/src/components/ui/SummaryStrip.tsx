@@ -27,11 +27,11 @@ export function SummaryStrip({ items, className }: { items: SummaryItem[]; class
             data-testid={it.testId}
             className="border-l border-t border-border px-4 py-2.5"
           >
-            <div className="text-note text-ink-mute">{it.label}</div>
+            <div className="text-note text-ink-dim">{it.label}</div>
             <div className="mt-0.5 text-lead font-semibold tabular-nums text-ink">
               {it.value}
               {it.sub != null && it.sub !== '' && (
-                <span className="ml-1 text-note font-normal text-ink-mute">{it.sub}</span>
+                <span className="ml-1 text-note font-normal text-ink-dim">{it.sub}</span>
               )}
             </div>
           </div>

@@ -1,0 +1,1745 @@
+{
+ "url": "http://localhost:5174/dashboard",
+ "at": "2026-10-20T01:28:37.134Z",
+ "allow": [],
+ "viewports": [
+  {
+   "width": 1440,
+   "height": 900,
+   "load": "load",
+   "screens": 1,
+   "filled": [
+    0.86
+   ],
+   "motion": {
+    "elements": 13,
+    "css": 11,
+    "transitions": 2,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "page": {
+     "height": 900,
+     "screens": 1,
+     "words": 254,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 29,
+     "sections": 0,
+     "horizontalOverflow": 0,
+     "overflowCulprits": [],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 0,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 1.3,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 24,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Overview",
+     "words": 1,
+     "lines": 1,
+     "size": 18,
+     "font": "-apple-system"
+    },
+    "headings": [],
+    "headingSummary": {
+     "count": 0,
+     "maxLines": 0,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": null,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "-apple-system",
+       "share": 0.9,
+       "mono": false
+      },
+      {
+       "family": "ui-monospace",
+       "share": 0.1,
+       "mono": false
+      }
+     ],
+     "familyCount": 2,
+     "sizes": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      18,
+      20,
+      24
+     ],
+     "sizeCount": 9,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 24,
+      "vw": 1.7,
+      "font": "-apple-system",
+      "text": "24"
+     },
+     "monoShare": 0.1,
+     "monoProseShare": 0.1,
+     "monoFamilies": [
+      "ui-monospace"
+     ],
+     "monoSamples": [
+      "violet-cavern",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sand-cinder",
+      "steel-fjord"
+     ],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.06,
+     "centerShare": 0.03,
+     "smallText": 26
+    },
+    "eyebrows": [],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#fafafa",
+     "bodyBgHsl": {
+      "h": 0,
+      "s": 0,
+      "l": 0.98
+     },
+     "dark": false,
+     "sectionBgs": [
+      {
+       "color": "#ffffff",
+       "top": 105,
+       "hsl": {
+        "h": 0,
+        "s": 0,
+        "l": 1
+       }
+      }
+     ],
+     "textColors": [
+      {
+       "color": "#64748b",
+       "share": 0.58
+      },
+      {
+       "color": "#0f172a",
+       "share": 0.34
+      },
+      {
+       "color": "#ef4444",
+       "share": 0.04
+      },
+      {
+       "color": "#94a3b8",
+       "share": 0.03
+      },
+      {
+       "color": "#5b21b6",
+       "share": 0.01
+      }
+     ],
+     "button": {
+      "bg": "#ffffff",
+      "hsl": {
+       "h": 0,
+       "s": 0,
+       "l": 1
+      },
+      "fg": "#0f172a"
+     },
+     "lowContrast": [
+      {
+       "text": "Control Plane",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 11,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Customer",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Runs",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Security",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Build",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Fleet",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      }
+     ]
+    },
+    "buttons": {
+     "count": 9,
+     "inHero": 9,
+     "radius": 8,
+     "height": 61,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "All customers",
+      "Dashboard",
+      "Usage →",
+      "local idle 1s",
+      "mini idle 1s"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 0,
+     "shadowOverlay": 0,
+     "shadowSamples": [],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 10,
+     "hairlineSamples": [
+      "aside.w-60.shrink-0 240px",
+      "div.flex.items-center 1150px",
+      "div.flex.items-center 1150px",
+      "div.flex.items-center 1150px",
+      "div.flex.items-center 1150px"
+     ],
+     "outlinedBoxes": 4,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 4,
+     "boxRadius": 12,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": [
+      {
+       "count": 4,
+       "iconTopped": false,
+       "rounded": false,
+       "top": 550
+      }
+     ]
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 0,
+     "fixed": false,
+     "height": 713,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "pageH": 900,
+    "margins": {
+     "left": 8,
+     "right": 52
+    },
+    "sections": [
+     {
+      "sel": "div.overflow-hidden.rounded-xl",
+      "tag": "div",
+      "top": 105,
+      "height": 413,
+      "words": 72,
+      "media": 0,
+      "middle": 635,
+      "heading": null,
+      "left": 301,
+      "right": 52,
+      "textLeft": 301,
+      "textRight": 52,
+      "fullBleed": false,
+      "footer": false,
+      "hero": true,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "div.grid.grid-cols-1",
+      "tag": "div",
+      "top": 694,
+      "height": 131,
+      "words": 15,
+      "media": 0,
+      "middle": 273,
+      "heading": null,
+      "left": 297,
+      "right": 318,
+      "textLeft": 297,
+      "textRight": 318,
+      "fullBleed": false,
+      "footer": false,
+      "hero": false,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "div.grid.grid-cols-1",
+      "tag": "div",
+      "top": 857,
+      "height": 295,
+      "words": 31,
+      "media": 2,
+      "middle": 50,
+      "heading": null,
+      "left": 281,
+      "right": 41,
+      "textLeft": 281,
+      "textRight": 385,
+      "fullBleed": false,
+      "footer": true,
+      "hero": false,
+      "continues": false,
+      "pinned": false
+     }
+    ],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Overview",
+      "size": 18,
+      "top": 24,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Customer",
+      "side": "left",
+      "px": 12
+     }
+    ],
+    "edges": [
+     {
+      "x": 264,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 1,
+    "bodySize": 11,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0.19,
+    "voidBox": {
+     "x": 720,
+     "y": 120,
+     "w": 600,
+     "h": 420
+    }
+   },
+   "app": {
+    "viewport": {
+     "w": 1440,
+     "h": 900
+    },
+    "dark": false,
+    "ground": "#fafafa",
+    "sidebar": {
+     "w": 240,
+     "tag": "aside",
+     "links": 28,
+     "share": 0.17
+    },
+    "topbar": null,
+    "canvas": {
+     "left": 24,
+     "right": 52
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 1.3,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 24,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 2,
+    "layout": {
+     "panels": 5,
+     "firstScreen": 3,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 10,
+     "radii": [
+      [
+       0,
+       6
+      ],
+      [
+       12,
+       4
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 0,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 0,
+     "leftAligned": 0,
+     "figures": 8,
+     "tabularShare": 1,
+     "kpiMax": 24
+    },
+    "rows": null,
+    "chartHues": 5,
+    "placeholders": [],
+    "type": {
+     "under13": 0.82,
+     "tiny": 27,
+     "tinySamples": [
+      "Customer 10px",
+      "Runs 10px",
+      "Security 10px",
+      "Build 10px"
+     ],
+     "sizes": [
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      18,
+      20,
+      24
+     ]
+    },
+    "title": {
+     "text": "Overview",
+     "size": 18,
+     "top": 24
+    },
+    "colourShare": 0.002
+   },
+   "consoleErrors": []
+  },
+  {
+   "width": 768,
+   "height": 1024,
+   "load": "load",
+   "screens": 1,
+   "filled": [
+    0.82
+   ],
+   "motion": {
+    "elements": 27,
+    "css": 25,
+    "transitions": 2,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "page": {
+     "height": 1024,
+     "screens": 1,
+     "words": 254,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 29,
+     "sections": 0,
+     "horizontalOverflow": 0,
+     "overflowCulprits": [],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 0,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 2.3,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 16,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Overview",
+     "words": 1,
+     "lines": 1,
+     "size": 18,
+     "font": "-apple-system"
+    },
+    "headings": [],
+    "headingSummary": {
+     "count": 0,
+     "maxLines": 0,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": null,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "-apple-system",
+       "share": 0.9,
+       "mono": false
+      },
+      {
+       "family": "ui-monospace",
+       "share": 0.1,
+       "mono": false
+      }
+     ],
+     "familyCount": 2,
+     "sizes": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      18,
+      20,
+      24
+     ],
+     "sizeCount": 9,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 24,
+      "vw": 3.1,
+      "font": "-apple-system",
+      "text": "24"
+     },
+     "monoShare": 0.1,
+     "monoProseShare": 0.1,
+     "monoFamilies": [
+      "ui-monospace"
+     ],
+     "monoSamples": [
+      "violet-cavern",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sand-cinder",
+      "steel-fjord"
+     ],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.06,
+     "centerShare": 0.03,
+     "smallText": 26
+    },
+    "eyebrows": [],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#fafafa",
+     "bodyBgHsl": {
+      "h": 0,
+      "s": 0,
+      "l": 0.98
+     },
+     "dark": false,
+     "sectionBgs": [
+      {
+       "color": "#ffffff",
+       "top": 0,
+       "hsl": {
+        "h": 0,
+        "s": 0,
+        "l": 1
+       }
+      }
+     ],
+     "textColors": [
+      {
+       "color": "#64748b",
+       "share": 0.58
+      },
+      {
+       "color": "#0f172a",
+       "share": 0.34
+      },
+      {
+       "color": "#ef4444",
+       "share": 0.04
+      },
+      {
+       "color": "#94a3b8",
+       "share": 0.03
+      },
+      {
+       "color": "#5b21b6",
+       "share": 0.01
+      }
+     ],
+     "button": {
+      "bg": "#ffffff",
+      "hsl": {
+       "h": 0,
+       "s": 0,
+       "l": 1
+      },
+      "fg": "#0f172a"
+     },
+     "lowContrast": [
+      {
+       "text": "Control Plane",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 11,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Customer",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Runs",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Security",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Build",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Fleet",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      }
+     ]
+    },
+    "buttons": {
+     "count": 9,
+     "inHero": 9,
+     "radius": 8,
+     "height": 61,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "All customers",
+      "Dashboard",
+      "Usage →",
+      "local idle 0s",
+      "mini idle 0s"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 0,
+     "shadowOverlay": 0,
+     "shadowSamples": [],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 10,
+     "hairlineSamples": [
+      "aside.w-60.shrink-0 240px",
+      "div.flex.items-center 494px",
+      "div.flex.items-center 494px",
+      "div.flex.items-center 494px",
+      "div.flex.items-center 494px"
+     ],
+     "outlinedBoxes": 5,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 5,
+     "boxRadius": 12,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": [
+      {
+       "count": 3,
+       "iconTopped": false,
+       "rounded": true,
+       "top": 97
+      },
+      {
+       "count": 4,
+       "iconTopped": false,
+       "rounded": false,
+       "top": 542
+      }
+     ]
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 0,
+     "fixed": false,
+     "height": 837,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "pageH": 1024,
+    "margins": {
+     "left": 8,
+     "right": 33
+    },
+    "sections": [
+     {
+      "sel": "div.overflow-hidden.rounded-xl",
+      "tag": "div",
+      "top": 97,
+      "height": 413,
+      "words": 72,
+      "media": 0,
+      "middle": 32,
+      "heading": null,
+      "left": 293,
+      "right": 44,
+      "textLeft": 293,
+      "textRight": 44,
+      "fullBleed": false,
+      "footer": false,
+      "hero": true,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "div.overflow-hidden.rounded-xl",
+      "tag": "div",
+      "top": 542,
+      "height": 221,
+      "words": 20,
+      "media": 0,
+      "middle": 107,
+      "heading": {
+       "text": "24",
+       "size": 24,
+       "tag": "div"
+      },
+      "left": 273,
+      "right": 89,
+      "textLeft": 273,
+      "textRight": 89,
+      "fullBleed": false,
+      "footer": false,
+      "hero": false,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "div.grid.grid-cols-1",
+      "tag": "div",
+      "top": 796,
+      "height": 202,
+      "words": 15,
+      "media": 0,
+      "middle": 132,
+      "heading": null,
+      "left": 289,
+      "right": 31,
+      "textLeft": 289,
+      "textRight": 31,
+      "fullBleed": false,
+      "footer": false,
+      "hero": false,
+      "continues": false,
+      "pinned": false
+     },
+     {
+      "sel": "div.grid.grid-cols-1",
+      "tag": "div",
+      "top": 1030,
+      "height": 550,
+      "words": 31,
+      "media": 2,
+      "middle": 0,
+      "heading": null,
+      "left": 273,
+      "right": 33,
+      "textLeft": 273,
+      "textRight": 33,
+      "fullBleed": false,
+      "footer": true,
+      "hero": false,
+      "continues": false,
+      "pinned": false
+     }
+    ],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Overview",
+      "size": 18,
+      "top": 16,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Customer",
+      "side": "left",
+      "px": 12
+     }
+    ],
+    "edges": [
+     {
+      "x": 256,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 1,
+    "bodySize": 11,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0,
+    "voidBox": null
+   },
+   "app": {
+    "viewport": {
+     "w": 768,
+     "h": 1024
+    },
+    "dark": false,
+    "ground": "#fafafa",
+    "sidebar": {
+     "w": 240,
+     "tag": "aside",
+     "links": 28,
+     "share": 0.31
+    },
+    "topbar": null,
+    "canvas": {
+     "left": 16,
+     "right": 31
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 2.3,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 16,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 2,
+    "layout": {
+     "panels": 6,
+     "firstScreen": 3,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 11,
+     "radii": [
+      [
+       0,
+       6
+      ],
+      [
+       12,
+       4
+      ],
+      [
+       8,
+       1
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 0,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 0,
+     "leftAligned": 0,
+     "figures": 8,
+     "tabularShare": 1,
+     "kpiMax": 24
+    },
+    "rows": null,
+    "chartHues": 5,
+    "placeholders": [],
+    "type": {
+     "under13": 0.82,
+     "tiny": 27,
+     "tinySamples": [
+      "Customer 10px",
+      "Runs 10px",
+      "Security 10px",
+      "Build 10px"
+     ],
+     "sizes": [
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      18,
+      20,
+      24
+     ]
+    },
+    "title": {
+     "text": "Overview",
+     "size": 18,
+     "top": 16
+    },
+    "colourShare": 0.004
+   },
+   "consoleErrors": []
+  },
+  {
+   "width": 390,
+   "height": 844,
+   "load": "load",
+   "screens": 1,
+   "filled": [
+    0.89
+   ],
+   "motion": {
+    "elements": 13,
+    "css": 11,
+    "transitions": 2,
+    "scripted": 0,
+    "videos": 0,
+    "playingVideos": 0
+   },
+   "metrics": {
+    "viewport": {
+     "w": 390,
+     "h": 844
+    },
+    "page": {
+     "height": 844,
+     "screens": 1,
+     "words": 254,
+     "img": 0,
+     "video": 0,
+     "canvas": 0,
+     "svg": 29,
+     "sections": 0,
+     "horizontalOverflow": 0,
+     "overflowCulprits": [],
+     "uiFragments": 0,
+     "uiAbuse": false,
+     "realPictures": 0,
+     "videoCount": 0,
+     "uiPictures": 0,
+     "pictureSamples": [],
+     "blendText": 0,
+     "sideScrollers": 1,
+     "brokenImages": [],
+     "emoji": [],
+     "videosNoPoster": 0
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 4.6,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 16,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "h1": {
+     "text": "Overview",
+     "words": 1,
+     "lines": 1,
+     "size": 18,
+     "font": "-apple-system"
+    },
+    "headings": [
+     {
+      "text": "28",
+      "words": 1,
+      "chars": 2,
+      "lines": 1,
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "weight": 600,
+      "tracking": -0.025,
+      "leading": 1.33,
+      "upper": false,
+      "italic": false,
+      "mono": false,
+      "align": "left",
+      "position": "right",
+      "widthRatio": 0.07,
+      "top": 642,
+      "tag": "div",
+      "kind": "heading"
+     },
+     {
+      "text": "92%",
+      "words": 1,
+      "chars": 3,
+      "lines": 1,
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "weight": 600,
+      "tracking": -0.025,
+      "leading": 1.33,
+      "upper": false,
+      "italic": false,
+      "mono": false,
+      "align": "left",
+      "position": "right",
+      "widthRatio": 0.07,
+      "top": 658,
+      "tag": "div",
+      "kind": "heading"
+     },
+     {
+      "text": "100",
+      "words": 1,
+      "chars": 3,
+      "lines": 1,
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "weight": 600,
+      "tracking": -0.025,
+      "leading": 1.33,
+      "upper": false,
+      "italic": false,
+      "mono": false,
+      "align": "left",
+      "position": "right",
+      "widthRatio": 0.07,
+      "top": 748,
+      "tag": "div",
+      "kind": "heading"
+     },
+     {
+      "text": "0",
+      "words": 1,
+      "chars": 1,
+      "lines": 1,
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "weight": 600,
+      "tracking": -0.025,
+      "leading": 1.33,
+      "upper": false,
+      "italic": false,
+      "mono": false,
+      "align": "left",
+      "position": "right",
+      "widthRatio": 0.07,
+      "top": 764,
+      "tag": "div",
+      "kind": "heading"
+     },
+     {
+      "text": "518+",
+      "words": 1,
+      "chars": 4,
+      "lines": 1,
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "weight": 600,
+      "tracking": -0.025,
+      "leading": 1.33,
+      "upper": false,
+      "italic": false,
+      "mono": false,
+      "align": "left",
+      "position": "right",
+      "widthRatio": 0.07,
+      "top": 907,
+      "tag": "div",
+      "kind": "heading"
+     }
+    ],
+    "headingSummary": {
+     "count": 5,
+     "maxLines": 1,
+     "over2Lines": 0,
+     "statements": 0,
+     "centered": 0,
+     "medianWords": 1,
+     "mixedFontHeadings": 0
+    },
+    "type": {
+     "families": [
+      {
+       "family": "-apple-system",
+       "share": 0.85,
+       "mono": false
+      },
+      {
+       "family": "ui-monospace",
+       "share": 0.15,
+       "mono": false
+      }
+     ],
+     "familyCount": 2,
+     "sizes": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      18,
+      20,
+      24
+     ],
+     "sizeCount": 9,
+     "notLoaded": [],
+     "body": null,
+     "measureChars": null,
+     "max": {
+      "size": 24,
+      "vw": 6.2,
+      "font": "-apple-system",
+      "text": "28"
+     },
+     "monoShare": 0.15,
+     "monoProseShare": 0.15,
+     "monoFamilies": [
+      "ui-monospace"
+     ],
+     "monoSamples": [
+      "violet-cavern",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sienna-beacon",
+      "sand-cinder",
+      "steel-fjord"
+     ],
+     "microLabels": 0,
+     "microLabelShare": 0,
+     "microSamples": [],
+     "upperShare": 0.08,
+     "centerShare": 0.04,
+     "smallText": 17
+    },
+    "eyebrows": [
+     {
+      "text": "Failed",
+      "above": "28",
+      "upper": false,
+      "tracked": false,
+      "mono": false,
+      "pill": false,
+      "size": 11,
+      "top": 617
+     },
+     {
+      "text": "Success rate",
+      "above": "92%",
+      "upper": false,
+      "tracked": false,
+      "mono": false,
+      "pill": false,
+      "size": 11,
+      "top": 617
+     },
+     {
+      "text": "Cycles",
+      "above": "100",
+      "upper": false,
+      "tracked": false,
+      "mono": false,
+      "pill": false,
+      "size": 11,
+      "top": 723
+     },
+     {
+      "text": "Active now",
+      "above": "0",
+      "upper": false,
+      "tracked": false,
+      "mono": false,
+      "pill": false,
+      "size": 11,
+      "top": 723
+     },
+     {
+      "text": "Open findings",
+      "above": "518+",
+      "upper": false,
+      "tracked": false,
+      "mono": false,
+      "pill": false,
+      "size": 11,
+      "top": 866
+     }
+    ],
+    "numbered": [],
+    "color": {
+     "bodyBg": "#fafafa",
+     "bodyBgHsl": {
+      "h": 0,
+      "s": 0,
+      "l": 0.98
+     },
+     "dark": false,
+     "sectionBgs": [
+      {
+       "color": "#ffffff",
+       "top": 0,
+       "hsl": {
+        "h": 0,
+        "s": 0,
+        "l": 1
+       }
+      }
+     ],
+     "textColors": [
+      {
+       "color": "#0f172a",
+       "share": 0.46
+      },
+      {
+       "color": "#64748b",
+       "share": 0.43
+      },
+      {
+       "color": "#ef4444",
+       "share": 0.05
+      },
+      {
+       "color": "#94a3b8",
+       "share": 0.05
+      },
+      {
+       "color": "#5b21b6",
+       "share": 0.01
+      }
+     ],
+     "button": {
+      "bg": "#ffffff",
+      "hsl": {
+       "h": 0,
+       "s": 0,
+       "l": 1
+      },
+      "fg": "#0f172a"
+     },
+     "lowContrast": [
+      {
+       "text": "Control Plane",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 11,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Customer",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Runs",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Security",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Build",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      },
+      {
+       "text": "Fleet",
+       "ratio": 2.6,
+       "need": 4.5,
+       "size": 10,
+       "fg": "#94a3b8",
+       "bg": "#ffffff"
+      }
+     ]
+    },
+    "buttons": {
+     "count": 9,
+     "inHero": 3,
+     "radius": 8,
+     "height": 61,
+     "withShadow": 0,
+     "withGradient": 0,
+     "mono": 0,
+     "upper": 0,
+     "heroLabels": [
+      "All customers",
+      "Dashboard",
+      "Usage →"
+     ]
+    },
+    "surfaces": {
+     "shadowStatic": 0,
+     "shadowOverlay": 0,
+     "shadowSamples": [],
+     "gradients": 0,
+     "scrims": 0,
+     "gradientSamples": [],
+     "gradientText": 0,
+     "hairlines": 3,
+     "hairlineSamples": [
+      "aside.w-60.shrink-0 240px",
+      "div.border-t.border-border 223px rule",
+      "div.border-t.border-border 223px rule"
+     ],
+     "outlinedBoxes": 0,
+     "dashed": 0,
+     "blurred": 0,
+     "roundedBoxes": 0,
+     "boxRadius": 0,
+     "squareMedia": 0,
+     "roundedMedia": 0,
+     "mediaRadius": 0,
+     "textShadow": 0,
+     "cardRows": []
+    },
+    "heroMedia": [],
+    "nav": {
+     "links": 0,
+     "fixed": false,
+     "height": 657,
+     "floatingPill": false,
+     "blur": false
+    },
+    "fontsLoaded": []
+   },
+   "layout": {
+    "viewport": {
+     "w": 390,
+     "h": 844
+    },
+    "pageH": 844,
+    "margins": {
+     "left": 8,
+     "right": 14
+    },
+    "sections": [],
+    "gaps": [],
+    "h1s": [
+     {
+      "text": "Overview",
+      "size": 18,
+      "top": 16,
+      "firstScreen": true
+     }
+    ],
+    "edgeText": [
+     {
+      "text": "Customer",
+      "side": "left",
+      "px": 12
+     },
+     {
+      "text": "Success rate",
+      "side": "right",
+      "px": 14
+     },
+     {
+      "text": "92%",
+      "side": "right",
+      "px": 8
+     },
+     {
+      "text": "Providers",
+      "side": "right",
+      "px": 9
+     },
+     {
+      "text": "Workers",
+      "side": "right",
+      "px": 15
+     },
+     {
+      "text": "Pending",
+      "side": "right",
+      "px": 16
+     }
+    ],
+    "edges": [
+     {
+      "x": 256,
+      "n": 1
+     }
+    ],
+    "leftBlocks": 1,
+    "bodySize": 11,
+    "stage": false,
+    "explains": false,
+    "slivers": [],
+    "voidShare": 0,
+    "voidBox": null
+   },
+   "app": {
+    "viewport": {
+     "w": 390,
+     "h": 844
+    },
+    "dark": false,
+    "ground": "#fafafa",
+    "sidebar": null,
+    "topbar": {
+     "h": 75
+    },
+    "canvas": {
+     "left": 8,
+     "right": -211
+    },
+    "hero": {
+     "text": "Overview",
+     "words": 1,
+     "chars": 8,
+     "lines": 1,
+     "size": 18,
+     "vw": 4.6,
+     "font": "-apple-system",
+     "weight": 600,
+     "tracking": -0.02,
+     "leading": 1.56,
+     "top": 16,
+     "tag": "h1",
+     "kind": "heading",
+     "align": "left",
+     "position": "left"
+    },
+    "charts": 0,
+    "layout": {
+     "panels": 1,
+     "firstScreen": 1,
+     "ragged": [],
+     "voids": []
+    },
+    "tiles": 0,
+    "panels": {
+     "count": 1,
+     "radii": [
+      [
+       0,
+       1
+      ]
+     ],
+     "heavyBorders": 0,
+     "borderSamples": [],
+     "heavyShadows": 0,
+     "softShadows": 0,
+     "shadowSamples": [],
+     "glass": 0
+    },
+    "chips": {
+     "count": 0,
+     "hues": 0,
+     "samples": []
+    },
+    "numbers": {
+     "cells": 0,
+     "leftAligned": 0,
+     "figures": 9,
+     "tabularShare": 1,
+     "kpiMax": 24
+    },
+    "rows": null,
+    "chartHues": 0,
+    "placeholders": [],
+    "type": {
+     "under13": 0.82,
+     "tiny": 27,
+     "tinySamples": [
+      "Customer 10px",
+      "Runs 10px",
+      "Security 10px",
+      "Build 10px"
+     ],
+     "sizes": [
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      18,
+      20,
+      24
+     ]
+    },
+    "title": {
+     "text": "Overview",
+     "size": 18,
+     "top": 16
+    },
+    "colourShare": 0.007
+   },
+   "consoleErrors": []
+  }
+ ],
+ "findings": [
+  {
+   "level": "FAIL",
+   "id": "palette-purple",
+   "width": 1440,
+   "message": "Indigo / violet (text #5b21b6).",
+   "fix": "Use the accent from the drawn palette.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "WARN",
+   "id": "contrast",
+   "width": 1440,
+   "message": "Low-contrast text: \"Control Plane\" 2.6:1 needs 4.5:1; \"Customer\" 2.6:1 needs 4.5:1; \"Runs\" 2.6:1 needs 4.5:1; \"Security\" 2.6:1 needs 4.5:1",
+   "fix": "Darken or lighten the text colour.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "FAIL",
+   "id": "edge-text",
+   "width": 1440,
+   "message": "1 text block(s) sit within 16px of the screen edge: \"Customer\" (12px from the left)",
+   "fix": "Keep text inside the page margin (16–32px or more). Only display type deliberately bled past the edge may touch it.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  },
+  {
+   "level": "WARN",
+   "id": "rainbow-chart",
+   "width": 1440,
+   "message": "The charts use 5 different hues.",
+   "fix": "Four series colours at most; prefer one accent and neutrals.",
+   "alsoAt": [
+    768
+   ]
+  },
+  {
+   "level": "FAIL",
+   "id": "tiny-text",
+   "width": 1440,
+   "message": "27 text blocks under 11px: Customer 10px, Runs 10px, Security 10px, Build 10px.",
+   "fix": "Nothing below 11px; secondary text 12px, data 13–14px.",
+   "alsoAt": [
+    768,
+    390
+   ]
+  }
+ ],
+ "images": [
+  {
+   "viewport": "desktop",
+   "width": 1440,
+   "fold": "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/desktop-fold.jpg",
+   "pages": [
+    "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/desktop-page-01.jpg"
+   ],
+   "film": []
+  },
+  {
+   "viewport": "tablet",
+   "width": 768,
+   "fold": "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/tablet-fold.jpg",
+   "pages": [
+    "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/tablet-page-01.jpg"
+   ],
+   "film": []
+  },
+  {
+   "viewport": "mobile",
+   "width": 390,
+   "fold": "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/mobile-fold.jpg",
+   "pages": [
+    "/Users/matt/Code/Oracle/rupu/.claude/worktrees/cp-visual-language-build-3585fb/crates/rupu-cp/web/.taste-skill/inspect/mobile-page-01.jpg"
+   ],
+   "film": []
+  }
+ ]
+}

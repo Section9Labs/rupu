@@ -43,7 +43,7 @@ const RANGE_OPTIONS = [
 /** A section label in the triage flow. */
 function SectionLabel({ children, count }: { children: React.ReactNode; count?: number }) {
   return (
-    <h2 className="mb-2.5 mt-6 text-note font-semibold uppercase tracking-wide text-ink-mute first:mt-0">
+    <h2 className="mb-2.5 mt-6 text-note font-semibold uppercase tracking-wide text-ink-dim first:mt-0">
       {children}
       {count != null && <span className="ml-1.5 tabular-nums text-ink-dim">· {count}</span>}
     </h2>
@@ -132,7 +132,7 @@ export default function Dashboard() {
     <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1">
       <span>
         {hosts.length > 0 ? `${okCount}/${hosts.length} hosts` : 'Fleet'}
-        {freshness && <span className="text-ink-mute"> · updated {freshness}</span>}
+        {freshness && <span className="text-ink-dim"> · updated {freshness}</span>}
       </span>
       <ScopeChip />
     </span>
@@ -240,7 +240,7 @@ export default function Dashboard() {
           <UnscopedNote>Fleet counts aren’t per customer.</UnscopedNote>
           <SummaryStrip items={inventoryItems(data.fleet)} />
           {data.fleet_partial && (
-            <p className="mt-1 text-note text-ink-mute">Partial sum — some hosts don’t report every count.</p>
+            <p className="mt-1 text-note text-ink-dim">Partial sum — some hosts don’t report every count.</p>
           )}
         </>
       ) : error ? (

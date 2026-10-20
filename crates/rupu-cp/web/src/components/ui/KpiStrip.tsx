@@ -44,7 +44,7 @@ export function KpiStrip({ items, className }: { items: KpiItem[]; className?: s
               {it.value}
             </div>
             {it.meta != null && it.meta !== '' && (
-              <div className="mt-1 text-note text-ink-mute">{it.meta}</div>
+              <div className="mt-1 text-note text-ink-dim">{it.meta}</div>
             )}
           </div>
         ))}

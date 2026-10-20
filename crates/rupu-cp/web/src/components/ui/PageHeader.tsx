@@ -30,7 +30,7 @@ export function PageHeader({ title, subtitle, back, actions, className }: PageHe
         {back && (
           <Link
             to={back.to}
-            className="mb-1 inline-flex items-center gap-1 text-note text-ink-mute hover:text-ink"
+            className="mb-1 inline-flex items-center gap-1 text-note text-ink-dim hover:text-ink"
           >
             <ChevronLeft size={13} aria-hidden />
             {back.label}
@@ -38,7 +38,7 @@ export function PageHeader({ title, subtitle, back, actions, className }: PageHe
         )}
         <h1 className="truncate text-lg font-semibold tracking-tight text-ink">{title}</h1>
         {subtitle != null && subtitle !== '' && (
-          <p className="mt-0.5 text-ui text-ink-mute">{subtitle}</p>
+          <p className="mt-0.5 text-ui text-ink-dim">{subtitle}</p>
         )}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}

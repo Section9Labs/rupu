@@ -58,12 +58,12 @@ export function FleetHostCards({ hosts }: { hosts: DashboardHostState[] }) {
             <Dot color={v.dot} />
             <div className="min-w-0">
               <div className="truncate font-mono text-ui font-semibold text-ink">{h.name}</div>
-              <div className="text-note text-ink-mute" title={v.title}>
+              <div className="text-note text-ink-dim" title={v.title}>
                 {v.state}
               </div>
             </div>
             <span className="flex-1" />
-            <span className="shrink-0 text-note tabular-nums text-ink-mute">
+            <span className="shrink-0 text-note tabular-nums text-ink-dim">
               {ageLabel(h.summary?.captured_at, now)}
             </span>
           </Link>

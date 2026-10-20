@@ -143,14 +143,14 @@ export function Chart({
         <div className="mb-1 flex items-start justify-between gap-4">
           <div className="min-w-0">
             {title && <div className="text-lead font-semibold text-ink">{title}</div>}
-            {subtitle && <div className="mt-0.5 text-note text-ink-mute">{subtitle}</div>}
+            {subtitle && <div className="mt-0.5 text-note text-ink-dim">{subtitle}</div>}
           </div>
           {headline && (
             <div className="shrink-0 text-right">
               <div className="text-xl font-semibold leading-none tabular-nums tracking-tight text-ink">
                 {headline.value}
               </div>
-              {headline.label && <div className="mt-1 text-meta text-ink-mute">{headline.label}</div>}
+              {headline.label && <div className="mt-1 text-note text-ink-dim">{headline.label}</div>}
             </div>
           )}
         </div>
@@ -203,7 +203,7 @@ export function Chart({
                   y={y + 3}
                   textAnchor="end"
                   className="font-mono"
-                  style={{ fill: colors.inkMute, fontSize: 10 }}
+                  style={{ fill: colors.inkDim, fontSize: 10 }}
                 >
                   {t}
                 </text>
@@ -263,7 +263,7 @@ export function Chart({
                 y={PLOT.yTop + 5}
                 textAnchor="middle"
                 className="font-mono"
-                style={{ fill: colors.inkMute, fontSize: 9 }}
+                style={{ fill: colors.inkDim, fontSize: 9 }}
               >
                 {peakSubLabel ? peakSubLabel(peak, tot[peak]) : 'peak'}
               </text>
@@ -294,7 +294,7 @@ export function Chart({
               y={XTICK_Y}
               textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
               className="font-mono"
-              style={{ fill: colors.inkMute, fontSize: 10 }}
+              style={{ fill: colors.inkDim, fontSize: 10 }}
             >
               {dates[i]}
             </text>
@@ -345,7 +345,7 @@ export function Chart({
               </div>
             ))}
             <div className="mt-1 flex justify-between gap-4 border-t border-border pt-1">
-              <span className="text-ink-mute">Total</span>
+              <span className="text-ink-dim">Total</span>
               <span className="font-mono font-bold tabular-nums text-ink">{tip.total}</span>
             </div>
           </div>

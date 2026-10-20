@@ -40,7 +40,7 @@ export function Field({ label, origin, help, locked = false, children }: FieldPr
           </span>
         )}
       </div>
-      {help != null && help !== '' && <p className="mt-0.5 text-note text-ink-mute">{help}</p>}
+      {help != null && help !== '' && <p className="mt-0.5 text-note text-ink-dim">{help}</p>}
       {children && <div className="mt-2">{children}</div>}
     </div>
   );
