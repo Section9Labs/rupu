@@ -42,6 +42,14 @@ async fn send_logged<T: Transport>(transport: &T, msg: Value) {
 // McpServer: the protocol core over pluggable tool sources.
 // ---------------------------------------------------------------------------
 
+/// What the transport knows about the request a message arrived on.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HandleCx<'a> {
+    pub session: Option<&'a str>,
+    /// The request's `Host` header.
+    pub host: Option<&'a str>,
+}
+
 /// JSON-RPC 2.0 over any transport, serving the tools of its
 /// [`ToolSource`]s. `handle` takes one message (or batch) and returns the
 /// reply, so an HTTP transport can call it per request; `run` drives a
@@ -128,7 +136,20 @@ impl McpServer {
     /// deliberate, so a disconnect never aborts a write half-way; only
     /// `notifications/cancelled` stops a call.
     pub async fn handle(&self, msg: Value, session: Option<&str>) -> Option<Value> {
-        let session = session.map(str::to_string);
+        self.handle_with(
+            msg,
+            HandleCx {
+                session,
+                host: None,
+            },
+        )
+        .await
+    }
+
+    /// [`McpServer::handle`] with the request's context.
+    pub async fn handle_with(&self, msg: Value, cx: HandleCx<'_>) -> Option<Value> {
+        let session = cx.session.map(str::to_string);
+        let host = cx.host.map(str::to_string);
         match msg {
             Value::Array(batch) if batch.is_empty() => {
                 Some(McpError::InvalidRequest("empty batch".into()).to_jsonrpc(Value::Null))
@@ -140,7 +161,10 @@ impl McpServer {
                     .into_iter()
                     .map(|m| {
                         let id = m.get("id").cloned();
-                        (id, tokio::spawn(self.core.clone().one(m, session.clone())))
+                        (
+                            id,
+                            tokio::spawn(self.core.clone().one(m, session.clone(), host.clone())),
+                        )
                     })
                     .collect();
                 let mut out = Vec::new();
@@ -161,7 +185,7 @@ impl McpServer {
                 }
                 (!out.is_empty()).then_some(Value::Array(out))
             }
-            msg => self.core.clone().one(msg, session).await,
+            msg => self.core.clone().one(msg, session, host).await,
         }
     }
 
@@ -206,7 +230,12 @@ impl McpServer {
 
 impl Core {
     /// One non-batch message.
-    async fn one(self: Arc<Self>, msg: Value, session: Option<String>) -> Option<Value> {
+    async fn one(
+        self: Arc<Self>,
+        msg: Value,
+        session: Option<String>,
+        host: Option<String>,
+    ) -> Option<Value> {
         let Value::Object(msg) = msg else {
             let e = McpError::InvalidRequest("not a JSON-RPC object".into());
             return Some(e.to_jsonrpc(Value::Null));
@@ -244,7 +273,7 @@ impl Core {
             }
             "ping" => ok(json!({})),
             "tools/list" => ok(json!({ "tools": self.list() })),
-            "tools/call" => self.tools_call(id, params, session).await,
+            "tools/call" => self.tools_call(id, params, session, host).await,
             other => Some(McpError::UnknownMethod(other.to_string()).to_jsonrpc(id)),
         }
     }
@@ -270,6 +299,7 @@ impl Core {
         id: Value,
         params: Value,
         session: Option<String>,
+        host: Option<String>,
     ) -> Option<Value> {
         let key = (session.clone().unwrap_or_default(), id.to_string());
         let core = self.clone();
@@ -289,7 +319,7 @@ impl Core {
                 let _guard = guard;
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let result = core.call(name, args, CallCx { session }).await;
+                let result = core.call(name, args, CallCx { session, host }).await;
                 json!({ "jsonrpc": "2.0", "id": id, "result": result })
             });
             if flight
@@ -334,6 +364,20 @@ impl Core {
             Some(ToolResult::Json(v)) => json!({
                 "content": [{"type": "text", "text": v.to_string()}],
             }),
+            Some(ToolResult::Annotated { value, notes, meta }) => {
+                let mut content = vec![json!({"type": "text", "text": value.to_string()})];
+                content.extend(
+                    notes
+                        .into_iter()
+                        .map(|n| json!({"type": "text", "text": n})),
+                );
+                let mut out = json!({ "content": content, "_meta": meta });
+                if value.is_object() {
+                    out["structuredContent"] = value;
+                }
+                out
+            }
+            Some(ToolResult::Resource(r)) => json!({ "content": [r.to_content()] }),
             Some(ToolResult::Text(t)) => json!({ "content": [{"type": "text", "text": t}] }),
             Some(ToolResult::Error(t)) => {
                 warn!(tool = %name, error = %t, "tool call failed");

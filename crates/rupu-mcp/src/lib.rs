@@ -20,6 +20,6 @@ pub mod transport;
 pub use catalog::{CatalogSource, ContextFactory};
 pub use error::{McpError, ServeError};
 pub use filter::ToolFilter;
-pub use server::{negotiate_protocol_version, McpServer, PROTOCOL_VERSIONS};
-pub use source::{CallCx, ToolDef, ToolHints, ToolResult, ToolSource};
+pub use server::{negotiate_protocol_version, HandleCx, McpServer, PROTOCOL_VERSIONS};
+pub use source::{CallCx, EmbeddedResource, ToolDef, ToolHints, ToolResult, ToolSource};
 pub use transport::{decode_line, InProcessTransport, Transport};

@@ -1,6 +1,7 @@
 //! Session-keyed cancel, annotations and structured results.
 
 use crate::stub::stub_server;
+use rupu_mcp::HandleCx;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -187,4 +188,64 @@ async fn a_dropped_handle_future_does_not_stop_the_call() {
     let _ = tokio::time::timeout(Duration::from_millis(50), fut).await;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(TOUCHED.load(Ordering::SeqCst), before + 1);
+}
+
+async fn call_result(name: &str) -> Value {
+    stub_server()
+        .handle(call(1, name, json!({})), None)
+        .await
+        .unwrap()["result"]
+        .clone()
+}
+
+#[tokio::test]
+async fn a_text_resource_is_embedded_as_text() {
+    let r = call_result("stub.text_file").await;
+    let c = &r["content"][0];
+    assert_eq!(c["type"], "resource");
+    assert_eq!(c["resource"]["uri"], "rupu://api/x");
+    assert_eq!(c["resource"]["mimeType"], "text/markdown; charset=utf-8");
+    assert_eq!(c["resource"]["text"], "# hi");
+    assert!(c["resource"].get("blob").is_none());
+    assert_eq!(c["resource"]["_meta"]["name"], "x.md");
+}
+
+#[tokio::test]
+async fn a_binary_resource_is_embedded_as_base64() {
+    let r = call_result("stub.bin_file").await;
+    let res = &r["content"][0]["resource"];
+    assert_eq!(res["blob"], "JVBERv8=");
+    assert!(res.get("text").is_none());
+    assert!(res.get("_meta").is_none());
+}
+
+#[tokio::test]
+async fn annotated_results_carry_notes_and_meta() {
+    let r = call_result("stub.annotated").await;
+    assert_eq!(r["content"].as_array().unwrap().len(), 2);
+    assert!(r["content"][1]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("x-rupu-hosts-unfilterable"));
+    assert!(r.get("structuredContent").is_none());
+    assert!(r["_meta"]["rupu/headers"].is_object());
+}
+
+#[tokio::test]
+async fn the_callers_host_reaches_the_source() {
+    let reply = stub_server()
+        .handle_with(
+            call(1, "stub.host", json!({})),
+            HandleCx {
+                host: Some("127.0.0.1:7879"),
+                ..HandleCx::default()
+            },
+        )
+        .await
+        .unwrap();
+    let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        json!({"host": "127.0.0.1:7879"})
+    );
 }
