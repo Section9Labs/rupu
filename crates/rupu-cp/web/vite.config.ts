@@ -15,10 +15,6 @@ export default defineConfig({
           react: ['react', 'react-dom', 'react-router-dom'],
           // Heavy graph deps — only loaded when a run-detail route is visited.
           xyflow: ['@xyflow/react', '@dagrejs/dagre'],
-          // Charting (recharts) — the Usage/run-detail charts and the usage
-          // timelines. The Dashboard's own living charts are hand-built SVG
-          // (components/ui/Chart.tsx) and don't pull this in.
-          charts: ['recharts'],
           // Markdown rendering (react-markdown + rehype-highlight + highlight.js)
           // — loaded by the transcript route, the project Code tab
           // (ProjectCodeTab, itself React.lazy-loaded) and the findings tables'
