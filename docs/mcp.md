@@ -105,7 +105,7 @@ catalog tools for everything.
 
 ## Operator tools
 
-138 tools over the CP's own endpoints, one per route (`GET /api/tools` and
+185 tools over the CP's own endpoints, one per route (`GET /api/tools` and
 `tools/list` give each tool's full input schema). Each takes the arguments of
 the endpoint it wraps (path parameters, the handler's query struct, the JSON
 body), an optional `host` where the API takes `?host=`, refuses unknown
@@ -117,16 +117,17 @@ gate nothing.
 
 | Area | Tools |
 |---|---|
-| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.usage` `runs.usage_timeline` `runs.source` `runs.ast` `runs.autoflow` |
-| Agent runs and transcripts | `agent_runs.list` `transcripts.get` `transcripts.archive` `transcripts.delete` `events.recent` |
+| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.usage` `runs.usage_timeline` `runs.source` `runs.ast` `runs.autoflow` `runs.retry` |
+| Agent runs and transcripts | `agent_runs.list` `agent_runs.continue` `transcripts.get` `transcripts.archive` `transcripts.delete` `events.recent` |
 | Autoflow runs | `autoflow_runs.list` `autoflow_runs.problems` `autoflow_runs.cycles` `autoflow_runs.events` |
-| Sessions and messages | `sessions.list` `sessions.get` `sessions.turns` `sessions.usage_timeline` `sessions.start` `sessions.send` `sessions.archive` `sessions.restore` `sessions.delete` `messages.list` `messages.send` |
-| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.steer` |
-| Definitions | `workflows.list` `workflows.get` `workflows.create` `workflows.save` `workflows.delete` `workflows.validate` `workflows.generate` `workflows.run` `agents.list` `agents.get` `agents.create` `agents.save` `agents.delete` `agents.generate` `agents.run` `generate.models` `autoflows.list` `autoflows.enable` `autoflows.disable` `claims.list` `claims.release` `claims.requeue` `skills.list` `skills.get` `tools.list` `models.list` `models.refresh` |
-| Findings, coverage, assets | `findings.list` `findings.get` `findings.tags` `findings.tag` `findings.export` `findings.export_many` `findings.artifact` `coverage.list` `coverage.get` `coverage.audit` `coverage.catalog` `coverage.runs` `coverage.diff` `coverage.templates` `coverage.template` `assets.list` |
+| Sessions and messages | `sessions.list` `sessions.get` `sessions.turns` `sessions.usage_timeline` `sessions.start` `sessions.send` `sessions.archive` `sessions.restore` `sessions.delete` `sessions.stop` `sessions.compact` `messages.list` `messages.send` |
+| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.steer` `agentiflows.run` `agentiflows.stop` `agentiflow_defs.list` `agentiflow_defs.get` `agentiflow_defs.create` `agentiflow_defs.save` `agentiflow_defs.delete` `agentiflow_defs.validate` |
+| Definitions | `workflows.list` `workflows.get` `workflows.create` `workflows.save` `workflows.delete` `workflows.validate` `workflows.generate` `workflows.run` `workflows.run_yaml` `agents.list` `agents.get` `agents.create` `agents.save` `agents.delete` `agents.generate` `agents.run` `agents.validate` `agents.validate_all` `generate.models` `autoflows.list` `autoflows.get` `autoflows.enable` `autoflows.disable` `autoflows.run` `autoflows.explain` `autoflows.doctor` `autoflows.wakes` `claims.list` `claims.release` `claims.requeue` `claims.repair` `skills.list` `skills.get` `skills.install` `skills.update` `skills.validate` `tools.list` `models.list` `models.refresh` |
+| Findings, coverage, assets | `findings.list` `findings.get` `findings.tags` `findings.tag` `findings.export` `findings.export_many` `findings.artifact` `findings.import` `findings.schema` `coverage.list` `coverage.get` `coverage.audit` `coverage.catalog` `coverage.runs` `coverage.diff` `coverage.templates` `coverage.template` `coverage.gap` `coverage.rerun` `assets.list` `query.fields` `query.check` |
 | Observability | `netflow.run` `netflow.agentiflow` `netflow.project` `netflow.global` `netflow.graph` `netflow.explorer` `netflow.index` `netflow.latest` `usage.get` `usage.timeline` `usage.runs` `usage.outliers` `dashboard.get` |
-| Fleet, config, customers | `hosts.list` `hosts.registered` `hosts.add` `hosts.add_ssh` `hosts.add_bucket` `hosts.enroll_node` `hosts.remove` `host.info` `workers.list` `config.get` `config.put_global` `config.put_customer` `config.put_project` `config.put_policy` `customers.list` `customers.create` `customers.get` `customers.update` `customers.delete` `customers.archive` `customers.unarchive` `customers.assign_project` `customers.unassign_project` `launch.preview` `repos.list` |
-| Projects | `projects.list` `projects.get` `projects.runs` `projects.sessions` `projects.agents` `projects.workflows` `projects.autoflows` `projects.coverage` `projects.coverage_assessed` `projects.tree` `projects.source` `projects.files` |
+| Fleet, config, customers | `hosts.list` `hosts.registered` `hosts.add` `hosts.add_ssh` `hosts.add_bucket` `hosts.enroll_node` `hosts.remove` `host.info` `workers.list` `config.get` `config.put_global` `config.put_customer` `config.put_project` `config.put_policy` `customers.list` `customers.create` `customers.get` `customers.update` `customers.delete` `customers.archive` `customers.unarchive` `customers.assign_project` `customers.unassign_project` `launch.preview` `repos.list` `repos.tracked` `repos.attach` `repos.prefer` `repos.forget` `scm_accounts.list` `scm_rules.list` `scm_rules.bind` `auth.status` |
+| Projects | `projects.list` `projects.get` `projects.runs` `projects.sessions` `projects.agents` `projects.workflows` `projects.autoflows` `projects.coverage` `projects.coverage_assessed` `projects.tree` `projects.source` `projects.files` `projects.init` |
+| Setup and housekeeping | `fleet.list` `fleet.install` `engagement_profiles.list` `engagement_profiles.get` `cron.list` `cron.events` `cron.tick` `maintenance.prune` |
 
 The tool names are pinned by `crates/rupu-cp/tests/fixtures/mcp/tool_names.json`.
 Every CP route is a tool except the ones in `EXCLUDED`
@@ -282,6 +283,29 @@ and `wait`; name them (`runs.*,wait,...`) to keep them. A name that matches no
 tool fails startup, listing the namespaces served and, for a near miss, a
 did-you-mean (`--tools run.list` suggests `runs.list`).
 
+## Resources and prompts
+
+`/mcp` also serves read-only **resources**, built into the binary (never read
+from `RUPU_HOME`), so an agent can learn rupu from the MCP alone and sees the
+docs of the version it talks to:
+
+| URI | Content |
+|---|---|
+| `rupu://docs/<name>` | The docs under `docs/`: `using-rupu`, `agent-format`, `agent-authoring`, `workflow-format`, `workflow-authoring`, `agentiflows`, `triggers`, `engagement-profiles`, `coverage`, `messaging`, `skills`, `transcript-schema`, `cp-api`, `control-plane`, `response-outcomes`, `netflow`, `configuration`, `mcp` (Markdown) |
+| `rupu://schema/finding-report` | The finding report JSON Schema (what `findings.schema` answers) |
+| `rupu://query/<list>` | A list query's field registry: `findings`, `workflow_runs`, `agent_runs`, `sessions`, `autoflow_runs`, `events` (what `query.fields` answers) |
+| `rupu://profiles/<id>` | Each built-in engagement profile, as TOML. `engagement_profiles.list` also lists layered ones |
+| `rupu://tools` | The tool catalog, the rows of `GET /api/tools` |
+| `rupu://examples/<path>` | The repo's `examples/` agents, workflows and contracts |
+
+`resources/list` and `resources/templates/list` are cursor-paged;
+`resources/read` of an unknown URI answers `-32002` with `data.uri`.
+
+Four **prompts** (`prompts/list`, `prompts/get`): `author-agent`,
+`author-workflow`, `author-agentiflow` and `triage-findings` (with a `project`
+argument). Each is a short instruction that names the resources and tools to
+use; the links are text, not embedded resources, because the docs run 5–73 KB.
+
 ## Attribution
 
 An operator message sent through `messages.send`, and a finding tag event
@@ -305,7 +329,8 @@ MCP streamable HTTP, JSON responses:
 - Versions: `initialize` answers the client's `protocolVersion` when rupu
   speaks it (`2024-11-05`, `2025-03-26`, `2025-06-18`, `2025-11-25`), otherwise
   its newest.
-- Methods: `initialize`, `ping`, `tools/list`, `tools/call`. A tool that fails,
+- Methods: `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`,
+  `resources/templates/list`, `resources/read`, `prompts/list`, `prompts/get`. A tool that fails,
   refuses its arguments or is unknown comes back as a `tools/call` result with
   `isError: true`, so the model sees why.
 
