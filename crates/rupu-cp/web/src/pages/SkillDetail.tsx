@@ -1,9 +1,9 @@
 // Skill detail — one installed skill (`GET /api/skills/:layer/:name`): its
-// facts, files and `SKILL.md` body. Read-only: install and update are
-// `rupu skill` operations. Route: /skills/:layer/:name[?ws_id=] (a project
-// skill needs its project's ws_id).
+// facts, files and `SKILL.md` body, with Update (from its recorded source)
+// and Validate. Route: /skills/:layer/:name[?ws_id=] (a project skill needs
+// its project's ws_id).
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 import { api, apiErrorMessage, type SkillDetail, type SkillLayer } from '../lib/api';
@@ -12,6 +12,7 @@ import { Badge } from '../components/ui/Badge';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { SkillActions } from '../components/skills/SkillActions';
 
 export default function SkillDetailPage() {
   const { layer = '', name = '' } = useParams<{ layer: string; name: string }>();
@@ -19,10 +20,16 @@ export default function SkillDetailPage() {
   const wsId = params.get('ws_id') ?? undefined;
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped after an update: the skill is read again, quietly.
+  const [reload, setReload] = useState(0);
+  const shown = useRef('');
 
   useEffect(() => {
     let cancelled = false;
-    setSkill(null);
+    // A reload after an update keeps the page up; another skill clears it.
+    const key = `${layer}/${name}/${wsId ?? ''}`;
+    if (shown.current !== key) setSkill(null);
+    shown.current = key;
     setError(null);
     api
       .getSkill(layer as SkillLayer, name, wsId)
@@ -35,7 +42,7 @@ export default function SkillDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [layer, name, wsId]);
+  }, [layer, name, wsId, reload]);
 
   if (error) {
     return (
@@ -64,24 +71,36 @@ export default function SkillDetailPage() {
       <BackLink />
 
       <header className="mt-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="break-all font-mono text-2xl font-semibold text-ink">{skill.name}</h1>
-          <ScopeChip scope={skill.layer} />
-          {skill.both_layers && <Badge ring>both layers</Badge>}
-          {skill.disable_model_invocation && (
-            <Badge ring title="disable-model-invocation: only an operator or a preload brings it in">
-              operator-invoked only
-            </Badge>
-          )}
-        </div>
-        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-note text-ink-mute">
-          <span>
-            source{' '}
-            <span className="font-mono text-ink-dim">
-              {skill.source ?? (skill.source_error ? `unreadable (${skill.source_error})` : '-')}
-            </span>
-          </span>
-          <span className="break-all font-mono">{skill.path}</span>
+        <div className="flex flex-wrap items-start gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="break-all font-mono text-2xl font-semibold text-ink">{skill.name}</h1>
+              <ScopeChip scope={skill.layer} />
+              {skill.both_layers && <Badge ring>both layers</Badge>}
+              {skill.disable_model_invocation && (
+                <Badge ring title="disable-model-invocation: only an operator or a preload brings it in">
+                  operator-invoked only
+                </Badge>
+              )}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-note text-ink-mute">
+              <span>
+                source{' '}
+                <span className="font-mono text-ink-dim">
+                  {skill.source ?? (skill.source_error ? `unreadable (${skill.source_error})` : '-')}
+                </span>
+              </span>
+              <span className="break-all font-mono">{skill.path}</span>
+            </div>
+          </div>
+          <SkillActions
+            key={`${skill.layer}/${skill.name}`}
+            name={skill.name}
+            layer={skill.layer}
+            wsId={wsId}
+            hasSource={skill.source !== null}
+            onChanged={() => setReload((n) => n + 1)}
+          />
         </div>
         {skill.status === 'invalid' && skill.error && (
           <ErrorBanner className="mt-3">

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, within } from '@testing-library/react';
+import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { api, ApiError, type SkillDetail } from '../lib/api';
 import SkillDetailPage from './SkillDetail';
@@ -130,5 +130,23 @@ describe('Skill detail', () => {
     mount('/skills/global/nope');
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/^no installed skill "nope"$/);
+  });
+  it('reads the skill again after Update replaced it, keeping the page up', async () => {
+    const getSkill = vi
+      .spyOn(api, 'getSkill')
+      .mockResolvedValueOnce(detail({ content_hash: 'old0000' }))
+      .mockResolvedValueOnce(detail({ content_hash: 'new1111' }));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ layer: 'global', results: [{ name: 'pdf', outcome: 'updated', from: 'c1', to: 'c2' }] })),
+    );
+    mount('/skills/global/pdf');
+    expect(await screen.findByText('old0000')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Update' }));
+
+    expect(await screen.findByText('new1111')).toBeInTheDocument();
+    await waitFor(() => expect(getSkill).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('Updated from c1 to c2.')).toBeInTheDocument();
   });
 });

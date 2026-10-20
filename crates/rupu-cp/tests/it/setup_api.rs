@@ -268,6 +268,44 @@ async fn install_from_a_local_directory_then_refuse_a_second_without_force() {
 }
 
 #[tokio::test]
+async fn a_dry_run_lists_what_an_install_would_do_and_writes_nothing() {
+    let s = spawn_setup(true, true).await;
+    let src = s.skill_src.display().to_string();
+    let (st, v) = post(
+        &s,
+        "/api/skills/install",
+        json!({"source": src, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["layer"], "global");
+    assert_eq!(v["found"][0]["name"], "demo-skill");
+    assert_eq!(v["found"][0]["status"], "new");
+    assert!(v["found"][0]["description"].is_string(), "{v}");
+    assert!(!s.global.join("skills").exists(), "a dry run wrote");
+
+    let (st, _) = post(&s, "/api/skills/install", json!({"source": src})).await;
+    assert_eq!(st, 200);
+    let (st, v) = post(
+        &s,
+        "/api/skills/install",
+        json!({"source": src, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["found"][0]["status"], "up_to_date");
+    // The dry run is local-only like the install.
+    let (st, _) = post(
+        &s,
+        "/api/skills/install?host=peer",
+        json!({"source": src, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(st, 501);
+}
+
+#[tokio::test]
 async fn install_into_a_project_lands_in_its_layer() {
     let s = spawn_setup(true, true).await;
     let src = s.skill_src.display().to_string();

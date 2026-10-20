@@ -333,6 +333,45 @@ fn require_installer(
         .ok_or_else(|| ApiError::not_available(format!("{what} requires `rupu cp serve`")))
 }
 
+/// An install dry run reads the source and the layer and writes nothing, so
+/// it needs only the fetch `rupu cp serve` provides, not a writable config.
+fn require_preview(
+    s: &AppState,
+    host: Option<&str>,
+) -> ApiResult<std::sync::Arc<crate::skill_installer::SkillInstaller>> {
+    crate::api::fleet::require_local(host, "previewing a skill install")?;
+    s.skill_installer.clone().ok_or_else(|| {
+        ApiError::not_available("previewing a skill install requires `rupu cp serve`")
+    })
+}
+
+fn preview_report(preview: &[rupu_skills::install::Preview], layer: Layer) -> serde_json::Value {
+    use rupu_skills::install::PreviewStatus as P;
+    let found: Vec<serde_json::Value> = preview
+        .iter()
+        .map(|p| {
+            let status = match p.status {
+                P::New => "new",
+                P::UpToDate => "up_to_date",
+                P::Changed => "changed",
+                P::LocallyModified => "locally_modified",
+                P::Invalid => "invalid",
+            };
+            let mut row = serde_json::json!({
+                "name": p.found.name,
+                "rel": p.found.rel,
+                "description": p.found.description,
+                "status": status,
+            });
+            if let Some(reason) = &p.reason {
+                row["reason"] = serde_json::json!(reason);
+            }
+            row
+        })
+        .collect();
+    serde_json::json!({ "dry_run": true, "layer": layer.as_str(), "found": found })
+}
+
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct SkillsWriteQuery {
     /// Must be this host: skill installs are local-only.
@@ -361,6 +400,11 @@ pub(crate) struct InstallBody {
     /// Replace installed skills of the same name (`--force`).
     #[serde(default)]
     force: bool,
+    /// List the source's skills and what installing each would do, writing
+    /// nothing: `{dry_run, layer, found: [{name, rel, description, status,
+    /// reason?}]}`. `skills` and `all` are not read.
+    #[serde(default)]
+    dry_run: bool,
 }
 
 /// What an install failure is to the caller: the request's fault (400),
@@ -428,8 +472,12 @@ async fn install_skills(
     Json(body): Json<InstallBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     use rupu_skills::install::{install_from, InstallSpec, Selection};
-    let fetcher = require_installer(&s, "installing skills", q.host.as_deref())?;
-    if body.all && !body.skills.is_empty() {
+    let fetcher = if body.dry_run {
+        require_preview(&s, q.host.as_deref())?
+    } else {
+        require_installer(&s, "installing skills", q.host.as_deref())?
+    };
+    if !body.dry_run && body.all && !body.skills.is_empty() {
         return Err(ApiError::bad_request("give `skills` or `all`, not both"));
     }
     let local = std::path::Path::new(&body.source);
@@ -443,6 +491,16 @@ async fn install_skills(
     tokio::task::spawn_blocking(move || {
         let source = rupu_skills::parse_source(&body.source, body.git_ref.as_deref(), None)
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if body.dry_run {
+            let preview = rupu_skills::install::preview_install(
+                &source,
+                fetcher.as_ref(),
+                &skills_dir,
+                layer,
+            )
+            .map_err(install_err)?;
+            return Ok(Json(preview_report(&preview, layer)));
+        }
         let selection = if body.all {
             Selection::All
         } else if !body.skills.is_empty() {
