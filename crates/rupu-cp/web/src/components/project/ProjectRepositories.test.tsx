@@ -36,7 +36,7 @@ describe('ProjectRepositories', () => {
     render(<ProjectRepositories projectPath="/src/widgets" />);
 
     const row = await screen.findByRole('row', { name: /github:acme\/widgets/ });
-    expect(within(row).getByText('/src/widgets')).toBeInTheDocument();
+    expect(within(row).getByText('project root')).toHaveAttribute('title', '/src/widgets');
     expect(screen.queryByText('github:acme/gadgets')).not.toBeInTheDocument();
   });
 
@@ -61,7 +61,7 @@ describe('ProjectRepositories', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Forget /src/widgets' }));
     expect(forget).not.toHaveBeenCalled();
     expect(screen.getByRole('group', { name: 'Confirm forget' })).toHaveTextContent(
-      'Forget /src/widgets as a checkout of github:acme/widgets?',
+      'Forget the project root as a checkout of github:acme/widgets?',
     );
     fireEvent.click(screen.getByRole('button', { name: 'Forget' }));
 

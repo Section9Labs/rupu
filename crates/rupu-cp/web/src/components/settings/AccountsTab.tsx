@@ -284,9 +284,11 @@ export function AccountsTab() {
           <ol className="mt-2 rounded-lg border border-border bg-surface px-3 py-2 font-mono text-note">
             {ruleLines(rules).map((r, i) => (
               <li key={i} className="flex gap-3 py-0.5">
-                <span className="min-w-0 flex-1 text-ink">{r.target}</span>
+                <span className="w-72 min-w-0 truncate text-ink" title={r.target}>
+                  {r.target}
+                </span>
                 <span className="text-ink-mute">→</span>
-                <span className="w-40 text-ink-dim">{r.account}</span>
+                <span className="min-w-0 flex-1 text-ink-dim">{r.account}</span>
               </li>
             ))}
           </ol>

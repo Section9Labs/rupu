@@ -7,7 +7,7 @@
 
 import { useEffect, useState } from 'react';
 import { BellRing } from 'lucide-react';
-import { admin, type AutoflowWakeRow } from '../../lib/api3b/admin';
+import { admin, wakeDue, type AutoflowWakeRow } from '../../lib/api3b/admin';
 import { shortIssueRef } from '../../lib/issueRef';
 import { relativeTime } from '../../lib/time';
 import { StatusChip } from '../ui/StatusChip';
@@ -27,7 +27,7 @@ function WakeRow({ wake }: { wake: AutoflowWakeRow }) {
       <span className="text-ink-mute">{wake.source}</span>
       <span className="flex-1" />
       <span className="text-ink-mute" title={wake.not_before}>
-        {wake.state === 'queued' ? `not before ${relativeTime(wake.not_before)}` : relativeTime(wake.not_before)}
+        {wake.state === 'queued' ? wakeDue(wake.not_before) : relativeTime(wake.not_before)}
       </span>
     </li>
   );

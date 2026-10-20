@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ApiError } from '../api';
-import { admin, accountModes, loginCommand, pruneSummary, ruleLines } from './admin';
+import { admin, accountModes, loginCommand, pruneSummary, ruleLines, wakeDue } from './admin';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -199,5 +199,15 @@ describe('tracked repos', () => {
     expect(call(fetchMock, 1).url).toBe('/api/repos/tracked/prefer');
     expect(call(fetchMock, 2)).toMatchObject({ url: '/api/repos/tracked/github_acme_widgets?path=%2Fsrc%2Fw2', method: 'DELETE' });
     expect(call(fetchMock, 3)).toMatchObject({ url: '/api/repos/tracked/github_acme_widgets', method: 'DELETE' });
+  });
+});
+
+describe('wakeDue', () => {
+  const now = Date.parse('2026-10-20T12:00:00Z');
+  it('says due now once not_before has passed, else how long until it is', () => {
+    expect(wakeDue('2026-10-20T11:00:00Z', now)).toBe('due now');
+    expect(wakeDue('2026-10-20T12:20:00Z', now)).toBe('due in 20m');
+    expect(wakeDue('2026-10-20T15:00:00Z', now)).toBe('due in 3h');
+    expect(wakeDue('2026-10-23T12:00:00Z', now)).toBe('due in 3d');
   });
 });

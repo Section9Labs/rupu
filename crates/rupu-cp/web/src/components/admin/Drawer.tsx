@@ -1,8 +1,9 @@
 // Drawer — a right-hand panel over the page for a text report (Explain,
 // Doctor, Repair claims). DialogFrame's behaviour in a side sheet: a dimmed
 // overlay, `role="dialog"` named by its title, Escape / overlay click close,
-// Tab trapped inside, the first control focused on open. The owner renders it
-// only while open.
+// Tab trapped inside. The panel itself takes focus on open (so the first Tab
+// reaches its first control, and no control shows a focus ring unasked). The
+// owner renders it only while open.
 
 import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode } from 'react';
 import { X } from 'lucide-react';
@@ -32,7 +33,7 @@ export function Drawer({
   closeRef.current = onClose;
 
   useEffect(() => {
-    panelRef.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    panelRef.current?.focus();
     function onKey(e: globalThis.KeyboardEvent) {
       if (e.key === 'Escape') closeRef.current();
     }
@@ -68,8 +69,9 @@ export function Drawer({
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        tabIndex={-1}
         onKeyDown={trapTab}
-        className={cn('flex h-full w-full max-w-lg flex-col border-l border-border bg-panel shadow-card', className)}
+        className={cn('flex h-full w-full max-w-lg flex-col border-l border-border bg-panel shadow-card outline-none', className)}
       >
         <div className="flex items-start gap-3 border-b border-border px-5 py-4">
           <div className="min-w-0 flex-1">

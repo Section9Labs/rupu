@@ -105,6 +105,9 @@ describe('MaintenanceTab', () => {
     await waitFor(() => expect(prune).toHaveBeenCalledWith({ kind: 'transcripts', older_than: '30d', dry_run: false }));
     expect(await screen.findByText('Removed 3 transcripts')).toBeInTheDocument();
     await waitFor(() => expect(within(row).getByText('nothing')).toBeInTheDocument());
+    // Cleanup overlaps the transcripts: it counts again after their prune.
+    const cleanupDryRuns = () => prune.mock.calls.filter(([b]) => b.kind === 'cleanup' && b.dry_run).length;
+    await waitFor(() => expect(cleanupDryRuns()).toBe(2));
   });
 
   it('re-counts when the older-than field changes', async () => {

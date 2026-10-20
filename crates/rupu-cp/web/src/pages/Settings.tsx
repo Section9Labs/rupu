@@ -536,7 +536,9 @@ export default function Settings() {
         </div>
       )}
 
-      <div className="-mx-8">
+      {/* Thirteen tabs outgrow a laptop-width page: the strip wraps to a
+          second row rather than hide tabs, and each label stays on one line. */}
+      <div className="-mx-8 [&>div]:flex-wrap [&_button]:whitespace-nowrap">
         <TabBar>
           <TabButton active={tab === 'general'} onClick={() => setTab('general')} icon={SlidersHorizontal} label="General" />
           <TabButton active={tab === 'providers'} onClick={() => setTab('providers')} icon={Cpu} label="Providers" />

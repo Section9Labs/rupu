@@ -2,8 +2,8 @@
 // /api/maintenance/prune`. Each row dry-runs on open and whenever its
 // older-than field changes, shows what it would remove, and only then offers
 // "Prune N", which asks once before it deletes. The answer to the real prune
-// lists what was removed; the row then dry-runs again, so the count it shows
-// is always the server's.
+// lists what was removed; every row then dry-runs again (cleanup overlaps
+// the transcript and session kinds), so each count is always the server's.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, apiErrorMessage } from '../../lib/api';
@@ -32,7 +32,18 @@ const KINDS: KindSpec[] = [
 
 type Preview = { rows: PruneRow[] } | { error: string; unavailable: boolean } | null;
 
-function PruneRowView({ spec, initialOlderThan }: { spec: KindSpec; initialOlderThan: string }) {
+function PruneRowView({
+  spec,
+  initialOlderThan,
+  generation,
+  onPruned,
+}: {
+  spec: KindSpec;
+  initialOlderThan: string;
+  /** Bumped after any row prunes: every row counts again. */
+  generation: number;
+  onPruned: () => void;
+}) {
   const [olderThan, setOlderThan] = useState(initialOlderThan);
   const [preview, setPreview] = useState<Preview>(null);
   const [loading, setLoading] = useState(true);
@@ -78,6 +89,14 @@ function PruneRowView({ spec, initialOlderThan }: { spec: KindSpec; initialOlder
     return () => clearTimeout(t);
   }, [dryRun]);
 
+  // Recount after a prune, this row's or another's.
+  const seenGeneration = useRef(generation);
+  useEffect(() => {
+    if (seenGeneration.current === generation) return;
+    seenGeneration.current = generation;
+    void dryRun();
+  }, [generation, dryRun]);
+
   async function prune() {
     setConfirming(false);
     setPruning(true);
@@ -89,7 +108,7 @@ function PruneRowView({ spec, initialOlderThan }: { spec: KindSpec; initialOlder
       setPruneError(apiErrorMessage(e));
     } finally {
       setPruning(false);
-      void dryRun();
+      onPruned();
     }
   }
 
@@ -178,6 +197,7 @@ function PruneRowView({ spec, initialOlderThan }: { spec: KindSpec; initialOlder
 }
 
 export function MaintenanceTab({ retention }: { retention: { transcripts?: string; sessions?: string } }) {
+  const [generation, setGeneration] = useState(0);
   const initial: Record<PruneKind, string> = {
     transcripts: retention.transcripts ?? '30d',
     sessions: retention.sessions ?? '30d',
@@ -203,7 +223,13 @@ export function MaintenanceTab({ retention }: { retention: { transcripts?: strin
         </thead>
         <tbody className="divide-y divide-border">
           {KINDS.map((spec) => (
-            <PruneRowView key={spec.kind} spec={spec} initialOlderThan={initial[spec.kind]} />
+            <PruneRowView
+              key={spec.kind}
+              spec={spec}
+              initialOlderThan={initial[spec.kind]}
+              generation={generation}
+              onPruned={() => setGeneration((g) => g + 1)}
+            />
           ))}
         </tbody>
       </table>

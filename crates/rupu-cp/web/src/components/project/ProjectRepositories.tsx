@@ -28,6 +28,12 @@ const inside = (path: string, root: string) => {
   return path === r || path.startsWith(`${r}/`);
 };
 
+/** A checkout's path as the project sees it: `project root`, or relative to it. */
+export function relativeTo(path: string, root: string): string {
+  const r = root.replace(/\/+$/, '');
+  return path === r ? 'project root' : path.slice(r.length + 1);
+}
+
 /** The checkouts inside `root`, one per (repo, path). */
 export function checkoutsIn(repos: TrackedRepo[], root: string): Checkout[] {
   return repos.flatMap((repo) => {
@@ -181,7 +187,10 @@ export function ProjectRepositories({ projectPath }: { projectPath: string }) {
           <thead className="bg-surface">
             <tr>
               {['Repository', 'Checkout', 'Default branch', 'Last seen', ''].map((h, i) => (
-                <th key={i} className="px-3 py-2 text-left text-meta font-semibold uppercase tracking-wide text-ink-mute">
+                <th
+                  key={i}
+                  className="whitespace-nowrap px-3 py-2 text-left text-meta font-semibold uppercase tracking-wide text-ink-mute"
+                >
                   {h}
                 </th>
               ))}
@@ -196,12 +205,14 @@ export function ProjectRepositories({ projectPath }: { projectPath: string }) {
                   <td className="px-3 py-2 font-mono text-ink">{c.repo.repo}</td>
                   <td className="px-3 py-2">
                     <span className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono text-ink-dim">{c.path}</span>
+                      <span className="font-mono text-ink-dim" title={c.path}>
+                        {relativeTo(c.path, projectPath)}
+                      </span>
                       {preferred && <StatusChip tone="completed">preferred</StatusChip>}
                     </span>
                   </td>
                   <td className="px-3 py-2 font-mono text-ink-dim">{c.repo.default_branch ?? '—'}</td>
-                  <td className="px-3 py-2 text-ink-mute" title={c.repo.last_seen_at}>
+                  <td className="whitespace-nowrap px-3 py-2 text-ink-mute" title={c.repo.last_seen_at}>
                     {relativeTime(c.repo.last_seen_at)}
                   </td>
                   <td className="px-3 py-2">
@@ -240,7 +251,13 @@ export function ProjectRepositories({ projectPath }: { projectPath: string }) {
           className="mt-3 flex flex-wrap items-center gap-2 rounded-lg border border-err/30 bg-err-bg px-3 py-2 text-note"
         >
           <span className="text-ink">
-            Forget <span className="font-mono">{confirming.path}</span> as a checkout of{' '}
+            Forget{' '}
+            <span className="font-mono" title={confirming.path}>
+              {relativeTo(confirming.path, projectPath) === 'project root'
+                ? 'the project root'
+                : relativeTo(confirming.path, projectPath)}
+            </span>{' '}
+            as a checkout of{' '}
             <span className="font-mono">{confirming.repo.repo}</span>? The files stay; rupu stops reusing it.
           </span>
           <span className="flex-1" />

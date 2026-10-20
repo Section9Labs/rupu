@@ -35,6 +35,17 @@ export interface AutoflowWakeRow {
   repo: string;
 }
 
+/** When a queued wake may run: `due now` once `not_before` has passed, else `due in 2h`. */
+export function wakeDue(notBefore: string, now = Date.now()): string {
+  const ms = Date.parse(notBefore) - now;
+  if (Number.isNaN(ms)) return notBefore;
+  if (ms <= 0) return 'due now';
+  const min = Math.round(ms / 60_000);
+  if (min < 60) return `due in ${Math.max(min, 1)}m`;
+  if (min < 1440) return `due in ${Math.round(min / 60)}h`;
+  return `due in ${Math.round(min / 1440)}d`;
+}
+
 export interface AutoflowWakesReport {
   kind: 'autoflow_wakes';
   version: number;
