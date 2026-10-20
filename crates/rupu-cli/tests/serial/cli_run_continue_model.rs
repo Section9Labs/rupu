@@ -84,6 +84,9 @@ async fn a_refused_run_fails_and_continues_on_another_model() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("refused"))
+        .stderr(predicate::str::contains(
+            "continue with a prompt on the same model: rupu run guarded --continue run_refused \"<instruction>\"",
+        ))
         .stderr(predicate::str::contains("--continue run_refused --model"));
     let rec = run_record(dir.path(), "run_refused");
     assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);
@@ -348,6 +351,9 @@ async fn an_exhausted_provider_error_prints_the_continue_hint() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("boom"))
+        .stderr(predicate::str::contains(
+            "rupu run guarded --continue run_boom \"<instruction>\"",
+        ))
         .stderr(predicate::str::contains("--continue run_boom --model"));
     let rec = run_record(dir.path(), "run_boom");
     assert_eq!(rec.status, rupu_orchestrator::RunStatus::Failed);

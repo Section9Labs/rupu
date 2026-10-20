@@ -960,8 +960,10 @@ under the same handles: finished ones as they ended, the rest continued (see
 [When the parent ends](#when-the-parent-ends)).
 
 A run that failed on a provider-side outcome — a refusal, a reply that kept
-getting cut off — with no fallback left ends with a hint naming this command.
-Its conversation is intact, so it can be continued on another model:
+getting cut off — with no fallback left ends with a hint naming two commands:
+a continue with a prompt, on the same model ([Continuing with a
+prompt](#continuing-with-a-prompt)), and this one. Its conversation is intact,
+so it can be continued on another model:
 
     rupu run <agent> --continue <agent_run_id> --model <model> [--provider <provider>]
 

@@ -1180,13 +1180,15 @@ pub const SESSION_NO_RECOVERY_HINT: &str =
     "no recovery left — send another message to continue, or start a new session on another model";
 
 /// The rung-3 hint: what the operator can do once nothing is left to try.
+/// A standalone run names both ways on: a prompt, which continues it on the
+/// same model, or another model.
 fn no_recovery_hint(opts: &Run) -> String {
     if opts.session_turn() {
         SESSION_NO_RECOVERY_HINT.to_string()
     } else if opts.step().is_empty() {
+        let (agent, run_id) = (&opts.id.agent, &opts.id.run_id);
         format!(
-            "no recovery left — continue with another model: rupu run {} --continue {} --model <model> [--provider <provider>]",
-            opts.id.agent, opts.id.run_id
+            "no recovery left — continue with a prompt on the same model: rupu run {agent} --continue {run_id} \"<instruction>\", or with another model: rupu run {agent} --continue {run_id} --model <model> [--provider <provider>]"
         )
     } else {
         "no recovery left — add fallbacks: to the agent or [recovery].fallbacks to try other models"
