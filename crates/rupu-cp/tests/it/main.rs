@@ -38,6 +38,7 @@ mod mcp_ops_projects;
 mod mcp_ops_observe;
 mod mcp_ops_runs;
 mod mcp_ops_sessions;
+mod mcp_resources;
 mod mcp_routes;
 mod mcp_wait;
 mod legacy_codenames;
