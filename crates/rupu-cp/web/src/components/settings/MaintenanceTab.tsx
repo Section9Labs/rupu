@@ -4,6 +4,9 @@
 // "Prune N", which asks once before it deletes. The answer to the real prune
 // lists what was removed; every row then dry-runs again (cleanup overlaps
 // the transcript and session kinds), so each count is always the server's.
+// The confirm states a count for one older-than; Prune sends exactly that
+// older-than (snapshotted when the confirm opens), editing the field closes
+// the confirm, and nothing can be confirmed while a count is pending.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ApiError, apiErrorMessage } from '../../lib/api';
@@ -30,7 +33,14 @@ const KINDS: KindSpec[] = [
   { kind: 'cleanup', label: 'Cleanup (archived sessions and transcripts)', noun: ['item', 'items'], verb: 'Clean', olderThan: false },
 ];
 
-type Preview = { rows: PruneRow[] } | { error: string; unavailable: boolean } | null;
+/** A dry run's answer, with the older-than it was asked for. */
+type Preview = ({ rows: PruneRow[] } | { error: string; unavailable: boolean }) & { olderThan: string };
+
+/** What the open confirm states: the count, and the older-than it is for. */
+interface Confirming {
+  count: number;
+  olderThan: string;
+}
 
 function PruneRowView({
   spec,
@@ -45,37 +55,38 @@ function PruneRowView({
   onPruned: () => void;
 }) {
   const [olderThan, setOlderThan] = useState(initialOlderThan);
-  const [preview, setPreview] = useState<Preview>(null);
+  const [preview, setPreview] = useState<Preview | null>(null);
   const [loading, setLoading] = useState(true);
-  const [confirming, setConfirming] = useState(false);
+  const [confirming, setConfirming] = useState<Confirming | null>(null);
   const [pruning, setPruning] = useState(false);
   const [result, setResult] = useState<{ removed: PruneRow[]; errors: string[] } | null>(null);
   const [pruneError, setPruneError] = useState<string | null>(null);
   const seq = useRef(0);
 
   const body = useCallback(
-    (dry: boolean) => ({
+    (older: string, dry: boolean) => ({
       kind: spec.kind,
-      ...(spec.olderThan && olderThan.trim() ? { older_than: olderThan.trim() } : {}),
+      ...(spec.olderThan && older.trim() ? { older_than: older.trim() } : {}),
       dry_run: dry,
     }),
-    [spec, olderThan],
+    [spec],
   );
 
   const dryRun = useCallback(async () => {
     const mine = ++seq.current;
+    const asked = olderThan;
     setLoading(true);
     try {
-      const reply = await admin.prune(body(true));
-      if (mine === seq.current) setPreview({ rows: reply.would_remove ?? [] });
+      const reply = await admin.prune(body(asked, true));
+      if (mine === seq.current) setPreview({ rows: reply.would_remove ?? [], olderThan: asked });
     } catch (e) {
       if (mine === seq.current) {
-        setPreview({ error: apiErrorMessage(e), unavailable: e instanceof ApiError && e.status === 501 });
+        setPreview({ error: apiErrorMessage(e), unavailable: e instanceof ApiError && e.status === 501, olderThan: asked });
       }
     } finally {
       if (mine === seq.current) setLoading(false);
     }
-  }, [body]);
+  }, [body, olderThan]);
 
   // Dry-run on open, and again (debounced) when the field changes.
   const first = useRef(true);
@@ -97,12 +108,12 @@ function PruneRowView({
     void dryRun();
   }, [generation, dryRun]);
 
-  async function prune() {
-    setConfirming(false);
+  async function prune(confirmed: Confirming) {
+    setConfirming(null);
     setPruning(true);
     setPruneError(null);
     try {
-      const reply = await admin.prune(body(false));
+      const reply = await admin.prune(body(confirmed.olderThan, false));
       setResult({ removed: reply.removed ?? [], errors: reply.errors });
     } catch (e) {
       setPruneError(apiErrorMessage(e));
@@ -114,6 +125,8 @@ function PruneRowView({
 
   const rows = preview && 'rows' in preview ? preview.rows : null;
   const count = rows?.length ?? 0;
+  // The count on screen is for the field as typed only once its dry run answered.
+  const counted = !loading && preview !== null && preview.olderThan === olderThan;
   const [one, many] = spec.noun;
 
   return (
@@ -127,6 +140,7 @@ function PruneRowView({
               value={olderThan}
               onChange={(e) => {
                 setResult(null);
+                setConfirming(null);
                 setOlderThan(e.target.value);
               }}
               placeholder="30d"
@@ -150,8 +164,8 @@ function PruneRowView({
         <td className="px-3 py-2.5 text-right">
           <Button
             variant="ring-danger"
-            disabled={loading || pruning || count === 0}
-            onClick={() => setConfirming(true)}
+            disabled={!counted || pruning || count === 0}
+            onClick={() => setConfirming({ count, olderThan })}
           >
             {pruning ? 'Pruning…' : count > 0 ? `${spec.verb} ${count}` : spec.verb}
           </Button>
@@ -163,13 +177,15 @@ function PruneRowView({
             {confirming ? (
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-ink">
-                  Delete {count} {count === 1 ? one : many}? This can't be undone.
+                  Delete {confirming.count} {confirming.count === 1 ? one : many}
+                  {spec.olderThan && confirming.olderThan.trim() ? ` older than ${confirming.olderThan.trim()}` : ''}? This
+                  can't be undone.
                 </span>
                 <span className="flex-1" />
-                <Button variant="secondary" size="sm" onClick={() => setConfirming(false)}>
+                <Button variant="secondary" size="sm" onClick={() => setConfirming(null)}>
                   Cancel
                 </Button>
-                <Button variant="danger" size="sm" onClick={() => void prune()}>
+                <Button variant="danger" size="sm" disabled={!counted || pruning} onClick={() => void prune(confirming)}>
                   Delete
                 </Button>
               </div>

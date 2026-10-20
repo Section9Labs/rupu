@@ -99,7 +99,7 @@ describe('MaintenanceTab', () => {
     expect(prune).toHaveBeenCalledWith({ kind: 'transcripts', older_than: '30d', dry_run: true });
 
     fireEvent.click(within(row).getByRole('button', { name: 'Prune 3' }));
-    expect(screen.getByText("Delete 3 archived transcripts? This can't be undone.")).toBeInTheDocument();
+    expect(screen.getByText("Delete 3 archived transcripts older than 30d? This can't be undone.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(prune).toHaveBeenCalledWith({ kind: 'transcripts', older_than: '30d', dry_run: false }));
@@ -108,6 +108,34 @@ describe('MaintenanceTab', () => {
     // Cleanup overlaps the transcripts: it counts again after their prune.
     const cleanupDryRuns = () => prune.mock.calls.filter(([b]) => b.kind === 'cleanup' && b.dry_run).length;
     await waitFor(() => expect(cleanupDryRuns()).toBe(2));
+  });
+
+  it('editing older-than closes the confirm, and Delete sends exactly what the confirm stated', async () => {
+    const prune = vi.spyOn(admin, 'prune').mockImplementation(async (b: PruneRequest) => {
+      const n = b.kind !== 'transcripts' ? 0 : b.older_than === '1d' ? 5 : 3;
+      const rows = Array.from({ length: n }, (_, i) => ({ run_id: `r${i}` }));
+      return b.dry_run
+        ? { kind: b.kind, dry_run: true, would_remove: rows, errors: [] }
+        : { kind: b.kind, dry_run: false, removed: rows, errors: [] };
+    });
+    render(<MaintenanceTab retention={{ transcripts: '30d' }} />);
+    const row = await screen.findByRole('row', { name: /Archived transcripts/ });
+    fireEvent.click(await within(row).findByRole('button', { name: 'Prune 3' }));
+    expect(screen.getByText(/Delete 3 archived transcripts older than 30d\?/)).toBeInTheDocument();
+
+    fireEvent.change(within(row).getByLabelText('Archived transcripts older than'), { target: { value: '1d' } });
+
+    // The confirm for 30d is gone, and nothing can be confirmed until 1d is counted.
+    expect(screen.queryByText(/Delete 3 archived transcripts/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+    expect(within(row).getByRole('button', { name: /^Prune/ })).toBeDisabled();
+
+    fireEvent.click(await within(row).findByRole('button', { name: 'Prune 5' }));
+    expect(screen.getByText(/Delete 5 archived transcripts older than 1d\?/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+
+    await waitFor(() => expect(prune).toHaveBeenCalledWith({ kind: 'transcripts', older_than: '1d', dry_run: false }));
+    expect(prune.mock.calls.filter(([b]) => !b.dry_run)).toHaveLength(1);
   });
 
   it('re-counts when the older-than field changes', async () => {

@@ -1,12 +1,14 @@
 // WakesStrip — the line above Activity → Autoflows' table (Plan 3b, UI-5):
 // the queued autoflow wakes and the ten most recently processed (`GET
 // /api/autoflows/wakes`). It renders nothing while there are no wakes, or
-// when the endpoint can't answer here (a CP without `rupu cp serve` is a
-// 501). Queued wakes are listed; processed ones sit behind "Show". Polled
-// every 30 s, as the problems strip beside it is.
+// when the endpoint can't answer here. Queued wakes are listed; processed
+// ones sit behind "Show". Polled every 30 s while the tab is visible (and
+// once more when it comes back); a 501 (no `rupu cp serve` here) stops the
+// polling for good, since asking again can't change that answer.
 
 import { useEffect, useState } from 'react';
 import { BellRing } from 'lucide-react';
+import { ApiError } from '../../lib/api';
 import { admin, wakeDue, type AutoflowWakeRow } from '../../lib/api3b/admin';
 import { shortIssueRef } from '../../lib/issueRef';
 import { relativeTime } from '../../lib/time';
@@ -39,20 +41,42 @@ export function WakesStrip() {
 
   useEffect(() => {
     let live = true;
+    let unsupported = false;
+    let inFlight = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      if (live && !unsupported && !document.hidden) timer = setTimeout(() => void tick(), POLL_MS);
+    };
     const tick = async () => {
+      if (!live || unsupported || inFlight || document.hidden) return;
+      inFlight = true;
       try {
         const r = await admin.getAutoflowWakes();
         if (live) setRows(r.rows);
-      } catch {
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 501) unsupported = true;
         if (live) setRows([]);
+      } finally {
+        inFlight = false;
       }
-      if (live) timer = setTimeout(() => void tick(), POLL_MS);
+      schedule();
     };
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (timer) clearTimeout(timer);
+        timer = undefined;
+      } else {
+        void tick();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     void tick();
     return () => {
       live = false;
       if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
 

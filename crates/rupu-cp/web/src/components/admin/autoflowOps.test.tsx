@@ -137,6 +137,43 @@ describe('WakesStrip', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it('stops polling after a 501, and polls only while the tab is visible', async () => {
+    vi.useFakeTimers();
+    try {
+      const wakes = vi.spyOn(admin, 'getAutoflowWakes').mockRejectedValue(new ApiError(501, 'x', '{"error":"needs rupu cp serve"}'));
+      render(<WakesStrip />);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(wakes).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(wakes).toHaveBeenCalledTimes(1);
+      cleanup();
+
+      const empty = { kind: 'autoflow_wakes' as const, version: 1, rows: [] };
+      const polled = vi.spyOn(admin, 'getAutoflowWakes').mockResolvedValue(empty);
+      polled.mockClear();
+      const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+      render(<WakesStrip />);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(polled).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(polled).toHaveBeenCalledTimes(2);
+
+      hidden.mockReturnValue(true);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(5 * 60_000);
+      expect(polled).toHaveBeenCalledTimes(2);
+
+      hidden.mockReturnValue(false);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(polled).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('shows the queued wakes', async () => {
     vi.spyOn(admin, 'getAutoflowWakes').mockResolvedValue({
       kind: 'autoflow_wakes',
