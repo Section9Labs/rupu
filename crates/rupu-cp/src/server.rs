@@ -27,6 +27,7 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
 pub(crate) fn api_routes() -> Router<AppState> {
     Router::new()
         .merge(crate::api::agentiflows::routes())
+        .merge(crate::api::agentiflow_defs::routes())
         .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
         .merge(crate::api::assets::routes())

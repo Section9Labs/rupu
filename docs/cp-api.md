@@ -608,7 +608,7 @@ Bodies, status codes, attribution and `?customer=` semantics:
 
 ## Agentiflows
 
-Local host only, except the message space ([Messages](#messages)), which takes `host`.
+Local host only, except the message space ([Messages](#messages)), which takes `host`. The writes answer a remote `?host=` with a 501.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
@@ -616,6 +616,26 @@ Local host only, except the message space ([Messages](#messages)), which takes `
 | GET | `/api/agentiflows/:id` | One run: record, definition, budget, events, units, lead transcripts (`AgentiflowDetail`). | 404 unknown or malformed id. |
 | GET | `/api/agentiflows/:id/messages` | The run's message space (`MessagesView`). | See [Messages](#messages). |
 | POST | `/api/agentiflows/:id/steer` | Message the lead, or stop the run. | Body `SteerRequest {message, now?, stop?}`. Without `stop`: the alias of `POST /api/agentiflows/:id/messages {to: "lead", body: message, urgent: now}`, with its answers (`202 {id, delivery}`). With `stop: true`: queues a graceful stop → `200 {queued: true}`; 400 empty message; 404 unknown run; 409 when nothing would read it — the run isn't `running`, or its recorded coordinator process is gone (a dead coordinator leaves `running` on disk until the reaper closes it); 501 without `rupu cp serve`. |
+| POST | `/api/agentiflows` | Launch a run detached, as `rupu agentiflow run --detach` does. | Body `{definition, scope_kind?, scope_id?, working_dir?}`. The run starts in the directory `scope_kind` (`global`\|`project`, with `scope_id` the project's workspace id) picks, or the absolute `working_dir`, or the control plane's own; the two are exclusive. The id is minted before the spawn and the answer waits for the run to record itself: `202 {id, status: "started"}`, or `202 {id, status: "pending", log}` when it is still starting after 30 s. Before anything starts, the definition is looked up from that directory (project first, then global) and checked as the CLI checks it: 404 not found; 400 a file that does not parse, an unknown engagement profile, a validation rule, a bad `working_dir` or `scope_kind`; 404 a scope that doesn't hold it. A run whose process exits before it starts (a lead agent that does not load, no credential) is a 400 carrying its log, and leaves no run directory. `?host=<remote>` is a 501 (local only); 501 without `rupu cp serve`. |
+| POST | `/api/agentiflows/:id/stop` | Stop a running agentiflow. | Body `{now?}` (or none; a body that isn't one, e.g. `{"now": "true"}`, is a 400). Without `now`, the graceful stop `steer {stop: true}` queues, answered as `steer` answers it: `200 {queued: true}`; 409 when nothing would read it (see `steer`). With `now: true`, the hard stop `rupu agentiflow stop --now` runs: the coordinator and every unit still running are signalled (SIGKILL after a grace) and the run is recorded failed, answered once done with `200 {stopped: true, status, stop_reason}` (`operator_stop:now`); a `running` record whose coordinator died is closed out the same way. 404 unknown run; 409 a run that is not `running`; `?host=<remote>` 501; 501 without `rupu cp serve`. |
+
+### Agentiflow definitions
+
+The `<name>.yaml` files `rupu agentiflow run <name>` loads: the global layer
+(`<RUPU_HOME>/agentiflows/`, beside the run directories, which are never read
+as definitions) and each registered project's `.rupu/agentiflows/`. A project
+definition shadows a same-named global one, as it does for the CLI. The
+`scope_kind`/`scope_id` selector works as it does for workflows. Local only:
+every route answers `?host=<remote>` with a 501.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/agentiflow-defs` | Every definition. | Rows `{name, scope, scope_kind, scope_id, description, lead, engagement_profiles, error}`, sorted by name then scope. A file that does not parse is still listed, with `error`. |
+| GET | `/api/agentiflow-defs/:name` | One definition. | Query `scope_kind`, `scope_id`; without them, project first. `{name, def, yaml, error, scope, scope_kind, scope_id}`: `def` is the parsed definition, or null with `error` when it does not parse. 404 not found in the layer asked for. |
+| POST | `/api/agentiflow-defs` | Create a definition in the global layer. | Body `{raw}`, named by its `name:`. Answers as `GET`. 400 a file that does not parse or a bad name (`validate` included: it is another route); 409 the name exists in any layer; 501 without `rupu cp serve`. |
+| PUT | `/api/agentiflow-defs/:name` | Overwrite a definition. | Query `scope_kind`, `scope_id`; body `{raw}`, whose `name:` must equal `:name` (400). With a selector, that layer's existing file (404 otherwise); without, the project-first match, or a new global file. Answers as `GET`. 501 without `rupu cp serve`. |
+| DELETE | `/api/agentiflow-defs/:name` | Delete a definition file. | Query `scope_kind`, `scope_id`; without them, the project-first match. `{deleted, scope, scope_kind}`; 404 nothing matches; 501 without `rupu cp serve`. |
+| POST | `/api/agentiflow-defs/validate` | Check a definition as `agentiflow run` does, writing nothing. | Body `{raw, scope_id?}`: the file parses, its engagement profiles resolve (built-ins, `<RUPU_HOME>/profiles` and, with `scope_id`, that project's `.rupu/profiles`) and it validates against them. `{ok: true, name, lead, engagement_profiles}`, or a 400 naming the first problem; 404 an unknown `scope_id`. A definition named `validate` can't be reached by `GET /api/agentiflow-defs/:name`. |
 
 ## Node tunnel
 

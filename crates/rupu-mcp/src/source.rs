@@ -68,9 +68,16 @@ pub struct EmbeddedResource {
 }
 
 impl EmbeddedResource {
-    /// The `resource` content block: `text` when the MIME type is textual
-    /// and the bytes are UTF-8, else a padded standard base64 `blob`.
+    /// The `resource` content block: [`EmbeddedResource::to_contents`] as a
+    /// tool result's content.
     pub fn to_content(&self) -> Value {
+        json!({ "type": "resource", "resource": self.to_contents() })
+    }
+
+    /// `{uri, mimeType, text | blob}`, the shape `resources/read` answers
+    /// with: `text` when the MIME type is textual and the bytes are UTF-8,
+    /// else a padded standard base64 `blob`.
+    pub fn to_contents(&self) -> Value {
         let mut res = json!({ "uri": self.uri, "mimeType": self.mime_type });
         let text = is_textual(&self.mime_type)
             .then(|| std::str::from_utf8(&self.bytes).ok())
@@ -85,7 +92,7 @@ impl EmbeddedResource {
         if let Some(name) = &self.name {
             res["_meta"] = json!({ "name": name });
         }
-        json!({ "type": "resource", "resource": res })
+        res
     }
 }
 
@@ -100,6 +107,8 @@ fn is_textual(mime: &str) -> bool {
         || essence == "application/json"
         || essence.ends_with("+json")
         || essence.ends_with("+xml")
+        || essence == "application/yaml"
+        || essence == "application/toml"
 }
 
 /// A call's progress channel: present only when the request carried
@@ -149,4 +158,72 @@ pub trait ToolSource: Send + Sync {
     fn tools(&self) -> Vec<ToolDef>;
     /// `None` when `name` is not this source's tool.
     async fn call(&self, name: &str, args: Value, cx: &CallCx) -> Option<ToolResult>;
+}
+
+/// One resource a [`ResourceSource`] lists.
+#[derive(Debug, Clone)]
+pub struct ResourceDef {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: String,
+}
+
+/// A parameterized URI (RFC 6570) a [`ResourceSource`] answers, for
+/// `resources/templates/list`.
+#[derive(Debug, Clone)]
+pub struct ResourceTemplate {
+    pub uri_template: String,
+    pub name: String,
+    pub description: String,
+    /// Every resource the template expands to has this type, when they share
+    /// one.
+    pub mime_type: Option<String>,
+}
+
+/// Read-only resources (`resources/list`, `resources/read`).
+#[async_trait]
+pub trait ResourceSource: Send + Sync {
+    fn resources(&self) -> Vec<ResourceDef>;
+    fn templates(&self) -> Vec<ResourceTemplate>;
+    /// `None` when `uri` is not this source's resource.
+    async fn read(&self, uri: &str) -> Option<EmbeddedResource>;
+}
+
+/// One argument a prompt takes. Arguments are strings (the protocol's).
+#[derive(Debug, Clone)]
+pub struct PromptArgument {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+
+/// One prompt a [`PromptSource`] lists.
+#[derive(Debug, Clone)]
+pub struct PromptDef {
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<PromptArgument>,
+}
+
+/// A prompt rendered for its arguments: `prompts/get` answers with
+/// `description` and one user message holding `text`.
+#[derive(Debug, Clone)]
+pub struct PromptReply {
+    pub description: String,
+    pub text: String,
+}
+
+/// Prompts (`prompts/list`, `prompts/get`).
+#[async_trait]
+pub trait PromptSource: Send + Sync {
+    fn prompts(&self) -> Vec<PromptDef>;
+    /// `None` when `name` is not this source's prompt. The server has
+    /// checked `args` first: every required argument is present, and every
+    /// value is a string.
+    async fn get(
+        &self,
+        name: &str,
+        args: &std::collections::BTreeMap<String, String>,
+    ) -> Option<PromptReply>;
 }
