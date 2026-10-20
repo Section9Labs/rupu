@@ -46,6 +46,8 @@ import { api, ApiError, type ConfigRuntimeStatus, type ConfigView } from '../lib
 import { cn } from '../lib/cn';
 import { TabBar, TabButton } from '../components/TabBar';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Skeleton } from '../components/ui/Skeleton';
 import {
   getPath,
   sameSet,
@@ -415,8 +417,23 @@ export default function Settings() {
 
   if (configView === null) {
     return (
-      <div className="p-8">
-        <div className="text-sm text-ink-dim">Loading settings…</div>
+      <div className="p-8 space-y-6">
+        <PageHeader title="Settings" subtitle="Global rupu configuration." />
+        <section
+          role="status"
+          aria-label="Loading settings…"
+          className="rounded-xl border border-border bg-panel px-5 py-4"
+        >
+          <span className="sr-only">Loading settings…</span>
+          <div className="space-y-5" aria-hidden>
+            {[0, 1, 2, 3].map((i) => (
+              <div key={i}>
+                <Skeleton className="h-3.5 w-40" />
+                <Skeleton className="mt-2 h-8 w-full max-w-sm" />
+              </div>
+            ))}
+          </div>
+        </section>
       </div>
     );
   }
@@ -427,25 +444,27 @@ export default function Settings() {
 
   return (
     <div className="p-8 space-y-6">
-      <header className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Settings</h1>
-          <p className="mt-1 text-sm text-ink-dim">
+      <PageHeader
+        title="Settings"
+        subtitle={
+          <>
             Global rupu configuration, resolved from{' '}
             <span className="font-mono">~/.rupu/config.toml</span>.
-          </p>
-        </div>
-        <div className="flex items-center gap-3">
-          {dirtyCount > 0 && (
-            <span className="text-note text-ink-dim">
-              {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}
-            </span>
-          )}
-          <Button onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving}>
-            {saving ? 'Saving…' : 'Save changes'}
-          </Button>
-        </div>
-      </header>
+          </>
+        }
+        actions={
+          <>
+            {dirtyCount > 0 && (
+              <span className="text-note text-ink-dim">
+                {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}
+              </span>
+            )}
+            <Button variant="solid" onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving}>
+              {saving ? 'Saving…' : 'Save changes'}
+            </Button>
+          </>
+        }
+      />
 
       {readOnly && (
         <div className="rounded-lg border border-warn/30 bg-warn-bg px-4 py-3 text-sm text-warn">
