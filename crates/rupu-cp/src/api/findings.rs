@@ -35,11 +35,35 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/findings", get(list_findings))
         .route("/api/findings/export", post(export_findings))
+        .route(
+            "/api/findings/import",
+            post(crate::api::findings_import::import_handler),
+        )
+        .route("/api/findings/schema", get(finding_schema))
         .route("/api/findings/tags", get(tags_in_use).post(tag_findings))
         .route("/api/findings/:id", get(get_finding))
         .route("/api/findings/:id/export", get(export_finding))
         .route("/api/findings/:id/artifacts/:sha256", get(get_artifact))
         .route("/api/findings/artifacts/:sha256", get(get_artifact_blob))
+}
+
+/// `?advertised=` on `GET /api/findings/schema`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SchemaQuery {
+    /// The simplified copy used in tool definitions instead of the canonical
+    /// draft-07 schema.
+    #[serde(default)]
+    advertised: bool,
+}
+
+/// `GET /api/findings/schema` — the finding report JSON Schema embedded in
+/// this build, what `rupu findings schema [--advertised]` prints.
+async fn finding_schema(Query(q): Query<SchemaQuery>) -> Json<serde_json::Value> {
+    Json(if q.advertised {
+        rupu_coverage::report::schema::advertised_schema()
+    } else {
+        rupu_coverage::report::schema::canonical_schema()
+    })
 }
 
 /// A single finding plus its provenance (which workspace / project / coverage

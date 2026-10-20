@@ -49,6 +49,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::findings::routes())
+        .merge(crate::api::query::routes())
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
         .merge(crate::api::graph::routes())
