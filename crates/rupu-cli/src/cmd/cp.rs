@@ -43,7 +43,82 @@ pub enum Action {
         /// always printed regardless.
         #[arg(long)]
         no_open: bool,
+        /// Serve no web UI or page shell: `/api/*`, `/healthz` and `/mcp`
+        /// only. Implies `--no-open`.
+        #[arg(long)]
+        no_web: bool,
+        /// Do not serve the MCP endpoint (`/mcp` is a 404).
+        #[arg(long)]
+        no_mcp: bool,
+        /// Narrow the MCP to these tools (exact names, `ns.*`, `*`;
+        /// comma-separated). Default: every tool.
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
     },
+}
+
+/// What `rupu mcp serve` runs: the control plane with no web UI, MCP only
+/// narrowed by `tools`, on the default bind.
+pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
+    handle(Action::Serve {
+        bind: "127.0.0.1:7878".parse().expect("default bind"),
+        token: None,
+        no_open: true,
+        no_web: true,
+        no_mcp: false,
+        tools,
+    })
+    .await
+}
+
+/// The catalog tools' context: one `mcp_<ULID>` run identity per server
+/// process, the run assembler's call-site context over the workspace a call
+/// names.
+struct CliContextFactory {
+    assembler: rupu_runtime::assembly::RunAssembler,
+    global: std::path::PathBuf,
+    run_id: String,
+}
+
+impl rupu_mcp::ContextFactory for CliContextFactory {
+    fn context(&self, workspace: Option<&str>) -> Result<rupu_tools::ToolContext, String> {
+        use rupu_runtime::assembly::WorkspaceBinding;
+        let binding = match workspace {
+            None => WorkspaceBinding {
+                id: String::new(),
+                path: self.global.clone(),
+            },
+            Some(ws) => {
+                let store = rupu_workspace::WorkspaceStore {
+                    root: self.global.join("workspaces"),
+                };
+                let found = match store.load(ws) {
+                    Ok(Some(w)) => Some(w),
+                    _ => rupu_workspace::store::find_by_path(&store, std::path::Path::new(ws))
+                        .map_err(|e| format!("reading projects: {e}"))?,
+                };
+                match found {
+                    Some(w) => WorkspaceBinding {
+                        id: w.id,
+                        path: std::path::PathBuf::from(w.path),
+                    },
+                    None => return Err(format!("no registered project `{ws}`")),
+                }
+            }
+        };
+        Ok(self.assembler.call_site_context(
+            rupu_tools::RunIdentity {
+                run_id: self.run_id.clone(),
+                surface: rupu_tools::Surface::Agent,
+                scope_name: Some("mcp".into()),
+                ..Default::default()
+            },
+            &binding,
+            // A long-lived server is no run: a served `bash`'s flows have no
+            // run ledger to land in.
+            Arc::new(rupu_netflow::NullSink),
+        ))
+    }
 }
 
 pub async fn handle(action: Action) -> ExitCode {
@@ -52,7 +127,18 @@ pub async fn handle(action: Action) -> ExitCode {
             bind,
             token,
             no_open,
+            no_web,
+            no_mcp,
+            tools,
         } => {
+            if no_mcp && !tools.is_empty() {
+                eprintln!("error: --tools needs the MCP; drop --no-mcp");
+                return ExitCode::FAILURE;
+            }
+            if no_web && no_mcp {
+                eprintln!("error: nothing to serve: --no-web and --no-mcp together");
+                return ExitCode::FAILURE;
+            }
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -423,6 +509,51 @@ pub async fn handle(action: Action) -> ExitCode {
                 )
                 .await,
             );
+            // The MCP's catalog tools: the same SCM registry, findings
+            // options and global config the control plane serves with.
+            let mcp = if no_mcp {
+                None
+            } else {
+                let assembler = rupu_runtime::assembly::RunAssembler::new(
+                    rupu_runtime::assembly::AssemblyContext {
+                        config: scm_cfg.clone(),
+                        resolver: Arc::clone(&scm_resolver),
+                        scm: Some(Arc::clone(&scm_registry)),
+                        findings: crate::findings_opts::base_options(
+                            &global_dir,
+                            &scm_cfg.findings,
+                        ),
+                        ..rupu_runtime::assembly::AssemblyContext::minimal(global_dir.clone())
+                    },
+                );
+                let factory = Arc::new(CliContextFactory {
+                    assembler,
+                    global: global_dir.clone(),
+                    run_id: format!("mcp_{}", ulid::Ulid::new()),
+                });
+                let catalog = match rupu_mcp::CatalogSource::new(factory) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: building the MCP catalog: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let unavailable = catalog.unavailable();
+                if !unavailable.is_empty() {
+                    tracing::info!(
+                        "mcp: not served (service missing): {}",
+                        unavailable
+                            .iter()
+                            .map(|u| u.notice_message())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                }
+                Some(rupu_cp::mcp::McpOpts {
+                    catalog: Some(Arc::new(catalog)),
+                    tools,
+                })
+            };
             let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
                 Arc::new(crate::cp_repos::CpRepoLister {
                     registry: Arc::clone(&scm_registry),
@@ -482,7 +613,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     bind,
                     token,
                     global_dir,
-                    open_browser: !no_open,
+                    open_browser: !no_open && !no_web,
                     launcher: Some(launcher),
                     session_sender: Some(session_sender),
                     repos,
@@ -493,8 +624,8 @@ pub async fn handle(action: Action) -> ExitCode {
                     session_mutator,
                     transcript_mutator,
                     inventory: Some(inventory),
-                    web: true,
-                    mcp: None,
+                    web: !no_web,
+                    mcp,
                 },
             )
             .await;
