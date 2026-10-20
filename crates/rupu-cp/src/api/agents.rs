@@ -1,6 +1,8 @@
 use crate::{
     agent_launcher::{AgentLaunchError, AgentLaunchRequest, AgentLauncher},
-    api::fs_safety::{validate_name, validate_stem, validate_within, write_atomic},
+    api::fs_safety::{
+        validate_name, validate_new_name, validate_stem, validate_within, write_atomic,
+    },
     api::repo_scope::{distinct_repo_workspaces, scope_name, ScopeKind, ScopeQuery},
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -318,7 +320,7 @@ fn save_agent_file(global_dir: &FsPath, url_name: &str, raw: &str) -> Result<Pat
 /// `.md` (no write on parse failure), enforces frontmatter-name == url-name,
 /// then atomically writes `<dir>/<url_name>.md`. Returns the written path.
 fn save_agent_file_at(url_name: &str, raw: &str, dir: &FsPath) -> Result<PathBuf, ApiError> {
-    validate_name(url_name)?;
+    validate_new_name("agent", url_name)?;
     let spec = parse_agent_for_write(raw)?;
     if spec.name != url_name {
         return Err(ApiError::bad_request(
@@ -366,7 +368,7 @@ fn parse_agent_for_write(raw: &str) -> Result<rupu_agent::AgentSpec, ApiError> {
 fn create_agent_file(global_dir: &FsPath, raw: &str) -> Result<PathBuf, ApiError> {
     let spec = parse_agent_for_write(raw)?;
     let name = spec.name.clone();
-    validate_name(&name)?;
+    validate_new_name("agent", &name)?;
     let dir = global_dir.join("agents");
     let target = dir.join(format!("{name}.md"));
     if target.exists() {
@@ -1040,7 +1042,7 @@ async fn create_agent(
     Json(body): Json<AgentWriteBody>,
 ) -> ApiResult<Json<AgentDetailDto>> {
     let spec = parse_agent_for_write(&body.raw)?;
-    validate_name(&spec.name)?;
+    validate_new_name("agent", &spec.name)?;
     if resolve_agent_scoped(&s, &spec.name).is_some() {
         return Err(ApiError::conflict("agent already exists"));
     }

@@ -75,6 +75,12 @@ pub struct RetryRequest {
     /// Start every interrupted step and `for_each` unit over from its
     /// prompt instead of continuing it from its transcript.
     pub restart_interrupted: bool,
+    /// The permission mode to resume in (`--mode`); `None` resumes in the
+    /// run's own launch mode (`RunRecord.permission_mode`).
+    pub mode: Option<rupu_tools::PermissionMode>,
+    /// Where the child's stderr goes (the run dir's `retry.log`), so a
+    /// resume that refuses before it takes the run leaves its reason.
+    pub log: std::path::PathBuf,
 }
 
 impl RetryRequest {
@@ -85,7 +91,7 @@ impl RetryRequest {
         use rupu_runtime::argv::{RunArgv, WorkflowControl};
         RunArgv::WorkflowControl(WorkflowControl::Resume {
             run_id: self.run_id.clone(),
-            mode: None,
+            mode: self.mode,
             if_unfinished: false,
             restart_interrupted: self.restart_interrupted,
         })

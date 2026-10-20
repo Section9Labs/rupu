@@ -7,7 +7,7 @@
 
 use rupu_cp::launcher::{LaunchError, LaunchRequest, RetryRequest, RunLauncher};
 use rupu_runtime::argv::RunArgv;
-use rupu_runtime::spawn::{spawn_detached, SpawnSpec};
+use rupu_runtime::spawn::{spawn_detached, SpawnSpec, SpawnStdio};
 use std::path::PathBuf;
 
 /// Spawns `rupu workflow run …` children. `exe` is the path to the running
@@ -43,8 +43,9 @@ impl RunLauncher for SubprocessLauncher {
     /// launch. It runs where the resume worker's children run: the resume
     /// reads the run's own record and snapshot, not the cwd.
     async fn retry(&self, req: RetryRequest) -> Result<(), LaunchError> {
-        spawn_detached(SpawnSpec::new(&self.exe, req.argv()))
-            .map_err(|e| LaunchError::Spawn(e.to_string()))?;
+        let mut spec = SpawnSpec::new(&self.exe, req.argv());
+        spec.stdio = SpawnStdio::Log(req.log.clone());
+        spawn_detached(spec).map_err(|e| LaunchError::Spawn(e.to_string()))?;
         Ok(())
     }
 }
@@ -141,6 +142,8 @@ mod tests {
             let argv: Vec<String> = RetryRequest {
                 run_id: "run_X".into(),
                 restart_interrupted: restart,
+                mode: None,
+                log: "/g/runs/run_X/retry.log".into(),
             }
             .argv()
             .to_args()
@@ -149,6 +152,22 @@ mod tests {
             .collect();
             assert_eq!(argv, want);
         }
+    }
+
+    #[test]
+    fn a_retry_in_a_given_mode_passes_it() {
+        let argv: Vec<String> = RetryRequest {
+            run_id: "run_X".into(),
+            restart_interrupted: false,
+            mode: Some(rupu_tools::PermissionMode::Readonly),
+            log: "/g/runs/run_X/retry.log".into(),
+        }
+        .argv()
+        .to_args()
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(argv, ["workflow", "resume", "run_X", "--mode", "readonly"]);
     }
 
     #[test]

@@ -186,6 +186,10 @@ pub(crate) struct RetryBody {
     /// (`--restart-interrupted`). Default false.
     #[serde(default)]
     restart_interrupted: bool,
+    /// Permission mode (`ask` | `bypass` | `readonly`) to resume in. Absent:
+    /// the run's own launch mode, so a `readonly` run retries `readonly`.
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 /// Optional body for `POST /api/runs/:id/approve`. `mode` selects the
@@ -541,14 +545,22 @@ async fn resume_run(
     Ok(resp)
 }
 
+/// Where a retry's `rupu workflow resume` writes its stderr, in the run's
+/// dir: what a child that refused before taking the run said.
+pub(crate) const RETRY_LOG: &str = "retry.log";
+
 /// `POST /api/runs/:id/retry` — retry a failed, rejected or cancelled
 /// workflow run: a detached `rupu workflow resume <id>
 /// [--restart-interrupted]`, an operator's resume, which flips the run back
 /// to `Running` under the run lock before it runs it (what it left
-/// mid-flight is continued, unless `restart_interrupted`). A run left
-/// `Running` by a runner that died is reaped to `Failed` first, as the CLI
-/// does, and retried. 202 once the resume is spawned: the run's status is
-/// the confirmation.
+/// mid-flight is continued, unless `restart_interrupted`), in `mode` or else
+/// the run's own launch mode. A run left `Running` by a runner that died is
+/// reaped to `Failed` first, as the CLI does, and retried. The retry is
+/// recorded on the run (its resume marker, `RunStore::request_retry`)
+/// before the child is spawned, and the child's stderr goes to
+/// `<run dir>/retry.log`. 202 once the resume is spawned: the run's status
+/// is the confirmation, and a marker still on a finished run is a retry
+/// that never took it.
 ///
 /// 409 for a run that is running, pending, paused (`runs.resume`),
 /// awaiting approval or completed; 404 for an unknown run. Local-only:
@@ -558,6 +570,7 @@ async fn retry_run(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<RunControlQuery>,
+    via: crate::mcp::ViaMcp,
     body: Option<Json<RetryBody>>,
 ) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
     validate_id(&id)?;
@@ -570,37 +583,50 @@ async fn retry_run(
         .launcher
         .clone()
         .ok_or_else(|| ApiError::not_available("retrying a run requires `rupu cp serve`"))?;
-    let restart_interrupted = body.map(|b| b.0.restart_interrupted).unwrap_or(false);
-    let mut record = s.run_store.load(&id).map_err(|e| match e {
+    let body = body.map(|b| b.0).unwrap_or_default();
+    let mode =
+        crate::agent_launcher::parse_mode(body.mode.as_deref()).map_err(ApiError::bad_request)?;
+    let restart_interrupted = body.restart_interrupted;
+    let record = s.run_store.load(&id).map_err(|e| match e {
         RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
         other => ApiError::internal(other.to_string()),
     })?;
     if matches!(record.status, RunStatus::Running | RunStatus::Pending) {
         let now = chrono::Utc::now();
-        let mut listed = record.clone();
-        record = s
-            .run_store
-            .blocking(move |store| store.reap_if_orphaned(&mut listed, now).map(|_| listed))
+        let mut listed = record;
+        s.run_store
+            .blocking(move |store| store.reap_if_orphaned(&mut listed, now))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
     }
-    match record.status {
-        RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled => {}
-        RunStatus::Paused => {
-            return Err(ApiError::conflict(format!(
-                "run {id} is `paused`: resume it (`runs.resume`) instead of retrying it"
-            )))
-        }
-        other => {
-            return Err(ApiError::conflict(format!(
+    // Recorded before anything is spawned, under the run lock: the resume
+    // marker, which the resume's flip to `Running` consumes.
+    let (rid, actor, now) = (id.clone(), crate::mcp::actor(&via), chrono::Utc::now());
+    let wanted = mode.map(rupu_tools::PermissionMode::as_str);
+    let recorded = s
+        .run_store
+        .blocking(move |store| store.request_retry(&rid, actor, wanted, now))
+        .await
+        .map_err(|e| match e {
+            RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    if let Err(current) = recorded {
+        return Err(ApiError::conflict(match current.status {
+            RunStatus::Paused => {
+                format!("run {id} is `paused`: resume it (`runs.resume`) instead of retrying it")
+            }
+            other => format!(
                 "run {id} is `{}`: only a failed, rejected or cancelled run can be retried",
                 other.as_str()
-            )))
-        }
+            ),
+        }));
     }
     let req = crate::launcher::RetryRequest {
         run_id: id.clone(),
         restart_interrupted,
+        mode,
+        log: s.global_dir.join("runs").join(&id).join(RETRY_LOG),
     };
     launcher.retry(req).await.map_err(|e| match e {
         crate::launcher::LaunchError::Invalid(m) => ApiError::bad_request(m),

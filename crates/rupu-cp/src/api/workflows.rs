@@ -498,7 +498,7 @@ async fn write_workflow(
     Query(q): Query<ScopeQuery>,
     Json(body): Json<WorkflowWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    fs_safety::validate_name(&name)?;
+    fs_safety::validate_new_name("workflow", &name)?;
     let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     if wf.name != name {
         return Err(ApiError::bad_request(
@@ -552,7 +552,7 @@ async fn create_workflow(
 ) -> ApiResult<Json<serde_json::Value>> {
     let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let name = wf.name;
-    fs_safety::validate_name(&name)?;
+    fs_safety::validate_new_name("workflow", &name)?;
     if resolve_workflow_scoped(&s, &name).is_some() {
         return Err(ApiError::conflict("workflow already exists"));
     }
@@ -702,7 +702,9 @@ async fn launch_yaml_run(
         .launcher
         .clone()
         .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
+    // Everything a launch could refuse is checked before the file is written.
     let workflow = Workflow::parse(&b.yaml).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
     let engagement_profiles = crate::api::agents::parse_engagement_profiles(b.engagement_profiles)?;
     let dir = yaml_launch_dir(&s);
     let file = dir.join(format!("{}.yaml", ulid::Ulid::new()));

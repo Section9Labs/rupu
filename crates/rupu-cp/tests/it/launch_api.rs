@@ -13,7 +13,7 @@ use rupu_cp::server::{router_with, RouterOpts};
 use rupu_orchestrator::runs::{RunStatus, RunStore};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// What the CP asked its launchers for.
@@ -54,14 +54,23 @@ pub(super) const DONE: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0DONE";
 pub(super) const LIVE: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0LIVE";
 /// A run left `Running` by a runner that is gone.
 pub(super) const ORPHAN: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0ORPH";
-/// A standalone agent run that ended.
+/// A standalone agent run that ended, launched in `proj` with a repo target
+/// cloned into `proj/repo` (its meta's `workspace_path`).
 pub(super) const AGENT_DONE: &str = "run_01J9ZQ3K4M5N6P7Q8R9AGDONE";
 /// A standalone agent run whose process is this test process.
 pub(super) const AGENT_LIVE: &str = "run_01J9ZQ3K4M5N6P7Q8R9AGLIVE";
-/// A sub-agent of the completed workflow run `DONE`.
+/// A standalone agent run whose launch directory no record names.
+pub(super) const AGENT_LOST: &str = "run_01J9ZQ3K4M5N6P7Q8R9AGLOST";
+/// The agent run of a workflow step that dispatched sub-agents (W7: they
+/// live under it, `<runs>/<STEP>/sub/…`, in its `children.jsonl`).
+pub(super) const STEP: &str = "run_01J9ZQ3K4M5N6P7Q8R9S0STEP";
+/// A sub-agent of `STEP` that finished.
 pub(super) const SUB_DONE: &str = "sub_01J9ZQ3K4M5N6P7Q8R9SUBDONE";
-/// A sub-agent of the live workflow run `LIVE`.
+/// A sub-agent of `STEP` still running in this test process.
 pub(super) const SUB_LIVE: &str = "sub_01J9ZQ3K4M5N6P7Q8R9SUBLIVE";
+/// A sub-agent of `SUB_DONE` (`<runs>/<SUB_DONE>/sub/…`) left unfinished
+/// by a process that is gone.
+pub(super) const SUB_NESTED: &str = "sub_01J9ZQ3K4M5N6P7Q8R9SUBNEST";
 
 /// A workflow that parses, for the YAML launch.
 pub(super) const ADHOC: &str =
@@ -70,10 +79,10 @@ pub(super) const ADHOC: &str =
 /// A pid no process has: above every platform's pid range.
 const DEAD_PID: u32 = 99_999_999;
 
-fn transcript(path: &Path, run_id: &str, agent: &str) {
+fn transcript(path: &Path, run_id: &str, agent: &str, workspace_id: &str) {
     let start = rupu_transcript::Event::RunStart {
         run_id: run_id.into(),
-        workspace_id: "ws_test".into(),
+        workspace_id: workspace_id.into(),
         agent: agent.into(),
         provider: "anthropic".into(),
         model: "opus".into(),
@@ -91,7 +100,27 @@ fn transcript(path: &Path, run_id: &str, agent: &str) {
     std::fs::write(path, serde_json::to_string(&start).unwrap() + "\n").unwrap();
 }
 
-/// The runs and agent runs package B's tests act on, plus one agent.
+/// `sub` in `parent`'s children ledger, run by the process `pid`, ended
+/// when `finished`.
+fn ledger_child(dir: &Path, parent: &str, sub: &str, pid: u32, finished: bool) {
+    use rupu_launch::ledger::{append, Finished, LedgerLine, Started};
+    let ledger = dir.join("runs").join(parent);
+    let mut started = Started::new(sub, rupu_tools::ChildKind::Subagent, "helper", sub, pid, 1);
+    started.parent_start = rupu_launch::proc::start_stamp(pid);
+    append(&ledger, &LedgerLine::Started(started));
+    if finished {
+        let end = Finished::new(sub, rupu_tools::ChildState::Done, None);
+        append(&ledger, &LedgerLine::Finished(end));
+    }
+}
+
+/// The project the agent runs were launched from: `<global>/proj`, as its
+/// workspace record names it.
+pub(super) fn project(dir: &Path) -> PathBuf {
+    dir.join("proj").canonicalize().unwrap()
+}
+
+/// The runs and agent runs package B's tests act on, plus agents.
 pub(super) fn seed(dir: &Path) {
     let store = RunStore::new(dir.join("runs"));
     let wf = "name: test\nsteps: []\n";
@@ -104,24 +133,41 @@ pub(super) fn seed(dir: &Path) {
     ] {
         let mut rec = super::sse::seed_run(id, status);
         rec.runner_pid = pid;
+        rec.permission_mode = Some("readonly".into());
         rec.workspace_path = dir.to_path_buf();
         store.create(rec, wf).unwrap();
     }
-    let project = dir.join("proj");
-    std::fs::create_dir_all(&project).unwrap();
+    let proj = dir.join("proj");
+    std::fs::create_dir_all(proj.join("repo")).unwrap();
+    let ws = rupu_workspace::upsert(
+        &rupu_workspace::WorkspaceStore {
+            root: dir.join("workspaces"),
+        },
+        &proj,
+    )
+    .unwrap();
     let transcripts = dir.join("transcripts");
-    for (id, pid) in [(AGENT_DONE, None), (AGENT_LIVE, Some(std::process::id()))] {
-        transcript(&transcripts.join(format!("{id}.jsonl")), id, "scout");
-        let meta = json!({"run_id": id, "workspace_path": project, "pid": pid});
+    for (id, pid, ws_id) in [
+        (AGENT_DONE, None, ws.id.as_str()),
+        (AGENT_LIVE, Some(std::process::id()), ws.id.as_str()),
+        (AGENT_LOST, None, "ws_01J9ZQ3K4M5N6P7Q8R9S0GONE"),
+    ] {
+        transcript(&transcripts.join(format!("{id}.jsonl")), id, "scout", ws_id);
+        let meta = json!({"run_id": id, "workspace_path": proj.join("repo"), "pid": pid});
         std::fs::write(
             transcripts.join(format!("{id}.meta.json")),
             meta.to_string(),
         )
         .unwrap();
     }
-    for (parent, sub) in [(DONE, SUB_DONE), (LIVE, SUB_LIVE)] {
+    for (parent, sub, pid, finished) in [
+        (STEP, SUB_DONE, std::process::id(), true),
+        (STEP, SUB_LIVE, std::process::id(), false),
+        (SUB_DONE, SUB_NESTED, DEAD_PID, false),
+    ] {
         let t = dir.join("runs").join(parent).join("sub").join(sub);
-        transcript(&t.join("transcript.jsonl"), sub, "helper");
+        transcript(&t.join("transcript.jsonl"), sub, "helper", &ws.id);
+        ledger_child(dir, parent, sub, pid, finished);
     }
     let agents = dir.join("agents");
     std::fs::create_dir_all(&agents).unwrap();
@@ -218,7 +264,9 @@ async fn continuing_an_agent_run_launches_rupu_run_continue_in_its_directory() {
     assert_eq!(req.mode.as_deref(), Some("bypass"));
     // Nothing else is set: the child restores the original launch's flags.
     assert_eq!((&req.prompt, &req.target), (&None, &None));
-    let want = tmp.path().join("proj").display().to_string();
+    // The directory it was launched from, not its repo target's clone
+    // (`proj/repo`): the continuation reuses that checkout from there.
+    let want = project(tmp.path()).display().to_string();
     assert_eq!(req.working_dir.as_deref(), Some(want.as_str()));
     // `rupu run scout --continue <id> --model … --provider …`.
     let args: Vec<String> = rupu_runtime::argv::RunArgv::Agent(req.agent_run("run_01NEW").unwrap())
@@ -243,19 +291,25 @@ async fn continuing_an_agent_run_launches_rupu_run_continue_in_its_directory() {
     );
 }
 
+/// W7 sub-agents live under the run that dispatched them, which records them
+/// in its children ledger: a finished one, and one left unfinished by a
+/// process that is gone (here nested under another sub-agent), continue in
+/// the directory the tree was launched from.
 #[tokio::test]
 async fn a_sub_agent_run_continues_too() {
-    let (addr, _tmp, rec) = spawn_launch().await;
-    let (status, body) = post(
-        addr,
-        &format!("/api/runs/agents/{SUB_DONE}/continue"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, 202, "{body}");
+    let (addr, tmp, rec) = spawn_launch().await;
+    for id in [SUB_DONE, SUB_NESTED] {
+        let (status, body) =
+            post(addr, &format!("/api/runs/agents/{id}/continue"), json!({})).await;
+        assert_eq!(status, 202, "{id}: {body}");
+    }
     let agents = rec.agents.lock().unwrap();
-    assert_eq!(agents[0].agent, "helper");
-    assert_eq!(agents[0].continue_from.as_deref(), Some(SUB_DONE));
+    let want = project(tmp.path()).display().to_string();
+    for (req, id) in agents.iter().zip([SUB_DONE, SUB_NESTED]) {
+        assert_eq!(req.agent, "helper");
+        assert_eq!(req.continue_from.as_deref(), Some(id));
+        assert_eq!(req.working_dir.as_deref(), Some(want.as_str()), "{id}");
+    }
 }
 
 #[tokio::test]
@@ -268,6 +322,10 @@ async fn continue_refuses_a_running_run_an_unknown_one_a_prompt_and_a_remote_hos
         ("sub_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({}), 404),
         (AGENT_DONE, json!({"prompt": "and then?"}), 400),
         (AGENT_DONE, json!({"mode": "yolo"}), 400),
+        (AGENT_DONE, json!({"model": " "}), 400),
+        (AGENT_DONE, json!({"provider": ""}), 400),
+        // Nothing names the directory it was launched from.
+        (AGENT_LOST, json!({}), 409),
     ] {
         let (status, err) = post(addr, &format!("/api/runs/agents/{id}/continue"), body).await;
         assert_eq!(status, want, "{id}: {err}");
@@ -290,7 +348,7 @@ async fn continue_refuses_a_running_run_an_unknown_one_a_prompt_and_a_remote_hos
 
 #[tokio::test]
 async fn retrying_a_failed_run_spawns_an_operators_workflow_resume() {
-    let (addr, _tmp, rec) = spawn_launch().await;
+    let (addr, tmp, rec) = spawn_launch().await;
     let (status, body) = post(
         addr,
         &format!("/api/runs/{FAILED}/retry"),
@@ -307,18 +365,63 @@ async fn retrying_a_failed_run_spawns_an_operators_workflow_resume() {
         retries,
         [RetryRequest {
             run_id: FAILED.into(),
-            restart_interrupted: true
+            restart_interrupted: true,
+            mode: None,
+            log: tmp.path().join("runs").join(FAILED).join("retry.log"),
         }]
     );
+    // Recorded before the 202: the resume marker, which the resume's flip
+    // to `Running` consumes.
+    let rec_after = RunStore::new(tmp.path().join("runs")).load(FAILED).unwrap();
+    assert!(rec_after.resume_requested_at.is_some());
+    assert_eq!(rec_after.resume_approver.as_deref(), Some("web"));
+    assert_eq!(rec_after.resume_mode, None);
     let args: Vec<String> = retries[0]
         .argv()
         .to_args()
         .into_iter()
         .map(|a| a.into_string().unwrap())
         .collect();
+    // No `--mode`: the resume keeps the run's own launch mode
+    // (`RunRecord.permission_mode`, `readonly` here).
     assert_eq!(
         args,
         ["workflow", "resume", FAILED, "--restart-interrupted"]
+    );
+}
+
+/// An explicit `mode` replaces the run's own, and is recorded with the
+/// retry; a bad one is a 400 that records nothing.
+#[tokio::test]
+async fn a_retry_in_a_given_mode_passes_it_and_records_it() {
+    let (addr, tmp, rec) = spawn_launch().await;
+    let (status, err) = post(
+        addr,
+        &format!("/api/runs/{FAILED}/retry"),
+        json!({"mode": "yolo"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{err}");
+    let store = RunStore::new(tmp.path().join("runs"));
+    assert!(store.load(FAILED).unwrap().resume_requested_at.is_none());
+    let (status, body) = post(
+        addr,
+        &format!("/api/runs/{FAILED}/retry"),
+        json!({"mode": "bypass"}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let req = rec.retries.lock().unwrap()[0].clone();
+    let args: Vec<String> = req
+        .argv()
+        .to_args()
+        .into_iter()
+        .map(|a| a.into_string().unwrap())
+        .collect();
+    assert_eq!(args, ["workflow", "resume", FAILED, "--mode", "bypass"]);
+    assert_eq!(
+        store.load(FAILED).unwrap().resume_mode.as_deref(),
+        Some("bypass")
     );
 }
 
@@ -353,6 +456,13 @@ async fn retry_refuses_what_isnt_finished_or_failed() {
     assert_eq!(status, 501, "{err}");
     assert!(rec.retries.lock().unwrap().is_empty());
     assert_eq!(status_of(tmp.path(), LIVE), RunStatus::Running);
+    let store = RunStore::new(tmp.path().join("runs"));
+    for id in [LIVE, PAUSED, DONE, FAILED] {
+        assert!(
+            store.load(id).unwrap().resume_requested_at.is_none(),
+            "{id}: a refused retry records nothing"
+        );
+    }
 }
 
 // ── launch body gaps ────────────────────────────────────────────────────────
@@ -470,6 +580,17 @@ async fn a_yaml_launch_refuses_bad_yaml_before_writing_and_a_remote_host() {
     let (addr, tmp, rec) = spawn_launch().await;
     let (status, err) = post(addr, "/api/workflows/run", json!({"yaml": "steps: ["})).await;
     assert_eq!(status, 400, "{err}");
+    for bad in [
+        json!({"mode": "yolo"}),
+        json!({"engagement_profiles": [" "]}),
+    ] {
+        let mut body = json!({"yaml": ADHOC});
+        body.as_object_mut()
+            .unwrap()
+            .extend(bad.as_object().unwrap().clone());
+        let (status, err) = post(addr, "/api/workflows/run", body).await;
+        assert_eq!(status, 400, "{bad}: {err}");
+    }
     let (status, err) = post(
         addr,
         "/api/workflows/run",
@@ -530,4 +651,45 @@ async fn validating_every_agent_file_lists_a_row_per_file() {
         "{typo}"
     );
     assert_eq!(rows.len(), 2);
+}
+
+// ── reserved names ──────────────────────────────────────────────────────────
+
+/// `generate`, `validate` and `run` are literal routes beside
+/// `/api/agents/:name` and `/api/workflows/:name`: a definition so named
+/// could never be read, saved or deleted over HTTP, so none is created or
+/// saved under one.
+#[tokio::test]
+async fn an_agent_or_workflow_cant_take_a_route_name() {
+    let (addr, tmp, _) = spawn_launch().await;
+    for name in ["generate", "validate", "run"] {
+        let raw = format!("---\nname: {name}\n---\nx\n");
+        let (status, err) = post(addr, "/api/agents", json!({"raw": raw})).await;
+        assert_eq!(status, 400, "agent {name}: {err}");
+        assert!(err["error"].as_str().unwrap().contains("reserved"), "{err}");
+        let yaml = ADHOC.replace("name: adhoc", &format!("name: {name}"));
+        let (status, err) = post(addr, "/api/workflows", json!({"raw": yaml})).await;
+        assert_eq!(status, 400, "workflow {name}: {err}");
+    }
+    // `run` is reachable as `/api/agents/:name` and `/api/workflows/:name`.
+    let put = |path: &str, body: Value| {
+        let url = format!("http://{addr}{path}");
+        async move {
+            reqwest::Client::new()
+                .put(url)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+    let raw = "---\nname: run\n---\nx\n";
+    assert_eq!(put("/api/agents/run", json!({"raw": raw})).await, 400);
+    let yaml = ADHOC.replace("name: adhoc", "name: run");
+    assert_eq!(put("/api/workflows/run", json!({"raw": yaml})).await, 405);
+    assert!(!tmp.path().join("agents").join("run.md").exists());
+    assert!(!tmp.path().join("agents").join("validate.md").exists());
+    assert!(!tmp.path().join("workflows").join("run.yaml").exists());
 }

@@ -90,7 +90,7 @@ async fn validate_all_answers_what_the_api_answers() {
 
 #[tokio::test]
 async fn retry_and_continue_record_through_mcp() {
-    let (addr, _tmp, rec) = spawn_launch().await;
+    let (addr, tmp, rec) = spawn_launch().await;
     let r = call_tool(
         addr,
         "runs.retry",
@@ -101,6 +101,11 @@ async fn retry_and_continue_record_through_mcp() {
     assert_eq!(json_of(&r)["retrying"], json!(true));
     assert_eq!(rec.retries.lock().unwrap()[0].run_id, FAILED);
     assert!(rec.retries.lock().unwrap()[0].restart_interrupted);
+    // Recorded before the spawn, attributed to the MCP.
+    let recorded = rupu_orchestrator::RunStore::new(tmp.path().join("runs"))
+        .load(FAILED)
+        .unwrap();
+    assert_eq!(recorded.resume_approver.as_deref(), Some("mcp"));
     let live = call_tool(addr, "runs.retry", json!({"id": LIVE})).await;
     assert!(text_of(&live).starts_with("HTTP 409"), "{live}");
 
