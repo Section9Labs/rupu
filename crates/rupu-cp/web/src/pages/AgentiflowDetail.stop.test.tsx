@@ -6,7 +6,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
 import { agentiflowsApi } from '../lib/api3b/agentiflows';
 
@@ -71,12 +71,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+// A link-free way to move the page to another flow, as the sidebar or a
+// Messages link would: the same route element stays mounted.
+function GoTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      go to {to}
+    </button>
+  );
+}
+
 function renderPage() {
   return render(
     <MemoryRouter initialEntries={['/agentiflows/af_01RUN']}>
       <Routes>
         <Route path="/agentiflows/:id" element={<AgentiflowDetail />} />
       </Routes>
+      <GoTo to="/agentiflows/af_01OTHER" />
     </MemoryRouter>,
   );
 }
@@ -146,6 +158,21 @@ describe('AgentiflowDetail stop controls', () => {
     await waitFor(() => expect(stop).toHaveBeenCalledWith('af_01RUN', true));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop now' })).not.toBeInTheDocument());
     expect(screen.getByText('operator_stop:now')).toBeInTheDocument();
+  });
+
+  it("a stop requested on one flow does not follow the page to another flow", async () => {
+    vi.spyOn(agentiflowsApi, 'stop').mockResolvedValue({ queued: true });
+    const other: Detail = { ...RUNNING, record: { ...RUNNING.record, id: 'af_01OTHER', name: 'sweep-lab' } };
+    getAgentiflow.mockImplementation(async (id: string) => (id === 'af_01OTHER' ? other : RUNNING));
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
+    expect(await screen.findByText(/stops after this round/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'go to /agentiflows/af_01OTHER' }));
+    expect(await screen.findByRole('heading', { name: 'sweep-lab' })).toBeInTheDocument();
+    expect(screen.queryByText(/stops after this round/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('stop requested')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Stop' })).toBeEnabled();
   });
 
   it('a running record whose coordinator is gone offers only Stop now', async () => {

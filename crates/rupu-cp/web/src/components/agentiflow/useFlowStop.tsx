@@ -9,7 +9,7 @@
 // The hook returns the header buttons and the panel under the header (the
 // confirm card, the pending line, an inline error), so the page places each.
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ApiError, apiErrorMessage } from '../../lib/api';
 import { agentiflowsApi } from '../../lib/api3b/agentiflows';
 import { Button } from '../ui/Button';
@@ -39,6 +39,22 @@ export function useFlowStop({
   // A 501: this control plane can't stop flows (no `rupu cp serve`).
   const [unavailable, setUnavailable] = useState<string | null>(null);
 
+  // This state belongs to one flow: the page keeps the hook mounted when it
+  // moves to another flow id, so reset it as the id changes (during render,
+  // so the next flow never shows a frame of the last one's state).
+  // A request still in flight for the last flow is ignored when it answers.
+  const [flowId, setFlowId] = useState(id);
+  if (flowId !== id) {
+    setFlowId(id);
+    setRequested(false);
+    setConfirming(false);
+    setStoppingNow(false);
+    setBusy(false);
+    setError(null);
+  }
+  const shown = useRef(id);
+  shown.current = id;
+
   // Pending ends when the data says the run stopped, never on the POST.
   useEffect(() => {
     if (running) return;
@@ -55,31 +71,37 @@ export function useFlowStop({
   }
 
   async function stop() {
+    const flow = id;
     setBusy(true);
     setError(null);
     try {
-      await agentiflowsApi.stop(id, false);
-      setRequested(true);
+      await agentiflowsApi.stop(flow, false);
+      if (shown.current === flow) setRequested(true);
     } catch (e: unknown) {
-      fail(e);
+      if (shown.current === flow) fail(e);
     } finally {
-      setBusy(false);
+      if (shown.current === flow) setBusy(false);
     }
   }
 
   async function stopNow() {
+    const flow = id;
     setBusy(true);
     setError(null);
     setStoppingNow(true);
     try {
-      await agentiflowsApi.stop(id, true);
-      reload();
+      await agentiflowsApi.stop(flow, true);
+      if (shown.current === flow) reload();
     } catch (e: unknown) {
-      setStoppingNow(false);
-      fail(e);
+      if (shown.current === flow) {
+        setStoppingNow(false);
+        fail(e);
+      }
     } finally {
-      setBusy(false);
-      setConfirming(false);
+      if (shown.current === flow) {
+        setBusy(false);
+        setConfirming(false);
+      }
     }
   }
 
