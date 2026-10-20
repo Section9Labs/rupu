@@ -9,6 +9,7 @@ import { getShell, type ShellVersion } from './lib/shell';
 // All page-level routes are lazy-loaded so each page lands in its own chunk
 // and the main bundle only pays for the shell (Layout + router plumbing).
 const Dashboard         = React.lazy(() => import('./pages/Dashboard'));
+const Inbox             = React.lazy(() => import('./pages/Inbox'));
 const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
 const AgentiflowDetail  = React.lazy(() => import('./pages/AgentiflowDetail'));
@@ -96,6 +97,9 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
 
         {/* v2 destinations — registered under BOTH shells so deep links work */}
         <Route path="/overview" element={page(<Dashboard />)} />
+        {/* Inbox — the operator action board (gates/paused/failures to clear).
+            Its own route under both shells. */}
+        <Route path="/inbox" element={page(<Inbox />)} />
         <Route path="/activity" element={page(<ActivityV2 />)} />
         <Route path="/security" element={page(<SecurityV2 />)} />
         <Route path="/library" element={page(<LibraryV2 />)} />

@@ -1301,24 +1301,43 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
    cmTooltips.ts's header comment for the full specificity accounting. */
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Living stacked-area chart (components/ui/Chart.tsx). Draw-in riser, a
- * breathing now-pulse, and an interruptible hover crosshair. All token-based
- * (colors come from the component via inline `rgb(var(--c-*))`); this file owns
- * only the motion. Every rule is disabled under prefers-reduced-motion.
+ * Living stacked-area chart (components/ui/Chart.tsx). The plot draws in with a
+ * left-to-right reveal (the series trace across time), the latest point pops
+ * in and then breathes a now-pulse, and the hover crosshair glides. All
+ * token-based (colors come from the component via inline `rgb(var(--c-*))`);
+ * this file owns only the motion. Every rule is disabled under
+ * prefers-reduced-motion, where the chart simply appears, static and complete.
  * ────────────────────────────────────────────────────────────────────────── */
-.cp-chart-riser {
-  transform: scaleY(0);
-  transform-origin: bottom;
+
+/* Reveal wipe: the clip rect scales from the left, uncovering the areas and
+   lines in sync so the chart reads as drawing across its time axis. */
+.cp-chart-wipe {
+  transform: scaleX(0);
+  transform-origin: left;
   transform-box: fill-box;
 }
-.cp-chart-riser.cp-in {
-  transform: scaleY(1);
-  transition: transform 900ms cubic-bezier(0.23, 1, 0.32, 1);
+.cp-chart-wipe.cp-in {
+  transform: scaleX(1);
+  transition: transform 1000ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* The latest point: a solid dot that pops in once the reveal reaches it, then
+   its ring breathes continuously so "now" stays alive. */
+.cp-chart-now-dot {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: cp-now-pop 480ms 840ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+@keyframes cp-now-pop {
+  from { transform: scale(0); }
+  to { transform: scale(1); }
 }
 .cp-chart-now {
   transform-box: fill-box;
   transform-origin: center;
-  animation: cp-chart-ring 2.4s cubic-bezier(0.23, 1, 0.32, 1) infinite;
+  /* hidden until the reveal + pop are done, then it starts breathing */
+  opacity: 0;
+  animation: cp-chart-ring 2.4s cubic-bezier(0.23, 1, 0.32, 1) 1200ms infinite;
 }
 @keyframes cp-chart-ring {
   0% { transform: scale(0.55); opacity: 0.9; }
@@ -1328,12 +1347,16 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
   transition: transform 90ms cubic-bezier(0.23, 1, 0.32, 1);
 }
 @media (prefers-reduced-motion: reduce) {
-  .cp-chart-riser,
-  .cp-chart-riser.cp-in {
+  /* No reveal, no pop, no breathing: the finished chart, at rest. */
+  .cp-chart-wipe,
+  .cp-chart-wipe.cp-in {
     transform: none !important;
     transition: none !important;
   }
-  /* Drop the expanding ring; the solid "now" dot stays as a static marker. */
+  .cp-chart-now-dot {
+    animation: none !important;
+    transform: none !important;
+  }
   .cp-chart-now {
     animation: none !important;
     opacity: 0 !important;

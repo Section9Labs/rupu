@@ -12,7 +12,7 @@
 // (stacking order); the last series is the top of the stack (the attention band)
 // and owns the now-pulse.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
 import { cn } from '../../lib/cn';
 import {
@@ -83,6 +83,60 @@ function nearestIndex(xa: number[], px: number): number {
   return best;
 }
 
+/** True when the viewer asked for reduced motion (guarded for SSR/jsdom). */
+function prefersReducedMotion(): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+  try {
+    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  } catch {
+    return false;
+  }
+}
+
+const COUNT_MS = 750;
+function easeOutCubic(t: number): number {
+  return 1 - (1 - t) ** 3;
+}
+
+/** The headline figure, counting up from 0 on mount. It parses a LEADING number
+ *  from a string value ("92%", "518+", "1,284") and animates just that part,
+ *  keeping the suffix; anything without one (an em-dash, a node) renders
+ *  unchanged. Reduced motion → the final value immediately. */
+function AnimatedFigure({ value }: { value: React.ReactNode }) {
+  const parsed = typeof value === 'string' ? value.match(/^([\d,]+(?:\.\d+)?)(.*)$/s) : null;
+  const target = parsed ? Number(parsed[1].replace(/,/g, '')) : null;
+  const suffix = parsed ? parsed[2] : '';
+  const decimals = parsed && parsed[1].includes('.') ? parsed[1].split('.')[1].length : 0;
+  const [n, setN] = useState<number | null>(() =>
+    target != null && !prefersReducedMotion() ? 0 : target,
+  );
+
+  useEffect(() => {
+    if (target == null || prefersReducedMotion()) {
+      setN(target);
+      return;
+    }
+    let raf = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / COUNT_MS);
+      setN(target * easeOutCubic(t));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+
+  if (target == null || n == null) return <>{value}</>;
+  const shown = decimals > 0 ? n.toFixed(decimals) : Math.round(n).toLocaleString();
+  return (
+    <>
+      {shown}
+      {suffix}
+    </>
+  );
+}
+
 export function Chart({
   dates,
   series,
@@ -98,6 +152,8 @@ export function Chart({
   const svgRef = useRef<SVGSVGElement>(null);
   const [hover, setHover] = useState<number | null>(null);
   const [drawn, setDrawn] = useState(false);
+  const uid = useId().replace(/:/g, '');
+  const clipId = `cp-reveal-${uid}`;
 
   // Trigger the draw-in on the next frame after mount (CSS handles the
   // reduced-motion fallback — the riser just appears).
@@ -148,7 +204,7 @@ export function Chart({
           {headline && (
             <div className="shrink-0 text-right">
               <div className="text-xl font-semibold leading-none tabular-nums tracking-tight text-ink">
-                {headline.value}
+                <AnimatedFigure value={headline.value} />
               </div>
               {headline.label && <div className="mt-1 text-note text-ink-dim">{headline.label}</div>}
             </div>
@@ -184,6 +240,20 @@ export function Chart({
           onMouseMove={onMove}
           onMouseLeave={() => setHover(null)}
         >
+          {/* left-to-right reveal: the plot area wipes open as the chart draws
+              in, so the series trace across time rather than stretching up. */}
+          <defs>
+            <clipPath id={clipId}>
+              <rect
+                className={cn('cp-chart-wipe', drawn && 'cp-in')}
+                x={PLOT.x0}
+                y={PLOT.yTop - 6}
+                width={PLOT.x1 - PLOT.x0}
+                height={PLOT.y0 - PLOT.yTop + 10}
+              />
+            </clipPath>
+          </defs>
+
           {/* gridlines + y ticks */}
           {scale.ticks.map((t) => {
             const y = yOf(t, scale.max, PLOT);
@@ -211,9 +281,9 @@ export function Chart({
             );
           })}
 
-          {/* stacked areas + lines (draw-in) */}
+          {/* stacked areas + lines, revealed left-to-right by the wipe clip */}
           {hasData && (
-            <g className={cn('cp-chart-riser', drawn && 'cp-in')}>
+            <g clipPath={`url(#${clipId})`}>
               {series.map((s, si) => {
                 const top = tops[si];
                 const bottom = si === 0 ? null : tops[si - 1];
@@ -282,7 +352,13 @@ export function Chart({
                 strokeWidth={1.5}
                 style={{ stroke: colors.get(pulseColor) }}
               />
-              <circle cx={lastX} cy={lastTopY} r={3} style={{ fill: colors.get(pulseColor) }} />
+              <circle
+                className="cp-chart-now-dot"
+                cx={lastX}
+                cy={lastTopY}
+                r={3}
+                style={{ fill: colors.get(pulseColor) }}
+              />
             </>
           )}
 
