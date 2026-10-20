@@ -17,10 +17,14 @@ import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
 import { cn } from '../../lib/cn';
 import {
   areaPath,
+  bandCenters,
+  bandWidth,
   cumulativeTops,
   linePoints,
   niceScale,
   peakIndex,
+  roundedTopRect,
+  seriesMax,
   totals,
   xsFor,
   yOf,
@@ -31,6 +35,8 @@ const VB_W = 480;
 const VB_H = 176;
 const PLOT: Plot = { x0: 48, x1: 466, y0: 148, yTop: 26 };
 const XTICK_Y = 164;
+/** 1px seam between stacked column segments (app-screens §Charts). */
+const SEAM = 1;
 
 export interface ChartSeries {
   key: string;
@@ -43,11 +49,21 @@ export interface ChartSeries {
   fillOpacity?: number;
 }
 
+/** Which mark the same chart engine draws. All three share one frame (grid,
+ *  ticks, baseline), one reveal, one crosshair/tooltip, one now-pulse and one
+ *  count-up headline — the "living" language, applied to:
+ *   - `area`   stacked tinted areas + top lines (the default, unchanged);
+ *   - `line`   overlaid, unstacked series lines (no fills), each its own hue;
+ *   - `column` stacked columns rising to the baseline, rounded tops, seams. */
+export type ChartKind = 'area' | 'line' | 'column';
+
 export interface ChartProps {
   /** x labels, one per bucket. */
   dates: string[];
-  /** Bottom-first stacking order. */
+  /** Bottom-first stacking order (stacked for `area`/`column`; overlaid for `line`). */
   series: ChartSeries[];
+  /** The mark this chart draws (default `area`). */
+  kind?: ChartKind;
   title?: string;
   /** Sub-line under the title. */
   subtitle?: string;
@@ -140,6 +156,7 @@ function AnimatedFigure({ value }: { value: React.ReactNode }) {
 export function Chart({
   dates,
   series,
+  kind = 'area',
   title,
   subtitle,
   headline,
@@ -164,20 +181,32 @@ export function Chart({
 
   const n = dates.length;
   const valueSeries = series.map((s) => s.values);
+  // Area + column stack (scale on the per-bucket total); line overlays
+  // (scale on the largest single value, series never summed).
+  const stacked = kind !== 'line';
   const tot = totals(valueSeries);
-  const scale = niceScale(Math.max(1, ...tot));
+  const dataMax = stacked ? (tot.length ? Math.max(...tot) : 0) : seriesMax(valueSeries);
+  const scale = niceScale(Math.max(1, dataMax));
   const xa = xsFor(n, PLOT);
+  // Columns sit centred in n equal slots; area/line points sit on the plot edges.
+  const xc = kind === 'column' ? bandCenters(n, PLOT) : xa;
+  const barW = bandWidth(n, PLOT);
   const tops = cumulativeTops(valueSeries); // per series cumulative top
   const peak = peakIndex(tot);
 
   const hasData = n > 0;
 
+  /** y of series `si`'s mark at bucket `i`: the cumulative top when stacked,
+   *  the series' own value when overlaid (line). */
+  const markY = (si: number, i: number) =>
+    yOf(stacked ? tops[si][i] : valueSeries[si][i], scale.max, PLOT);
+
   // x-ticks: first, peak, last (deduped, in order).
   const tickIdx = [...new Set([0, peak, n - 1].filter((i) => i >= 0 && i < n))].sort((a, b) => a - b);
 
   const topSeries = series.length - 1;
-  const lastX = xa[n - 1];
-  const lastTopY = hasData ? yOf(tot[n - 1], scale.max, PLOT) : PLOT.y0;
+  const lastX = xc[n - 1];
+  const lastTopY = hasData ? markY(topSeries, n - 1) : PLOT.y0;
   const pulseColor = series[topSeries]?.color ?? 'status.running';
 
   const onMove = (e: React.MouseEvent) => {
@@ -186,12 +215,12 @@ export function Chart({
     const r = svg.getBoundingClientRect();
     if (r.width === 0) return; // jsdom / not laid out
     const px = ((e.clientX - r.left) / r.width) * VB_W;
-    setHover(nearestIndex(xa, px));
+    setHover(nearestIndex(xc, px));
   };
 
   const tip = hover != null && hasData ? tooltipModel(series, dates, hover) : null;
-  const hoverX = hover != null ? xa[hover] : 0;
-  const hoverTopY = hover != null ? yOf(tot[hover], scale.max, PLOT) : 0;
+  const hoverX = hover != null ? xc[hover] : 0;
+  const hoverTopY = hover != null ? markY(topSeries, hover) : 0;
 
   return (
     <div className={cn('rounded-xl border border-border bg-panel p-4', className)}>
@@ -281,47 +310,107 @@ export function Chart({
             );
           })}
 
-          {/* stacked areas + lines, revealed left-to-right by the wipe clip */}
+          {/* marks (area / line / column), revealed left-to-right by the wipe clip */}
           {hasData && (
             <g clipPath={`url(#${clipId})`}>
-              {series.map((s, si) => {
-                const top = tops[si];
-                const bottom = si === 0 ? null : tops[si - 1];
-                return (
-                  <path
-                    key={`a-${s.key}`}
-                    d={areaPath(top, bottom, xa, scale.max, PLOT)}
-                    style={{ fill: colors.alpha(s.color, s.fillOpacity ?? 0.16) }}
+              {/* area: stacked tinted bands + their top lines */}
+              {kind === 'area' &&
+                series.map((s, si) => {
+                  const top = tops[si];
+                  const bottom = si === 0 ? null : tops[si - 1];
+                  return (
+                    <path
+                      key={`a-${s.key}`}
+                      d={areaPath(top, bottom, xa, scale.max, PLOT)}
+                      style={{ fill: colors.alpha(s.color, s.fillOpacity ?? 0.16) }}
+                    />
+                  );
+                })}
+              {kind === 'area' &&
+                series.map((s, si) => (
+                  <polyline
+                    key={`l-${s.key}`}
+                    points={linePoints(tops[si], xa, scale.max, PLOT)}
+                    fill="none"
+                    strokeWidth={2}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{ stroke: colors.get(s.color) }}
                   />
-                );
-              })}
-              {series.map((s, si) => (
-                <polyline
-                  key={`l-${s.key}`}
-                  points={linePoints(tops[si], xa, scale.max, PLOT)}
-                  fill="none"
-                  strokeWidth={2}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  style={{ stroke: colors.get(s.color) }}
-                />
-              ))}
+                ))}
+
+              {/* line: one overlaid line per series, on its own values, no fill */}
+              {kind === 'line' &&
+                series.map((s) => (
+                  <polyline
+                    key={`l-${s.key}`}
+                    points={linePoints(s.values, xa, scale.max, PLOT)}
+                    fill="none"
+                    strokeWidth={2}
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    style={{ stroke: colors.get(s.color) }}
+                  />
+                ))}
+
+              {/* column: stacked columns, 1px seams, a rounded top on the cap */}
+              {kind === 'column' &&
+                xc.map((cx, i) => {
+                  // The topmost non-zero segment owns the rounded cap.
+                  let cap = -1;
+                  for (let si = series.length - 1; si >= 0; si--) {
+                    if ((valueSeries[si][i] ?? 0) > 0) {
+                      cap = si;
+                      break;
+                    }
+                  }
+                  const x = cx - barW / 2;
+                  return (
+                    <g key={`c-${i}`}>
+                      {series.map((s, si) => {
+                        if ((valueSeries[si][i] ?? 0) <= 0) return null;
+                        const segTop = yOf(tops[si][i], scale.max, PLOT);
+                        const segBot = yOf(si === 0 ? 0 : tops[si - 1][i], scale.max, PLOT);
+                        const h = segBot - segTop - SEAM;
+                        if (h <= 0) return null;
+                        const fill = colors.get(s.color);
+                        return si === cap ? (
+                          <path
+                            key={`seg-${s.key}`}
+                            d={roundedTopRect(x, segTop + SEAM, barW, h, 3)}
+                            style={{ fill }}
+                          />
+                        ) : (
+                          <rect
+                            key={`seg-${s.key}`}
+                            x={x}
+                            y={segTop + SEAM}
+                            width={barW}
+                            height={h}
+                            style={{ fill }}
+                          />
+                        );
+                      })}
+                    </g>
+                  );
+                })}
             </g>
           )}
 
-          {/* peak marker */}
-          {hasData && peak >= 0 && tot[peak] > 0 && (
+          {/* peak marker (stacked kinds only — an overlaid-line chart has no
+              single "total" to label) */}
+          {hasData && stacked && peak >= 0 && tot[peak] > 0 && (
             <g>
               <line
-                x1={xa[peak]}
+                x1={xc[peak]}
                 y1={yOf(tot[peak], scale.max, PLOT)}
-                x2={xa[peak]}
+                x2={xc[peak]}
                 y2={PLOT.yTop - 2}
                 style={{ stroke: colors.border, strokeDasharray: '2 2' }}
                 strokeWidth={1}
               />
               <text
-                x={xa[peak]}
+                x={xc[peak]}
                 y={PLOT.yTop - 6}
                 textAnchor="middle"
                 style={{ fill: colors.ink, fontSize: 11, fontWeight: 600 }}
@@ -329,7 +418,7 @@ export function Chart({
                 {tot[peak]}
               </text>
               <text
-                x={xa[peak]}
+                x={xc[peak]}
                 y={PLOT.yTop + 5}
                 textAnchor="middle"
                 className="font-mono"
@@ -340,9 +429,23 @@ export function Chart({
             </g>
           )}
 
-          {/* now pulse (latest point, top of stack) */}
-          {hasData && (
+          {/* now pulse on the latest point (area/line) + plain end-dots on the
+              other overlaid lines so every series terminates cleanly. Columns
+              don't need it — the rightmost bar already reads as "now". */}
+          {hasData && kind !== 'column' && (
             <>
+              {kind === 'line' &&
+                series.map((s, si) =>
+                  si === topSeries ? null : (
+                    <circle
+                      key={`end-${s.key}`}
+                      cx={lastX}
+                      cy={markY(si, n - 1)}
+                      r={2.6}
+                      style={{ fill: colors.get(s.color) }}
+                    />
+                  ),
+                )}
               <circle
                 className="cp-chart-now"
                 cx={lastX}
@@ -366,7 +469,7 @@ export function Chart({
           {tickIdx.map((i) => (
             <text
               key={`x-${i}`}
-              x={xa[i]}
+              x={xc[i]}
               y={XTICK_Y}
               textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
               className="font-mono"
@@ -387,16 +490,17 @@ export function Chart({
                 style={{ stroke: colors.get('status.pending') }}
                 strokeWidth={1}
               />
-              {series.map((s, si) => (
-                <circle
-                  key={`d-${s.key}`}
-                  cx={0}
-                  cy={yOf(tops[si][hover as number], scale.max, PLOT)}
-                  r={3.2}
-                  style={{ fill: colors.get(s.color), stroke: colors.panel }}
-                  strokeWidth={1.5}
-                />
-              ))}
+              {kind !== 'column' &&
+                series.map((s, si) => (
+                  <circle
+                    key={`d-${s.key}`}
+                    cx={0}
+                    cy={markY(si, hover as number)}
+                    r={3.2}
+                    style={{ fill: colors.get(s.color), stroke: colors.panel }}
+                    strokeWidth={1.5}
+                  />
+                ))}
             </g>
           )}
         </svg>
@@ -420,10 +524,12 @@ export function Chart({
                 <span className="font-mono font-semibold tabular-nums text-ink">{r.value}</span>
               </div>
             ))}
-            <div className="mt-1 flex justify-between gap-4 border-t border-border pt-1">
-              <span className="text-ink-dim">Total</span>
-              <span className="font-mono font-bold tabular-nums text-ink">{tip.total}</span>
-            </div>
+            {stacked && (
+              <div className="mt-1 flex justify-between gap-4 border-t border-border pt-1">
+                <span className="text-ink-dim">Total</span>
+                <span className="font-mono font-bold tabular-nums text-ink">{tip.total}</span>
+              </div>
+            )}
           </div>
         )}
       </div>

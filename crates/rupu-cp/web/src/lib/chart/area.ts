@@ -80,6 +80,42 @@ export function cumulativeTops(series: number[][]): number[][] {
   return out;
 }
 
+/** The largest single value across every series — the y-scale max for an
+ *  unstacked (overlaid line) chart, where series are NOT summed. */
+export function seriesMax(series: number[][]): number {
+  let m = 0;
+  for (const s of series) for (const v of s) if (v > m) m = v;
+  return m;
+}
+
+/** Column centres: `n` equal slots across the plot, each bar centred in its
+ *  slot so the first and last bars sit fully inside the plot (unlike line/area
+ *  points, which sit on the plot edges). */
+export function bandCenters(n: number, p: Plot): number[] {
+  if (n <= 0) return [];
+  const slot = (p.x1 - p.x0) / n;
+  return Array.from({ length: n }, (_, i) => p.x0 + slot * (i + 0.5));
+}
+
+/** A column's width: a fraction of its slot (never below 2px). */
+export function bandWidth(n: number, p: Plot, frac = 0.62): number {
+  if (n <= 0) return 0;
+  return Math.max(2, ((p.x1 - p.x0) / n) * frac);
+}
+
+/** A rounded-top, square-bottom rect as an SVG path (`d`) — the column cap
+ *  (app-screens §Charts: "4px top radius with a square bottom on the
+ *  baseline"). Radius is clamped to half the width and the height. */
+export function roundedTopRect(x: number, y: number, w: number, h: number, r: number): string {
+  const rr = Math.max(0, Math.min(r, w / 2, h));
+  return (
+    `M ${round(x)} ${round(y + h)} L ${round(x)} ${round(y + rr)} ` +
+    `Q ${round(x)} ${round(y)} ${round(x + rr)} ${round(y)} ` +
+    `L ${round(x + w - rr)} ${round(y)} Q ${round(x + w)} ${round(y)} ${round(x + w)} ${round(y + rr)} ` +
+    `L ${round(x + w)} ${round(y + h)} Z`
+  );
+}
+
 /** Totals per index (top of the stack) — for the peak label and the y scale. */
 export function totals(series: number[][]): number[] {
   const n = series[0]?.length ?? 0;
