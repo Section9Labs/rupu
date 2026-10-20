@@ -30,6 +30,7 @@ pub mod server;
 pub mod session_mutator;
 pub mod session_sender;
 pub mod session_starter;
+pub mod skill_installer;
 pub mod sse;
 pub mod state;
 pub mod transcript_mutator;
@@ -100,6 +101,10 @@ pub struct ServeOpts {
     /// the detached-start impl; `None` → `POST /api/agentiflows` returns 501.
     pub agentiflow_launcher:
         Option<std::sync::Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    /// Optional skill-installer adapter (the git fetch behind
+    /// `/api/skills/install|update`). rupu-cli's `cp serve` provides it;
+    /// `None` → those endpoints return 501.
+    pub skill_installer: Option<std::sync::Arc<crate::skill_installer::SkillInstaller>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -267,6 +272,7 @@ pub fn build_state(opts: &ServeOpts) -> state::AppState {
         .with_session_mutator(opts.session_mutator.clone())
         .with_transcript_mutator(opts.transcript_mutator.clone())
         .with_agentiflow_launcher(opts.agentiflow_launcher.clone())
+        .with_skill_installer(opts.skill_installer.clone())
         .with_bind(opts.bind.to_string())
         .with_token_set(opts.token.is_some());
 

@@ -696,6 +696,12 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::new(crate::cp_session_starter::SubprocessSessionStarter { exe }),
             );
 
+            // Adapter for rupu-cp's SkillInstaller port: the git fetch behind
+            // `/api/skills/install|update` (only this crate enables
+            // rupu-skills' `git` feature).
+            let skill_installer: Option<Arc<rupu_cp::skill_installer::SkillInstaller>> =
+                Some(Arc::new(rupu_skills::git::GitFetcher));
+
             // Adapter for rupu-cp's DefinitionGenerator port: calls the
             // orchestrator generation core with the real resolver.
             let generator: Option<Arc<dyn rupu_cp::definition_generator::DefinitionGenerator>> =
@@ -788,6 +794,7 @@ pub async fn handle(action: Action) -> ExitCode {
                     web: !no_web,
                     mcp,
                     agentiflow_launcher,
+                    skill_installer,
                 },
             )
             .await;

@@ -1,7 +1,7 @@
 //! Bidirectional manifest sync:
 //!   1. Every entry in MANIFEST / FLEET_MANIFEST exists on disk under
-//!      crates/rupu-cli/templates/.
-//!   2. Every file under crates/rupu-cli/templates/ appears in one of them.
+//!      crates/rupu-templates/templates/.
+//!   2. Every file under crates/rupu-templates/templates/ appears in one of them.
 //!
 //! MANIFEST source files live directly under `templates/` (its
 //! `target_relpath` is `.rupu/<...>`); FLEET_MANIFEST source files live
@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use rupu_cli::templates::{FLEET_MANIFEST, MANIFEST};
 
 fn templates_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../rupu-templates/templates")
 }
 
 #[test]

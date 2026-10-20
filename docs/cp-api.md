@@ -297,13 +297,15 @@ none, and a body that isn't the expected JSON is a 400.
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/sessions` | Sessions, most recently updated first. | `offset`, `limit`, `scope` (`active` / `archived`), `host`, `since`, `until`, `customer`, `q`, `facets`. |
-| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. |
+| GET | `/api/sessions/:id` | Session detail with usage and codename. | `host`. A local session also carries `compacting` (a compaction is running), `compaction` (its marker `{id, pid, pid_start, started_at}`, else null) and `last_compaction` (see `compact`). |
 | GET | `/api/sessions/:id/runs` | The session's turns for the chat view (`SessionRunRow`). | `host`. |
 | GET | `/api/sessions/:id/usage-timeline` | Tokens per model call. | `host`. |
 | POST | `/api/sessions/:id/send` | Send a prompt as the next turn, or invoke skills in it. | `host`. Body `{prompt?, skills?}` → `{run_id, host_id}`; watch the turn with `/api/transcript/stream`. `skills` (skill entries) become `rupu session send --skill`; the prompt may be empty when a skill is given. 400 with neither, a malformed or wildcard entry, or a skill the session can't take (unknown, ambiguous, held from the other layer; the body is the CLI's message); 404 unknown session; 409 session stopped; 501 without `cp serve`. A remote host that does not advertise `session.skills` refuses a send with skills: 501, "upgrade rupu there", and nothing reaches it. |
 | POST | `/api/sessions/:id/archive` | Archive a session. | `host`. |
 | POST | `/api/sessions/:id/restore` | Restore an archived session. | `host`. |
 | DELETE | `/api/sessions/:id` | Delete a session. | `host`. |
+| POST | `/api/sessions/:id/stop` | Stop a session (`rupu session stop`): end its worker and running turn, mark it stopped. | Local only (`host` other than `local` is 501). → `{ok, id}` once the record says stopped. 404 unknown session; 409 archived; 501 without `cp serve`. A later send reactivates it. |
+| POST | `/api/sessions/:id/compact` | Compact the stored conversation now (`rupu session compact`). | Local only. Body `{window?}` (tokens to size against, in place of the session's own). Recorded first: a marker (`<session dir>/compaction.json`, under `session.lock`) names the CP, then the child it starts, and while that process lives `send`, `stop`, `archive`, `DELETE` and another `compact` answer 409 (a marker whose process is gone is stale and cleared). Started detached: 202 `{ok, id, compaction_id, log}`. The child writes the compacted history only if the session record is unchanged since it read it (else it discards the summary); how it ended is `last_compaction` `{id, outcome: compacted\|nothing_to_compact\|discarded\|failed, detail, finished_at}` on the session detail, and errors are in `log` (`<session dir>/compact.log`). `rupu session compact` in a terminal takes the same marker. 404 unknown; 409 a turn or a compaction is running, or the session is archived; 501 without `cp serve`. |
 
 Start a session with `POST /api/agents/:name/session`.
 
@@ -403,15 +405,26 @@ curl -s -X POST -H "Authorization: Bearer $CP_TOKEN" -H 'Content-Type: applicati
 
 ## Skills
 
-Installed [Agent Skills](skills.md), read-only: installing and updating stay
-`rupu skill` operations. Both routes read the global layer and, with `ws_id`,
-that project's layer (`.rupu/skills` in the workspace; none when the project's
-`.rupu` is the global dir). An unknown `ws_id` is a 404.
+Installed [Agent Skills](skills.md). The reads take the global layer and, with
+`ws_id`, that project's layer (`.rupu/skills` in the workspace; none when the
+project's `.rupu` is the global dir). An unknown `ws_id` is a 404.
 
 | Method | Path | Purpose | Notes |
 |--------|------|---------|-------|
 | GET | `/api/skills` | Every installed skill, as `rupu skill list` (`SkillsResponse`). | `ws_id`. Rows sorted by name, then layer. Each row loads its skill to show its status. |
 | GET | `/api/skills/:layer/:name` | One skill, as `rupu skill show` (`SkillDetail`). | `ws_id`, required for `project`. 400 for a layer other than `global` / `project`, or `project` without `ws_id`; 404 `no installed skill <layer>:<name>`; 500 when the skill's layer can't be read. |
+
+The writes run what `rupu skill install|update|validate` run, through the same
+`rupu_skills` functions (an install is staged, validated and renamed in by
+`install_from`). They are local only: a `host` other than `local` is 501.
+Install and update need `cp serve` (501 otherwise), which provides the git
+fetch.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| POST | `/api/skills/install` | Install skills (`rupu skill install`). | Body `{source, ref?, skills?, all?, project?, force?}`: `source` is an absolute directory, `owner/repo`, a GitHub tree URL or an https git URL (`#path` narrows it); `project` is a `ws_id` (its `.rupu/skills`). → `{installed: [{name, layer, path, outcome: created\|replaced, content_hash, tracked}], skipped: [{name, reason}]}`; `tracked` is false for a project install from a directory outside the project (`update` can't follow it). 400 bad source, relative directory, unknown or invalid skill, `skills` with `all`; 404 unknown project; 409 a skill of that name is installed and `force` isn't set, or the project has no `.rupu/`; 502 the fetch failed. A batch that fails part-way names what landed in its error. |
+| POST | `/api/skills/update` | Re-fetch installed skills from their source (`rupu skill update`). | Body `{names?, project?, force?}`; no names = every skill with a source record. → `{layer, results: [{name, outcome, from?, to?, error?}]}`, `outcome` `updated` / `up_to_date` / `no_record` / `locally_modified` / `not_installed` / `failed`: per skill, never an error status. |
+| POST | `/api/skills/validate` | Check skills against the format (`rupu skill validate`). | Body `{path}` (an absolute directory: every skill under it, installed or not) or `{name, layer?, ws_id?}` (an installed skill, both layers without `layer`). → `{ok, skills: [{name, layer?, path, status, error?, warnings}]}`. 400 neither or a relative path; 404 no installed skill of that name. |
 
 Hosts receive the skills of a placed unit through two more routes, behind the
 `agent.skill_bundle` feature in `/api/host/info` (see
@@ -571,6 +584,21 @@ An unknown `ws_id` is a 404 on every route except the list.
 | GET | `/api/projects/:ws_id/tree` | One directory of the checkout (`TreeResult`). | `path` (workspace-relative). 400 for an absolute path, `..`, or a path leaving the workspace. Skips `.git`, `.rupu`, `node_modules`, `target`. |
 | GET | `/api/projects/:ws_id/source` | One file's contents (`FileContent`). | `path`. A missing, binary or > 2 MiB file is 200 with `available: false` and a `reason`. |
 | GET | `/api/projects/:ws_id/files` | Flat file list for search. | Capped at 20 000 (`truncated`). |
+
+## Stock fleet, project init and engagement profiles
+
+What `rupu fleet list|install`, `rupu init` and the run assembler's profile
+registry do, through the same functions (`rupu_templates`,
+`rupu_coverage::profile`). All local only: a `host` other than `local` is 501.
+The writes need `cp serve` (501 otherwise).
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/fleet` | The stock security-assessment fleet and where it is installed. | `ws_id`. → `{entries: [{kind: agent\|workflow, name, path, global, project?}], global_root, project_root}`; `global` / `project` are `missing`, `current` (the shipped file), `modified` or `unreadable`. |
+| POST | `/api/fleet/install` | Install the fleet (`rupu fleet install`). | Body `{force?, project?}`: the global root, or that project's `.rupu/`; existing files are kept unless `force`. → `{root, created, skipped, overwrote, files: [{path, action}]}`. 404 unknown project; 409 the project has no `.rupu/`. |
+| POST | `/api/projects/init` | Initialise a directory as a rupu project (`rupu init`). | Body `{path, with_samples?, force?}`. `path` must be absolute and exist (400 otherwise). 409 when `.rupu/config.toml` exists and `force` isn't set; `force` re-runs it, overwriting samples (never `config.toml`). → `{root, created, skipped, overwrote, files}`, `action` `created` / `skipped` / `overwrote` / `updated` (`.gitignore` lines appended, named in `detail`). It doesn't register the project. |
+| GET | `/api/engagement-profiles` | The engagement profiles a launch can select. | `ws_id` overlays that project's `.rupu/profiles` on `<RUPU_HOME>/profiles` on the built-ins (a later layer wins by id). → `{profiles, errors}`: each profile's TOML fields (`id`, `name`, `includes`, `asset_kinds`, `completeness`, `coverage`, `bundle`, …) plus its `layer` (`builtin` / `global` / `project`). `errors` names profile files that don't load (and a missing include); while it's non-empty every engagement launch fails. |
+| GET | `/api/engagement-profiles/:id` | One profile. | `ws_id`. The profile with its `layer` and the overlay's `errors`. 404 unknown id. |
 
 ## Hosts, workers and fleet
 

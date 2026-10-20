@@ -219,5 +219,34 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Check every agent file, global and project, as `rupu agent validate --all` does.\n\n`ws_id` limits the projects to that one; absent, every registered project is checked. Returns `{ok, rows}`: one row per file with `name`, `layer`, `scope_id`, `path`, `ok` and `error`; `ok` is false when any file failed.",
         )
         .query::<agents::ValidateAgentsQuery>(),
+        // Skill installs, updates and validation (Plan 3a, Package C).
+        op(
+            "skills.install",
+            Method::POST,
+            "/api/skills/install",
+            "Install Agent Skills from a directory, `owner/repo`, or an https git URL.\n\n`source` is required (a local directory must be absolute); `ref` picks a branch, tag or commit, `skills` names skills in a source that holds several (or `all`), `project` installs into that project's `.rupu/skills`, `force` replaces installed skills of the same name. Returns `{installed, skipped}`; `HTTP 409` when a skill of that name is installed and `force` is not set, `HTTP 502` when the fetch fails.",
+        )
+        .query::<skills::SkillsWriteQuery>()
+        .body::<skills::InstallBody>()
+        .destructive()
+        .open_world(),
+        op(
+            "skills.update",
+            Method::POST,
+            "/api/skills/update",
+            "Re-fetch installed skills from the source they were installed from.\n\n`names` picks skills (empty: every skill with a source record); `project` updates that project's layer; `force` replaces locally edited copies. Returns `{layer, results}`, one `{name, outcome}` per skill (`updated`, `up_to_date`, `no_record`, `locally_modified`, `not_installed`, `failed`).",
+        )
+        .query::<skills::SkillsWriteQuery>()
+        .body::<skills::UpdateBody>()
+        .open_world(),
+        op(
+            "skills.validate",
+            Method::POST,
+            "/api/skills/validate",
+            "Check skills against the Agent Skills format without installing anything.\n\nGive `path` (an absolute directory: every skill under it) or `name` (an installed skill; `layer` and `ws_id` narrow it). Returns `{ok, skills}`, each `{name, path, status, error?, warnings}`; `HTTP 404` when `name` matches no installed skill.",
+        )
+        .query::<skills::SkillsWriteQuery>()
+        .body::<skills::ValidateBody>()
+        .read_only(),
     ]
 }
