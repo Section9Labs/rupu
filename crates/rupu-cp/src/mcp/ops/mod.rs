@@ -137,8 +137,8 @@ pub fn ops() -> &'static [OpSpec] {
 }
 
 /// Routes that are deliberately not operator tools, each with the reason.
-/// `tests/it/mcp_routes.rs` holds this list, `ops()` and `PENDING_PLAN_2`
-/// in lockstep with the registered routes.
+/// `tests/it/mcp_routes.rs` holds this list and `ops()` in lockstep with the
+/// registered routes.
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
     ("GET", "/api/runs/:id/log", "SSE stream"),
     ("GET", "/api/events/stream", "SSE stream"),
@@ -190,22 +190,6 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
         "SSE stream; wait replaces it",
     ),
     ("POST", "/mcp", "the MCP endpoint itself"),
-];
-
-/// Routes not yet operator tools; Plan 2 empties this list.
-pub const PENDING_PLAN_2: &[(&str, &str)] = &[
-    ("GET", "/api/projects"),
-    ("GET", "/api/projects/:ws_id"),
-    ("GET", "/api/projects/:ws_id/agents"),
-    ("GET", "/api/projects/:ws_id/autoflows"),
-    ("GET", "/api/projects/:ws_id/coverage"),
-    ("GET", "/api/projects/:ws_id/coverage/assessed"),
-    ("GET", "/api/projects/:ws_id/files"),
-    ("GET", "/api/projects/:ws_id/runs"),
-    ("GET", "/api/projects/:ws_id/sessions"),
-    ("GET", "/api/projects/:ws_id/source"),
-    ("GET", "/api/projects/:ws_id/tree"),
-    ("GET", "/api/projects/:ws_id/workflows"),
 ];
 
 #[cfg(test)]

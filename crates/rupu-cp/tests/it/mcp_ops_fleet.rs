@@ -4,7 +4,7 @@
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
-use super::mcp::{assert_required_args, call_tool, json_of, spawn_operator_with, text_of, OP_RUN};
+use super::mcp::{assert_required_args, call_tool, json_of, spawn_operator_with, text_of};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
@@ -106,7 +106,7 @@ async fn spawn_routable() -> (SocketAddr, tempfile::TempDir) {
         rupu_config::PricingConfig::default(),
     )
     .with_launcher(Some(std::sync::Arc::new(super::mcp::NoopLauncher)))
-    .with_bind("0.0.0.0:7878".to_string());
+    .with_bind("0.0.0.0:0".to_string());
     let server = rupu_cp::mcp::build_server(
         &state,
         &rupu_cp::mcp::McpOpts {
@@ -350,7 +350,6 @@ async fn launch_preview_names_one_target_and_echoes_the_host() {
     let body = json_of(&r);
     assert_eq!(body["host"], "other");
     assert!(body["warnings"].as_array().is_some_and(|w| !w.is_empty()));
-    let _ = OP_RUN;
 }
 
 #[tokio::test]

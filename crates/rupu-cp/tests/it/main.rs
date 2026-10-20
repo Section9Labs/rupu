@@ -33,6 +33,7 @@ mod mcp_ops_agentiflows;
 mod mcp_ops_definitions;
 mod mcp_ops_findings;
 mod mcp_ops_fleet;
+mod mcp_ops_projects;
 mod mcp_ops_observe;
 mod mcp_ops_runs;
 mod mcp_ops_sessions;

@@ -34,7 +34,7 @@ pub struct TreeResult {
     pub entries: Vec<TreeEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TreeQuery {
     #[serde(default)]
     pub path: String,
