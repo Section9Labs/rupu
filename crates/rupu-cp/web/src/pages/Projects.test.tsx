@@ -7,7 +7,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type ProjectRow } from '../lib/api';
 
@@ -185,5 +185,24 @@ describe('Projects — customer scope and column', () => {
     renderPage();
     await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
     expect(spy.mock.calls[0]).toEqual([]);
+  });
+});
+
+describe('Projects: Initialize project (Plan 3b)', () => {
+  it('opens the init dialog from the header', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue(ROWS);
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Initialize project' }));
+    expect(await screen.findByRole('dialog', { name: 'Initialize project' })).toBeInTheDocument();
+  });
+
+  it('the empty state offers it too', async () => {
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    renderPage();
+    await screen.findByText('No projects yet');
+    const buttons = screen.getAllByRole('button', { name: 'Initialize project' });
+    expect(buttons).toHaveLength(2);
+    fireEvent.click(buttons[1]);
+    expect(await screen.findByRole('dialog', { name: 'Initialize project' })).toBeInTheDocument();
   });
 });

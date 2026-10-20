@@ -2,7 +2,9 @@
 //
 // Prompt textarea + Mode picker (Ask / Bypass / Read-only) + TargetPicker.
 // On Launch it POSTs to /api/agents/:name/run (single run) or
-// /api/agents/:name/session (session) and navigates to the result.
+// /api/agents/:name/session (session) and navigates to the result. A run
+// also takes a model/provider override and engagement profiles (Plan 3b);
+// `launchFieldGates` says when the launch can't carry them, and why.
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -16,6 +18,9 @@ import { Button } from './ui/Button';
 import { LaunchBillingPanel, type BillingState } from './customers/LaunchBillingPanel';
 import { CustomerChip } from './customers/CustomerChip';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
+import { launchApi, launchFieldGates } from '../lib/api3b/launch';
+import ModelProviderSection, { type ModelChoice } from './launch/ModelProviderSection';
+import EngagementProfilePicker from './launch/EngagementProfilePicker';
 
 export interface AgentLaunch {
   prompt?: string;
@@ -37,9 +42,14 @@ type LaunchKind = 'run' | 'session';
 
 export default function AgentLauncherSheet({
   agent,
+  agentProvider,
+  agentModel,
   onClose,
 }: {
   agent: string;
+  /** The agent's own provider and model, the Model & provider defaults. */
+  agentProvider?: string | null;
+  agentModel?: string | null;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -56,6 +66,8 @@ export default function AgentLauncherSheet({
   const [skills, setSkills] = useState<string[]>([]);
   const [preloadSkills, setPreloadSkills] = useState<string[]>([]);
   const [skillRows, setSkillRows] = useState<SkillRow[]>([]);
+  const [modelChoice, setModelChoice] = useState<ModelChoice>({ provider: '', model: '' });
+  const [profiles, setProfiles] = useState<string[]>([]);
   // Which customer/accounts the launch would use, and whether it would fail.
   const [billing, setBilling] = useState<BillingState>({ customer: undefined, blocked: false });
   const previewBody = useMemo<PreviewBody>(
@@ -72,6 +84,7 @@ export default function AgentLauncherSheet({
   // no suggestions (a typed name still goes through).
   const skillsWsId = target.wsId;
   const remoteHost = host !== 'local';
+  const gates = launchFieldGates({ kind: 'agent', host, session: launchKind === 'session' });
   useEffect(() => {
     if (remoteHost) {
       setSkillRows([]);
@@ -119,7 +132,12 @@ export default function AgentLauncherSheet({
         const sessionHostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
         navigate(`/sessions/${res.session_id}${sessionHostParam}`);
       } else {
-        const res = await api.launchAgent(agent, opts);
+        const res = await launchApi.launchAgentRun(agent, {
+          ...opts,
+          ...(gates.model === null && modelChoice.provider ? { provider: modelChoice.provider } : {}),
+          ...(gates.model === null && modelChoice.model ? { model: modelChoice.model } : {}),
+          ...(gates.profiles === null && profiles.length > 0 ? { engagement_profiles: profiles } : {}),
+        });
         const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
         navigate(`/runs/${res.run_id}${hostParam}`);
       }
@@ -262,6 +280,24 @@ export default function AgentLauncherSheet({
               className="w-full"
             />
           </label>
+
+          <ModelProviderSection
+            agentProvider={agentProvider}
+            agentModel={agentModel}
+            value={modelChoice}
+            onChange={setModelChoice}
+            disabledReason={gates.model}
+            disabled={launching}
+          />
+
+          <EngagementProfilePicker
+            value={profiles}
+            onChange={setProfiles}
+            wsId={target.wsId}
+            disabledReason={gates.profiles}
+            note={remoteHost ? 'The host must support engagement profiles; one that doesn’t refuses the launch.' : null}
+            disabled={launching}
+          />
 
           {/* ── Skills ─────────────────────────────────────────────── */}
           <details className="group" data-testid="launch-skills">

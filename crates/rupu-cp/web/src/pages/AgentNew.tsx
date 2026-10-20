@@ -9,6 +9,10 @@ import { useNavigate } from 'react-router-dom';
 import { api, skillNamesOf, type ProviderModels } from '../lib/api';
 import AgentBuilder from '../components/agentBuilder/AgentBuilder';
 import { NEW_AGENT_TEMPLATE } from '../lib/agentBuilder/agentSpec';
+import { launchApi } from '../lib/api3b/launch';
+
+// A new agent is created in the global layer, so it is checked against it.
+const validateNew = (raw: string) => launchApi.validateAgentRaw(raw);
 
 export default function AgentNew() {
   const navigate = useNavigate();
@@ -76,6 +80,7 @@ export default function AgentNew() {
         onGenerate={api.generateAgent}
         agentNames={agentNames}
         skillNames={skillNames}
+        serverValidate={validateNew}
       />
     </div>
   );

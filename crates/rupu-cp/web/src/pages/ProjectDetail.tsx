@@ -2,7 +2,8 @@
 // persistent identity header + 5 rollup tiles, then a TabBar that routes
 // between six tab bodies (Overview / Runs / Findings / Sessions / Coverage /
 // Config). The active tab is driven by the `tab` prop, set per-route in
-// App.tsx.
+// App.tsx. The Config tab also carries the project's tracked repositories
+// (`ProjectRepositories`, operator MCP Plan 3b UI-5).
 
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
@@ -37,6 +38,7 @@ import ProjectSessionsTab from '../components/project/ProjectSessionsTab';
 import ProjectCoverageTab from '../components/project/ProjectCoverageTab';
 import ProjectNetworkTab from '../components/project/ProjectNetworkTab';
 import ProjectConfigTab from '../components/project/ProjectConfigTab';
+import { ProjectRepositories } from '../components/project/ProjectRepositories';
 import { relativeTime } from '../lib/time';
 import { formatTokens, formatCost } from '../lib/usage';
 
@@ -342,7 +344,12 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
       {tab === 'sessions' && <ProjectSessionsTab wsId={p.ws_id} />}
       {tab === 'coverage' && <ProjectCoverageTab wsId={p.ws_id} />}
       {tab === 'network' && <ProjectNetworkTab wsId={p.ws_id} />}
-      {tab === 'config' && <ProjectConfigTab wsId={p.ws_id} reloadKey={customerChanges} />}
+      {tab === 'config' && (
+        <>
+          <ProjectConfigTab wsId={p.ws_id} reloadKey={customerChanges} />
+          <ProjectRepositories projectPath={p.path} />
+        </>
+      )}
     </div>
   );
 }

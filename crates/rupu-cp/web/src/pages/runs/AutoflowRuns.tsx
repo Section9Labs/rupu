@@ -27,12 +27,17 @@
 // (`AutoflowProblems`) sits between the bar and the table, over the same
 // hosts.
 //
+// Operator actions (Plan 3b mock §9, local host only as their endpoints
+// are): the header's Doctor opens `autoflow doctor` in a drawer, Repair
+// claims dry-runs the claims it flags before releasing them, and the Wakes
+// strip above the table lists queued wakes when there are any.
+//
 // Customer scope (customers Plan 2B): as Workflows, through the same per-host
 // engine (`?customer=<slug>`). Attempt rows record no customer, so the server
 // lists none while scoped; the page says so in one line.
 
 import { useCallback, useMemo, useState } from 'react';
-import { ListFilter, RefreshCw } from 'lucide-react';
+import { ListFilter, RefreshCw, Stethoscope, Wrench } from 'lucide-react';
 import { shortIssueRef } from '../../lib/issueRef';
 import { api, type AutoflowRunRow, type ListQueryOpts } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
@@ -61,6 +66,9 @@ import { runHref } from '../../lib/runs';
 import { shortId } from '../../lib/shortId';
 import { useRunCustomers, withCustomerColumn } from '../../components/customers/RunCustomer';
 import { useScopedList } from '../../lib/useScopedList';
+import { AutoflowDoctorDrawer } from '../../components/admin/AutoflowDoctorDrawer';
+import { RepairClaimsDrawer } from '../../components/admin/RepairClaimsDrawer';
+import { WakesStrip } from '../../components/admin/WakesStrip';
 
 /** A row's host for actions: the server tags every row; absent means local. */
 const hostOf = (r: AutoflowRunRow) => r.host_id ?? 'local';
@@ -80,6 +88,7 @@ export default function AutoflowRuns() {
   // the list-fetch error the hook owns, but shown in the same banner.
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyClaim, setBusyClaim] = useState<string | null>(null);
+  const [drawer, setDrawer] = useState<'doctor' | 'repair' | null>(null);
   const archive = asksArchived(q, AUTOFLOW_RUN_FIELDS);
   // The hosts the query asks, for the problems strip too.
   const pick = useMemo(() => hostPickOf(q, AUTOFLOW_RUN_FIELDS), [q]);
@@ -333,12 +342,24 @@ export default function AutoflowRuns() {
         title="Autoflow Runs"
         subtitle="Workflow runs launched by autoflows, and attempts that failed before a run started."
         actions={
-          <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
-            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-            Refresh
-          </Button>
+          <>
+            <Button variant="secondary" onClick={() => setDrawer('doctor')} className="gap-1.5">
+              <Stethoscope size={12} />
+              Doctor
+            </Button>
+            <Button variant="secondary" onClick={() => setDrawer('repair')} className="gap-1.5">
+              <Wrench size={12} />
+              Repair claims
+            </Button>
+            <Button variant="secondary" onClick={() => refresh()} className="gap-1.5">
+              <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+              Refresh
+            </Button>
+          </>
         }
       />
+      {drawer === 'doctor' && <AutoflowDoctorDrawer onClose={() => setDrawer(null)} />}
+      {drawer === 'repair' && <RepairClaimsDrawer onClose={() => setDrawer(null)} onChanged={() => refreshHost('local')} />}
 
       <ListQueryBar
         value={q}
@@ -358,6 +379,8 @@ export default function AutoflowRuns() {
       )}
 
       <AutoflowProblems pick={pick} />
+
+      <WakesStrip />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
