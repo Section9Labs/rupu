@@ -36,6 +36,12 @@ import { TabButton } from '../components/TabBar';
 import { msgHash, parseMsgHash } from '../lib/messages';
 import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
+import { StatusChip } from '../components/ui/StatusChip';
+import { SessionControls } from '../components/runops/SessionControls';
+import { compactionLine, type CompactionResult, type SessionCompaction } from '../lib/api3b/runs';
+
+/** How often the page re-reads a compacting session for the end of it. */
+const COMPACTING_POLL_MS = 1500;
 
 // ---------------------------------------------------------------------------
 // Component
@@ -49,7 +55,9 @@ export default function SessionDetailPage() {
   const host = searchParams.get('host') ?? undefined;
   const navigate = useNavigate();
 
-  const [session, setSession] = useState<SessionSummary | null>(null);
+  // A LOCAL session's detail also carries its compaction state (`compacting`,
+  // `last_compaction`), which Compact / Stop and the composer read.
+  const [session, setSession] = useState<(SessionSummary & SessionCompaction) | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
 
   // The session's message space (spec F1c §3.3): a Messages view beside the
@@ -202,6 +210,18 @@ export default function SessionDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, pollInterval, sessionActive, host]);
 
+  // While a compaction runs, re-read the session until it ends: the chip, the
+  // locked composer and the result line all come from the record.
+  const compactingNow = session?.compacting === true;
+  useEffect(() => {
+    if (!compactingNow) return;
+    const t = window.setInterval(() => {
+      if (document.visibilityState === 'visible') loadSession();
+    }, COMPACTING_POLL_MS);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compactingNow, id, host]);
+
   // Skills the composer's `/` menu offers: the global layer plus the
   // session's project. This CP's listing says nothing about a remote host's
   // skills, so a remote session gets no menu (a typed `/name` still goes
@@ -307,6 +327,9 @@ export default function SessionDetailPage() {
 
   const active = isSessionActive(session);
   const stopped = sessionStatusTone(session.status) === 'stopped';
+  const compacting = session.compacting === true;
+  const remote = !!host && host !== 'local';
+  const compactionNote = latestCompaction(session.last_compaction, runs ?? []);
 
   return (
     <div className="flex h-full flex-col">
@@ -337,6 +360,11 @@ export default function SessionDetailPage() {
             />
             <span className="text-ui text-ink-dim">{sessionStatusLabel(session.status)}</span>
           </span>
+          {compacting && (
+            <StatusChip tone="running" dot>
+              compacting
+            </StatusChip>
+          )}
           {/* "working…" pill — visible while a turn is in flight. */}
           {active && (
             <span className="inline-flex items-center gap-1 rounded px-1.5 py-px text-[9px] font-medium bg-status-running/10 text-status-running">
@@ -354,7 +382,17 @@ export default function SessionDetailPage() {
 
         {/* Archive / Restore / Delete button cluster */}
         <div className="mt-2 flex flex-col items-end gap-1">
-          <div className="flex items-center gap-2">
+          <div className="flex items-start gap-2">
+            {session.scope !== 'archived' && (
+              <SessionControls
+                sessionId={session.session_id}
+                compacting={compacting}
+                stopped={stopped}
+                turnRunning={active}
+                remote={remote}
+                onChanged={reload}
+              />
+            )}
             {session.scope === 'archived' ? (
               <Button
                 variant="secondary"
@@ -479,7 +517,22 @@ export default function SessionDetailPage() {
       <>
       {/* Conversation — the growing, scrolling chat body. */}
       <MessageLinksContext.Provider value={messages.space === 'present' ? messageLinks : {}}>
-        <SessionConversation session={session} runs={runs ?? []} onTurnComplete={reload} />
+        <SessionConversation
+          session={session}
+          runs={runs ?? []}
+          onTurnComplete={reload}
+          footer={
+            compactionNote && (
+              <p className="mt-6 flex items-center gap-3 text-note text-ink-dim" role="status">
+                <span className="h-px flex-1 bg-border" aria-hidden />
+                <span className={compactionNote.outcome === 'failed' ? 'text-err' : undefined}>
+                  {compactionLine(compactionNote)}
+                </span>
+                <span className="h-px flex-1 bg-border" aria-hidden />
+              </p>
+            )
+          }
+        />
       </MessageLinksContext.Provider>
 
       {/* Composer — pinned at the bottom. */}
@@ -507,9 +560,15 @@ export default function SessionDetailPage() {
                 handleSend();
               }
             }}
-            disabled={sending || stopped}
+            disabled={sending || stopped || compacting}
             rows={2}
-            placeholder={skills.length > 0 ? 'Message this session… (/ for skills)' : 'Message this session…'}
+            placeholder={
+              compacting
+                ? "The session is compacting; you can send again when it's done."
+                : skills.length > 0
+                  ? 'Message this session… (/ for skills)'
+                  : 'Message this session…'
+            }
             className="w-full resize-y rounded-lg border border-border bg-panel px-3 py-2 text-sm text-ink placeholder:text-ink-mute focus:outline-none focus:ring-2 focus:ring-brand-200 disabled:cursor-not-allowed disabled:bg-surface disabled:text-ink-dim"
           />
 
@@ -534,7 +593,7 @@ export default function SessionDetailPage() {
             </div>
             <Button
               onClick={handleSend}
-              disabled={sending || stopped || prompt.trim().length === 0}
+              disabled={sending || stopped || compacting || prompt.trim().length === 0}
               className="px-4 text-sm disabled:opacity-50"
             >
               {sending ? 'Sending…' : 'Send'}
@@ -551,6 +610,17 @@ export default function SessionDetailPage() {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/** The last compaction, when nothing has happened in the conversation since:
+ *  it ended after the newest turn started (a later turn makes it history). */
+function latestCompaction(
+  last: CompactionResult | null | undefined,
+  runs: SessionRunRow[],
+): CompactionResult | null {
+  if (!last) return null;
+  const newest = runs.reduce<number>((m, r) => Math.max(m, r.started_at ? Date.parse(r.started_at) : 0), 0);
+  return Date.parse(last.finished_at) >= newest ? last : null;
+}
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (

@@ -1,8 +1,8 @@
 // InboxBoard — the operator action board, rendered from a `UseInbox` result so
 // it draws without network in tests. Two sections, split by what the operator
 // can actually do (honest about the backend): "Waiting on you" (gates + paused,
-// with the real approve/reject/resume mutations) and "Recent failures" (no web
-// retry — open or clear). Every row can also be snoozed or dismissed, always
+// with the real approve/reject/resume mutations) and "Recent failures" (Retry,
+// open or clear). Every row can also be snoozed or dismissed, always
 // one click, so the board can be worked to zero. When it is, an "inbox zero"
 // fact sheet hands the operator back to the system.
 //
@@ -106,8 +106,11 @@ function Row({
   const waitMs = now - sinceMs(item);
   const urgent = actionable && item.since != null && waitMs >= HOUR;
 
+  const retryError = item.kind === 'failed' ? data.retryErrors[item.id] : undefined;
+
   return (
-    <div className="flex items-center gap-3 border-t border-border px-4 py-3 first:border-t-0 hover:bg-surface/60">
+    <div className="border-t border-border first:border-t-0 hover:bg-surface/60">
+    <div className="flex items-center gap-3 px-4 py-3">
       {actionable && longestWait > 0 ? (
         <WaitBar fraction={waitMs / longestWait} tone={item.kind === 'awaiting' ? 'awaiting' : 'paused'} />
       ) : (
@@ -149,6 +152,22 @@ function Row({
             {data.pending[item.id] === 'resume' ? 'Resuming…' : 'Resume'}
           </Button>
         )}
+        {item.kind === 'failed' &&
+          (data.retryRequested[item.id] ? (
+            <StatusChip tone="running" dot>
+              retry requested
+            </StatusChip>
+          ) : (
+            <Button
+              variant="solid"
+              size="sm"
+              disabled={busy || item.host !== 'local'}
+              title={item.host !== 'local' ? 'Retrying is local-only: a remote host resumes only paused runs.' : undefined}
+              onClick={() => data.retry(item)}
+            >
+              {data.pending[item.id] === 'retry' ? 'Retrying…' : 'Retry'}
+            </Button>
+          ))}
         {item.kind === 'failed' && (
           <Link
             to={href}
@@ -160,6 +179,12 @@ function Row({
         <span className="mx-0.5 h-4 w-px bg-border" aria-hidden />
         <ClearControls item={item} data={data} disabled={busy} />
       </div>
+    </div>
+    {retryError && (
+      <p role="alert" className="-mt-1.5 px-4 pb-2.5 text-right text-note font-medium text-err">
+        {retryError}
+      </p>
+    )}
     </div>
   );
 }
@@ -339,7 +364,7 @@ export function InboxBoard({ data, filter = 'all' }: { data: UseInbox; filter?: 
               <SectionLabel
                 title="Recent failures"
                 count={failures.length}
-                hint="nothing’s blocked — open the run or clear it"
+                hint="nothing’s blocked — open the run, retry it or clear it"
               />
               <div className="overflow-hidden rounded-xl border border-border bg-panel">
                 {(showAllFailures ? failures : failures.slice(0, FAILURE_CAP)).map((item) => (

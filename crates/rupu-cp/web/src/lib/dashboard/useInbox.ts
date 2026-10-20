@@ -9,7 +9,9 @@
 // (`status:awaiting_approval,paused`) and recent failures (`status:failed`) —
 // and merges them. The split the screen draws is honest about the backend:
 //   • ACTIONABLE (gates + paused) have a real mutation (approve/reject/resume);
-//   • FAILURES have none (no web retry endpoint), so they only link out or clear.
+//   • FAILURES can be retried (local runs, the run's recorded mode), opened or
+//     cleared; a retry is a request, so the row shows it until a reload no
+//     longer lists the run as failed.
 //
 // The "stalled run time" headline (sum of how long each actionable item has
 // been waiting) is derived here from the same `since` timestamps, and only ever
@@ -28,6 +30,7 @@ import {
   type RunListRow,
   type RunStatusStr,
 } from '../api';
+import { runsApi } from '../api3b/runs';
 import {
   activeSnoozes,
   addDismissed,
@@ -40,7 +43,7 @@ import {
 } from './inboxStore';
 
 export type InboxKind = 'awaiting' | 'paused' | 'failed';
-export type InboxVerb = 'approve' | 'reject' | 'resume';
+export type InboxVerb = 'approve' | 'reject' | 'resume' | 'retry';
 
 /** A run that is blocked on, or recently failed under, the operator. */
 export interface InboxItem {
@@ -86,6 +89,12 @@ export interface UseInbox {
   approve: (item: InboxItem) => void;
   reject: (item: InboxItem) => void;
   resume: (item: InboxItem) => void;
+  /** Retry a failed LOCAL run in its recorded mode (`POST /api/runs/:id/retry`). */
+  retry: (item: InboxItem) => void;
+  /** Failed runs whose retry was recorded and that a reload still lists as failed. */
+  retryRequested: Record<string, true>;
+  /** A refused retry's message, per run id (cleared by the next retry of it). */
+  retryErrors: Record<string, string>;
   snooze: (item: InboxItem, dur: SnoozeDuration) => void;
   dismiss: (item: InboxItem) => void;
   unsnooze: (id: string) => void;
@@ -96,6 +105,8 @@ export interface UseInbox {
 const BLOCKING_LIMIT = 25;
 const FAILED_LIMIT = 10;
 const RECONCILE_MS = 60_000;
+/** Faster reconcile while a requested retry waits to take its run. */
+const RETRY_RECONCILE_MS = 5_000;
 const TICK_MS = 30_000;
 
 /** Mutation host arg: remote host id, or undefined for local. */
@@ -136,6 +147,8 @@ export function useInbox(customer?: CustomerScope): UseInbox {
   const [pending, setPending] = useState<Record<string, InboxVerb>>({});
   const [now, setNow] = useState(() => Date.now());
   const [cleared, setCleared] = useState(0);
+  const [retryRequested, setRetryRequested] = useState<Record<string, true>>({});
+  const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
 
   // View state (localStorage-backed). `now` at mount prunes lapsed snoozes.
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(() => new Set(readDismissed()));
@@ -174,6 +187,16 @@ export function useInbox(customer?: CustomerScope): UseInbox {
           .filter((x): x is InboxItem => x !== null)
           .filter((it, i, arr) => arr.findIndex((o) => o.id === it.id && o.host === it.host) === i);
         setAllItems(merged);
+        // A requested retry is confirmed by the run leaving the failed list.
+        setRetryRequested((prev) => {
+          const stillFailed = new Set(merged.filter((it) => it.kind === 'failed').map((it) => it.id));
+          const next = Object.fromEntries(
+            Object.keys(prev)
+              .filter((id) => stillFailed.has(id))
+              .map((id) => [id, true as const]),
+          );
+          return Object.keys(next).length === Object.keys(prev).length ? prev : next;
+        });
         setError(null);
         setLoading(false);
       },
@@ -247,6 +270,36 @@ export function useInbox(customer?: CustomerScope): UseInbox {
     [act],
   );
 
+  const retry = useCallback(
+    (item: InboxItem) => {
+      if (item.host !== 'local') return;
+      setRetryErrors(({ [item.id]: _drop, ...rest }) => rest);
+      setPending((p) => ({ ...p, [item.id]: 'retry' }));
+      runsApi.retryRun(item.id, {}).then(
+        () => {
+          setPending(({ [item.id]: _drop, ...rest }) => rest);
+          setRetryRequested((r) => ({ ...r, [item.id]: true }));
+          setCleared((c) => c + 1);
+        },
+        (e: unknown) => {
+          setPending(({ [item.id]: _drop, ...rest }) => rest);
+          setRetryErrors((r) => ({ ...r, [item.id]: apiErrorMessage(e) }));
+        },
+      );
+    },
+    [],
+  );
+
+  // While a retry waits to take its run, reconcile faster than the minute.
+  const anyRetryRequested = Object.keys(retryRequested).length > 0;
+  useEffect(() => {
+    if (!anyRetryRequested) return;
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') load();
+    }, RETRY_RECONCILE_MS);
+    return () => clearInterval(t);
+  }, [anyRetryRequested, load]);
+
   const snooze = useCallback((item: InboxItem, dur: SnoozeDuration) => {
     const until = snoozeUntil(dur, Date.now());
     setSnoozeMap(addSnooze(item.id, until));
@@ -308,12 +361,33 @@ export function useInbox(customer?: CustomerScope): UseInbox {
       approve,
       reject,
       resume,
+      retry,
+      retryRequested,
+      retryErrors,
       snooze,
       dismiss,
       unsnooze,
       undismiss,
       refresh: load,
     }),
-    [view, cleared, loading, error, pending, now, approve, reject, resume, snooze, dismiss, unsnooze, undismiss, load],
+    [
+      view,
+      cleared,
+      loading,
+      error,
+      pending,
+      now,
+      approve,
+      reject,
+      resume,
+      retry,
+      retryRequested,
+      retryErrors,
+      snooze,
+      dismiss,
+      unsnooze,
+      undismiss,
+      load,
+    ],
   );
 }
