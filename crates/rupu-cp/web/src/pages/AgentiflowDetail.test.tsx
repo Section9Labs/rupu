@@ -8,7 +8,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
 
 vi.mock('../components/TranscriptPanel', () => ({
@@ -132,11 +132,23 @@ const DETAIL: Detail = {
   ],
 };
 
-function renderDetail() {
+function SearchProbe() {
+  return <p data-testid="location-search">{useLocation().search}</p>;
+}
+
+function renderDetail(entry = '/agentiflows/af_01ABC') {
   return render(
-    <MemoryRouter initialEntries={['/agentiflows/af_01ABC']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Routes>
-        <Route path="/agentiflows/:id" element={<AgentiflowDetail />} />
+        <Route
+          path="/agentiflows/:id"
+          element={
+            <>
+              <AgentiflowDetail />
+              <SearchProbe />
+            </>
+          }
+        />
       </Routes>
     </MemoryRouter>,
   );
@@ -310,6 +322,18 @@ describe('AgentiflowDetail', () => {
     // The lead transcript tails live while the run is running.
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('transcript.r1.jsonl:true');
+  });
+
+  it('opens the tab ?tab= names and writes the tab it switches to', async () => {
+    vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
+    renderDetail('/agentiflows/af_01ABC?tab=findings');
+    await screen.findByRole('heading', { name: 'rupu-self-review' });
+    expect(screen.getByText('verified by this engagement')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Findings' })).toHaveAttribute('aria-pressed', 'true');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    expect(screen.getByTestId('transcript-panel')).toHaveTextContent('/tmp/lead/transcript.r1.jsonl:false');
+    expect(screen.getByTestId('location-search')).toHaveTextContent('?tab=transcript');
   });
 
   it('says so when the agentiflow does not exist', async () => {

@@ -34,11 +34,14 @@ import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { TabButton } from '../components/TabBar';
 import { msgHash, parseMsgHash } from '../lib/messages';
+import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
+
+const SESSION_VIEWS = ['conversation', 'messages'] as const;
 
 export default function SessionDetailPage() {
   const { id = '' } = useParams<{ id: string }>();
@@ -52,7 +55,7 @@ export default function SessionDetailPage() {
   // The session's message space (spec F1c §3.3): a Messages view beside the
   // conversation, shown when the space exists.
   const { hash, search } = useLocation();
-  const [view, setView] = useState<'conversation' | 'messages'>(() => (parseMsgHash(hash) ? 'messages' : 'conversation'));
+  const [view, setView] = useTabParam(SESSION_VIEWS, parseMsgHash(hash) ? 'messages' : 'conversation');
   const [messagesOpened, setMessagesOpened] = useState(view === 'messages');
   useEffect(() => {
     if (view === 'messages') setMessagesOpened(true);
@@ -65,8 +68,7 @@ export default function SessionDetailPage() {
   const messageLinks = useMemo<MessageLinks>(
     () => ({
       openInFeed: (msgId) => {
-        setView('messages');
-        navigate({ search, hash: msgHash(msgId) });
+        navigate({ search: withTab(search, 'messages'), hash: msgHash(msgId) });
       },
     }),
     [navigate, search],
@@ -467,8 +469,7 @@ export default function SessionDetailPage() {
               const p = messages.participants.find((x) => x.address === m.from);
               if (p?.kind !== 'session_turn') return null;
               return () => {
-                setView('conversation');
-                navigate({ search, hash: msgHash(m.id) });
+                navigate({ search: withTab(search, 'conversation'), hash: msgHash(m.id) });
               };
             }}
             highlightId={parseMsgHash(hash)}

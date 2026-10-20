@@ -16,7 +16,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
-import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -246,11 +246,23 @@ const EMPTY_USAGE = {
 
 // ---- Render helpers -------------------------------------------------------
 
-function renderPage() {
+function SearchProbe() {
+  return <p data-testid="location-search">{useLocation().search}</p>;
+}
+
+function renderPage(entry = '/runs/run-1') {
   return render(
-    <MemoryRouter initialEntries={['/runs/run-1']}>
+    <MemoryRouter initialEntries={[entry]}>
       <Routes>
-        <Route path="/runs/:id" element={<RunDetailLoaded />} />
+        <Route
+          path="/runs/:id"
+          element={
+            <>
+              <RunDetailLoaded />
+              <SearchProbe />
+            </>
+          }
+        />
       </Routes>
     </MemoryRouter>,
   );
@@ -701,6 +713,16 @@ describe('RunDetail — Findings tab', () => {
     expect(await screen.findByText('No findings recorded for this run.')).toBeInTheDocument();
     expect(screen.getByText('(findings require a workflow with a coverage target)')).toBeInTheDocument();
   });
+
+  it('opens the tab ?tab= names and writes the tab it switches to, keeping ?host=', async () => {
+    stubApi(FINDINGS);
+    renderPage('/runs/run-1?host=local&tab=findings');
+    expect(await screen.findByText('No findings recorded for this run.')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Events' }));
+    expect(screen.queryByText('No findings recorded for this run.')).not.toBeInTheDocument();
+    expect(screen.getByTestId('location-search')).toHaveTextContent('?host=local&tab=events');
+  });
 });
 
 describe('RunDetail — remote host (?host=)', () => {
@@ -1093,6 +1115,16 @@ describe('RunDetail — Cycles tab', () => {
     // link is present for mouse clicks only (aria-hidden + tabIndex=-1).
     const priorRunLink = screen.getByRole('link', { name: /afc_ctx_old/ });
     expect(priorRunLink).toHaveAttribute('href', '/runs/run-old-1');
+  });
+
+  it('a ?tab=cycles link opens the Cycles tab once the autoflow context arrives', async () => {
+    stubApi();
+    vi.spyOn(api, 'getRunAutoflow').mockResolvedValue(AUTOFLOW_CONTEXT);
+
+    renderPage('/runs/run-1?tab=cycles');
+
+    expect(await screen.findByTestId('cycles-tab')).toHaveTextContent('afc_ctx_old');
+    expect(screen.getByTestId('location-search')).toHaveTextContent('?tab=cycles');
   });
 
   it('shows NO Cycles tab for a plain (non-autoflow) run', async () => {

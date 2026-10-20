@@ -37,6 +37,7 @@ import TranscriptPanel from '../components/TranscriptPanel';
 import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { msgHash, parseMsgHash } from '../lib/messages';
+import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
 import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
@@ -62,11 +63,12 @@ import {
 } from '../components/transcript/subrunIdentity';
 import { parseCodename } from '../lib/codename';
 import { useRunUsage } from '../lib/runUsage';
-import { parseCallHash, useToolCallAnchor } from '../lib/toolCallAnchor';
+import { useToolCallAnchor } from '../lib/toolCallAnchor';
 
 const MAX_EVENTS = 2000;
 
-type Tab = 'transcript' | 'events' | 'findings' | 'children' | 'cycles' | 'netflow' | 'messages';
+const RUN_TABS = ['transcript', 'events', 'findings', 'children', 'cycles', 'netflow', 'messages'] as const;
+type Tab = (typeof RUN_TABS)[number];
 
 /**
  * A single selection cursor that the whole tab panel follows. `unitIndex` is an
@@ -171,19 +173,26 @@ export default function RunDetail() {
   const [graph, setGraph] = useState<RunGraphResponse | null>(null);
 
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>('transcript');
+  // A `#msg-<id>` link opened from elsewhere lands on the Messages tab; a
+  // `#call-<id>` link (no `?tab=`) lands on the default, the Transcript.
+  const [tabParam, setTab] = useTabParam(RUN_TABS, parseMsgHash(hash) !== null ? 'messages' : 'transcript');
 
-  // `#call-<id>` (a socket flow's "transcript" link): make sure the Transcript
-  // tab is showing — the link may be followed from this run's Network tab — and
-  // scroll to the tool call's card once the transcript has rendered it.
-  useEffect(() => {
-    if (parseCallHash(hash) !== null) setTab('transcript');
-  }, [hash]);
-  // A `#msg-<id>` link opened from elsewhere lands on the Messages tab; the
-  // in-page links set the tab themselves.
-  useEffect(() => {
-    if (parseMsgHash(hash) !== null) setTab('messages');
-  }, [id]);
+  // Autoflow-history context — `null` means either "not fetched yet" or "this
+  // run has no autoflow trail" (a plain, non-autoflow run); either way no
+  // panel renders. Fetched independently of the graph/usage-timeline effects
+  // below so a slow/failed autoflow lookup never blocks the rest of the page.
+  const [autoflowCtx, setAutoflowCtx] = useState<AutoflowRunContext | null>(null);
+
+  // The children ledger is local-only (`/api/runs/:id/children` has no
+  // `?host=`), so a remote run has no Children tab.
+  const remote = !!host && host !== 'local';
+
+  // The Cycles tab exists only for autoflow runs and Children only for local
+  // ones: a `?tab=` naming a tab whose button doesn't render shows the
+  // Transcript, without rewriting the URL, so `?tab=cycles` flips to Cycles
+  // once the autoflow context arrives.
+  const tab: Tab = (tabParam === 'cycles' && !autoflowCtx) || (tabParam === 'children' && remote) ? 'transcript' : tabParam;
+
   const [messagesOpened, setMessagesOpened] = useState(false);
   useEffect(() => {
     if (tab === 'messages') setMessagesOpened(true);
@@ -213,10 +222,8 @@ export default function RunDetail() {
   // once it has been opened. `null` = not known yet.
   const [findingsCount, setFindingsCount] = useState<number | null>(null);
 
-  // The children ledger is local-only (`/api/runs/:id/children` has no
-  // `?host=`), so a remote run has no Children tab. `null` = not loaded yet;
-  // the panel itself loads on first open and polls while it is shown.
-  const remote = !!host && host !== 'local';
+  // `null` = not loaded yet; the panel itself loads on first open and polls
+  // while it is shown.
   const [childrenCount, setChildrenCount] = useState<number | null>(null);
 
   // Netflow lives entirely inside <NetflowExplorer> now (the v3 one-
@@ -234,12 +241,6 @@ export default function RunDetail() {
   useEffect(() => {
     if (tab === 'netflow' && id) setNetflowVisitedRunId(id);
   }, [tab, id]);
-
-  // Autoflow-history context — `null` means either "not fetched yet" or "this
-  // run has no autoflow trail" (a plain, non-autoflow run); either way no
-  // panel renders. Fetched independently of the graph/usage-timeline effects
-  // below so a slow/failed autoflow lookup never blocks the rest of the page.
-  const [autoflowCtx, setAutoflowCtx] = useState<AutoflowRunContext | null>(null);
 
   // Approval-gate local state. `gateDecision` reflects an optimistic local
   // decision (the live stream / next poll catches up); `gatePending` disables
@@ -373,16 +374,6 @@ export default function RunDetail() {
       cancelled = true;
     };
   }, [id]);
-
-  // The Cycles tab only exists for autoflow runs — if the id changes (e.g. a
-  // graph-node link) and the new run has no autoflow trail, fall back off a
-  // tab whose button no longer renders instead of leaving it stranded.
-  useEffect(() => {
-    if (tab === 'cycles' && !autoflowCtx) setTab('transcript');
-  }, [tab, autoflowCtx]);
-  useEffect(() => {
-    if (tab === 'children' && remote) setTab('transcript');
-  }, [tab, remote]);
 
   // ONE SSE subscription per open run — shared by graph + feed.
   // Thread the host param for remote runs.
@@ -579,13 +570,11 @@ export default function RunDetail() {
       const p = messages.participants.find((x) => x.address === address);
       const sel = p && model ? selectionOf(model, p) : null;
       if (sel) setSelection(sel);
-      setTab('transcript');
-      navigate({ search, hash: msgHash(msgId) });
+      navigate({ search: withTab(search, 'transcript'), hash: msgHash(msgId) });
     };
     return {
       openInFeed: (msgId) => {
-        setTab('messages');
-        navigate({ search, hash: msgHash(msgId) });
+        navigate({ search: withTab(search, 'messages'), hash: msgHash(msgId) });
       },
       openParticipant: openAt,
     };
@@ -767,7 +756,7 @@ export default function RunDetail() {
   const selectedFanout = useMemo(() => fanoutOf(selectedNode ?? undefined), [selectedNode]);
   const selectedTranscriptPath = selectedNode?.transcriptPath ?? null;
 
-  // `#call-<id>` scroll (see the hash effect near `tab`). Re-armed whenever the
+  // `#call-<id>` scroll, once the Transcript is showing. Re-armed whenever the
   // transcript on screen changes, so picking the step that ran the call — what
   // the "not in the transcript shown" notice asks for — scrolls to it.
   const callAnchor = useToolCallAnchor(

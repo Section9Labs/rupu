@@ -161,7 +161,8 @@ function renderPage(runId = 'run-1') {
 // Same route element instance across a run-1 -> run-2 navigation (React
 // Router does not remount on a param change alone) — only the explorer's
 // `key={run.id}` can reset netflow state between runs. Renders a Link so
-// the test can navigate without unmounting.
+// the test can navigate without unmounting; it keeps `?tab=netflow`, since a
+// link without it lands on the default tab.
 function renderWithNav() {
   return render(
     <MemoryRouter initialEntries={['/runs/run-1']}>
@@ -170,7 +171,7 @@ function renderWithNav() {
           path="/runs/:id"
           element={
             <>
-              <Link to="/runs/run-2">go-to-run-2</Link>
+              <Link to="/runs/run-2?tab=netflow">go-to-run-2</Link>
               <RunDetailLoaded />
             </>
           }
@@ -375,7 +376,7 @@ describe('RunDetail netflow tab', () => {
     await waitFor(() => expect(screen.queryByTestId('event-feed')).toBeNull());
   });
 
-  it('leaves the active tab alone for a non-call hash', async () => {
+  it('leaves the ?tab= tab alone for a non-call hash', async () => {
     stubApi(GRAPH);
     render(
       <MemoryRouter initialEntries={['/runs/run-1']}>
@@ -384,7 +385,7 @@ describe('RunDetail netflow tab', () => {
             path="/runs/:id"
             element={
               <>
-                <Link to="/runs/run-1#other">go-other</Link>
+                <Link to="/runs/run-1?tab=events#other">go-other</Link>
                 <RunDetailLoaded />
               </>
             }

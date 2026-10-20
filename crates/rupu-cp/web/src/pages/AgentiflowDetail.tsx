@@ -27,6 +27,7 @@ import ChildrenPanel from '../components/run/ChildrenPanel';
 import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { msgHash, parseMsgHash } from '../lib/messages';
+import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
 import EngagementFindings from '../components/agentiflow/EngagementFindings';
 import TranscriptBrowser, { type Selection as TranscriptSelection } from '../components/agentiflow/TranscriptBrowser';
@@ -73,11 +74,12 @@ const TABS: { value: AfTab; label: string }[] = [
   { value: 'transcript', label: 'Transcript' },
   { value: 'events', label: 'Events' },
 ];
+const AF_TAB_NAMES = TABS.map((t) => t.value);
 
 export default function AgentiflowDetail() {
   const { hash, search } = useLocation();
   const navigate = useNavigate();
-  const [tab, setTab] = useState<AfTab>(() => (parseMsgHash(hash) ? 'messages' : 'flow'));
+  const [tab, setTab] = useTabParam(AF_TAB_NAMES, parseMsgHash(hash) ? 'messages' : 'flow');
   const { id = '' } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<AgentiflowDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -150,15 +152,13 @@ export default function AgentiflowDetail() {
   const messageLinks = useMemo<MessageLinks>(
     () => ({
       openInFeed: (msgId) => {
-        setTab('messages');
-        navigate({ search, hash: msgHash(msgId) });
+        navigate({ search: withTab(search, 'messages'), hash: msgHash(msgId) });
       },
       openParticipant: (address, msgId) => {
         const sel = transcriptOf(address);
         if (!sel) return;
         setTranscriptFocus(sel);
-        setTab('transcript');
-        navigate({ search, hash: msgHash(msgId) });
+        navigate({ search: withTab(search, 'transcript'), hash: msgHash(msgId) });
       },
     }),
     [navigate, search, transcriptOf],
