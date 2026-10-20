@@ -83,4 +83,66 @@ describe('Chart', () => {
     // columns don't carry the breathing now-dot (the rightmost bar is "now")
     expect(container.querySelector('.cp-chart-now')).toBeNull();
   });
+
+  it('yFormat formats the y-tick labels', () => {
+    wrap(<Chart dates={dates} series={series} yFormat={(v) => `$${v}`} />);
+    // the baseline 0 tick is always present, now dollar-formatted
+    expect(screen.getByText('$0')).toBeInTheDocument();
+  });
+
+  it('rawColor paints the legend swatch with the raw CSS color (dynamic palette)', () => {
+    const dyn: ChartSeries[] = [
+      { key: 'alpha', label: 'alpha', values: [1, 2, 3, 4], rawColor: 'rgb(10, 20, 30)' },
+      { key: 'beta', label: 'beta', values: [2, 3, 4, 5], rawColor: 'rgb(40, 50, 60)' },
+    ];
+    const { container } = wrap(<Chart dates={dates} series={dyn} />);
+    const swatches = Array.from(container.querySelectorAll('.cp-chart-legend-swatch, [aria-hidden]')).filter(
+      (el) => (el as HTMLElement).style.background,
+    );
+    const backgrounds = swatches.map((el) => (el as HTMLElement).style.background);
+    expect(backgrounds).toContain('rgb(10, 20, 30)');
+    expect(backgrounds).toContain('rgb(40, 50, 60)');
+    // still a stacked area (one filled path per series inside the reveal clip)
+    expect(container.querySelectorAll('[clip-path] path').length).toBe(2);
+  });
+
+  it('showLegend={false} / showCard={false} drop the chrome but keep the plot', () => {
+    const { container } = wrap(
+      <Chart dates={dates} series={series} showLegend={false} showCard={false} ariaLabel="bare" />,
+    );
+    // no legend swatches in the header area; the plot is still there
+    expect(screen.getByRole('img', { name: 'bare' })).toBeInTheDocument();
+    expect(container.querySelector('.rounded-xl.border')).toBeNull();
+  });
+
+  it('kind="composed" overlays an area + two lines on two axes, unstacked (no Total, no peak)', () => {
+    const composed: ChartSeries[] = [
+      { key: 'in', label: 'In', values: [800, 600, 400, 900], color: 'status.running', mark: 'area', axis: 'left' },
+      { key: 'out', label: 'Out', values: [120, 90, 200, 110], color: 'status.done', mark: 'line', axis: 'right' },
+      { key: 'cached', label: 'Cached', values: [40, 50, 30, 20], color: 'status.awaiting', mark: 'line', axis: 'right' },
+    ];
+    const { container } = wrap(
+      <Chart dates={dates} series={composed} kind="composed" yFormat={(v) => `${v}`} yFormatRight={(v) => `${v}`} />,
+    );
+    // in → area (1 clipped path) + its top line; out/cached → 2 lines ⇒ 3 polylines
+    expect(container.querySelectorAll('[clip-path] path').length).toBe(1);
+    expect(container.querySelectorAll('polyline').length).toBe(3);
+    // overlaid, not stacked: the now-pulse still marks the latest point
+    expect(container.querySelector('.cp-chart-now')).not.toBeNull();
+  });
+
+  it('refLines draw a dashed vertical with its label', () => {
+    const composed: ChartSeries[] = [
+      { key: 'in', label: 'In', values: [800, 600, 400, 900], color: 'status.running', mark: 'area', axis: 'left' },
+    ];
+    wrap(<Chart dates={dates} series={composed} kind="composed" refLines={[{ index: 2, label: 'step-b' }]} />);
+    expect(screen.getByText('step-b')).toBeInTheDocument();
+  });
+
+  it('onSelectRange renders no band at rest and marks the svg selectable', () => {
+    const { container } = wrap(<Chart dates={dates} series={series} onSelectRange={() => {}} />);
+    expect(container.querySelector('[data-chart-band]')).toBeNull();
+    const svg = container.querySelector('svg');
+    expect(svg?.getAttribute('style') ?? '').toContain('crosshair');
+  });
 });

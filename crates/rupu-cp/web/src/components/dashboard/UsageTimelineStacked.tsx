@@ -20,18 +20,18 @@
 // `ModelBreakdownTable`'s `hosts` prop. The raw `host_id` stays the actual
 // stacking/color key; only the rendered label changes.
 //
-// recharts is the only heavy import here; it is force-split into the `charts`
-// rollup chunk (see vite.config manualChunks), so it never lands in the main
-// bundle. The pure `toChartData` transform is exported for unit testing.
+// Rendered by the shared living-chart engine (`components/ui/Chart`, pure SVG) —
+// a stacked area that varies by pivot, with a dynamic per-pivot palette, a
+// $/tokens y-axis, the marquee drag-select, and its own legend below. The pure
+// `toChartData` transform is exported for unit testing.
 
-import { Area, AreaChart, ReferenceArea, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import type { UsageTimelineBucket } from '../../lib/usage';
 import { formatCost, formatTokens } from '../../lib/usage';
 import { useThemeColors } from '../../lib/useThemeColors';
 import type { Pivot } from '../../lib/api';
 import { assignModelColors, pivotLabel } from './modelColors';
 import { assignCategoricalColors } from '../usage/pivotColors';
-import { useDragSelection } from './useDragSelection';
+import { Chart, type ChartSeries } from '../ui/Chart';
 import { Skeleton } from '../ui/Skeleton';
 
 export type UsageMetric = 'cost' | 'tokens';
@@ -123,15 +123,6 @@ export default function UsageTimelineStacked({
   loading?: boolean;
 }) {
   const theme = useThemeColors();
-  const drag = useDragSelection(onSelectRange);
-  const tooltipStyle: React.CSSProperties = {
-    background: theme.panel,
-    border: `1px solid ${theme.border}`,
-    color: theme.ink,
-    borderRadius: 6,
-    fontSize: 11,
-    padding: '6px 10px',
-  };
   const { models, data } = toChartData(buckets, metric, pivot);
 
   if (loading) {
@@ -168,53 +159,32 @@ export default function UsageTimelineStacked({
   const hostNameById = new Map((hosts ?? []).map((h) => [h.host_id, h.name]));
   const displayLabel = (key: string): string => (pivot === 'host' ? hostNameById.get(key) ?? key : key);
 
+  // One stacked series per pivot key, bottom-first in the sorted `models`
+  // order. `rawColor` carries the dynamic per-pivot palette into the engine
+  // (the one place the shared Chart paints outside the theme tokens). The full
+  // `bucket` is the drag-select key; the short `bucketTick` is only the x-label.
+  const chartSeries: ChartSeries[] = models.map((m) => ({
+    key: m,
+    label: displayLabel(m),
+    values: data.map((d) => (d[m] as number) ?? 0),
+    rawColor: colors.get(m),
+  }));
+  const dates = data.map((d) => bucketTick(d.bucket));
+  const selectKeys = data.map((d) => d.bucket);
+
   return (
     <div>
-      <div style={{ width: '100%', height: 240 }}>
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart
-            data={data}
-            margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
-            onMouseDown={drag.onMouseDown}
-            onMouseMove={drag.onMouseMove}
-            onMouseUp={drag.finalizeDrag}
-            onMouseLeave={drag.finalizeDrag}
-          >
-            <XAxis dataKey="bucket" tickFormatter={bucketTick} tick={{ fontSize: 10, fill: theme.inkMute }} />
-            <YAxis
-              width={48}
-              tick={{ fontSize: 10, fill: theme.inkMute }}
-              tickFormatter={(v) => fmt(typeof v === 'number' ? v : 0)}
-            />
-            <Tooltip
-              contentStyle={tooltipStyle}
-              formatter={(v, name) => [fmt(typeof v === 'number' ? v : 0), String(name)]}
-            />
-            {drag.band && (
-              <ReferenceArea
-                x1={drag.band.start}
-                x2={drag.band.current}
-                fill={theme.alpha('brand.500', 0.15)}
-                fillOpacity={1}
-                stroke="none"
-              />
-            )}
-            {models.map((m) => (
-              <Area
-                key={m}
-                type="monotone"
-                stackId="u"
-                dataKey={m}
-                name={displayLabel(m)}
-                stroke={colors.get(m)}
-                fill={colors.get(m)}
-                fillOpacity={0.5}
-                strokeWidth={1}
-              />
-            ))}
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
+      <Chart
+        kind="area"
+        showCard={false}
+        showLegend={false}
+        dates={dates}
+        selectKeys={selectKeys}
+        series={chartSeries}
+        yFormat={fmt}
+        onSelectRange={onSelectRange}
+        ariaLabel={`Usage over time (${metric === 'cost' ? 'spend' : 'tokens'})`}
+      />
       {/* Legend — pivot keys → colors (stable). */}
       <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
         {models.map((m) => (

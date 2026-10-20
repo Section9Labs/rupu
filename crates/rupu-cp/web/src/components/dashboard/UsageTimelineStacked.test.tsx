@@ -182,20 +182,21 @@ describe('UsageTimelineStacked', () => {
 
   // Task W3 — drag-select is inert when `onSelectRange` is not passed, so
   // the dashboard's other consumers of this component (no such prop) are
-  // completely unaffected. Driving a real Recharts pixel-drag isn't
-  // reproducible in jsdom (no ResizeObserver-driven layout to compute
-  // `activeLabel` from), so the drag STATE MACHINE itself is covered by
-  // `useDragSelection.test.ts` via `renderHook`; these tests cover only that
-  // the component wires `onSelectRange` through without side effects at rest.
+  // completely unaffected. Driving a real pixel-drag isn't reproducible in
+  // jsdom (no laid-out SVG to compute the bucket index from), so the drag
+  // STATE MACHINE itself is covered by `useDragSelection.test.ts` via
+  // `renderHook`; these tests cover only that the component wires
+  // `onSelectRange` through without side effects at rest. The selection band
+  // is the engine's `[data-chart-band]` rect (see `components/ui/Chart`).
   describe('drag-select wiring (Task W3)', () => {
     it('renders no selection band before any drag, with or without onSelectRange', () => {
       const { container: withoutHandler } = render(<UsageTimelineStacked buckets={BUCKETS} metric="cost" />);
-      expect(withoutHandler.querySelector('.recharts-reference-area')).toBeNull();
+      expect(withoutHandler.querySelector('[data-chart-band]')).toBeNull();
 
       const { container: withHandler } = render(
         <UsageTimelineStacked buckets={BUCKETS} metric="cost" onSelectRange={() => {}} />,
       );
-      expect(withHandler.querySelector('.recharts-reference-area')).toBeNull();
+      expect(withHandler.querySelector('[data-chart-band]')).toBeNull();
     });
 
     it('does not call onSelectRange merely from mounting', () => {
