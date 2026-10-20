@@ -116,8 +116,8 @@ struct CoverageFindingOut {
     report_summary: Option<ReportSummary>,
 }
 
-#[derive(Deserialize)]
-struct GetCoverageQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetCoverageQuery {
     /// Workspace id the target lives under. Required to disambiguate colliding
     /// target_ids; the frontend threads it from the list row.
     ws_id: Option<String>,
@@ -350,8 +350,8 @@ async fn get_runs(
     )))
 }
 
-#[derive(Deserialize)]
-struct DiffQuery {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct DiffQuery {
     ws_id: Option<String>,
     base: Option<String>,
     compare: Option<String>,

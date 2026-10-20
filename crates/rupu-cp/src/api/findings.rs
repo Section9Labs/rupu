@@ -182,7 +182,7 @@ pub struct FindingDetail {
 /// Plain `Option<String>` fields (NOT `#[serde(flatten)]`): serde_urlencoded
 /// — axum's `Query` extractor — cannot deserialize through a flattened struct,
 /// so the filters are inlined as string options.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub struct FindingsQuery {
     /// Keep only findings from this workspace id.
     pub ws_id: Option<String>,
@@ -913,7 +913,7 @@ const MAX_TAG_BATCH: usize = 1000;
 
 /// One finding, named by its workspace and id (ids repeat across
 /// workspaces).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FindingTarget {
     pub ws_id: String,
@@ -923,9 +923,9 @@ pub struct FindingTarget {
 /// Body of `POST /api/findings/tags`: the findings as bare `finding_ids`
 /// (tagged in every workspace that holds them) or as `findings` —
 /// `{ws_id, id}` pairs, tagged only there. Exactly one of the two.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct TagFindingsBody {
+pub(crate) struct TagFindingsBody {
     #[serde(default)]
     finding_ids: Vec<String>,
     #[serde(default)]
@@ -941,6 +941,7 @@ struct TagFindingsBody {
 /// attributed to the CP operator.
 async fn tag_findings(
     State(s): State<AppState>,
+    via: crate::mcp::ViaMcp,
     Json(body): Json<TagFindingsBody>,
 ) -> ApiResult<Json<TagAcrossResult>> {
     let (ids, only) = match (body.finding_ids.is_empty(), body.findings.is_empty()) {
@@ -969,7 +970,10 @@ async fn tag_findings(
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
     change.check().map_err(tag_error)?;
     let global = s.global_dir.clone();
-    let by = rupu_coverage::TagActor::operator(rupu_coverage::OperatorSurface::Cp);
+    let by = rupu_coverage::TagActor::operator_with_client(
+        rupu_coverage::OperatorSurface::Cp,
+        via.is_some().then_some("mcp"),
+    );
     let result = tokio::task::spawn_blocking(move || {
         tag_findings_across(&global, &change, &by, only.as_deref())
     })
@@ -985,7 +989,7 @@ async fn tag_findings(
     Ok(Json(result))
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub struct TagsQuery {
     pub ws_id: Option<String>,
 }
@@ -1082,8 +1086,8 @@ fn find_finding(
 
 /// `?ws_id=` on the single-finding routes: which workspace's finding `:id`
 /// means when the id exists in more than one.
-#[derive(Debug, Default, Deserialize)]
-struct FindingWsQuery {
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct FindingWsQuery {
     #[serde(default)]
     ws_id: Option<String>,
 }
@@ -1768,8 +1772,8 @@ const DEFAULT_EXPORT_TITLE: &str = "Findings report";
 const MAX_EXPORT_TITLE_CHARS: usize = 200;
 
 /// Query of `GET /api/findings/:id/export`.
-#[derive(Debug, Deserialize)]
-struct ExportQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ExportQuery {
     format: Option<String>,
     /// Single-finding export only: see [`FindingWsQuery`].
     #[serde(default)]
@@ -1779,9 +1783,9 @@ struct ExportQuery {
 /// Body of `POST /api/findings/export`. Unknown fields are refused: a
 /// misspelt filter (`severity` for `min_severity`) must not quietly widen the
 /// report to every finding.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ExportBody {
+pub(crate) struct ExportBody {
     format: Option<String>,
     title: Option<String>,
     /// Only these finding ids (which also opts summary findings in).

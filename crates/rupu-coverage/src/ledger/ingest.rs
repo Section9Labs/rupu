@@ -654,6 +654,7 @@ mod tests {
             by: crate::ledger::tags::TagActor::Operator(crate::ledger::tags::OperatorAttribution {
                 user: "u".into(),
                 via: crate::ledger::tags::OperatorSurface::Cli,
+                client: None,
             }),
             at: Utc::now(),
         }

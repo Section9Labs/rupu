@@ -448,3 +448,23 @@ fn merging_a_units_copy_of_the_log_keeps_events_written_meanwhile() {
         "merging copies again, twice in one pass, adds nothing"
     );
 }
+
+#[test]
+fn an_operator_tag_line_without_client_parses_and_round_trips_without_it() {
+    let line = r#"{"id":"tev_1","finding_id":"fnd_a","op":"add","tag":"needs-poc","by":{"kind":"operator","user":"u","via":"cp"},"at":"2026-10-19T00:00:00Z"}"#;
+    let event: TagEvent = serde_json::from_str(line).unwrap();
+    match &event.by {
+        TagActor::Operator(o) => assert_eq!(o.client, None),
+        other => panic!("not an operator: {other:?}"),
+    }
+    let back = serde_json::to_string(&event).unwrap();
+    assert_eq!(back, line);
+    assert!(!back.contains("client"));
+
+    // A client rides next to `via`, which does not change.
+    let with = TagActor::operator_with_client(OperatorSurface::Cp, Some("mcp"));
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["via"], "cp");
+    assert_eq!(v["client"], "mcp");
+    assert_eq!(serde_json::from_value::<TagActor>(v).unwrap(), with);
+}

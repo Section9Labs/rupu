@@ -130,6 +130,10 @@ pub enum OperatorSurface {
 pub struct OperatorAttribution {
     pub user: String,
     pub via: OperatorSurface,
+    /// The client that made the change on the operator's behalf (`mcp`),
+    /// when it was not the surface itself. Absent on older lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 /// Who changed a tag: an agent (the same attribution `report_finding`
@@ -144,11 +148,21 @@ pub enum TagActor {
 impl TagActor {
     /// The person running this process (`$USER`, else `unknown`).
     pub fn operator(via: OperatorSurface) -> Self {
+        Self::operator_with_client(via, None)
+    }
+
+    /// [`TagActor::operator`], recording the `client` that acted for the
+    /// operator (`Some("mcp")` for a change made through the MCP endpoint).
+    pub fn operator_with_client(via: OperatorSurface, client: Option<&str>) -> Self {
         let user = std::env::var("USER")
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| "unknown".to_string());
-        TagActor::Operator(OperatorAttribution { user, via })
+        TagActor::Operator(OperatorAttribution {
+            user,
+            via,
+            client: client.map(str::to_string),
+        })
     }
 }
 
@@ -749,6 +763,7 @@ mod tests {
         let op = serde_json::to_value(TagActor::Operator(OperatorAttribution {
             user: "alice".into(),
             via: OperatorSurface::Cli,
+            client: None,
         }))
         .unwrap();
         assert_eq!(

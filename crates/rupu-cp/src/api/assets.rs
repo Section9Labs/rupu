@@ -31,8 +31,8 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/assets", get(list_assets))
 }
 
-#[derive(Debug, Deserialize)]
-struct AssetQuery {
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AssetQuery {
     /// Restrict to a single workspace (as listed on each row).
     ws_id: Option<String>,
     /// Restrict to a single coverage target within the workspace(s).

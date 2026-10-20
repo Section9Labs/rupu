@@ -108,8 +108,6 @@ impl OpSpec {
     }
 
     /// The 2xx body is returned as an embedded resource.
-    // First used by the area tools that follow Plan 2's Task 4.
-    #[allow(dead_code)]
     pub(crate) fn bytes(mut self) -> Self {
         self.bytes = true;
         self
@@ -197,20 +195,11 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
 /// Routes not yet operator tools; Plan 2 empties this list.
 pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("GET", "/api/agentiflows/:id/netflow"),
-    ("GET", "/api/assets"),
     ("GET", "/api/config"),
     ("PUT", "/api/config/customer/:slug"),
     ("PUT", "/api/config/global"),
     ("PUT", "/api/config/policy"),
     ("PUT", "/api/config/project/:id"),
-    ("GET", "/api/coverage"),
-    ("GET", "/api/coverage/:target"),
-    ("GET", "/api/coverage/:target/audit"),
-    ("GET", "/api/coverage/:target/catalog"),
-    ("GET", "/api/coverage/:target/diff"),
-    ("GET", "/api/coverage/:target/runs"),
-    ("GET", "/api/coverage/templates"),
-    ("GET", "/api/coverage/templates/:name"),
     ("GET", "/api/customers"),
     ("POST", "/api/customers"),
     ("DELETE", "/api/customers/:slug"),
@@ -221,13 +210,6 @@ pub const PENDING_PLAN_2: &[(&str, &str)] = &[
     ("PUT", "/api/customers/:slug/projects/:ws_id"),
     ("POST", "/api/customers/:slug/unarchive"),
     ("GET", "/api/dashboard"),
-    ("GET", "/api/findings"),
-    ("GET", "/api/findings/:id"),
-    ("GET", "/api/findings/:id/artifacts/:sha256"),
-    ("GET", "/api/findings/:id/export"),
-    ("POST", "/api/findings/export"),
-    ("GET", "/api/findings/tags"),
-    ("POST", "/api/findings/tags"),
     ("GET", "/api/host/info"),
     ("GET", "/api/hosts"),
     ("POST", "/api/hosts"),
