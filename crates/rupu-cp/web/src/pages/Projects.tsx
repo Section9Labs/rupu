@@ -17,7 +17,8 @@ import SortableTable, { type Column } from '../components/lists/SortableTable';
 import UsageBarChart from '../components/charts/UsageBarChart';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
+import { PageHeader } from '../components/ui/PageHeader';
+import { Skeleton } from '../components/ui/Skeleton';
 import { formatTokens, formatCost } from '../lib/usage';
 import { relativeTime } from '../lib/time';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
@@ -28,6 +29,33 @@ import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../compo
 import { PROJECT_FIELDS } from '../lib/query/lists/projects';
 
 const STEP = 20;
+
+/** Loading view in the real table layout (spec §"Loading & empty"), keeping
+ *  the accessible announcement the bare spinner used to carry. */
+function ProjectsLoading() {
+  return (
+    <div
+      role="status"
+      aria-label="Loading projects…"
+      className="overflow-hidden rounded-xl border border-border bg-panel"
+    >
+      <span className="sr-only">Loading projects…</span>
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div
+          key={i}
+          aria-hidden
+          className="flex items-center gap-4 border-t border-border px-4 py-3.5 first:border-t-0"
+        >
+          <Skeleton className="h-5 w-5 rounded" />
+          <Skeleton className="h-4 w-44" />
+          <div className="flex-1" />
+          <Skeleton className="hidden h-4 w-16 sm:block" />
+          <Skeleton className="h-4 w-12" />
+        </div>
+      ))}
+    </div>
+  );
+}
 
 export default function Projects() {
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
@@ -68,21 +96,15 @@ export default function Projects() {
 
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Projects</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Workspaces registered with this control plane — each with its own runs, sessions, and
-          coverage.
-        </p>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Projects"
+        subtitle="Workspaces registered with this control plane — each with its own runs, sessions, and coverage."
+      />
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
-      {projects === null && !error && (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading projects…" />
-        </div>
-      )}
+      {projects === null && !error && <ProjectsLoading />}
 
       {projects !== null && projects.length === 0 && (
         <EmptyState

@@ -28,6 +28,8 @@ import { TabBar, TabButton } from '../components/TabBar';
 import { ProjectCustomerMenu } from '../components/customers/ProjectCustomerMenu';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { Spinner } from '../components/ui/Spinner';
+import { KpiStrip, type KpiItem } from '../components/ui/KpiStrip';
+import { Skeleton } from '../components/ui/Skeleton';
 import ProjectOverviewTab from '../components/project/ProjectOverviewTab';
 import ProjectRunsTab from '../components/project/ProjectRunsTab';
 import ProjectFindingsTab from '../components/project/ProjectFindingsTab';
@@ -58,29 +60,6 @@ export type ProjectTab =
 // ---------------------------------------------------------------------------
 // Rollup tile
 // ---------------------------------------------------------------------------
-
-function RollupTile({
-  label,
-  value,
-  sub,
-  children,
-}: {
-  label: string;
-  value: React.ReactNode;
-  sub?: string;
-  children?: React.ReactNode;
-}) {
-  return (
-    <div className="bg-panel border border-border rounded-xl shadow-card px-4 py-3">
-      <p className="text-[9px] font-semibold uppercase tracking-widest text-ink-mute mb-1">
-        {label}
-      </p>
-      <p className="text-2xl font-bold text-ink tabular-nums leading-none">{value}</p>
-      {sub && <p className="mt-1 text-note text-ink-dim">{sub}</p>}
-      {children}
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Page (shell)
@@ -179,9 +158,21 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
   // --- Loading state ---
   if (detail === null) {
     return (
-      <div className="p-8">
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading project…" />
+      <div className="p-8 space-y-6" role="status" aria-label="Loading project…">
+        <span className="sr-only">Loading project…</span>
+        <div className="rounded-xl border border-border bg-panel px-5 py-4" aria-hidden>
+          <Skeleton className="h-5 w-48" />
+          <Skeleton className="mt-2 h-3.5 w-72" />
+        </div>
+        <div className="overflow-hidden rounded-xl border border-border bg-panel" aria-hidden>
+          <div className="-ml-px -mt-px grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
+            {[0, 1, 2, 3, 4].map((i) => (
+              <div key={i} className="border-l border-t border-border p-4">
+                <Skeleton className="h-3 w-16" />
+                <Skeleton className="mt-3 h-6 w-12" />
+              </div>
+            ))}
+          </div>
         </div>
       </div>
     );
@@ -198,6 +189,42 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
     assessedPct === undefined ? '…' : pct !== null ? `${Math.round(pct)}%` : '—';
 
   const encodedId = encodeURIComponent(p.ws_id);
+
+  // Project rollups as the one KPI strip (spec §"KPIs": type, not tiles; the
+  // attention value — open findings — in red).
+  const kpis: KpiItem[] = [
+    {
+      label: 'Runs',
+      value: runs.total,
+      meta: runs.running > 0 ? `${runs.running} running` : 'none running',
+    },
+    {
+      label: 'Sessions',
+      value: sessions.total,
+      meta: sessions.active > 0 ? `${sessions.active} active` : 'none active',
+    },
+    { label: 'Coverage', value: pctLabel },
+    {
+      label: 'Findings',
+      value: coverage.findings,
+      attention: coverage.findings > 0,
+      meta: coverage.findings > 0 ? 'needs attention' : 'all clear',
+    },
+    ...(usage
+      ? [
+          {
+            label: 'Usage',
+            value: (
+              <span className="inline-flex items-center gap-1.5">
+                {formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
+                <PricingErrorMark error={usage.pricing_error} />
+              </span>
+            ),
+            meta: `${formatTokens(usage.total_tokens)} tok`,
+          } as KpiItem,
+        ]
+      : []),
+  ];
 
   return (
     <div className="p-8 space-y-6">
@@ -233,56 +260,8 @@ export default function ProjectDetail({ tab = 'overview' }: { tab?: ProjectTab }
         </div>
       </header>
 
-      {/* ── Rollup tiles ── */}
-      <section className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-        <RollupTile
-          label="Runs"
-          value={runs.total}
-          sub={runs.running > 0 ? `${runs.running} running` : 'none running'}
-        />
-        <RollupTile
-          label="Sessions"
-          value={sessions.total}
-          sub={sessions.active > 0 ? `${sessions.active} active` : 'none active'}
-        />
-        <RollupTile label="Coverage" value={pctLabel}>
-          {/* Progress bar — width via inline style (CSS value, not Tailwind class) */}
-          <div className="mt-2 h-1.5 rounded-full bg-surface-hover overflow-hidden">
-            {pct !== null ? (
-              <div
-                className="h-full rounded-full bg-gradient-to-r from-brand-500 to-green-500"
-                style={{ width: `${pct}%` }}
-              />
-            ) : null}
-          </div>
-        </RollupTile>
-        <RollupTile label="Findings" value={coverage.findings}>
-          {coverage.findings > 0 && (
-            <p className="mt-1 text-note text-err font-medium flex items-center gap-1">
-              <ShieldAlert size={11} />
-              needs attention
-            </p>
-          )}
-          {coverage.findings === 0 && (
-            <p className="mt-1 text-note text-ok flex items-center gap-1">
-              <ShieldCheck size={11} />
-              all clear
-            </p>
-          )}
-        </RollupTile>
-        {usage && (
-          <RollupTile
-            label="Usage"
-            value={
-              <span className="inline-flex items-center gap-1.5">
-                {formatCost(usage.cost_usd) + (usage.cost_usd !== null && !usage.priced ? '*' : '')}
-                <PricingErrorMark error={usage.pricing_error} />
-              </span>
-            }
-            sub={`${formatTokens(usage.total_tokens)} tok`}
-          />
-        )}
-      </section>
+      {/* ── Rollup KPIs ── */}
+      <KpiStrip items={kpis} />
 
       {/* ── Tab bar ── */}
       <div className="-mx-8">
