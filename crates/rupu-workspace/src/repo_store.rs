@@ -198,6 +198,80 @@ impl RepoRegistryStore {
     }
 }
 
+/// Why [`RepoRegistryStore::track_checkout`] refused a checkout.
+#[derive(Debug, Error)]
+pub enum TrackCheckoutError {
+    #[error("checkout {path}: {source}")]
+    Path {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Checkout(#[from] rupu_scm::checkout::CheckoutError),
+    #[error("checkout {path} points at {detected}, not {expected}")]
+    Mismatch {
+        path: String,
+        detected: String,
+        expected: String,
+    },
+    #[error("git remote get-url origin in {path}: {source}")]
+    Git {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Store(#[from] RepoStoreError),
+}
+
+impl RepoRegistryStore {
+    /// `rupu repos attach` (and `prefer`, with `prefer`): track the git
+    /// checkout at `path` as a local copy of `repo`. The checkout's own
+    /// origin must point at `repo`; its origin url and default branch are
+    /// recorded with it. With `prefer`, it also becomes the repo's
+    /// preferred path.
+    pub fn track_checkout(
+        &self,
+        repo: &rupu_scm::RepoRef,
+        path: &Path,
+        prefer: bool,
+    ) -> Result<TrackedRepo, TrackCheckoutError> {
+        let path = path
+            .canonicalize()
+            .map_err(|source| TrackCheckoutError::Path {
+                path: path.display().to_string(),
+                source,
+            })?;
+        let expected = rupu_scm::checkout::canonical_repo_ref(repo);
+        let detected =
+            rupu_scm::checkout::canonical_repo_ref(&rupu_scm::checkout::repo_of_checkout(&path)?);
+        if detected != expected {
+            return Err(TrackCheckoutError::Mismatch {
+                path: path.display().to_string(),
+                detected,
+                expected,
+            });
+        }
+        let origin_url =
+            rupu_scm::checkout::origin_url(&path).map_err(|source| TrackCheckoutError::Git {
+                path: path.display().to_string(),
+                source,
+            })?;
+        let default_branch = rupu_scm::checkout::origin_default_branch(&path);
+        let rec = self.upsert(
+            &expected,
+            &path,
+            origin_url.as_deref(),
+            default_branch.as_deref(),
+        )?;
+        if prefer {
+            return Ok(self.set_preferred_path(&expected, &path)?);
+        }
+        Ok(rec)
+    }
+}
+
 pub fn repo_ref_key(repo_ref: &str) -> String {
     sanitize_component(repo_ref)
 }

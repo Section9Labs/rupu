@@ -584,6 +584,27 @@ and pulls back the diff. The web UI never calls these.
 | GET | `/api/repos` | Repositories visible to the configured SCM accounts. | 501 with no SCM credentials. |
 | GET | `/api/fs/browse` | Subdirectories of a server path, for the folder picker. | `path` (default `$HOME`). Only under `$HOME` or a registered project: anything else (missing or not) is a 403, and `parent` is `null` at the top of a browsable directory. |
 
+## SCM, repos and auth status
+
+What `rupu scm accounts` / `scm bind`, `rupu repos tracked` / `attach` /
+`prefer` / `forget` and `rupu auth status` show and write. Local host only:
+`?host=` other than `local` is a 501 that says so. The SCM endpoints read
+and write the **global** config (where `rupu scm bind` writes). No answer
+carries any part of a credential: not a token, an API key or a refresh
+token, and a tracked repo's origin urls (which can embed one) are never
+returned. Logging in stays `rupu auth login`.
+
+| Method | Path | Purpose | Notes |
+|--------|------|---------|-------|
+| GET | `/api/scm/accounts` | The configured GitHub/GitLab accounts: `github`, `gitlab`, then each `[scm.<name>]` whose kind is a repo platform. | Rows `{account, kind, base_url, rules, credentials, state}`; `rules` are the `[[scm.rules]]` selecting it, each `{owner}` or `{path}`; `credentials` is whether an API key or SSO token is stored (or `RUPU_<ACCOUNT>_API_KEY` is set); `state` is `ok`, `needs_login` (only an expired SSO token) or `absent`. |
+| GET | `/api/scm/rules` | The global config's `[[scm.rules]]`, in order. | Rows `{owner?, path?, account}`. |
+| POST | `/api/scm/rules` | Append a rule (`rupu scm bind`). | Body `{owner?, path?, account}`, exactly one of `owner` (owner glob) or `path` (path glob); unknown fields are refused. → `{rule, warning?, rules}`; `warning` when `account` is neither a declared `[scm.*]` account nor `github`/`gitlab` (the rule is written but may never match). Comments survive; the result is validated before it is written, under the config file's lock. 400 a bad rule or a config that would not validate; 501 without `rupu cp serve`. |
+| GET | `/api/repos/tracked` | The local repo registry (`~/.rupu/repos/`). | Rows `{id, repo, preferred_path, known_paths, default_branch?, last_seen_at}`; `id` is the record key `DELETE` takes, `repo` is `<platform>:<owner>/<repo>`. |
+| POST | `/api/repos/tracked` | Track a checkout as a copy of a repo (`rupu repos attach`). | Body `{repo, path}`: `repo` in run-target syntax (`github:owner/repo`; a PR or GitHub/GitLab issue target names its repo), `path` absolute. The checkout's `origin` must point at `repo`; its origin url and default branch are recorded. → the tracked repo row. 400 a relative or missing path, no git checkout, or a checkout of another repo; 501 without `rupu cp serve`. |
+| POST | `/api/repos/tracked/prefer` | Track a checkout and make it the repo's preferred path (`rupu repos prefer`). | As `POST /api/repos/tracked`. |
+| DELETE | `/api/repos/tracked/:id` | Forget a tracked repo, or one path (`rupu repos forget`). | `path` (query) forgets only that path; forgetting the last path forgets the repo. → `{repo, path?, remaining}`, `remaining` the record left or `null`. 404 unknown id or untracked path; 501 without `rupu cp serve`. |
+| GET | `/api/auth/status` | Credential state per account (`rupu auth status`): the built-in vendors, then every declared `[providers.*]` / `[scm.*]` account. | Rows `{account, kind, api_key, sso, state}`; `sso` is `{expires_at, expired, summary}` or `null`, `state` as above. Read from the global config and this host's credential store. |
+
 ## Customers
 
 | Method | Path | Purpose |

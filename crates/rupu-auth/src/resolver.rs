@@ -60,6 +60,15 @@ use crate::backend::ProviderId;
 use crate::stored::StoredCredential;
 use std::path::PathBuf;
 
+/// What [`KeychainResolver::peek_sso_status_named`] reports about a stored
+/// SSO token: when it expires and the one-line summary `rupu auth status`
+/// prints (`expires in 8d`, `expired — re-login`, `no expiry`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsoPeek {
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub summary: String,
+}
+
 /// Production resolver: reads/writes [`StoredCredential`] JSON to a
 /// chmod-600 file at `~/.rupu/auth.json`, overridable via `RUPU_HOME`
 /// or `RUPU_AUTH_FILE`.
@@ -703,8 +712,17 @@ impl KeychainResolver {
     /// Byte-identical lookup to `peek_sso(p)` when `name == p.as_str()`,
     /// since `legacy_account_for(p) == p.as_str()` (see `account_key.rs`).
     pub async fn peek_sso_named(&self, name: &str) -> Option<String> {
+        self.peek_sso_status_named(name).await.map(|p| p.summary)
+    }
+
+    /// [`Self::peek_sso_named`] with the token's expiry as a timestamp too.
+    /// Carries no part of the credential itself.
+    pub async fn peek_sso_status_named(&self, name: &str) -> Option<SsoPeek> {
         let sc = self.read_account(name, Some(name), AuthMode::Sso).ok()??;
-        Self::expiry_string(&sc)
+        Some(SsoPeek {
+            expires_at: sc.expires_at,
+            summary: Self::expiry_string(&sc)?,
+        })
     }
 
     /// The OAuth request itself is keyed on **vendor** (`kind`): two

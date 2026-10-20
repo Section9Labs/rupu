@@ -27,7 +27,7 @@ pub mod netflow_sink;
 pub mod output;
 pub mod paths;
 pub mod resume;
-pub mod run_target;
+pub use rupu_scm::run_target;
 pub mod standalone_run_metadata;
 pub mod templates;
 pub mod update_notice;

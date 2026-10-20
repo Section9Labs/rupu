@@ -582,44 +582,7 @@ pub(crate) fn resolve_repo_or_autodetect(
     configured_default: Option<RepoRef>,
 ) -> anyhow::Result<RepoRef> {
     if let Some(s) = repo_arg {
-        let parsed = crate::run_target::parse_run_target(s)?;
-        match parsed {
-            crate::run_target::RunTarget::Repo {
-                platform,
-                owner,
-                repo,
-                ..
-            }
-            | crate::run_target::RunTarget::Pr {
-                platform,
-                owner,
-                repo,
-                ..
-            } => Ok(RepoRef {
-                platform,
-                owner,
-                repo,
-            }),
-            crate::run_target::RunTarget::Issue {
-                tracker, project, ..
-            } => {
-                let (owner, repo) = project.split_once('/').ok_or_else(|| {
-                    anyhow::anyhow!("issue project `{project}` is not `<owner>/<repo>`")
-                })?;
-                let platform = match tracker {
-                    IssueTracker::Github => Platform::Github,
-                    IssueTracker::Gitlab => Platform::Gitlab,
-                    other => anyhow::bail!(
-                        "tracker {other} not yet supported by `rupu issues` (only GitHub / GitLab)"
-                    ),
-                };
-                Ok(RepoRef {
-                    platform,
-                    owner: owner.into(),
-                    repo: repo.into(),
-                })
-            }
-        }
+        Ok(crate::run_target::parse_run_target(s)?.repo_ref()?)
     } else if let Some(r) = configured_default {
         Ok(r)
     } else {
@@ -696,128 +659,18 @@ pub(crate) fn resolve_issue_ref(s: &str) -> anyhow::Result<IssueRef> {
     )
 }
 
+pub(crate) use rupu_scm::checkout::{canonical_repo_ref, parse_remote_url};
+
 /// Autodetect the repo from the cwd's git remote. Walks up looking
 /// for `.git/config`, parses the `[remote "origin"]` `url = ...`
 /// line, and converts common forms (HTTPS, SSH) into a `RepoRef`.
-pub(crate) fn canonical_repo_ref(repo: &RepoRef) -> String {
-    format!("{}:{}/{}", repo.platform, repo.owner, repo.repo)
-}
-
 fn autodetect_repo_from_cwd() -> anyhow::Result<RepoRef> {
     let pwd = std::env::current_dir()?;
     autodetect_repo_from_path(&pwd)
 }
 
 pub(crate) fn autodetect_repo_from_path(path: &Path) -> anyhow::Result<RepoRef> {
-    let git_config = find_git_config(path).ok_or_else(|| {
-        anyhow::anyhow!("not in a git checkout — pass --repo <platform>:<owner>/<repo>")
-    })?;
-    let url = read_origin_url(&git_config)?;
-    parse_remote_url(&url).ok_or_else(|| {
-        anyhow::anyhow!("could not parse origin url `{url}` to <platform>:<owner>/<repo>")
-    })
-}
-
-fn find_git_config(start: &Path) -> Option<std::path::PathBuf> {
-    let mut cur: Option<&Path> = Some(start);
-    while let Some(d) = cur {
-        let candidate = d.join(".git").join("config");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        cur = d.parent();
-    }
-    None
-}
-
-pub(crate) fn read_origin_url(config_path: &Path) -> anyhow::Result<String> {
-    let text = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", config_path.display()))?;
-    let mut in_origin = false;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            // Match `[remote "origin"]` exactly so a [remote "upstream"]
-            // section doesn't trigger.
-            in_origin = trimmed == "[remote \"origin\"]";
-            continue;
-        }
-        if !in_origin {
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("url = ") {
-            return Ok(rest.trim().to_string());
-        }
-        if let Some(rest) = trimmed.strip_prefix("url=") {
-            return Ok(rest.trim().to_string());
-        }
-    }
-    anyhow::bail!("no [remote \"origin\"] url in {}", config_path.display())
-}
-
-/// Map common origin URL forms to a `RepoRef`. Handles:
-/// - `git@github.com:owner/repo.git`
-/// - `https://github.com/owner/repo.git`
-/// - `ssh://git@github.com/owner/repo`
-/// - GitLab equivalents
-/// - `github-<alias>:owner/repo` (SSH alias forms used in user `.ssh/config`)
-pub(crate) fn parse_remote_url(url: &str) -> Option<RepoRef> {
-    let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    // ssh-alias / SSH form: `<host>:owner/repo` (no scheme)
-    if !stripped.contains("://") {
-        // `git@github.com:owner/repo` or `github-foo:owner/repo`
-        if let Some((host_part, path)) = stripped.split_once(':') {
-            // Strip a leading `git@` if present.
-            let host = host_part.rsplit('@').next().unwrap_or(host_part);
-            let platform = host_to_platform(host)?;
-            let (owner, repo) = path.split_once('/')?;
-            // Some hosts allow nested groups (gitlab). Take the LAST
-            // segment as the repo, the rest as owner.
-            let (owner, repo) = owner_repo_from_path(&format!("{owner}/{repo}"))?;
-            return Some(RepoRef {
-                platform,
-                owner,
-                repo,
-            });
-        }
-        return None;
-    }
-    // URL form: scheme://[user@]host/path
-    let after_scheme = stripped.split_once("://")?.1;
-    let (host_and_user, path) = after_scheme.split_once('/')?;
-    let host = host_and_user.rsplit('@').next().unwrap_or(host_and_user);
-    let platform = host_to_platform(host)?;
-    let (owner, repo) = owner_repo_from_path(path)?;
-    Some(RepoRef {
-        platform,
-        owner,
-        repo,
-    })
-}
-
-fn host_to_platform(host: &str) -> Option<Platform> {
-    // Match exact + ssh-alias prefix (e.g. `github-personal` from
-    // `.ssh/config` Host blocks). Self-hosted GitLab installs need
-    // `--repo` since their hostname carries no signal.
-    let lower = host.to_ascii_lowercase();
-    if lower == "github.com" || lower.starts_with("github-") || lower.starts_with("github.") {
-        return Some(Platform::Github);
-    }
-    if lower == "gitlab.com" || lower.starts_with("gitlab-") || lower.starts_with("gitlab.") {
-        return Some(Platform::Gitlab);
-    }
-    None
-}
-
-fn owner_repo_from_path(path: &str) -> Option<(String, String)> {
-    let cleaned = path.trim_matches('/').trim_end_matches(".git");
-    let mut parts: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let repo = parts.pop()?.to_string();
-    let owner = parts.join("/");
-    Some((owner, repo))
+    Ok(rupu_scm::checkout::repo_of_checkout(path)?)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -832,45 +685,6 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_remote_url_https_github() {
-        let r = parse_remote_url("https://github.com/Section9Labs/rupu.git").unwrap();
-        assert_eq!(r.platform, Platform::Github);
-        assert_eq!(r.owner, "Section9Labs");
-        assert_eq!(r.repo, "rupu");
-    }
-
-    #[test]
-    fn parse_remote_url_ssh_github() {
-        let r = parse_remote_url("git@github.com:Section9Labs/rupu.git").unwrap();
-        assert_eq!(r.platform, Platform::Github);
-        assert_eq!(r.owner, "Section9Labs");
-        assert_eq!(r.repo, "rupu");
-    }
-
-    #[test]
-    fn parse_remote_url_ssh_alias() {
-        // `.ssh/config` Host alias form: github-daneel:section9labs/rupu.git
-        let r = parse_remote_url("github-daneel:section9labs/rupu.git").unwrap();
-        assert_eq!(r.platform, Platform::Github);
-        assert_eq!(r.owner, "section9labs");
-        assert_eq!(r.repo, "rupu");
-    }
-
-    #[test]
-    fn parse_remote_url_gitlab_nested_groups() {
-        // GitLab supports nested groups; owner is everything before the last segment.
-        let r = parse_remote_url("https://gitlab.com/foo/bar/baz.git").unwrap();
-        assert_eq!(r.platform, Platform::Gitlab);
-        assert_eq!(r.owner, "foo/bar");
-        assert_eq!(r.repo, "baz");
-    }
-
-    #[test]
-    fn parse_remote_url_unknown_host_returns_none() {
-        assert!(parse_remote_url("https://example.com/owner/repo.git").is_none());
-    }
 
     // ── ISSUES.md I-73: `[issues.default]` wiring ──────────────────────
 

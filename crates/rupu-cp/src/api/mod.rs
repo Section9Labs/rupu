@@ -1,6 +1,7 @@
 pub mod agentiflows;
 pub mod agents;
 pub mod assets;
+pub mod auth_status;
 pub mod autoflow_claims;
 pub mod autoflow_runs;
 pub mod autoflows;
@@ -29,6 +30,7 @@ pub mod repos;
 pub mod run_resolve;
 pub mod run_streams;
 pub mod runs;
+pub mod scm;
 pub mod sessions;
 pub mod skills;
 pub mod source;
