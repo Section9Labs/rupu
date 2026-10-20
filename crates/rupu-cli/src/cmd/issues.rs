@@ -582,7 +582,14 @@ pub(crate) fn resolve_repo_or_autodetect(
     configured_default: Option<RepoRef>,
 ) -> anyhow::Result<RepoRef> {
     if let Some(s) = repo_arg {
-        Ok(crate::run_target::parse_run_target(s)?.repo_ref()?)
+        crate::run_target::parse_run_target(s)?
+            .repo_ref()
+            .map_err(|e| match e {
+                crate::run_target::NotARepo::Tracker(t) => anyhow::anyhow!(
+                    "tracker {t} not yet supported by `rupu issues` (only GitHub / GitLab)"
+                ),
+                other => other.into(),
+            })
     } else if let Some(r) = configured_default {
         Ok(r)
     } else {
@@ -685,6 +692,20 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_issue_target_on_another_tracker_names_rupu_issues() {
+        let err = resolve_repo_or_autodetect(Some("linear:acme/w/issues/4"), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tracker linear not yet supported by `rupu issues` (only GitHub / GitLab)"
+        );
+        let err = resolve_repo_or_autodetect(Some("github:solo/issues/4"), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "issue project `solo` is not `<owner>/<repo>`"
+        );
+    }
 
     // ── ISSUES.md I-73: `[issues.default]` wiring ──────────────────────
 

@@ -337,7 +337,20 @@ fn track_inner(args: &TrackArgs, prefer: bool) -> anyhow::Result<rupu_workspace:
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir()?,
     };
-    Ok(store.track_checkout(&repo, &path, prefer)?)
+    store
+        .track_checkout(&repo, &path, prefer)
+        .map_err(track_error)
+}
+
+/// A failed attach/prefer as `rupu repos` has always printed it: an io
+/// failure (canonicalizing the path, running git) bare, the rest as they
+/// read.
+fn track_error(e: rupu_workspace::TrackCheckoutError) -> anyhow::Error {
+    match e {
+        rupu_workspace::TrackCheckoutError::Path { source, .. }
+        | rupu_workspace::TrackCheckoutError::Git { source, .. } => source.into(),
+        other => other.into(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -558,4 +571,30 @@ fn emit_private_repo_diag(prefs: &crate::cmd::ui::UiPrefs, scopes: &[String]) {
         ),
         "rupu auth logout --provider github && rupu auth login --provider github --mode sso",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_io_failure_prints_bare() {
+        let e = rupu_workspace::TrackCheckoutError::Path {
+            path: "/nope".into(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        assert_eq!(
+            track_error(e).to_string(),
+            std::io::Error::from(std::io::ErrorKind::NotFound).to_string()
+        );
+        let e = rupu_workspace::TrackCheckoutError::Mismatch {
+            path: "/c".into(),
+            detected: "github:a/b".into(),
+            expected: "github:a/c".into(),
+        };
+        assert_eq!(
+            track_error(e).to_string(),
+            "checkout /c points at github:a/b, not github:a/c"
+        );
+    }
 }

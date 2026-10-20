@@ -65,7 +65,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "auth.status",
             Method::GET,
             "/api/auth/status",
-            "Show which provider and SCM accounts have credentials, their auth mode and SSO expiry.\n\nReturns a JSON array of `{account, kind, api_key, sso, state}`: `sso` is `{expires_at, expired, summary}` or null, `state` ok, needs_login (an expired SSO token) or absent. Never a token; logging in stays `rupu auth login`.",
+            "Show which provider and SCM accounts have credentials, their auth mode and SSO expiry.\n\nReturns a JSON array of `{account, kind, api_key, sso, state}`: `sso` is `{expires_at, expired, refreshable, summary}` or null; `state` ok, needs_login (an expired SSO token that can't be refreshed) or absent. Never a token; logging in stays `rupu auth login`.",
         )
         .query::<scm::LocalHostQuery>(),
     ]

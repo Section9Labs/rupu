@@ -4,7 +4,9 @@
 //! `[[scm.rules]]` select them and whether a credential is stored for each.
 //!
 //! Nothing here reads or returns any part of a credential: the resolver is
-//! only asked whether one exists and, for an SSO token, when it expires.
+//! only asked whether one exists and, for an SSO token, when it expires and
+//! whether it can be refreshed. Give it [`crate::accounts::resolver_for_home`]
+//! (or `resolver_for`), so a declared account's kind is known.
 
 use chrono::{DateTime, Utc};
 use rupu_auth::KeychainResolver;
@@ -43,6 +45,9 @@ pub struct AccountAuth {
 pub struct SsoStatus {
     pub expires_at: Option<DateTime<Utc>>,
     pub expired: bool,
+    /// A refresh token is stored for an account kind that can refresh: an
+    /// expired token is renewed on next use, no login needed.
+    pub refreshable: bool,
     /// What `rupu auth status` prints: `expires in 8d`, `expired — re-login`,
     /// `no expiry`.
     pub summary: String,
@@ -52,9 +57,10 @@ pub struct SsoStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthState {
-    /// An API key, or an SSO token that has not expired.
+    /// An API key, or an SSO token that has not expired or can be refreshed.
     Ok,
-    /// Only an expired SSO token: `rupu auth login` again.
+    /// Only an expired SSO token that can't be refreshed: `rupu auth login`
+    /// again.
     NeedsLogin,
     /// No credential at all.
     Absent,
@@ -109,11 +115,12 @@ pub async fn account_auth(
         .map(|p| SsoStatus {
             expired: p.expires_at.is_some_and(|at| at <= Utc::now()),
             expires_at: p.expires_at,
+            refreshable: p.refreshable,
             summary: p.summary,
         });
     let state = match (&sso, api_key) {
         (_, true) => AuthState::Ok,
-        (Some(s), false) if !s.expired => AuthState::Ok,
+        (Some(s), false) if !s.expired || s.refreshable => AuthState::Ok,
         (Some(_), false) => AuthState::NeedsLogin,
         (None, false) => AuthState::Absent,
     };

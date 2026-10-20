@@ -185,6 +185,8 @@ async fn no_answer_carries_a_stored_secret() {
     let (addr, tmp) = spawn_operator_with(seed, None).await;
     let one = checkout(tmp.path(), "widgets");
     let two = checkout(tmp.path(), "widgets-2");
+    let corp = checkout(tmp.path(), "corp");
+    let scp = checkout(tmp.path(), "scp");
     assert!(std::fs::read_to_string(tmp.path().join("auth.json"))
         .unwrap()
         .contains(SECRET));
@@ -214,6 +216,17 @@ async fn no_answer_carries_a_stored_secret() {
             "POST",
             "/api/repos/tracked".into(),
             Some(json!({"repo": "github:acme/nope", "path": one})),
+        ),
+        // Remotes that parse to no repo, with the secret as user info.
+        (
+            "POST",
+            "/api/repos/tracked".into(),
+            Some(json!({"repo": "github:acme/w", "path": corp})),
+        ),
+        (
+            "POST",
+            "/api/repos/tracked/prefer".into(),
+            Some(json!({"repo": "github:acme/w", "path": scp})),
         ),
         ("GET", "/api/repos/tracked".into(), None),
         ("GET", "/api/auth/status".into(), None),
@@ -254,6 +267,14 @@ async fn no_answer_carries_a_stored_secret() {
             "repos.attach",
             json!({"repo": "github:acme/nope", "path": two}),
         ),
+        (
+            "repos.attach",
+            json!({"repo": "github:acme/w", "path": corp}),
+        ),
+        (
+            "repos.prefer",
+            json!({"repo": "github:acme/w", "path": scp}),
+        ),
         ("repos.tracked", json!({})),
         ("auth.status", json!({})),
         ("auth.status", json!({"host": "box"})),
@@ -274,6 +295,13 @@ async fn no_answer_carries_a_stored_secret() {
     assert!(answers
         .iter()
         .any(|(_, a)| a.contains("github:acme/widgets")));
+    // The unknown remotes were refused naming the url, user info dropped.
+    assert!(answers
+        .iter()
+        .any(|(_, a)| a.contains("https://git.corp.example/acme/w.git")));
+    assert!(answers
+        .iter()
+        .any(|(_, a)| a.contains("github.com:acme/w`")));
     for (what, answer) in &answers {
         assert!(!answer.contains(SECRET), "{what} leaked a secret: {answer}");
         assert!(!answer.contains("x-access-token"), "{what}: {answer}");

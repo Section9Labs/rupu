@@ -66,6 +66,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsoPeek {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A refresh token is stored and the account's kind can be refreshed,
+    /// so using the account renews an expired token without a login.
+    pub refreshable: bool,
     pub summary: String,
 }
 
@@ -719,8 +722,15 @@ impl KeychainResolver {
     /// Carries no part of the credential itself.
     pub async fn peek_sso_status_named(&self, name: &str) -> Option<SsoPeek> {
         let sc = self.read_account(name, Some(name), AuthMode::Sso).ok()??;
+        // What `get` needs to refresh it: a stored refresh token and an
+        // account whose kind has an OAuth config.
+        let refreshable = sc.refresh_token.is_some()
+            && crate::account::resolve_provider_id(name, &self.accounts)
+                .and_then(crate::oauth::providers::provider_oauth)
+                .is_some();
         Some(SsoPeek {
             expires_at: sc.expires_at,
+            refreshable,
             summary: Self::expiry_string(&sc)?,
         })
     }

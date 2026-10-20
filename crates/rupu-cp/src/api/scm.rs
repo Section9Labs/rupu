@@ -49,9 +49,20 @@ pub(crate) fn local_only(host: Option<&str>, what: &str) -> ApiResult<()> {
 }
 
 /// The global config as it is on disk now: a `rupu scm bind` from the CLI
-/// lands without the CP reloading.
-pub(crate) fn global_config(s: &AppState) -> rupu_config::Config {
-    AppState::resolve_global_config(&s.global_dir)
+/// lands without the CP reloading. A file that doesn't parse is a 500 with
+/// the parse error: answering from defaults would list accounts and rules
+/// the config doesn't have.
+pub(crate) fn global_config(s: &AppState) -> ApiResult<rupu_config::Config> {
+    let path = s.global_dir.join("config.toml");
+    rupu_config::resolve(rupu_config::LayerPaths::global_only(&path))
+        .map(|r| r.config)
+        .map_err(|e| ApiError::internal(format!("global config {}: {e}", path.display())))
+}
+
+/// The credential resolver over this host's store, knowing every account
+/// `cfg` declares (so an SSO token's refreshability is judged right).
+pub(crate) fn resolver(s: &AppState, cfg: &rupu_config::Config) -> rupu_auth::KeychainResolver {
+    rupu_runtime::accounts::resolver_for_home(cfg, &s.global_dir)
 }
 
 /// One `GET /api/scm/accounts` row.
@@ -70,8 +81,8 @@ async fn list_accounts(
     Query(q): Query<LocalHostQuery>,
 ) -> ApiResult<Json<Vec<ScmAccountDto>>> {
     local_only(q.host.as_deref(), "listing SCM accounts")?;
-    let cfg = global_config(&s);
-    let resolver = rupu_auth::KeychainResolver::for_home(&s.global_dir);
+    let cfg = global_config(&s)?;
+    let resolver = resolver(&s, &cfg);
     let mut out = Vec::new();
     for account in account_status::scm_accounts(&cfg) {
         let auth = account_status::account_auth(&cfg, &resolver, &account.account).await;
@@ -89,7 +100,7 @@ async fn list_rules(
     Query(q): Query<LocalHostQuery>,
 ) -> ApiResult<Json<Vec<rupu_config::ScmRule>>> {
     local_only(q.host.as_deref(), "listing SCM rules")?;
-    Ok(Json(global_config(&s).scm.rules))
+    Ok(Json(global_config(&s)?.scm.rules))
 }
 
 /// `POST /api/scm/rules`: give exactly one of `owner` or `path`.
@@ -134,12 +145,12 @@ async fn bind_rule(
     .await
     .map_err(|e| ApiError::internal(format!("bind task: {e}")))?
     .map_err(|e| match e {
-        ConfigWriteError::Validate(m) => ApiError::bad_request(m),
+        ConfigWriteError::Validate(m) | ConfigWriteError::Refused(m) => ApiError::bad_request(m),
         ConfigWriteError::Locked(m) => ApiError::conflict(format!("config busy: {m}")),
-        ConfigWriteError::Io(m) => ApiError::internal(m),
+        ConfigWriteError::Io(m) | ConfigWriteError::Read(m) => ApiError::internal(m),
     })?;
     s.reload_config();
-    let cfg = global_config(&s);
+    let cfg = global_config(&s)?;
     let warning = (!account_status::is_known_scm_account(&cfg, &rule.account)).then(|| {
         format!(
             "`{}` is not a declared [scm.*] account or a bare vendor name (github/gitlab): \

@@ -12,35 +12,45 @@ use std::path::{Path, PathBuf};
 /// Every secret the seed stores carries this marker.
 pub(super) const SECRET: &str = "rupu-secret-7f3a9c";
 
-/// A `RUPU_HOME` with an `[scm."gh.work"]` account and one rule, stored
-/// credentials for several accounts (each holding [`SECRET`]) and two git
-/// checkouts of `github:acme/widgets` whose origin url embeds [`SECRET`].
+/// A `RUPU_HOME` with `[scm."gh.work"]` and `[scm."gl.corp"]` accounts and
+/// one rule, stored credentials for several accounts (each holding
+/// [`SECRET`]), two git checkouts of `github:acme/widgets` whose origin url
+/// embeds [`SECRET`], and two checkouts whose remotes parse to no repo but
+/// carry [`SECRET`] as user info (an unknown host, an scp-form remote).
 pub(super) fn seed(dir: &Path) {
     std::fs::write(
         dir.join("config.toml"),
         "# operator note\n\
          [scm.\"gh.work\"]\nkind = \"github\"\nbase_url = \"https://ghe.example\"\n\n\
+         [scm.\"gl.corp\"]\nkind = \"gitlab\"\n\n\
          [[scm.rules]]\nowner = \"acme/*\"\naccount = \"gh.work\"\n",
     )
     .unwrap();
-    let oauth = |expires_at: &str| {
-        json!({
+    let oauth = |expires_at: &str, refresh: bool| {
+        let mut c = json!({
             "credentials": {
                 "type": "oauth",
                 "access": format!("access-{SECRET}"),
                 "refresh": format!("refresh-{SECRET}"),
                 "expires": 0,
             },
-            "refresh_token": format!("stored-refresh-{SECRET}"),
             "expires_at": expires_at,
-        })
-        .to_string()
+        });
+        if refresh {
+            c["refresh_token"] = json!(format!("stored-refresh-{SECRET}"));
+        }
+        c.to_string()
     };
     let auth = json!({
         "gh.work/api-key": format!("ghp-{SECRET}"),
         "anthropic/api-key": format!("sk-ant-{SECRET}"),
-        "github/sso": oauth("2099-01-01T00:00:00Z"),
-        "gitlab/sso": oauth("2000-01-01T00:00:00Z"),
+        "github/sso": oauth("2099-01-01T00:00:00Z", true),
+        // Expired, but refreshable: no login needed.
+        "gitlab/sso": oauth("2000-01-01T00:00:00Z", true),
+        // A declared account: refreshable only because its kind is known.
+        "gl.corp/sso": oauth("2000-01-01T00:00:00Z", true),
+        // Expired with no refresh token: needs a login.
+        "copilot/sso": oauth("2000-01-01T00:00:00Z", false),
     });
     std::fs::write(dir.join("auth.json"), auth.to_string()).unwrap();
     for name in ["widgets", "widgets-2"] {
@@ -52,6 +62,14 @@ pub(super) fn seed(dir: &Path) {
     git_checkout(
         &dir.join("checkouts").join("other"),
         "git@github.com:acme/other.git",
+    );
+    git_checkout(
+        &dir.join("checkouts").join("corp"),
+        &format!("https://oauth2:{SECRET}@git.corp.example/acme/w.git"),
+    );
+    git_checkout(
+        &dir.join("checkouts").join("scp"),
+        &format!("user:{SECRET}@github.com:acme/w"),
     );
 }
 
@@ -148,9 +166,11 @@ async fn scm_accounts_list_kinds_rules_and_credential_state() {
             {"account": "github", "kind": "github", "base_url": null, "rules": [],
              "credentials": true, "state": "ok"},
             {"account": "gitlab", "kind": "gitlab", "base_url": null, "rules": [],
-             "credentials": true, "state": "needs_login"},
+             "credentials": true, "state": "ok"},
             {"account": "gh.work", "kind": "github", "base_url": "https://ghe.example",
              "rules": [{"owner": "acme/*"}], "credentials": true, "state": "ok"},
+            {"account": "gl.corp", "kind": "gitlab", "base_url": null, "rules": [],
+             "credentials": true, "state": "ok"},
         ])
     );
 }
@@ -185,7 +205,8 @@ async fn auth_status_reports_modes_expiry_and_state() {
             "gitlab",
             "linear",
             "jira",
-            "gh.work"
+            "gh.work",
+            "gl.corp"
         ]
     );
     assert_eq!(
@@ -194,7 +215,7 @@ async fn auth_status_reports_modes_expiry_and_state() {
     );
     assert_eq!(
         row("github")["sso"],
-        json!({"expires_at": "2099-01-01T00:00:00Z", "expired": false,
+        json!({"expires_at": "2099-01-01T00:00:00Z", "expired": false, "refreshable": true,
                "summary": row("github")["sso"]["summary"]})
     );
     assert!(row("github")["sso"]["summary"]
@@ -202,9 +223,21 @@ async fn auth_status_reports_modes_expiry_and_state() {
         .unwrap()
         .starts_with("expires in "));
     assert_eq!(row("github")["state"], "ok");
-    assert_eq!(row("gitlab")["sso"]["expired"], true);
-    assert_eq!(row("gitlab")["sso"]["summary"], "expired — re-login");
-    assert_eq!(row("gitlab")["state"], "needs_login");
+    // An expired token with a refresh token is renewed on use: no login.
+    for name in ["gitlab", "gl.corp"] {
+        assert_eq!(
+            row(name)["sso"],
+            json!({"expires_at": "2000-01-01T00:00:00Z", "expired": true, "refreshable": true,
+                   "summary": "expired — re-login"}),
+            "{name}"
+        );
+        assert_eq!(row(name)["state"], "ok", "{name}");
+    }
+    assert_eq!(row("gl.corp")["kind"], "gitlab");
+    // Without one, it needs a login.
+    assert_eq!(row("copilot")["sso"]["expired"], true);
+    assert_eq!(row("copilot")["sso"]["refreshable"], false);
+    assert_eq!(row("copilot")["state"], "needs_login");
     assert_eq!(row("anthropic")["kind"], "anthropic");
     assert_eq!(row("anthropic")["api_key"], true);
     assert_eq!(
@@ -476,4 +509,41 @@ async fn a_remote_host_is_501_local_only() {
     let (status, _) = send(addr, "GET", "/api/auth/status?host=local", None).await;
     assert_eq!(status, 200);
     assert!(!tmp.path().join("repos").exists());
+}
+
+#[tokio::test]
+async fn an_unparseable_global_config_is_500_not_defaults() {
+    let (addr, tmp) = spawn(true).await;
+    std::fs::write(tmp.path().join("config.toml"), "[scm\nnot = = toml").unwrap();
+    for path in ["/api/scm/accounts", "/api/scm/rules", "/api/auth/status"] {
+        let (status, body) = send_json(addr, "GET", path, None).await;
+        assert_eq!(status, 500, "{path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("config.toml"),
+            "{path}: {body}"
+        );
+    }
+}
+
+/// A tracked-repo record that doesn't parse is reported by its file name,
+/// not with the TOML error's quote of the offending line.
+#[tokio::test]
+async fn a_corrupt_repo_record_error_quotes_no_line() {
+    let (addr, tmp) = spawn(true).await;
+    std::fs::create_dir_all(tmp.path().join("repos")).unwrap();
+    std::fs::write(
+        tmp.path().join("repos/github--acme--widgets.toml"),
+        format!("origin_urls = [\"https://t:{SECRET}@github.com/acme/widgets.git\"\n"),
+    )
+    .unwrap();
+    let (status, text) = send(
+        addr,
+        "POST",
+        "/api/repos/tracked",
+        Some(json!({"repo": "github:acme/widgets", "path": checkout(tmp.path(), "widgets")})),
+    )
+    .await;
+    assert_eq!(status, 500, "{text}");
+    assert!(text.contains("is not valid TOML"), "{text}");
+    assert!(!text.contains(SECRET), "{text}");
 }

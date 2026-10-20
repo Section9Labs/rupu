@@ -6,7 +6,7 @@
 //! (`rupu auth login`).
 
 use crate::{
-    api::scm::{global_config, local_only, LocalHostQuery},
+    api::scm::{global_config, local_only, resolver, LocalHostQuery},
     error::ApiResult,
     state::AppState,
 };
@@ -26,7 +26,7 @@ async fn status(
     Query(q): Query<LocalHostQuery>,
 ) -> ApiResult<Json<Vec<AccountAuth>>> {
     local_only(q.host.as_deref(), "auth status")?;
-    let cfg = global_config(&s);
-    let resolver = rupu_auth::KeychainResolver::for_home(&s.global_dir);
+    let cfg = global_config(&s)?;
+    let resolver = resolver(&s, &cfg);
     Ok(Json(account_status::auth_status(&cfg, &resolver).await))
 }

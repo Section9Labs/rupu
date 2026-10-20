@@ -22,7 +22,9 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use rupu_workspace::{repo_ref_key, RepoRegistryStore, TrackCheckoutError, TrackedRepo};
+use rupu_workspace::{
+    repo_ref_key, RepoRegistryStore, RepoStoreError, TrackCheckoutError, TrackedRepo,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +51,18 @@ async fn list_repos(
     axum::extract::State(s): axum::extract::State<AppState>,
 ) -> ApiResult<Json<Vec<RepoEntry>>> {
     Ok(Json(list_repos_with(s.repos.clone()).await?))
+}
+
+/// A repo-registry failure as a 500. A record that doesn't parse is named
+/// by its file only: the TOML error quotes the offending line, which can be
+/// an origin url with a token in it.
+fn store_error(e: RepoStoreError) -> ApiError {
+    match e {
+        RepoStoreError::Parse { path, .. } => {
+            ApiError::internal(format!("tracked repo record {path} is not valid TOML"))
+        }
+        other => ApiError::internal(other.to_string()),
+    }
 }
 
 fn store(s: &AppState) -> RepoRegistryStore {
@@ -93,7 +107,7 @@ async fn list_tracked(
     let repos = tokio::task::spawn_blocking(move || store.list())
         .await
         .map_err(|e| ApiError::internal(format!("list task: {e}")))?
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+        .map_err(store_error)?;
     Ok(Json(repos.into_iter().map(Into::into).collect()))
 }
 
@@ -150,9 +164,8 @@ async fn track(
             TrackCheckoutError::Path { .. }
             | TrackCheckoutError::Checkout(_)
             | TrackCheckoutError::Mismatch { .. } => ApiError::bad_request(e.to_string()),
-            TrackCheckoutError::Git { .. } | TrackCheckoutError::Store(_) => {
-                ApiError::internal(e.to_string())
-            }
+            TrackCheckoutError::Store(e) => store_error(e),
+            TrackCheckoutError::Git { .. } => ApiError::internal(e.to_string()),
         })?;
     Ok(Json(rec.into()))
 }
@@ -184,7 +197,7 @@ async fn forget(
     require_writable_to(&s, "forgetting a tracked repo")?;
     let store = store(&s);
     tokio::task::spawn_blocking(move || {
-        let internal = |e: rupu_workspace::RepoStoreError| ApiError::internal(e.to_string());
+        let internal = store_error;
         let repo_ref = store
             .list()
             .map_err(internal)?

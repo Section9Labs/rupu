@@ -32,7 +32,32 @@ pub fn canonical_repo_ref(repo: &RepoRef) -> String {
 pub fn repo_of_checkout(path: &Path) -> Result<RepoRef, CheckoutError> {
     let git_config = find_git_config(path).ok_or(CheckoutError::NotACheckout)?;
     let url = read_origin_url(&git_config)?;
-    parse_remote_url(&url).ok_or(CheckoutError::UnknownRemote(url))
+    parse_remote_url(&url).ok_or_else(|| CheckoutError::UnknownRemote(without_userinfo(&url)))
+}
+
+/// `url` with any `user[:password]@` taken out: an origin url can carry a
+/// token there (`https://oauth2:<token>@host/…`, `user:<token>@host:path`),
+/// and it must never reach an error message.
+pub fn without_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => rest.split_at(i),
+                None => (rest, ""),
+            };
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{scheme}://{host}{path}")
+        }
+        // scp form `[user[:password]@]host:path`: the userinfo ends at the
+        // last `@` before the host's `:`.
+        None => {
+            let host_end = url.rfind(':').unwrap_or(url.len());
+            match url[..host_end].rfind('@') {
+                Some(at) => url[at + 1..].to_string(),
+                None => url.to_string(),
+            }
+        }
+    }
 }
 
 fn find_git_config(start: &Path) -> Option<PathBuf> {
@@ -239,6 +264,40 @@ mod tests {
     #[test]
     fn parse_remote_url_unknown_host_returns_none() {
         assert!(parse_remote_url("https://example.com/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn without_userinfo_drops_credentials_in_both_url_forms() {
+        for (url, want) in [
+            (
+                "https://oauth2:glpat-XYZ@git.corp.example/acme/w.git",
+                "https://git.corp.example/acme/w.git",
+            ),
+            ("https://tok@host", "https://host"),
+            ("ssh://git@github.com/acme/w", "ssh://github.com/acme/w"),
+            ("user:tok@github.com:acme/w", "github.com:acme/w"),
+            ("git@github.com:acme/w.git", "github.com:acme/w.git"),
+            ("github-alias:acme/w", "github-alias:acme/w"),
+            ("https://github.com/acme/w", "https://github.com/acme/w"),
+        ] {
+            assert_eq!(without_userinfo(url), want, "{url}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_remote_error_names_no_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(
+            tmp.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://oauth2:glpat-SECRET@git.corp.example/acme/w.git\n",
+        )
+        .unwrap();
+        let err = repo_of_checkout(tmp.path()).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "could not parse origin url `https://git.corp.example/acme/w.git` to <platform>:<owner>/<repo>"
+        );
     }
 
     #[test]

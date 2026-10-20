@@ -18,6 +18,13 @@ pub enum ConfigWriteError {
     Io(String),
     #[error("config busy: {0}")]
     Locked(String),
+    /// A write refused before anything was written (an existing file that
+    /// isn't TOML, a request that names no rule); the message stands alone.
+    #[error("{0}")]
+    Refused(String),
+    /// The existing file could not be read.
+    #[error("{0}")]
+    Read(String),
 }
 
 /// Parse `candidate` into the typed `rupu_config::Config` (deny_unknown_fields
@@ -104,13 +111,13 @@ pub fn append_scm_rule(
             account: account.to_string(),
         },
         _ => {
-            return Err(ConfigWriteError::Validate(
+            return Err(ConfigWriteError::Refused(
                 "a rule takes exactly one of `owner` or `path`".into(),
             ))
         }
     };
     if account.trim().is_empty() {
-        return Err(ConfigWriteError::Validate("`account` is empty".into()));
+        return Err(ConfigWriteError::Refused("`account` is empty".into()));
     }
     let lock = lock_config(cfg_path)?;
     let written = append_scm_rule_locked(cfg_path, &rule);
@@ -125,10 +132,10 @@ fn append_scm_rule_locked(
     let text = match std::fs::read_to_string(cfg_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(ConfigWriteError::Io(e.to_string())),
+        Err(e) => return Err(ConfigWriteError::Read(e.to_string())),
     };
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| {
-        ConfigWriteError::Validate(format!(
+        ConfigWriteError::Refused(format!(
             "refusing to write: {} is not valid TOML ({e}). \
              Fix or move the file first — writing would discard its contents.",
             cfg_path.display()
@@ -142,9 +149,7 @@ fn append_scm_rule_locked(
     let scm = root
         .get_mut("scm")
         .and_then(|item| item.as_table_mut())
-        .ok_or_else(|| {
-            ConfigWriteError::Validate("`scm` is already a value, not a table".into())
-        })?;
+        .ok_or_else(|| ConfigWriteError::Refused("`scm` is already a value, not a table".into()))?;
     if scm.get("rules").is_none() {
         scm.insert(
             "rules",
@@ -155,7 +160,7 @@ fn append_scm_rule_locked(
         .get_mut("rules")
         .and_then(|item| item.as_array_of_tables_mut())
         .ok_or_else(|| {
-            ConfigWriteError::Validate(
+            ConfigWriteError::Refused(
                 "`scm.rules` is already declared as something other than an array of tables".into(),
             )
         })?;
@@ -696,7 +701,15 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "this is not = = toml").unwrap();
 
-        assert!(append_scm_rule(&path, Some("acme/*"), None, "gh-work").is_err());
+        let err = append_scm_rule(&path, Some("acme/*"), None, "gh-work").unwrap_err();
+        // `rupu scm bind` prints this as it is: no "invalid config: " prefix.
+        assert!(
+            err.to_string().starts_with(&format!(
+                "refusing to write: {} is not valid TOML (",
+                path.display()
+            )),
+            "{err}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "this is not = = toml"
