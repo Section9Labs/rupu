@@ -7,7 +7,7 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, within } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 
 vi.mock('../CodeEditor', () => ({
   __esModule: true,
@@ -596,5 +596,73 @@ describe('AgentBuilder', () => {
       .getByText('Reasoning', { selector: '.ab-ct' })
       .closest('.ab-card-head') as HTMLElement;
     expect(reasoningHead.querySelector('svg.ab-cicon')).toBeInTheDocument();
+  });
+});
+
+describe('AgentBuilder server validation (Plan 3b)', () => {
+  it('takes the server’s answer once it arrives, over the browser’s', async () => {
+    const serverValidate = vi.fn().mockResolvedValue({
+      ok: false,
+      error: 'tools: unknown tool `bsh` (did you mean `bash`?)',
+    });
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        serverValidate={serverValidate}
+      />,
+    );
+    // the browser's instant first pass
+    expect(screen.getByText('valid')).toBeInTheDocument();
+    // in the strip under the header, and the preview's footer
+    expect(
+      await screen.findAllByText('tools: unknown tool `bsh` (did you mean `bash`?)', undefined, { timeout: 2000 }),
+    ).toHaveLength(2);
+    expect(screen.getByText('invalid')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeDisabled();
+    expect(serverValidate).toHaveBeenCalledTimes(1);
+    expect(serverValidate.mock.calls[0][0]).toContain('name: security-reviewer');
+  });
+
+  it('debounces: one call for a burst of edits, on the latest text', async () => {
+    const serverValidate = vi.fn().mockResolvedValue({ ok: true, name: 'x' });
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        serverValidate={serverValidate}
+      />,
+    );
+    const name = screen.getByLabelText('agent name');
+    fireEvent.change(name, { target: { value: 'a1' } });
+    fireEvent.change(name, { target: { value: 'a12' } });
+    fireEvent.change(name, { target: { value: 'a123' } });
+    await waitFor(() => expect(serverValidate).toHaveBeenCalled(), { timeout: 2000 });
+    expect(serverValidate).toHaveBeenCalledTimes(1);
+    expect(serverValidate.mock.calls[0][0]).toContain('name: a123');
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeEnabled();
+  });
+
+  it('keeps the browser’s answer when the server can’t be asked', async () => {
+    const serverValidate = vi.fn().mockRejectedValue(new Error('offline'));
+    render(
+      <AgentBuilder
+        initialRaw={SAMPLE_RAW}
+        submitLabel="Create agent"
+        submitting={false}
+        error={null}
+        onSubmit={vi.fn()}
+        serverValidate={serverValidate}
+      />,
+    );
+    await waitFor(() => expect(serverValidate).toHaveBeenCalled(), { timeout: 2000 });
+    expect(screen.getByText('valid')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeEnabled();
   });
 });
