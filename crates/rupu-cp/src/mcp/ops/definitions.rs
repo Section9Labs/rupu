@@ -16,7 +16,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "workflows.run",
             Method::POST,
             "/api/workflows/:name/run",
-            "Launch a workflow run.\n\n`name` is the workflow; `inputs` maps input names to string values; `mode` (ask|bypass|readonly), `target`, `working_dir`, `host` and `scope_kind`/`scope_id` are optional. Returns the new run id.",
+            "Launch a workflow run.\n\n`name` is the workflow; `inputs` maps input names to string values; `mode` (ask|bypass|readonly), `target`, `working_dir`, `host` and `scope_kind`/`scope_id` are optional. Returns `{run_id, host_id}`.",
         )
         .body::<workflows::LaunchBody>()
         .open_world(),
@@ -30,7 +30,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "agents.run",
             Method::POST,
             "/api/agents/:name/run",
-            "Launch a standalone agent run.\n\n`name` is the agent; `prompt` is its task; `mode`, `target`, `working_dir`, `host`, `skills` and the other launch options are optional. Returns the new run id.",
+            "Launch a standalone agent run.\n\n`name` is the agent; `prompt` is its task; `mode`, `target`, `working_dir`, `host`, `skills` and the other launch options are optional. Returns `{run_id, host_id}`.",
         )
         .body::<agents::AgentRunBody>()
         .open_world(),

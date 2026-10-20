@@ -122,7 +122,12 @@ fn progress_stream(
     let events = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(|v| {
         Ok::<_, std::convert::Infallible>(Event::default().event("message").data(v.to_string()))
     });
-    Sse::new(events).into_response()
+    // Keep-alive comments: a long call that reports no progress (a PDF
+    // export, `agents.generate`) would otherwise send nothing until it
+    // answers, and an idle-timing proxy or client would cut it.
+    Sse::new(events)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 async fn handle(

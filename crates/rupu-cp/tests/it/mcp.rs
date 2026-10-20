@@ -748,7 +748,8 @@ async fn run_control_through_mcp_records_actor_mcp_and_plain_http_web() {
         assert_ne!(r["isError"], json!(true), "{verb}: {r}");
     }
     // Plain HTTP, with and without the header the operator source once
-    // sent: never `mcp`. `resume` is no MCP tool yet; its HTTP side the same.
+    // sent: never `mcp`, `resume` included (its MCP side is
+    // `mcp_ops_runs::runs_pause_resume_record_through_mcp`).
     for verb in VERBS.iter().copied().chain(["resume"]) {
         for (how, header) in [("http", false), ("spoof", true)] {
             let mut req = c.post(format!("http://{addr}/api/runs/{}/{verb}", id(verb, how)));

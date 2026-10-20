@@ -60,7 +60,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "sessions.start",
             Method::POST,
             "/api/agents/:name/session",
-            "Start an interactive agent session.\n\n`name` is the agent; `prompt` is the first message; `mode`, `target`, `working_dir`, `host` and `skills` are optional. Returns the new session id.",
+            "Start an interactive agent session.\n\n`name` is the agent; `prompt` is the first message; `mode`, `target`, `working_dir`, `host` and `skills` are optional. Returns `{session_id, host_id}`.",
         )
         .body::<agents::SessionStartBody>()
         .open_world(),
@@ -68,7 +68,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "sessions.send",
             Method::POST,
             "/api/sessions/:id/send",
-            "Send a message to a live session, starting a new turn.\n\n`id` is the session id; `prompt` is the message and `skills` are skills to invoke (at least one is required). Returns the run id of the turn.",
+            "Send a message to a live session, starting a new turn.\n\n`id` is the session id; `prompt` is the message and `skills` are skills to invoke (at least one is required). Returns `{run_id, host_id}`, `run_id` the turn's run (what `wait`'s `session_turn` takes).",
         )
         .query::<sessions::SendQuery>()
         .body::<sessions::SendBody>()

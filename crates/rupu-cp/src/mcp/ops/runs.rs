@@ -24,7 +24,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.approve",
             Method::POST,
             "/api/runs/:id/approve",
-            "Approve a workflow run's parked gate so the run continues.\n\n`id` is the run id; `gate` names the gate step when several are parked; `mode` (ask|bypass|readonly) sets the permission mode the resumed run uses. Returns once the approval is recorded, not when the run has resumed.",
+            "Approve a workflow run's parked gate so the run continues.\n\n`id` is the run id; `gate` names the gate step when several are parked; `mode` (ask|bypass|readonly) sets the permission mode the resumed run uses. Answers once the approval is recorded, not when the run has resumed. Returns the run detail (`{run, steps, usage}`) plus `host_id`; with a remote `host`, `{ok, host_id}`.",
         )
         .query::<runs::RunControlQuery>()
         .body::<runs::ApproveBody>(),
@@ -32,7 +32,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.reject",
             Method::POST,
             "/api/runs/:id/reject",
-            "Reject a workflow run's parked gate; the run's rejection path runs.\n\n`id` is the run id; `gate` names the gate step when several are parked; `reason` is recorded with the decision. Returns once the rejection is recorded.",
+            "Reject a workflow run's parked gate; the run's rejection path runs.\n\n`id` is the run id; `gate` names the gate step when several are parked; `reason` is recorded with the decision. Answers once the rejection is recorded. Returns the run detail (`{run, steps, usage}`) plus `host_id`; with a remote `host`, `{ok, host_id}`.",
         )
         .query::<runs::RunControlQuery>()
         .body::<runs::RejectBody>()
@@ -41,7 +41,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.cancel",
             Method::POST,
             "/api/runs/:id/cancel",
-            "Cancel a running or paused workflow run.\n\n`id` is the run id; `reason` is recorded. A finished run is refused with HTTP 409. Returns once the cancel is recorded.",
+            "Cancel a running or paused workflow run.\n\n`id` is the run id; `reason` is recorded. A finished run is refused with HTTP 409. Answers once the cancel is recorded. Returns the run detail (`{run, steps, usage}`) plus `host_id`; with a remote `host`, `{ok, host_id}`.",
         )
         .query::<runs::RunControlQuery>()
         .body::<runs::CancelBody>()
@@ -71,28 +71,28 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.archive",
             Method::POST,
             "/api/runs/:id/archive",
-            "Archive a finished workflow run, moving it out of the active lists.\n\n`id` is the run id; `host` picks a remote host. A run that has not finished is refused with HTTP 409. Undo with runs.restore.",
+            "Archive a finished workflow run, moving it out of the active lists.\n\n`id` is the run id; `host` picks a remote host. A run that has not finished is refused with HTTP 409. Returns `{ok, id, archived}` (plus `host_id` with a remote `host`). Undo with runs.restore.",
         )
         .query::<runs::RunControlQuery>(),
         op(
             "runs.restore",
             Method::POST,
             "/api/runs/:id/restore",
-            "Restore an archived workflow run to the active lists.\n\n`id` is the run id; `host` picks a remote host.",
+            "Restore an archived workflow run to the active lists.\n\n`id` is the run id; `host` picks a remote host. Returns `{ok, id, archived}` (plus `host_id` with a remote `host`).",
         )
         .query::<runs::RunControlQuery>(),
         op(
             "runs.pause",
             Method::POST,
             "/api/runs/:id/pause",
-            "Pause a running workflow run.\n\n`id` is the run id; `host` picks a remote host. The pause travels by signal to the run's process, so a 200 means it was recorded, not that the run has stopped; read runs.get for the status. Undo with runs.resume.",
+            "Pause a running workflow run.\n\n`id` is the run id; `host` picks a remote host. The pause travels by signal to the run's process, so a 200 means it was recorded, not that the run has stopped; read runs.get for the status. Returns the run detail (`{run, steps, usage}`) plus `host_id`; with a remote `host`, `{ok, host_id}`. Undo with runs.resume.",
         )
         .query::<runs::RunControlQuery>(),
         op(
             "runs.resume",
             Method::POST,
             "/api/runs/:id/resume",
-            "Resume a paused workflow run, continuing what it left mid-flight.\n\n`id` is the run id; `host` picks a remote host. Any run that is not paused is refused with HTTP 409. The resume is picked up by a worker, so a 200 means it was requested, not that the run is running.",
+            "Resume a paused workflow run, continuing what it left mid-flight.\n\n`id` is the run id; `host` picks a remote host. Any run that is not paused is refused with HTTP 409. The resume is picked up by a worker, so a 200 means it was requested, not that the run is running. Returns the run detail (`{run, steps, usage}`) plus `host_id`; with a remote `host`, `{ok, host_id}`.",
         )
         .query::<runs::RunControlQuery>()
         .open_world(),
@@ -107,7 +107,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.children",
             Method::GET,
             "/api/runs/:id/children",
-            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns the children with handle, kind, status and tokens.",
+            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns `{children}`, each with its handle, kind, status and tokens.",
         ),
         op(
             "runs.usage",
@@ -161,14 +161,14 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "transcripts.archive",
             Method::POST,
             "/api/transcripts/:id/archive",
-            "Archive a standalone agent run's transcript.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` archives a run whose recorded process id looks alive (a reused pid).",
+            "Archive a standalone agent run's transcript.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` archives a run whose recorded process id looks alive (a reused pid). Returns `{ok, id}` (plus `host_id` with a remote `host`).",
         )
         .query::<transcripts::TranscriptHostQuery>(),
         op(
             "transcripts.delete",
             Method::DELETE,
             "/api/transcripts/:id",
-            "Delete a standalone agent run's transcript for good.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` deletes a run whose recorded process id looks alive (a reused pid).",
+            "Delete a standalone agent run's transcript for good.\n\n`id` is the agent run id; `host` picks a remote host; `ignore_liveness` deletes a run whose recorded process id looks alive (a reused pid). Returns `{ok, id}` (plus `host_id` with a remote `host`).",
         )
         .query::<transcripts::TranscriptHostQuery>(),
         op(
