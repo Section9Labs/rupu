@@ -20,7 +20,7 @@ The MCP gives a connected client the same reach as the CP's operator. rupu adds
 permission prompts, `--allowedTools`, Cursor's approvals). Each tool carries
 read-only / destructive / open-world hints so a client's permission UI can tell
 `runs.list` from `runs.cancel`. Treat the bearer token like a key to the whole
-control plane, and narrow what is served with [`--tools`](#choosing-the-catalog-tools---tools)
+control plane, and narrow what is served with [`--tools`](#choosing-the-tools---tools)
 if you want less.
 
 ## Serve modes
@@ -125,7 +125,7 @@ unknown arguments, and returns the API's JSON as `structuredContent`.
 | `messages.list` | Read a run's, session's or agentiflow's message log |
 | `messages.send` | Send an operator message to a live run, session or agentiflow |
 
-Plans 2-4 of the rollout add the remaining CP routes as tools (findings,
+Later releases add the remaining CP routes as tools (findings,
 autoflows, projects, usage, hosts and so on), `wait` support for findings,
 session turns, agentiflows and remote hosts, the CLI-only extras, and MCP
 resources and prompts. What is listed here is what ships today.
@@ -154,8 +154,7 @@ Behaviour:
 - The timeout defaults to 30 s and is capped at 55 s.
 - The reply carries `events`, the advanced `cursor`, which conditions `fired`,
   and `timed_out`. Pass the returned `cursor` back on the next call.
-- Local host only for now: a `host` naming a remote answers "not built yet
-  (Plan 2)".
+- Local host only for now: a `host` naming a remote is not yet supported.
 - **Once `run_gate` has fired, drop it from `watch`** (or approve / reject the
   gate): a parked gate is state, so it fires immediately on every call.
 
@@ -185,23 +184,28 @@ until the server restarts.
 
 `agents.list` / `agents.get`, `workflows.list` / `workflows.get` and
 `findings.query` / `findings.tag` from the catalog are hidden from the list,
-because the operator tools (and, in Plan 2, the findings routes) cover them.
+because the operator tools cover them.
 Findings filed over MCP record under the `mcp` scope. A served `bash`'s network
 flows are not captured: the call is no run, so there is no run ledger for them.
 
-### Choosing the catalog tools: `--tools`
+### Choosing the tools: `--tools`
 
-`rupu cp serve --tools <grant>` narrows the catalog tools using the agent
-`tools:` grammar ([agent-format.md](agent-format.md)): exact names, legacy
-aliases, `ns.*`, `core.*` and `*`, comma-separated or repeated:
+`rupu cp serve --tools <grant>` narrows the MCP to the tools it names. It
+filters **every** tool: the operator tools and `wait` as well as the catalog
+tools. It uses the agent `tools:` grammar ([agent-format.md](agent-format.md)):
+exact names, legacy aliases, `ns.*`, `core.*` and `*`, comma-separated or
+repeated. Without `--tools` every tool is served.
 
 ```sh
-rupu cp serve --no-web --tools 'issues.*,findings.*'
+# operator tools, wait, messages and findings only
+rupu cp serve --no-web --tools 'runs.*,wait,messages.*,findings.*'
+# a read-only code browser: no operator tools at all
 rupu cp serve --no-web --tools read_file,grep
 ```
 
-Without it the default grant is served. `--tools` does not affect the operator
-tools or `wait`. An unknown name fails startup with a did-you-mean.
+A narrow grant such as `read_file,grep` therefore drops the operator tools
+and `wait`; name them (`runs.*,wait,...`) to keep them. An unknown name fails
+startup with a did-you-mean.
 
 ## Attribution
 
@@ -242,7 +246,7 @@ HTTP URL as above (for a client that only speaks stdio, use `mcp-remote`).
 | `405` on GET / DELETE | Expected: `/mcp` is POST only |
 | A fs / shell / findings tool says `workspace` is required | Pass a project id or the absolute path of a registered project |
 | `wait` returns instantly with `run_gate` | The gate is still parked; approve it or drop `run_gate` from `watch` |
-| `wait` on a remote host: "not built yet" | Remote hosts arrive with Plan 2 |
+| `wait` on a remote host is refused | Remote hosts are not yet supported by `wait` |
 | Tool is missing from `tools/list` | `--tools` excludes it, or it is hidden because an operator tool covers it |
 
 ## See also

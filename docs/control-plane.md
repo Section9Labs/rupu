@@ -43,7 +43,7 @@ rupu cp serve
 | `--no-open` | off | Don't open the URL in a browser. By default the URL is opened when running in a terminal; it is always printed. |
 | `--no-web` | off | Serve `/api` and `/mcp` only, no web UI (implies `--no-open`). |
 | `--no-mcp` | off | Don't serve `/mcp`. Refused together with `--no-web`. |
-| `--tools <grant>` | default grant | Narrow the catalog tools `/mcp` serves (agent `tools:` grammar). Refused with `--no-mcp`; a bad grant fails before binding. |
+| `--tools <grant>` | every tool | Narrow the MCP to these tools, operator tools and `wait` included (exact names, `ns.*`, `*`; comma-separated). Refused with `--no-mcp`; a bad grant fails before binding. |
 | `--max-open-files <N>` | — | Raise the process's open-file limit (overrides `RUPU_MAX_OPEN_FILES` and `[runtime].max_open_files`). |
 
 Besides the web UI and `/api`, the server serves an MCP endpoint at `/mcp`
