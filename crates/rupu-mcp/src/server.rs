@@ -649,7 +649,7 @@ impl Resources {
                 return Ok(json!({ "contents": [r.to_contents()] }));
             }
         }
-        Err(McpError::InvalidArgs(format!("unknown resource: {uri}")))
+        Err(McpError::ResourceNotFound(uri.to_string()))
     }
 }
 

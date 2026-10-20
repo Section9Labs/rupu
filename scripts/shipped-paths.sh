@@ -3,8 +3,8 @@
 #
 # Reads repository paths (one per line, e.g. `git diff --name-only`) on stdin
 # and writes back the ones that can change what a release publishes, in input
-# order. Empty output means the batch changed no product — only docs, CI,
-# release scripts or tests — and release-beta.yml skips the cut rather than
+# order. Empty output means the batch changed no product — only plans and
+# specs, CI, release scripts or tests — and release-beta.yml skips the cut rather than
 # publish a beta identical to the last one. A fix to the release machinery
 # that does need re-publishing is what release-beta.yml's `force` input is for.
 #
@@ -14,8 +14,11 @@
 # costs one unneeded beta; a path wrongly on it silently skips a release that
 # had real changes. So only these shapes are dropped:
 #
-#   docs/**                 — including docs/pages/, which GitHub Pages deploys
-#                             on merge; no release publishes it.
+#   docs/<dir>/**           — docs/superpowers/ (plans, specs) and docs/pages/,
+#                             which GitHub Pages deploys on merge; no release
+#                             publishes either. A top-level docs/*.md DOES ship:
+#                             rupu-cp embeds the docs with include_str! and
+#                             serves them as `rupu://docs/<name>` on /mcp.
 #   <root>/*.md             — CLAUDE.md, TODO.md, README.md, ISSUES.md, ...
 #   .github/**              — CI, release workflows, rulesets.
 #   scripts/**              — release and dev helper scripts.
@@ -29,7 +32,12 @@ set -euo pipefail
 # `|| [ -n "$path" ]` keeps an unterminated final line.
 while IFS= read -r path || [ -n "$path" ]; do
   case "$path" in
-    ''|docs/*|.github/*|scripts/*) continue ;;
+    ''|.github/*|scripts/*) continue ;;
+    # `*` matches `/` too, so this takes every path below a docs/ subdirectory
+    # first; what reaches docs/*.md is a top-level doc, which ships.
+    docs/*/*) continue ;;
+    docs/*.md) ;;
+    docs/*) continue ;;
     crates/*/tests/*)
       # `*` in a case pattern also matches `/`, so `crates/*/tests/*` alone
       # would match crates/x/src/tests/y.rs. Require tests/ to be the

@@ -20,6 +20,11 @@ pub enum McpError {
     #[error("invalid arguments: {0}")]
     InvalidArgs(String),
 
+    /// `resources/read` of a URI no source serves (the MCP resources spec's
+    /// `-32002`, with the URI as `data.uri`).
+    #[error("resource not found: {0}")]
+    ResourceNotFound(String),
+
     #[error("transport: {0}")]
     Transport(#[source] anyhow::Error),
 }
@@ -28,23 +33,24 @@ impl McpError {
     /// JSON-RPC 2.0 error code per MCP convention.
     pub fn code(&self) -> i32 {
         match self {
-            Self::Parse(_) => -32700,          // parse error
-            Self::InvalidRequest(_) => -32600, // invalid request
-            Self::UnknownMethod(_) => -32601,  // method not found
-            Self::InvalidArgs(_) => -32602,    // invalid params
-            Self::Transport(_) => -32603,      // internal error
+            Self::Parse(_) => -32700,            // parse error
+            Self::InvalidRequest(_) => -32600,   // invalid request
+            Self::UnknownMethod(_) => -32601,    // method not found
+            Self::InvalidArgs(_) => -32602,      // invalid params
+            Self::ResourceNotFound(_) => -32002, // MCP: resource not found
+            Self::Transport(_) => -32603,        // internal error
         }
     }
 
     pub fn to_jsonrpc(&self, id: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": self.code(),
-                "message": self.to_string(),
-            }
-        })
+        let mut error = serde_json::json!({
+            "code": self.code(),
+            "message": self.to_string(),
+        });
+        if let Self::ResourceNotFound(uri) = self {
+            error["data"] = serde_json::json!({ "uri": uri });
+        }
+        serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": error })
     }
 }
 

@@ -202,10 +202,10 @@ async fn resources_read_answers_text_or_a_blob_and_refuses_an_unknown_uri() {
     let r = call(&s, "resources/read", json!({"uri": "stub://bin"})).await;
     assert_eq!(r["result"]["contents"][0]["blob"], "/wA=");
     let r = call(&s, "resources/read", json!({"uri": "stub://doc/7"})).await;
-    assert_eq!(r["error"]["code"], -32602);
     assert_eq!(
-        r["error"]["message"],
-        "invalid arguments: unknown resource: stub://doc/7"
+        r["error"],
+        json!({"code": -32002, "message": "resource not found: stub://doc/7",
+               "data": {"uri": "stub://doc/7"}})
     );
     let r = call(&s, "resources/read", json!({})).await;
     assert_eq!(r["error"]["code"], -32602);

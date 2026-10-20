@@ -112,6 +112,12 @@ fn example_files() -> BTreeSet<String> {
     fn walk(dir: &Path, base: &Path, out: &mut BTreeSet<String>) {
         for e in std::fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
+            // Not part of the repo: a Finder `.DS_Store`, an editor's swap file.
+            if p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            {
+                continue;
+            }
             if p.is_dir() {
                 walk(&p, base, out);
             } else {
@@ -277,12 +283,16 @@ async fn templates_cover_each_parameterized_uri() {
 }
 
 #[tokio::test]
-async fn an_unknown_uri_is_invalid_params_naming_it() {
+async fn an_unknown_uri_is_resource_not_found_naming_it() {
     let (s, _tmp) = server();
     for uri in ["rupu://docs/nope", "rupu://docs", "file:///etc/passwd"] {
         let r = call(&s, "resources/read", json!({"uri": uri})).await;
-        assert_eq!(r["error"]["code"], -32602, "{uri}: {r}");
-        assert!(r["error"]["message"].as_str().unwrap().contains(uri), "{r}");
+        assert_eq!(
+            r["error"],
+            json!({"code": -32002, "message": format!("resource not found: {uri}"),
+                   "data": {"uri": uri}}),
+            "{uri}"
+        );
     }
 }
 
