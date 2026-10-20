@@ -4,14 +4,16 @@
 // skill needs its project's ws_id).
 
 import { useEffect, useState, type ReactNode } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { api, apiErrorMessage, type SkillDetail, type SkillLayer } from '../lib/api';
 import Markdown from '../components/transcript/Markdown';
 import { Badge } from '../components/ui/Badge';
+import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+
+const BACK = { label: 'Skills', to: '/library?tab=skills' };
 
 export default function SkillDetailPage() {
   const { layer = '', name = '' } = useParams<{ layer: string; name: string }>();
@@ -40,7 +42,7 @@ export default function SkillDetailPage() {
   if (error) {
     return (
       <div className="p-8">
-        <BackLink />
+        <PageHeader back={BACK} title="Skill" />
         <ErrorBanner className="mt-4">{error}</ErrorBanner>
       </div>
     );
@@ -49,8 +51,8 @@ export default function SkillDetailPage() {
   if (!skill) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4">
+        <PageHeader back={BACK} title="Skill" />
+        <div className="mt-6">
           <Spinner label="Loading…" />
         </div>
       </div>
@@ -61,11 +63,10 @@ export default function SkillDetailPage() {
 
   return (
     <div className="p-8">
-      <BackLink />
+      <PageHeader back={BACK} title={<span className="break-all font-mono">{skill.name}</span>} />
 
       <header className="mt-3">
         <div className="flex flex-wrap items-center gap-2">
-          <h1 className="break-all font-mono text-2xl font-semibold text-ink">{skill.name}</h1>
           <ScopeChip scope={skill.layer} />
           {skill.both_layers && <Badge ring>both layers</Badge>}
           {skill.disable_model_invocation && (
@@ -184,17 +185,5 @@ function Code({ children }: { children: ReactNode }) {
     <span className="inline-flex items-center rounded bg-surface px-1.5 py-0.5 font-mono text-note text-ink ring-1 ring-border">
       {children}
     </span>
-  );
-}
-
-function BackLink() {
-  return (
-    <Link
-      to="/library?tab=skills"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Skills
-    </Link>
   );
 }

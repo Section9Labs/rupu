@@ -8,11 +8,13 @@ import { api, scopeSelectorFor, type AutoflowDefRow } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
-import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { TriggerChip } from '../components/TriggerChip';
 import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
@@ -38,20 +40,6 @@ export function EnabledChip({ enabled }: { enabled: boolean }) {
 }
 
 const STEP = 20;
-
-const TRIGGER_CLS: Record<string, string> = {
-  cron:  'bg-violet-50 text-violet-700 ring-violet-200',
-  event: 'bg-sky-50 text-sky-700 ring-sky-200',
-};
-
-function TriggerChip({ trigger }: { trigger: string }) {
-  const cls = TRIGGER_CLS[trigger] ?? 'bg-surface text-ink ring-border';
-  return (
-    <span className={cn('inline-flex items-center rounded ring-1 text-meta font-medium uppercase tracking-wide px-1.5 py-0.5', cls)}>
-      {trigger}
-    </span>
-  );
-}
 
 // Autoflows are workflows with an `autoflow:` block, so they reuse the
 // workflow detail page — keyed by file stem (`slug`), not the parsed display
@@ -209,25 +197,24 @@ export default function AutoflowsDefs() {
 
   return (
     <div className="p-8">
-      <header className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Autoflows</h1>
-          <p className="mt-1 text-sm text-ink-dim">Workflows with autoflow triggers configured.</p>
-        </div>
-        <Button variant="secondary" onClick={() => void load()} className="gap-1.5">
-          <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
-          Refresh
-        </Button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Autoflows"
+        subtitle="Workflows with autoflow triggers configured."
+        actions={
+          <Button variant="secondary" onClick={() => void load()} className="gap-1.5">
+            <RefreshCw size={12} className={cn(refreshing && 'animate-spin')} />
+            Refresh
+          </Button>
+        }
+      />
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
 
       <UnscopedNote className="mb-4">This list covers every customer’s autoflow definitions.</UnscopedNote>
 
       {defs === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading autoflow definitions…" />
-        </div>
+        <ListSkeleton label="Loading autoflow definitions…" />
       ) : defs.length === 0 ? (
         <EmptyState
           icon={<Inbox size={20} />}
