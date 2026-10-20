@@ -54,7 +54,7 @@ the way GitHub SSO uses `gh`'s; a self-managed instance needs its own applicatio
 (`oauth_client_id` below, walkthrough in `docs/scm/gitlab.md`). GitLab OAuth access
 tokens expire two hours after issue: every GitLab connector refreshes its token
 through the credential store before a request when it is within five minutes of
-expiry, so a long-lived `rupu cp serve` / `rupu mcp serve` / session keeps working,
+expiry, so a long-lived `rupu cp serve` (its `/mcp` included) / session keeps working,
 and the rotated token is persisted (under `auth.json.lock`) for every other process.
 A request GitLab refuses (401) is retried once with the token now in the store, so a
 `rupu auth login` reaches processes that are already running. GitHub SSO tokens don't
@@ -294,5 +294,5 @@ Override per-platform via `[scm.<platform>].max_concurrency`.
 
 - `docs/scm/github.md` — GitHub-specific walkthrough (PAT, OAuth, GHES)
 - `docs/scm/gitlab.md` — GitLab-specific walkthrough (PAT, OAuth, self-hosted)
-- `docs/mcp.md` — wiring `rupu mcp serve` into Claude Desktop / Cursor
+- `docs/mcp.md` — connecting Claude Code / Cursor / Claude Desktop to `rupu cp serve`'s `/mcp`
 - `docs/providers.md` — LLM-provider reference (separate auth surface)

@@ -41,7 +41,15 @@ rupu cp serve
 | `--bind <addr>` | `127.0.0.1:7878` | Address and port to listen on. |
 | `--token <token>` | none | Require the token on every `/api/*` route — a bearer header, or the browser cookie the printed link sets (see [Authentication](#authentication)). |
 | `--no-open` | off | Don't open the URL in a browser. By default the URL is opened when running in a terminal; it is always printed. |
+| `--no-web` | off | Serve `/api` and `/mcp` only, no web UI (implies `--no-open`). |
+| `--no-mcp` | off | Don't serve `/mcp`. Refused together with `--no-web`. |
+| `--tools <grant>` | default grant | Narrow the catalog tools `/mcp` serves (agent `tools:` grammar). Refused with `--no-mcp`; a bad grant fails before binding. |
 | `--max-open-files <N>` | — | Raise the process's open-file limit (overrides `RUPU_MAX_OPEN_FILES` and `[runtime].max_open_files`). |
+
+Besides the web UI and `/api`, the server serves an MCP endpoint at `/mcp`
+(streamable HTTP, behind the same token) so Claude Code, Cursor and other MCP
+clients can operate rupu; startup prints its URL and the `claude mcp add`
+line. See [mcp.md](mcp.md).
 
 The web UI is compiled into the `rupu` binary; nothing else needs to be
 installed. `RUPU_HOME` moves the global directory the server reads, which is

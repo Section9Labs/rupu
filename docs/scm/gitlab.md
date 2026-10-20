@@ -26,7 +26,7 @@ rotates on every refresh. Every GitLab connector checks its token before each
 request and refreshes it through the credential store when it is within five
 minutes of expiry. The refresh happens under `auth.json.lock`, so concurrent rupu
 processes don't spend the same refresh token twice, and the rotated token is
-persisted. A long-running `rupu cp serve`, `rupu mcp serve` or session keeps
+persisted. A long-running `rupu cp serve` or session keeps
 working past the two hours. A refresh that fails while the token still works
 (the token endpoint briefly down) is retried after 30 seconds, and the token is
 used meanwhile. Once the token no longer works and the refresh fails (the grant

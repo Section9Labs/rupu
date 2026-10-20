@@ -1359,13 +1359,14 @@ When the repo is tracked under `rupu repos ...`, `rupu webhook serve` also queue
 
 ## MCP mode
 
-Expose `rupu`'s SCM / issue tool surface to another MCP client:
+Expose `rupu` to another MCP client (Claude Code, Cursor, Claude Desktop) over HTTP:
 
 ```sh
-rupu mcp serve --transport stdio
+rupu cp serve --no-web   # MCP at http://127.0.0.1:7878/mcp
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp
 ```
 
-Use this when you want Claude Desktop, Cursor, or another MCP host to operate on the same unified repo / issue abstraction.
+The client gets operator tools (runs, workflows, agents, sessions, messages, `wait`) and the same unified repo / issue tools. See [mcp.md](mcp.md). `rupu mcp serve` (stdio) is deprecated.
 
 ---
 
