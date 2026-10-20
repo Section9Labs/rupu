@@ -196,12 +196,6 @@ pub const EXCLUDED: &[(&str, &str, &str)] = &[
 
 /// Routes not yet operator tools; Plan 2 empties this list.
 pub const PENDING_PLAN_2: &[(&str, &str)] = &[
-    ("GET", "/api/agentiflows"),
-    ("GET", "/api/agentiflows/:id"),
-    ("GET", "/api/agentiflows/:id/children"),
-    ("GET", "/api/agentiflows/:id/events"),
-    ("POST", "/api/agentiflows/:id/steer"),
-    ("GET", "/api/agentiflows/:id/units/:unit_id/output"),
     ("GET", "/api/agentiflows/:id/netflow"),
     ("POST", "/api/agents"),
     ("DELETE", "/api/agents/:name"),

@@ -1,5 +1,11 @@
 [
   "agent_runs.list",
+  "agentiflows.children",
+  "agentiflows.events",
+  "agentiflows.get",
+  "agentiflows.list",
+  "agentiflows.steer",
+  "agentiflows.unit_output",
   "agents.list",
   "agents.run",
   "autoflow_runs.cycles",

@@ -1080,8 +1080,8 @@ async fn get_agentiflow_unit_output(
 /// coordinator that died without finalizing leaves `running` on disk, and a
 /// stop queued there is never drained ([`steerable`]). A write, so `cp serve`
 /// only (501 otherwise).
-#[derive(Deserialize)]
-struct SteerRequest {
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct SteerRequest {
     message: String,
     /// `send --now`: ask for mid-round delivery, not just the round boundary.
     #[serde(default)]
