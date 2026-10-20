@@ -11,6 +11,9 @@ those types live in `crates/rupu-cp/src/api/` (and `rupu_orchestrator` /
 `rupu_transcript` for events). The API is versioned with the binary: a feature
 a peer needs is advertised in `GET /api/host/info` → `features`.
 
+For agents rather than apps, `rupu cp serve` also serves every route here as an
+MCP tool at `/mcp` (plus a `wait` long-poll); see [`mcp.md`](mcp.md).
+
 - [Conventions](#conventions)
 - [Server-sent events](#server-sent-events)
 - [Runs](#runs) · [Run control](#run-control) · [Run views](#run-views)
