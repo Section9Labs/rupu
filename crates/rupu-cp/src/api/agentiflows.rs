@@ -1154,8 +1154,9 @@ enum GeneratedRefusal {
 }
 
 /// The definition the flow in `run_dir` dispatched as `handle`: a direct
-/// child whose request is `generated`, read from its recorded file once that
-/// file's canonical path is under the canonical `<run_dir>/generated/`.
+/// child whose request is `generated`, read from its recorded file once
+/// `rupu_launch::launcher::is_generated_file` places it under the flow's
+/// `generated/`.
 fn generated_definition(
     run_dir: &std::path::Path,
     handle: &str,
@@ -1179,17 +1180,12 @@ fn generated_definition(
     let canonical = file.canonicalize().map_err(|_| {
         GeneratedRefusal::NotFound(format!("the definition child `{handle}` ran is gone"))
     })?;
-    let outside = || {
-        GeneratedRefusal::Outside(format!(
+    // The launcher's own containment rule (a real `generated/`, the
+    // canonical file under it): what it would dispatch is what is served.
+    if !rupu_launch::launcher::is_generated_file(run_dir, &file) {
+        return Err(GeneratedRefusal::Outside(format!(
             "child `{handle}`'s definition is not under the flow's generated/ directory"
-        ))
-    };
-    let dir = run_dir
-        .join("generated")
-        .canonicalize()
-        .map_err(|_| outside())?;
-    if !canonical.starts_with(&dir) {
-        return Err(outside());
+        )));
     }
     let yaml = std::fs::read_to_string(&canonical).map_err(|e| {
         GeneratedRefusal::Unreadable(format!("child `{handle}`'s definition is unreadable: {e}"))

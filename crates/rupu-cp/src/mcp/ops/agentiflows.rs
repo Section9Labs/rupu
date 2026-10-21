@@ -40,7 +40,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "agentiflows.board",
             Method::GET,
             "/api/agentiflows/:id/board",
-            "Read an agentiflow's board: its claims and directives.\n\n`id` is the agentiflow id. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, owner, acquired, lease expiry, ended, state held|released|expired), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
+            "Read an agentiflow's board: its claims and directives.\n\n`id` is the agentiflow id. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, key_known, owner, acquired, lease expiry, ended, state held|released|expired; key_known false means `key` is only the claim file's stem, from a claim written before the journal), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
         )
         .query::<agentiflows::LocalHostQuery>(),
         op(

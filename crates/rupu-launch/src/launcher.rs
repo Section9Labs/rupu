@@ -2015,13 +2015,20 @@ impl RunLauncher {
 }
 
 /// Whether `file` lies inside `<children_dir>/generated/`, where
-/// `workflows.generate` writes.
-fn is_generated_file(children_dir: &Path, file: &Path) -> bool {
-    match (
-        children_dir.join("generated").canonicalize().ok(),
-        file.canonicalize().ok(),
-    ) {
-        (Some(dir), Some(f)) => f.starts_with(dir),
+/// `workflows.generate` writes: `generated` must be a real directory (a
+/// symlinked one would widen what counts as inside), and `file`'s canonical
+/// path must be under the canonical `<children_dir>` joined with
+/// `generated`. The one containment rule for a generated workflow: the
+/// launcher's dispatch and the CP's `GET /api/agentiflows/:id/generated/:handle`
+/// both ask it.
+pub fn is_generated_file(children_dir: &Path, file: &Path) -> bool {
+    let real_dir = std::fs::symlink_metadata(children_dir.join("generated"))
+        .is_ok_and(|m| m.file_type().is_dir());
+    if !real_dir {
+        return false;
+    }
+    match (children_dir.canonicalize(), file.canonicalize()) {
+        (Ok(root), Ok(f)) => f.starts_with(root.join("generated")),
         _ => false,
     }
 }
@@ -2427,6 +2434,37 @@ impl WorkflowGenerator for RunLauncher {
 
 #[cfg(test)]
 mod tests {
+    /// Inside means under a real `generated/` directory: not reached by `..`
+    /// or a symlinked file, and not through a symlinked `generated/`.
+    #[test]
+    fn a_generated_file_is_only_one_under_a_real_generated_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (run, outside) = (tmp.path().join("run"), tmp.path().join("outside"));
+        std::fs::create_dir_all(run.join("generated")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(run.join("generated/wf.yaml"), "x").unwrap();
+        std::fs::write(outside.join("wf.yaml"), "x").unwrap();
+        assert!(is_generated_file(&run, &run.join("generated/wf.yaml")));
+        assert!(!is_generated_file(
+            &run,
+            &run.join("generated/../../outside/wf.yaml")
+        ));
+        std::os::unix::fs::symlink(outside.join("wf.yaml"), run.join("generated/link.yaml"))
+            .unwrap();
+        assert!(!is_generated_file(&run, &run.join("generated/link.yaml")));
+        assert!(!is_generated_file(
+            &run,
+            &run.join("generated/missing.yaml")
+        ));
+
+        let linked = tmp.path().join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside, linked.join("generated")).unwrap();
+        assert!(!is_generated_file(
+            &linked,
+            &linked.join("generated/wf.yaml")
+        ));
+    }
     use super::*;
 
     /// `workflows.generate`'s provider is resolved once per caller provider

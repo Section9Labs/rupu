@@ -115,7 +115,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.board",
             Method::GET,
             "/api/runs/:id/board",
-            "Read a run's board: the claims and directives in its message space.\n\n`id` is the run id; `host` picks a remote host. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, owner, acquired, lease expiry, ended, state held|released|expired), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
+            "Read a run's board: the claims and directives in its message space.\n\n`id` is the run id; `host` picks a remote host. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, key_known, owner, acquired, lease expiry, ended, state held|released|expired; key_known false means `key` is only the claim file's stem, from a claim written before the journal), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
         )
         .query::<board::BoardQuery>(),
         op(

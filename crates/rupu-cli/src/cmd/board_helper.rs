@@ -1,6 +1,7 @@
 //! The hidden `rupu __board <id>`: what an SSH coordinator runs on a remote
 //! host to read a run's board. Its stdout is a contract with `rupu-cp`'s SSH
-//! connector (`rupu_cp::host::ssh::board_argv`):
+//! connector (`rupu_cp::host::ssh::board_argv`), emitted by
+//! [`emit_helper_reply`] as `rupu __message`'s is:
 //!
 //! - success prints one JSON object, the `BoardView`
 //!   (`rupu_runtime::services::board`) of the message space `<id>` names, and
@@ -14,39 +15,21 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use rupu_runtime::services::board::board_view;
-use rupu_runtime::services::operator::{
-    MessageError, MessageErrorCode, MessageErrorReply, MessageRoot,
-};
+use rupu_runtime::services::board::{board_view, BoardView};
+use rupu_runtime::services::operator::{MessageError, MessageErrorCode, MessageRoot};
 
+use crate::cmd::message::emit_helper_reply;
 use crate::paths;
 
-/// The exit status of a failed `rupu __board`.
-const HELPER_FAILED: u8 = 3;
-
 pub fn handle(id: &str) -> ExitCode {
-    let internal =
-        |e: &dyn std::fmt::Display| MessageError::new(MessageErrorCode::Internal, e.to_string());
-    let reply = paths::global_dir()
-        .map_err(|e| internal(&e))
-        .and_then(|global| view(&global, id))
-        .and_then(|view| serde_json::to_string(&view).map_err(|e| internal(&e)));
-    match reply {
-        Ok(json) => {
-            println!("{json}");
-            ExitCode::SUCCESS
-        }
-        Err(error) => {
-            match serde_json::to_string(&MessageErrorReply { error }) {
-                Ok(json) => println!("{json}"),
-                Err(_) => println!(r#"{{"error":{{"code":"internal","message":"serialize"}}}}"#),
-            }
-            ExitCode::from(HELPER_FAILED)
-        }
-    }
+    emit_helper_reply(
+        paths::global_dir()
+            .map_err(|e| MessageError::new(MessageErrorCode::Internal, e.to_string()))
+            .and_then(|global| view(&global, id)),
+    )
 }
 
-fn view(global: &Path, id: &str) -> Result<rupu_runtime::services::board::BoardView, MessageError> {
+fn view(global: &Path, id: &str) -> Result<BoardView, MessageError> {
     let root = MessageRoot::resolve(global, id).map_err(|e| MessageError::from(&e))?;
     board_view(&root.space, chrono::Utc::now()).map_err(|e| {
         MessageError::new(

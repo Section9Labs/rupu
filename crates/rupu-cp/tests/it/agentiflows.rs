@@ -896,4 +896,31 @@ async fn generated_definition_is_served_and_path_checked() {
     assert_eq!(status, 501);
     let (status, _) = get(addr, "/api/agentiflows/af_01NOSUCHFLOW/generated/ch_gen").await;
     assert_eq!(status, 404);
+
+    // A flow whose `generated/` is itself a symlink to a directory outside
+    // it: what is reached through it is not the flow's.
+    let af2 = "af_01GENERATEDLINK00000000000";
+    let run2 = agentiflow_dir(global).join(af2);
+    record(af2, "2026-10-21T00:00:00Z", "running")
+        .write(&run2)
+        .unwrap();
+    let elsewhere = global.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("planted.yaml"), "name: planted\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, run2.join("generated")).unwrap();
+    launched(
+        &run2,
+        "ch_planted",
+        ChildKind::Workflow,
+        "run_01GENF",
+        1,
+        Some(1),
+        Some((&run2.join("generated").join("planted.yaml"), true)),
+    );
+    let (status, body) = get(
+        addr,
+        &format!("/api/agentiflows/{af2}/generated/ch_planted"),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
 }
