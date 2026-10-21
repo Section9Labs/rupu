@@ -1438,9 +1438,11 @@
 }
 .afx-lead {
   display: flex; align-items: baseline; gap: 8px; padding: 4px 0; white-space: nowrap;
-  font-size: 12px; color: rgb(var(--c-ink-mute));
+  /* Two columns wide at most: it never runs under the canvas's summary chip. */
+  max-width: 488px; font-size: 12px; color: rgb(var(--c-ink-mute));
 }
-.afx-lead b { color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-lead b { flex: none; color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-lead span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* A workflow child's frame. */
 .afx-frame {
@@ -1499,6 +1501,9 @@
   padding: 10px 12px 0; font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
 }
 .afx-rail-node .afx-rail { overflow: visible; }
+/* Arcs land on an item's anchor (or a section's "earlier" row), never on
+ * the rail's own port. */
+.afx-rail-node > .react-flow__handle.gx-port { opacity: 0; pointer-events: none; }
 .afx-rail-node .afx-rail-body,
 .afx-rail-compact .afx-rail-body {
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
@@ -1509,13 +1514,24 @@
   border: 1.5px solid rgb(var(--c-ink-mute) / 0.6); background: rgb(var(--gx-card));
 }
 
-/* The operator's entry, left of the spine. */
-.afx-entry {
-  padding: 2px 8px; border: 1px solid rgb(var(--c-sev-critical) / 0.5); border-radius: 999px;
-  background: rgb(var(--c-panel)); font-size: 11px; font-weight: 600; color: rgb(var(--c-sev-critical));
-  white-space: nowrap;
+/* A section's folded items, and the row that opens it in place. */
+.afx-rail-earlier {
+  position: relative; display: block; width: 100%; margin: 0 0 6px; padding: 4px 8px;
+  border: 1px dashed rgb(var(--c-border-strong)); border-radius: 8px; background: none;
+  font-size: 11px; color: rgb(var(--c-ink-mute)); text-align: left; cursor: pointer;
+  transition: background-color 120ms var(--ease-out), color 120ms var(--ease-out);
 }
-.afx-entry .react-flow__handle { opacity: 0; }
+.afx-rail-earlier:hover { background: rgb(var(--c-surface-hover)); color: rgb(var(--c-ink)); }
+.afx-rail-compact .afx-rail-earlier { width: auto; margin: 0; padding: 2px 7px; }
+/* A frame's strip with nothing on its board. */
+.afx-rail-none { display: flex; align-items: baseline; gap: 6px; color: rgb(var(--c-ink-mute)); }
+.afx-rail-none .afx-rail-h { margin: 0; }
+
+/* A stub's far end: the operator, or an address off the map. */
+.afx-msg-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em; stroke: none; pointer-events: none;
+  animation: rgx-fade 240ms ease-out backwards;
+}
 
 /* The panels under the canvas. */
 .afx-panel {

@@ -14,15 +14,18 @@ const model = buildFlowModel(fixtureInput());
 
 describe('BoardRail', () => {
   it('board_unavailable_is_said_in_place', () => {
-    wrap(<BoardRail board={{ kind: 'unavailable', reason: 'host too old' }} posts={[]} onSelect={() => {}} />);
-    expect(screen.getByText(/this host can't show the board/)).toBeInTheDocument();
-    expect(screen.getByText(/host too old/)).toBeInTheDocument();
+    // The reason is the sentence (`boardUnavailable` writes it).
+    wrap(<BoardRail board={{ kind: 'unavailable', reason: 'This host can\'t show the board: too old.' }} posts={[]} onSelect={() => {}} />);
+    expect(screen.getByText("This host can't show the board: too old.")).toBeInTheDocument();
     expect(screen.queryByText('Claims')).toBeNull();
+    cleanup();
+    wrap(<BoardRail board={{ kind: 'unavailable', reason: '' }} posts={[]} onSelect={() => {}} />);
+    expect(screen.getByText("This host can't show the board.")).toBeInTheDocument();
   });
 
   it('an_unavailable_board_still_lists_its_posts', () => {
     wrap(<BoardRail board={{ kind: 'unavailable', reason: 'host too old' }} posts={model.board.posts} onSelect={() => {}} />);
-    expect(screen.getByText(/this host can't show the board/)).toBeInTheDocument();
+    expect(screen.getByText('host too old')).toBeInTheDocument();
     expect(screen.getByText(/token-fixation advisory/)).toBeInTheDocument();
     expect(screen.queryByText('Claims')).toBeNull();
   });

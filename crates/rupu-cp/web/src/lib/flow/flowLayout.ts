@@ -27,7 +27,8 @@ export const FRAME_PLACEHOLDER: Size = { width: 480, height: 220 };
 /** The board rail's width and its gap from the widest block. */
 export const RAIL_W = 260;
 export const RAIL_GAP = 96;
-/** How far left of the spine the operator enters. */
+/** How far left of the spine the map reaches (the operator's entry stubs
+ *  and their labels at the round cards). */
 export const OPERATOR_GAP = 96;
 
 export interface FlowLayout {
@@ -39,7 +40,7 @@ export interface FlowLayout {
   frames: Map<string, Pos>;
   /** The board rail's left edge. */
   railX: number;
-  /** Where operator messages enter, left of the spine. */
+  /** The map's left reach: where the operator's stubs and labels end. */
   operator: { x: number; y: number };
   width: number;
   height: number;

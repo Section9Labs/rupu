@@ -13,6 +13,7 @@ import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import { FileCode2, PenLine, Workflow } from 'lucide-react';
 import type { RunChild } from '../../lib/api';
 import type { FlowBoardSpace } from '../../lib/flow/flowModel';
+import { STRIP_LIMIT, type RailSection } from '../../lib/flow/flowEdges';
 import { FRAME_HEAD } from '../../lib/flow/flowLayout';
 import { StatusCapsule } from '../graph/NodeFrame';
 import BoardRail from './BoardRail';
@@ -30,6 +31,9 @@ export interface WorkflowFrameData extends Record<string, unknown> {
   loaded: boolean;
   error: string | null;
   board: FlowBoardSpace | null;
+  /** The strip's sections opened past their latest items. */
+  boardOpen: ReadonlySet<RailSection>;
+  onBoardOpen: (node: string, section: RailSection, open: boolean) => void;
   messages: number;
   onLoad: (childRunId: string) => void;
   onDefinition: (child: RunChild) => void;
@@ -91,6 +95,9 @@ function WorkflowFrameView({ data }: NodeProps<FrameFlowNode>) {
             posts={data.board!.posts}
             onSelect={data.onSelectMessage}
             anchor={data.anchor}
+            limit={STRIP_LIMIT}
+            open={data.boardOpen}
+            onOpen={(section, open) => data.onBoardOpen(c.run_id, section, open)}
           />
         </div>
       )}

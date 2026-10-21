@@ -97,7 +97,12 @@ function overlay(revealed: Set<string> | null = null) {
 }
 
 const arcs = () => rf.edges.filter((e) => e.type === 'message' && !e.hidden);
-const arcPairs = () => arcs().map((e) => `${(e.data as { message: { id: string } }).message.id}:${e.source}->${e.target}`);
+/** `<message>:<source>-><target>`; a stub as `<message>:<stub>@<card>`. */
+const arcPairs = () =>
+  arcs().map((e) => {
+    const d = e.data as { message: { id: string }; stub?: string };
+    return d.stub ? `${d.message.id}:${d.stub}@${e.source}` : `${d.message.id}:${e.source}->${e.target}`;
+  });
 const shownNodes = () => rf.nodes.filter((n) => !n.hidden).map((n) => n.id);
 
 describe('RunGraph overlay', () => {
@@ -113,21 +118,23 @@ describe('RunGraph overlay', () => {
     // The step graph is still the step graph.
     expect(rf.edges.filter((e) => e.type === 'run').map((e) => e.id)).toEqual(['collect->probe', 'probe->report']);
     // Arcs between the steps' cards: a loop for the units of one step, the
-    // operator from its entry, the board post onto its item on the rail, and
-    // the dead end off canvas.
+    // board post onto its item on the rail; the operator's (and an off-map
+    // sender's) as a short entry at each card it reached, the message that
+    // reached nobody as a dead end beside its sender.
     expect(arcPairs()).toEqual(
       expect.arrayContaining([
         'msg_r3:collect->rail',
-        'msg_r4:operator->collect',
-        'msg_r4:operator->probe',
-        'msg_r4:operator->report',
+        'msg_r4:enter@collect',
+        'msg_r4:enter@probe',
+        'msg_r4:enter@report',
         'msg_r1:probe->probe',
         'msg_r2:probe->report',
-        'msg_r5:report->offcanvas',
-        'msg_r6:offcanvas->report',
+        'msg_r5:dead@report',
+        'msg_r6:enter@report',
         `claim:package-lock.json:${RUN_BOARD.claims[0].acquired_at}:collect->rail`,
       ]),
     );
+    expect(arcs().find((e) => e.id.startsWith('m:run:msg_r6:'))!.data).toMatchObject({ label: 'off map' });
     const post = arcs().find((e) => e.id.startsWith('m:run:msg_r3:'))!;
     expect(post.targetHandle).toBe('msg_r3');
     // The rail is on the canvas, to the right of every card.
@@ -137,9 +144,8 @@ describe('RunGraph overlay', () => {
     const railEl = screen.getByTestId('node-rail');
     expect(within(railEl).getByText('claim: package-lock.json')).toBeInTheDocument();
     expect(within(railEl).getByText('package-lock.json')).toBeInTheDocument();
-    // The entries sit left of the graph.
-    expect(screen.getByTestId('flow-entry-operator')).toBeInTheDocument();
-    expect(rf.nodes.find((n) => n.id === 'operator')!.position.x).toBeLessThan(0);
+    // No entry nodes: nothing but the steps and the rail is on the canvas.
+    expect(rf.nodes.map((n) => n.id)).toEqual(['collect', 'probe', 'report', 'rail']);
     // The dead end draws dashed.
     expect(screen.getByTestId('msg-arc-msg_r5').closest('g')).toHaveAttribute('data-dead', 'true');
   });
@@ -171,9 +177,8 @@ describe('RunGraph overlay', () => {
     expect(screen.getByTestId('rg-summary')).toHaveTextContent('1 done');
   });
 
-  it('a_claim_writer_off_canvas_gets_its_entry', () => {
-    // No message touches off canvas, but a claim's owner no step answers to
-    // is there: its arc needs the entry it leaves from.
+  it('a_claim_writer_off_canvas_enters_at_its_item', () => {
+    // A claim's owner no step answers to: a short entry into its item.
     const board = { ...RUN_BOARD, claims: [{ ...RUN_BOARD.claims[0], owner: 'ghost#2' }] };
     render(
       <RunGraph
@@ -182,7 +187,8 @@ describe('RunGraph overlay', () => {
         overlay={{ messages: [], board, writers: new Map([['ghost#2', 'offcanvas']]), revealed: null }}
       />,
     );
-    expect(rf.nodes.map((n) => n.id)).toContain('offcanvas');
-    expect(arcPairs()).toEqual([`claim:package-lock.json:${RUN_BOARD.claims[0].acquired_at}:offcanvas->rail`]);
+    expect(rf.nodes.map((n) => n.id)).not.toContain('offcanvas');
+    expect(arcPairs()).toEqual([`claim:package-lock.json:${RUN_BOARD.claims[0].acquired_at}:enter@rail`]);
+    expect(arcs()[0].targetHandle).toBe(`claim:package-lock.json:${RUN_BOARD.claims[0].acquired_at}`);
   });
 });

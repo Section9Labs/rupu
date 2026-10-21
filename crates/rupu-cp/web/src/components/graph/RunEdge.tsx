@@ -5,10 +5,20 @@
 // travels along it toward the step (amber and slower toward a gate that waits
 // on the operator); out of a failed step it is a faint dashed red dead end.
 // Motion lives in styles/graph-motion.css; colors arrive resolved in `data`.
+//
+// Many edges out of one source (an agentiflow round into 23 children) share
+// one trunk: the edge to the farthest target draws it (`trunk`), out of the
+// source and down a line in the gutter, and each other edge draws only its
+// short branch off that line (`branch`), so the halos never stack.
 
 import { memo, useId } from 'react';
 import { getBezierPath, type Edge, type EdgeProps } from '@xyflow/react';
 import { svgId, type EdgeTone } from '../../lib/graph/runMotion';
+import { roundedPath } from '../../lib/graph/polyline';
+
+/** How far into the gutter a shared trunk runs. */
+export const TRUNK_DX = 28;
+const TRUNK_RADIUS = 12;
 
 export interface RunEdgeData extends Record<string, unknown> {
   tone: EdgeTone;
@@ -20,6 +30,20 @@ export interface RunEdgeData extends Record<string, unknown> {
   light: string;
   /** Entrance slot of the source node (see `useEntranceSlots`). */
   slot: number;
+  /** One of several edges out of its source: the one that draws the shared
+   *  trunk, or a branch off it. */
+  trunk?: 'trunk' | 'branch';
+}
+
+/** The trunk's or a branch's path (see the header). */
+function trunkPath(role: 'trunk' | 'branch', sx: number, sy: number, tx: number, ty: number): string {
+  const x = sx + TRUNK_DX;
+  if (role === 'trunk') return roundedPath([{ x: sx, y: sy }, { x, y: sy }, { x, y: ty }, { x: tx, y: ty }], TRUNK_RADIUS);
+  const dir = Math.sign(ty - sy);
+  // Level with the source: the trunk's own first leg covers it.
+  if (dir === 0) return roundedPath([{ x, y: sy }, { x: tx, y: ty }], TRUNK_RADIUS);
+  const from = Math.abs(ty - sy) > TRUNK_RADIUS ? ty - dir * TRUNK_RADIUS : sy;
+  return roundedPath([{ x, y: from }, { x, y: ty }, { x: tx, y: ty }], TRUNK_RADIUS);
 }
 
 export type RunFlowEdge = Edge<RunEdgeData, 'run'>;
@@ -35,7 +59,9 @@ function RunEdgeView({
 }: EdgeProps<RunFlowEdge>) {
   const gid = svgId('rgx-g', useId());
   if (!data) return null;
-  const [path] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+  const path = data.trunk
+    ? trunkPath(data.trunk, sourceX, sourceY, targetX, targetY)
+    : getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })[0];
   const flowing = data.tone === 'live' || data.tone === 'await';
 
   return (

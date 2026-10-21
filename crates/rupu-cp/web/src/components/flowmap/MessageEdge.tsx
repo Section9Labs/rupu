@@ -1,13 +1,19 @@
 // MessageEdge — a message as an arc between two cards (xyflow edge `message`).
 // The run graph's edge family: same round caps and draw-in, a packet that
 // travels once when the message arrives, a dashed red dead end when it
-// reached nobody. Hover shows the body. Motion is in styles/graph-motion.css.
+// reached nobody. Hover shows the body. The route (`arcRoute`) leaves a card
+// from its side and runs through the gutters, from the card boxes the map
+// hands over (`from` / `to`) and xyflow's anchor point for a board item; a
+// stub is drawn short at its one card. Motion is in styles/graph-motion.css.
 
 import { memo, useState } from 'react';
 import type { Edge, EdgeProps } from '@xyflow/react';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { deadPaint, messagePaint } from '../../lib/flow/messagePaint';
-import type { FlowMessage } from '../../lib/flow/flowModel';
+import type { FlowMessage, FlowUndelivered } from '../../lib/flow/flowModel';
+import type { Stub } from '../../lib/flow/flowEdges';
+import { ARC_RADIUS, routeArc, spreadOf, stubRoute, type Box } from '../../lib/flow/arcRoute';
+import { cutAt, pointAt, roundedPath, type Pt } from '../../lib/graph/polyline';
 import { undeliveredText } from '../../lib/messages';
 
 export interface MessageEdgeData extends Record<string, unknown> {
@@ -17,6 +23,17 @@ export interface MessageEdgeData extends Record<string, unknown> {
   arriving: boolean;
   /** Selects the message (its list row). */
   onSelect?: (id: string) => void;
+  /** The sender's card (a stub's one card), as laid out. */
+  from?: Box;
+  /** The receiver's card; absent for a board item (xyflow's anchor point). */
+  to?: Box;
+  stub?: Stub;
+  /** The cards an arc's runs keep clear of (shared by every arc). */
+  obstacles?: readonly Box[];
+  /** A stub's far end: `operator` or `off map`. */
+  label?: string;
+  /** The recipient this end never reached (else looked up by target). */
+  dead?: FlowUndelivered;
 }
 
 export type MessageFlowEdge = Edge<MessageEdgeData, 'message'>;
@@ -25,56 +42,80 @@ export type MessageFlowEdge = Edge<MessageEdgeData, 'message'>;
 const DEAD_AT = 0.72;
 const BODY_CHARS = 280;
 
-interface Pt {
-  x: number;
-  y: number;
-}
-const lerp = (a: Pt, b: Pt, t: number): Pt => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
 const f = (n: number) => Math.round(n * 10) / 10;
 
-/** The arc: a quadratic bowed to one side of the chord; a loop on the node
- *  for a message from a card to itself. Returns the path from `from` to the
- *  point at `t` (the whole arc at 1), that point, and the arc's midpoint. */
-function arc(from: Pt, to: Pt, self: boolean, t: number): { d: string; end: Pt; mid: Pt } {
-  if (self) {
-    const c1 = { x: from.x + 44, y: from.y - 40 };
-    const c2 = { x: from.x + 44, y: from.y + 40 };
-    const end = { x: from.x, y: from.y };
-    return {
-      d: `M ${f(from.x)} ${f(from.y)} C ${f(c1.x)} ${f(c1.y)}, ${f(c2.x)} ${f(c2.y)}, ${f(end.x)} ${f(end.y)}`,
-      end,
-      mid: { x: from.x + 33, y: from.y },
-    };
-  }
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const bow = Math.min(60, len * 0.22);
-  const ctl = { x: (from.x + to.x) / 2 + (-dy / len) * bow, y: (from.y + to.y) / 2 + (dx / len) * bow };
-  const mid = lerp(lerp(from, ctl, 0.5), lerp(ctl, to, 0.5), 0.5);
-  if (t >= 1) return { d: `M ${f(from.x)} ${f(from.y)} Q ${f(ctl.x)} ${f(ctl.y)} ${f(to.x)} ${f(to.y)}`, end: to, mid };
-  // De Casteljau: the sub-curve from the start to t.
-  const a = lerp(from, ctl, t);
-  const b = lerp(ctl, to, t);
-  const end = lerp(a, b, t);
-  return { d: `M ${f(from.x)} ${f(from.y)} Q ${f(a.x)} ${f(a.y)} ${f(end.x)} ${f(end.y)}`, end, mid };
+/** A card's message to itself (units of one step): a loop over its top,
+ *  clear of the ports and the edges at its sides. */
+function topLoop(b: Box): { d: string; mid: Pt; start: Pt } {
+  const cx = b.x + b.width * 0.72;
+  const a = { x: cx - 14, y: b.y };
+  const z = { x: cx + 14, y: b.y };
+  return {
+    d: `M ${f(a.x)} ${f(a.y)} C ${f(a.x - 16)} ${f(a.y - 40)}, ${f(z.x + 16)} ${f(z.y - 40)}, ${f(z.x)} ${f(z.y)}`,
+    mid: { x: cx, y: b.y - 30 },
+    start: z,
+  };
 }
 
-function MessageEdgeView({ id, source, target, sourceX, sourceY, targetX, targetY, data }: EdgeProps<MessageFlowEdge>) {
+/** The same without a box: a loop off the port. */
+function loop(from: Pt): { d: string; mid: Pt } {
+  const c1 = { x: from.x + 44, y: from.y - 40 };
+  const c2 = { x: from.x + 44, y: from.y + 40 };
+  return {
+    d: `M ${f(from.x)} ${f(from.y)} C ${f(c1.x)} ${f(c1.y)}, ${f(c2.x)} ${f(c2.y)}, ${f(from.x)} ${f(from.y)}`,
+    mid: { x: from.x + 33, y: from.y },
+  };
+}
+
+const slotOf = (key: string) => Math.abs(spreadOf(key)) % 3;
+
+function MessageEdgeView({
+  id,
+  source,
+  target,
+  targetHandleId,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  data,
+}: EdgeProps<MessageFlowEdge>) {
   const colors = useThemeColors();
   const [hover, setHover] = useState(false);
   if (!data) return null;
-  const { message, highlighted, arriving } = data;
-  const self = source === target;
-  const dead = message.undelivered.find((u) => u.to === target);
+  const { message, highlighted, arriving, stub } = data;
+  const dead = data.dead ?? message.undelivered.find((u) => u.to === target);
   const paint = messagePaint(message.kind, colors);
-  const from = { x: sourceX, y: sourceY };
-  const to = { x: targetX, y: targetY };
-  const full = arc(from, to, self, 1);
-  const shown = dead && !self ? arc(from, to, false, DEAD_AT) : full;
+  // A board item's anchor; a card's box when the map gave one.
+  const point = { x: targetX, y: targetY };
+  const source0 = data.from ?? { x: sourceX, y: sourceY, width: 0, height: 0 };
+  let full: { d: string; mid: Pt };
+  let shownD: string;
+  let tip: Pt;
+  let far: Pt | null = null;
+  if (stub) {
+    // A board item's stub sits at its anchor, a card's at the card.
+    const at = targetHandleId ? point : (data.from ?? point);
+    const ps = stubRoute(at, stub, slotOf(id));
+    const d = roundedPath(ps, 8);
+    full = { d, mid: pointAt(ps, 0.5) };
+    shownD = d;
+    tip = ps[ps.length - 1];
+    far = stub === 'enter' ? ps[0] : ps[ps.length - 1];
+  } else if (source === target && !targetHandleId) {
+    const l = data.from ? topLoop(data.from) : null;
+    full = l ?? loop({ x: sourceX, y: sourceY });
+    shownD = full.d;
+    tip = l?.start ?? { x: sourceX, y: sourceY };
+  } else {
+    const ps = routeArc(source0, targetHandleId ? point : (data.to ?? point), spreadOf(message.id), data.obstacles);
+    full = { d: roundedPath(ps, ARC_RADIUS), mid: pointAt(ps, 0.5) };
+    const cut = dead ? cutAt(ps, DEAD_AT) : ps;
+    shownD = dead ? roundedPath(cut, ARC_RADIUS) : full.d;
+    tip = cut[cut.length - 1];
+  }
   const stroke = dead ? deadPaint(colors).stroke : paint.stroke;
   const body = message.body.length > BODY_CHARS ? `${message.body.slice(0, BODY_CHARS)}…` : message.body;
-  const tip = shown.end;
 
   return (
     <g
@@ -83,15 +124,20 @@ function MessageEdgeView({ id, source, target, sourceX, sourceY, targetX, target
       data-highlighted={highlighted}
       data-dead={dead ? 'true' : undefined}
     >
-      <path className="afx-msg-halo" d={shown.d} pathLength={1} stroke={stroke} />
+      <path className="afx-msg-halo" d={shownD} pathLength={1} stroke={stroke} />
       {dead ? (
         // Dashed in real units (no pathLength), so the dash survives; it
         // fades in rather than drawing.
-        <path className="afx-msg-dashed" d={shown.d} stroke={stroke} strokeDasharray={deadPaint(colors).dash} />
+        <path className="afx-msg-dashed" d={shownD} stroke={stroke} strokeDasharray={deadPaint(colors).dash} />
       ) : (
-        <path className="afx-msg-base" d={shown.d} pathLength={1} stroke={stroke} />
+        <path className="afx-msg-base" d={shownD} pathLength={1} stroke={stroke} />
       )}
-      {arriving && !dead && <path className="afx-msg-packet" d={shown.d} pathLength={1} stroke={stroke} />}
+      {arriving && !dead && <path className="afx-msg-packet" d={shownD} pathLength={1} stroke={stroke} />}
+      {far && data.label && (
+        <text className="afx-msg-label" x={f(far.x) - 4} y={f(far.y) + 3} textAnchor="end" fill={stroke}>
+          {data.label}
+        </text>
+      )}
       {dead && (
         <g className="afx-msg-dead" transform={`translate(${f(tip.x)} ${f(tip.y)})`} stroke={deadPaint(colors).stroke}>
           <title>{undeliveredText({ to: dead.address, reason: dead.reason })}</title>

@@ -3,7 +3,9 @@ import { KIND_FILTERS, type KindFilter } from '../messages';
 import { buildFlowModel, type FlowModel } from './flowModel';
 import {
   RAIL,
+  boardAnchors,
   boardAnchorKeys,
+  railWindow,
   claimMessages,
   makeRouter,
   messageArcs,
@@ -31,11 +33,15 @@ const opts = (over: Partial<ArcOptions> = {}): ArcOptions => ({
   focus: null,
   hover: null,
   selected: null,
-  anchors: new Set(),
+  anchors: new Map(),
   ...over,
 });
 
-const model = buildFlowModel(fixtureInput());
+// Every arc at rest (the fixture's flow space is past ARC_REST_LIMIT; the
+// rest rule has its own test in flowModel).
+const model = ((m: FlowModel) => ({ ...m, messages: m.messages.map((x) => ({ ...x, atRest: true })) }))(
+  buildFlowModel(fixtureInput()),
+);
 const msg = (id: string) => model.messages.find((m) => m.id === id)!;
 
 describe('flowEdges', () => {
@@ -46,8 +52,8 @@ describe('flowEdges', () => {
     // The lead lands on the round it was in at the message's time.
     expect(router.anchorOf('lead', msg('msg_001'))).toEqual({ node: 'round:0' });
     expect(router.anchorOf('lead', msg('msg_015'))).toEqual({ node: 'round:2' });
-    // An operator message enters at the operator; a board write at its item.
-    expect(router.anchorOf('operator', msg('msg_007'))).toEqual({ node: 'operator' });
+    // The operator is no card (its arcs are stubs); a board write lands at its item.
+    expect(router.anchorOf('operator', msg('msg_007'))).toBeNull();
     expect(router.anchorOf('board', msg('msg_016'))).toEqual({ node: RAIL, handle: 'msg_016' });
     expect(router.anchorOf(`${RUN.gannet1}/probe`, msg('msg_009'))).toEqual({ node: `${RUN.gannet1}/probe` });
     // A frame not drawn: its round; a "+N more" round: its more card.
@@ -105,7 +111,7 @@ describe('flowEdges', () => {
     const owl = messageArcs(model.messages, router, opts({ participant: 'owl#1' }));
     expect(new Set(owl.map((a) => a.message.id))).toEqual(new Set(['msg_017', 'msg_018']));
     // A board write lands on its item only when the board shows it.
-    const anchors = new Set(boardAnchorKeys(RAIL, FLOW_BOARD, model.board.posts));
+    const anchors = new Map(boardAnchorKeys(RAIL, FLOW_BOARD, model.board.posts).map((k) => [k, k.slice(k.indexOf('|') + 1)]));
     const post = messageArcs(model.messages, router, opts({ anchors })).find((a) => a.message.id === 'msg_016')!;
     expect(post).toMatchObject({ target: RAIL, targetHandle: 'msg_016' });
     const bare = messageArcs(model.messages, router, opts()).find((a) => a.message.id === 'msg_016')!;
@@ -142,5 +148,58 @@ describe('flowEdges', () => {
     expect(placed).toBe(1);
     const router = makeRouter(m, drawn(m));
     expect(router.anchorOf('lead', m.messages.find((x) => x.id === 'msg_900')!)).toEqual({ node: `round:${placed}` });
+  });
+
+  it('outside_ends_and_dead_ends_are_stubs_at_their_one_card', () => {
+    const input = fixtureInput();
+    const extra = [
+      { id: 'msg_980', ts: at(100), kind: 'direct' as const, from: 'kite#1', to: 'operator', body: 'decide', delivery: { resolved: ['operator'] }, seen: [] },
+      {
+        id: 'msg_981', ts: at(101), kind: 'direct' as const, from: 'kite#1', to: 'ghost#4', body: 'gone',
+        delivery: { resolved: [], undelivered: [{ to: 'ghost#4', reason: 'unknown_participant' }] }, seen: [],
+      },
+      { id: 'msg_982', ts: at(102), kind: 'direct' as const, from: 'stranger#2', to: 'kite#1', body: 'hi', delivery: { resolved: ['kite#1'] }, seen: [] },
+    ];
+    input.spaces = [{ ...input.spaces[0], messages: [...FLOW_MESSAGES, ...extra] }, input.spaces[1]];
+    const m = buildFlowModel(input);
+    for (const x of m.messages) x.atRest = true;
+    const arcs = messageArcs(m.messages, makeRouter(m, drawn(m)), opts());
+    const of = (id: string) => arcs.filter((a) => a.message.id === id).map((a) => [a.stub, a.source, a.target, a.label]);
+    // The operator's message enters the card it reached (the lead's round).
+    expect(of('msg_007')).toEqual([['enter', 'round:1', 'round:1', 'operator']]);
+    // A message to the operator leaves its sender.
+    expect(of('msg_980')).toEqual([['exit', RUN.kite1, RUN.kite1, 'operator']]);
+    // Nobody answers to the address: a dead end beside the sender, with why.
+    expect(of('msg_981')).toEqual([['dead', RUN.kite1, RUN.kite1, undefined]]);
+    expect(arcs.find((a) => a.message.id === 'msg_981')!.dead).toMatchObject({ address: 'ghost#4', reason: 'unknown_participant' });
+    // An address the CP can't place sends from off the map.
+    expect(of('msg_982')).toEqual([['enter', RUN.kite1, RUN.kite1, 'off map']]);
+    // None of them is a card: counts and lit ends are the cards only.
+    expect(makeRouter(m, drawn(m)).endsOf(m.messages.find((x) => x.id === 'msg_980')!)).toEqual([RUN.kite1]);
+  });
+
+  it('a_rail_section_shows_its_latest_items_and_folds_the_rest_onto_one_row', () => {
+    const many = Array.from({ length: 8 }, (_, i) => ({ ...model.board.posts[0], id: `p${i}` }));
+    const w = railWindow(FLOW_BOARD, many, new Set(), 3);
+    expect(w.posts.items.map((p) => p.id)).toEqual(['p5', 'p6', 'p7']);
+    expect(w.posts.earlier).toBe(5);
+    // Folded posts land on the "earlier" row; shown ones on themselves.
+    expect(w.handleOf.get('p0')).toBe('earlier:posts');
+    expect(w.handleOf.get('p7')).toBe('p7');
+    // A held claim and a standing directive always show.
+    expect(FLOW_BOARD.claims.some((c) => c.state === 'held')).toBe(true);
+    const tight = railWindow(FLOW_BOARD, [], new Set(), 0);
+    expect(tight.claims.items.every((c) => c.state === 'held')).toBe(true);
+    expect(tight.claims.items).toHaveLength(FLOW_BOARD.claims.filter((c) => c.state === 'held').length);
+    expect(tight.directives.items.every((d) => !d.retracted)).toBe(true);
+    // Opened, everything shows.
+    const open = railWindow(FLOW_BOARD, many, new Set(['posts']), 3);
+    expect(open.posts.items).toHaveLength(8);
+    expect(open.posts.earlier).toBe(0);
+    // An arc to a folded post lands on the row.
+    const post = { ...model.messages.find((x) => x.id === 'msg_016')!, atRest: true };
+    const anchors = new Map(boardAnchors(RAIL, railWindow(FLOW_BOARD, [post, ...many], new Set(), 3)));
+    const arc = messageArcs([post], makeRouter(model, drawn(model)), opts({ anchors }))[0];
+    expect(arc).toMatchObject({ target: RAIL, targetHandle: 'earlier:posts' });
   });
 });

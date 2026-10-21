@@ -10,14 +10,16 @@
 //
 // With an `overlay` (a run with a message space, spec
 // `2026-10-21-rupu-agentiflow-flow-design.md` goal 6) the graph also carries
-// the run's messages as arcs between its step cards, the operator's entry on
-// the left, the board as a rail on the right, and the replay's reveal: a
-// step, edge, arc or board item not yet revealed is hidden. The arcs, rail
-// and entries are the agentiflow map's (flowmap/), routed by `flowEdges`.
+// the run's messages as arcs between its step cards (the operator's as a
+// short entry at the card it reached), the board as a rail on the right, and
+// the replay's reveal: a step, edge, arc or board item not yet revealed is
+// hidden. The arcs and rail are the agentiflow map's (flowmap/), routed by
+// `flowEdges`.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Background,
+  type FitViewOptions,
   BackgroundVariant,
   Controls,
   MiniMap,
@@ -50,7 +52,7 @@ import { parseCodename } from '../lib/codename';
 import { edgeTone, useEntranceSlots } from '../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../lib/graph/measured';
 import MessageEdge from './flowmap/MessageEdge';
-import { EntryNode, RailNode } from './flowmap/MapNodes';
+import { RailNode } from './flowmap/MapNodes';
 import { useRunLayerCanvas, type RunGraphOverlay } from './run/RunLayerCanvas';
 
 export type { RunGraphOverlay } from './run/RunLayerCanvas';
@@ -89,9 +91,15 @@ export const NODE_TYPES: NodeTypes = {
   action: ActionNode,
 };
 const EDGE_TYPES: EdgeTypes = { run: RunEdge, message: MessageEdge };
-/** The layer's own nodes: the board rail and the operator / off-canvas entries. */
-const LAYER_NODE_TYPES: NodeTypes = { ...NODE_TYPES, rail: RailNode, entry: EntryNode };
+/** The layer's own node: the board rail. */
+const LAYER_NODE_TYPES: NodeTypes = { ...NODE_TYPES, rail: RailNode };
 const FIT_OPTIONS = { padding: 0.2, maxZoom: 1.0, minZoom: 0.2 };
+/** With the minimap showing, the fit keeps the graph's right edge (the
+ *  board rail's, with a layer) clear of it. */
+const FIT_WITH_MINIMAP = {
+  ...FIT_OPTIONS,
+  padding: { top: '10%', bottom: '10%', left: '10%', right: '180px' } as FitViewOptions['padding'],
+};
 
 /** A graph this small fits the canvas; the minimap only earns its place past it. */
 const MINIMAP_MIN_NODES = 6;
@@ -287,6 +295,8 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
   }, [model, colors, slots, revealed]);
 
   const layer = useRunLayerCanvas(overlay, model, positions, measured, selectedId);
+  const showMinimap = model.nodes.length > MINIMAP_MIN_NODES;
+  const fitOptions = showMinimap ? FIT_WITH_MINIMAP : FIT_OPTIONS;
   const nodes = useMemo<Node[]>(() => (layer ? [...stepNodes, ...layer.nodes] : stepNodes), [stepNodes, layer]);
   const edges = useMemo<Edge[]>(() => (layer ? [...runFlowEdges, ...layer.edges] : runFlowEdges), [runFlowEdges, layer]);
 
@@ -296,7 +306,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
   const layerOn = !!layer;
   useEffect(() => {
     if (!layerOn || !rf.viewportInitialized) return;
-    const raf = requestAnimationFrame(() => void rf.fitView(FIT_OPTIONS));
+    const raf = requestAnimationFrame(() => void rf.fitView(fitOptions));
     return () => cancelAnimationFrame(raf);
     // Only when the layer first appears (or the canvas first initialises).
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -330,12 +340,12 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         fitView
         // Low enough that a narrow pane (a phone) still frames the whole run.
         minZoom={0.2}
-        fitViewOptions={FIT_OPTIONS}
+        fitViewOptions={fitOptions}
         proOptions={{ hideAttribution: true }}
         style={{ background: 'transparent' }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1.1} color={colors.alpha('ink', 0.09)} />
-        {model.nodes.length > MINIMAP_MIN_NODES && (
+        {showMinimap && (
           <MiniMap
             pannable
             zoomable
@@ -348,7 +358,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
             nodeBorderRadius={4}
           />
         )}
-        <Controls showInteractive={false} fitViewOptions={{ padding: 0.2, maxZoom: 1.0, duration: 320 }} />
+        <Controls showInteractive={false} fitViewOptions={{ ...fitOptions, duration: 320 }} />
       </ReactFlow>
     </div>
   );

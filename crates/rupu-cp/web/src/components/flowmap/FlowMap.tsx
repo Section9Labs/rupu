@@ -30,13 +30,13 @@ import {
   type NodeChange,
   type NodeMouseHandler,
   type NodeTypes,
+  type FitViewOptions,
 } from '@xyflow/react';
 import { useNavigate } from 'react-router-dom';
 import { api, apiErrorMessage, type AgentiflowDetail, type RunChild } from '../../lib/api';
 import {
   buildFlowModel,
   FLOW_SPACE,
-  OFFCANVAS,
   type BoardSource,
   type FlowBoardSpace,
   type FlowNodeRef,
@@ -44,12 +44,16 @@ import {
 } from '../../lib/flow/flowModel';
 import {
   RAIL,
-  boardAnchorKeys,
+  RAIL_LIMIT,
+  STRIP_LIMIT,
+  boardAnchors,
   claimMessages,
   makeRouter,
   messageArcs,
   messageCounts,
   passesFilters,
+  railWindow,
+  type RailSection,
 } from '../../lib/flow/flowEdges';
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
@@ -57,7 +61,7 @@ import { useArrivals } from '../../lib/flow/useArrivals';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
 import { countAtOrBefore, timeBounds } from '../../lib/timeline/timeline';
-import { KIND_FILTERS, OPERATOR, type KindFilter } from '../../lib/messages';
+import { KIND_FILTERS, type KindFilter } from '../../lib/messages';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
@@ -76,7 +80,7 @@ import FlowToolbar from './FlowToolbar';
 import RoundNode from './RoundNode';
 import ChildNode, { CHILD_KIND, childState } from './ChildNode';
 import WorkflowFrameNode from './WorkflowFrameNode';
-import { EntryNode, LeadNode, RailNode, SpineNode } from './MapNodes';
+import { LeadNode, RailNode, SpineNode } from './MapNodes';
 import { GoalsPanel, HeaderStrip, MapSummary } from './FlowPanels';
 import MoreNode from './MoreNode';
 
@@ -84,12 +88,26 @@ import '@xyflow/react/dist/style.css';
 
 /** The run graph's minimap rule: only past this many cards. */
 const MINIMAP_MIN_NODES = 6;
+/** The minimap's size; while it shows, the placed and fitted map keeps its
+ *  width clear of it (the run graph does the same), so the rail's foot is
+ *  never under it. */
+const MINIMAP = { width: 150, height: 96 };
+const MINIMAP_CLEAR = MINIMAP.width + 30;
+/** The map's top sits below the canvas's summary chip. */
+const TOP = 48;
 /** The spine sits this far left of the round cards. */
 const SPINE_X = -28;
 /** The rail's top: clear of the summary chip at the canvas's top right. */
 const RAIL_TOP = 56;
 const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
-const FIT = { padding: 0.12, maxZoom: 1.0, minZoom: 0.15 };
+const EMPTY_OPEN: ReadonlySet<RailSection> = new Set();
+const FIT = { maxZoom: 1.0, minZoom: 0.15 };
+const fitPadding = (minimap: boolean): FitViewOptions['padding'] => ({
+  top: `${TOP}px`,
+  left: '24px',
+  bottom: '24px',
+  right: minimap ? `${MINIMAP_CLEAR}px` : '24px',
+});
 
 const MAP_NODE_TYPES: NodeTypes = {
   ...NODE_TYPES,
@@ -101,7 +119,6 @@ const MAP_NODE_TYPES: NodeTypes = {
   more: MoreNode,
   summary: MoreNode,
   rail: RailNode,
-  entry: EntryNode,
 };
 const MAP_EDGE_TYPES: EdgeTypes = { run: RunEdge, message: MessageEdge };
 
@@ -289,11 +306,35 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     }
     return m;
   }, [model, boardAsOf, isShown, shownSet]);
+  // Each board's sections opened past their latest items, `<node>|<section>`.
+  const [railOpen, setRailOpen] = useState<ReadonlySet<string>>(() => new Set());
+  const onRailOpen = useCallback((node: string, section: RailSection, open: boolean) => {
+    setRailOpen((cur) => {
+      const next = new Set(cur);
+      if (open) next.add(`${node}|${section}`);
+      else next.delete(`${node}|${section}`);
+      return next;
+    });
+  }, []);
+  const openOf = useCallback(
+    (node: string) =>
+      new Set((['claims', 'directives', 'posts'] as RailSection[]).filter((s) => railOpen.has(`${node}|${s}`))),
+    [railOpen],
+  );
+  const railOpenSet = useMemo(() => openOf(RAIL), [openOf]);
+  const frameOpen = useMemo(() => {
+    const m = new Map<string, ReadonlySet<RailSection>>();
+    for (const f of frameBoards.keys()) m.set(f, openOf(f));
+    return m;
+  }, [frameBoards, openOf]);
   const anchors = useMemo(() => {
-    const s = new Set(boardAnchorKeys(RAIL, railView, railPosts));
-    for (const [f, b] of frameBoards) if (visible.has(f)) for (const k of boardAnchorKeys(f, b.view, b.posts)) s.add(k);
-    return s;
-  }, [railView, railPosts, frameBoards, visible]);
+    const m = new Map(boardAnchors(RAIL, railWindow(railView, railPosts, railOpenSet, RAIL_LIMIT)));
+    for (const [f, b] of frameBoards) {
+      if (!visible.has(f)) continue;
+      for (const [k, h] of boardAnchors(f, railWindow(b.view, b.posts, frameOpen.get(f) ?? new Set(), STRIP_LIMIT))) m.set(k, h);
+    }
+    return m;
+  }, [railView, railPosts, railOpenSet, frameBoards, frameOpen, visible]);
   const anchor = useCallback(
     (key: string) => <Handle key={`a:${key}`} id={key} type="target" position={Position.Left} className="afx-anchor" />,
     [],
@@ -474,6 +515,8 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               loaded: !!n.graph,
               error: data.frameErrors.get(n.id) ?? null,
               board: frameBoards.get(n.id) ?? null,
+              boardOpen: frameOpen.get(n.id) ?? EMPTY_OPEN,
+              onBoardOpen: onRailOpen,
               messages: counts.get(n.id) ?? 0,
               onLoad: data.loadFrame,
               onDefinition,
@@ -504,16 +547,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       node(
         RAIL,
         'rail',
-        { view: railView, posts: railPosts, minHeight: Math.max(0, layout.height - RAIL_TOP), onSelect: selectMessage, anchor },
+        { view: railView, posts: railPosts, open: railOpenSet, onOpen: onRailOpen, onSelect: selectMessage, anchor },
         // Below the canvas's summary chip, which sits over the top-right.
         { position: { x: layout.railX, y: RAIL_TOP }, selectable: false, hidden: false, selected: false },
       ),
     );
-    const ends = new Set(model.messages.flatMap((m) => [m.from, ...m.to]));
-    const entry = (id: string, label: string, y: number) =>
-      node(id, 'entry', { label }, { position: { x: layout.operator.x, y }, selectable: false, hidden: false, selected: false });
-    if (ends.has(OPERATOR)) out.push(entry('operator', 'operator', layout.operator.y));
-    if (ends.has(OFFCANVAS)) out.push(entry('offcanvas', 'off map', layout.operator.y + 40));
     return out;
   }, [
     model,
@@ -536,6 +574,9 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     anchor,
     railView,
     railPosts,
+    railOpenSet,
+    frameOpen,
+    onRailOpen,
     frameBoards,
     handlersOf,
     data.frameErrors,
@@ -571,12 +612,22 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const r of model.rounds) {
       if (r.collapsed) tree(`round:${r.round}`, `summary:${r.round}`, refById.get(`round:${r.round}`), undefined);
     }
+    // A source with several children shares one trunk (RunEdge): the edge to
+    // its lowest child draws it, the others branch off it.
+    const bySource = new Map<string, RunFlowEdge[]>();
+    for (const e of out as RunFlowEdge[]) bySource.set(e.source, [...(bySource.get(e.source) ?? []), e]);
+    for (const list of bySource.values()) {
+      if (list.length < 2) continue;
+      const y = (e: RunFlowEdge) => layout.positions.get(e.target)?.y ?? 0;
+      const far = list.reduce((a, b) => (y(b) > y(a) ? b : a));
+      for (const e of list) e.data = { ...e.data!, trunk: e === far ? 'trunk' : 'branch' };
+    }
     // Each loaded frame's own run graph.
     for (const n of model.nodes) {
       if (n.kind === 'frame' && n.graph && visible.has(n.id)) out.push(...runEdges(n.graph, colors, slots, `${n.id}/`));
     }
     return out;
-  }, [model, visible, liveRound, colors, slots, refById]);
+  }, [model, visible, liveRound, colors, slots, refById, layout]);
 
   const arcs = useMemo(
     () =>
@@ -591,6 +642,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     [shownMessages, claims, router, kinds, participant, focus?.id, hoverNode, selectedMsg, anchors],
   );
   const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
+  // The cards an arc keeps clear of: every drawn card, not the frames (a
+  // region, crossed freely) or the rail.
+  const obstacles = useMemo(
+    () => [...layout.positions].filter(([id]) => visible.has(id) && !layout.frames.has(id) && id !== 'lead').map(([, p]) => p),
+    [layout, visible],
+  );
   const edges = useMemo<Edge[]>(
     () => [
       ...treeEdges,
@@ -602,17 +659,24 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             target: a.target,
             targetHandle: a.targetHandle,
             type: 'message',
-            zIndex: a.highlighted ? 20 : 10,
+            // Under the cards at rest (they are opaque); a lit arc lifts over them.
+            zIndex: a.highlighted ? 20 : 0,
             data: {
               message: a.message,
               highlighted: a.highlighted,
               arriving: arrivals.has(a.message.id),
               onSelect: claimIds.has(a.message.id) ? undefined : selectMessage,
+              from: layout.positions.get(a.source),
+              to: a.targetHandle ? undefined : layout.positions.get(a.target),
+              obstacles,
+              stub: a.stub,
+              label: a.label,
+              dead: a.dead,
             },
           }) satisfies MessageFlowEdge,
       ),
     ],
-    [treeEdges, arcs, arrivals, claimIds, selectMessage],
+    [treeEdges, arcs, arrivals, claimIds, selectMessage, layout, obstacles],
   );
 
   // --- interaction ---------------------------------------------------------
@@ -625,6 +689,9 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, []);
   const onNodeEnter = useCallback<NodeMouseHandler>((_e, n) => setHoverNode(n.id), []);
   const onNodeLeave = useCallback<NodeMouseHandler>(() => setHoverNode(null), []);
+
+  const cardCount = model.nodes.filter((n) => n.kind === 'child' || n.kind === 'frame' || n.kind === 'round').length;
+  const showMinimap = cardCount > MINIMAP_MIN_NODES;
 
   // The viewport: fit the map's width at first, from its top (a running flow
   // from its newest round); follow the newest round while running unless
@@ -643,12 +710,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     const h = el.clientHeight;
     if (w === 0 || h === 0) return;
     const left = layout.operator.x - 24;
-    const fitZoom = Math.min(1, Math.max(FIT.minZoom, w / (layout.width - left + 48)));
+    const room = w - 24 - (showMinimap ? MINIMAP_CLEAR : 24);
+    const fitZoom = Math.min(1, Math.max(FIT.minZoom, room / (layout.width - left)));
     if (!placed.current) {
       placed.current = true;
       placedWidth.current = layout.width;
-      const y = running ? -(lastRoundPos.y * fitZoom) + h * 0.35 : 24;
-      void rf.setViewport({ x: -left * fitZoom + 24, y: Math.min(24, y), zoom: fitZoom });
+      const y = running ? -(lastRoundPos.y * fitZoom) + h * 0.35 : TOP;
+      void rf.setViewport({ x: -left * fitZoom + 24, y: Math.min(TOP, y), zoom: fitZoom });
       return;
     }
     if (panned.current) return;
@@ -663,7 +731,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     }
     if (!followKey) return;
     const vp = rf.getViewport();
-    void rf.setViewport({ x: vp.x, y: Math.min(24, -(lastRoundPos.y * vp.zoom) + h * 0.35), zoom: vp.zoom }, { duration: 320 });
+    void rf.setViewport({ x: vp.x, y: Math.min(TOP, -(lastRoundPos.y * vp.zoom) + h * 0.35), zoom: vp.zoom }, { duration: 320 });
     // Only a new newest round, a wider map or the first placement moves it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followKey, lastRoundPos !== undefined, rf.viewportInitialized, data.childrenLoaded, layout.width]);
@@ -698,8 +766,6 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const sp of spaces) if (sp.id !== FLOW_SPACE) m.set(sp.id, childById.get(sp.id)?.address ?? sp.id);
     return m;
   }, [spaces, childById]);
-  const cardCount = model.nodes.filter((n) => n.kind === 'child' || n.kind === 'frame' || n.kind === 'round').length;
-
   return (
     <div className="afx-map space-y-3" data-testid="flow-map">
       <HeaderStrip detail={detail} model={model} running={running} />
@@ -753,11 +819,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           style={{ background: 'transparent' }}
         >
           <Background variant={BackgroundVariant.Dots} gap={20} size={1.1} color={colors.alpha('ink', 0.09)} />
-          {cardCount > MINIMAP_MIN_NODES && (
+          {showMinimap && (
             <MiniMap
               pannable
               zoomable
-              style={{ width: 150, height: 96 }}
+              style={MINIMAP}
               maskColor={colors.alpha('bg', 0.55)}
               nodeColor={(n) => miniColor(colors, n)}
               nodeBorderRadius={4}
@@ -765,7 +831,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           )}
           <Controls
             showInteractive={false}
-            fitViewOptions={{ ...FIT, duration: 320 }}
+            fitViewOptions={{ ...FIT, padding: fitPadding(showMinimap), duration: 320 }}
             onFitView={() => {
               panned.current = false;
             }}

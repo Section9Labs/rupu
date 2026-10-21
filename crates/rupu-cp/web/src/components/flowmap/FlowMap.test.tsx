@@ -139,6 +139,9 @@ const GANNET_RESPONSE = {
 const FLOW: AgentiflowDetail = DETAIL;
 
 let children: RunChild[] = CHILDREN;
+/** The flow's messages at ARC_REST_LIMIT (12), so every arc is at rest; the
+ *  dropped one (lynx#2 → lynx#1) folds onto round 0's summary anyway. */
+const QUIET_FLOW = FLOW_MESSAGES.filter((m) => m.id !== 'msg_004');
 
 beforeEach(() => {
   children = CHILDREN;
@@ -155,7 +158,7 @@ beforeEach(() => {
     kind: 'ok',
     view:
       route === 'agentiflows'
-        ? { participants: FLOW_PARTICIPANTS, messages: FLOW_MESSAGES, legacy: false, space: 'present' }
+        ? { participants: FLOW_PARTICIPANTS, messages: QUIET_FLOW, legacy: false, space: 'present' }
         : { participants: GANNET_PARTICIPANTS, messages: GANNET_MESSAGES, legacy: false, space: 'present' },
   }));
   vi.spyOn(api, 'getAgentiflowGenerated').mockResolvedValue({
@@ -227,7 +230,9 @@ describe('FlowMap', () => {
     // The flow's board is the rail; arcs are drawn between the cards.
     expect(within(node('rail')!).getByText('engagement report')).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('msg-arc-msg_015')).toBeInTheDocument());
-    expect(node('operator')).not.toBeNull();
+    // The operator is no node: its message enters the card it reached.
+    expect(node('operator')).toBeNull();
+    expect(screen.getByTestId('msg-arc-msg_007').closest('g')).toHaveTextContent('operator');
   });
 
   it('frame_loads_its_graph_on_first_view', async () => {
@@ -366,7 +371,7 @@ describe('FlowMap', () => {
   it('a_frame_log_read_in_two_pages_sends_no_packets_on_open', async () => {
     vi.mocked(api.getMessages).mockImplementation(async (route, _id, opts) => {
       if (route === 'agentiflows') {
-        return { kind: 'ok', view: { participants: FLOW_PARTICIPANTS, messages: FLOW_MESSAGES, legacy: false, space: 'present' } };
+        return { kind: 'ok', view: { participants: FLOW_PARTICIPANTS, messages: QUIET_FLOW, legacy: false, space: 'present' } };
       }
       // gannet#1's log, in two pages; the second comes a little later.
       const second = opts?.after === 'page-2';

@@ -1,11 +1,11 @@
 // The agentiflow map's own small nodes (FlowMap): the lead's spine with a
-// dot per round (its live end breathes), the lead's start, the flow's board
-// as a rail on the canvas, and the operator's (or an unknown address's)
-// entry left of the spine.
+// dot per round (its live end breathes), the lead's start, and the flow's
+// board as a rail on the canvas.
 
 import type { ReactNode } from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import { RAIL_W } from '../../lib/flow/flowLayout';
+import { RAIL, RAIL_LIMIT, type RailSection } from '../../lib/flow/flowEdges';
 import type { FlowMessage } from '../../lib/flow/flowModel';
 import BoardRail from './BoardRail';
 
@@ -58,31 +58,28 @@ export function LeadNode({ data }: NodeProps<Node<LeadData, 'lead'>>) {
 export interface RailData extends Record<string, unknown> {
   view: Parameters<typeof BoardRail>[0]['board'];
   posts: FlowMessage[];
-  minHeight: number;
+  /** Its sections opened past their latest items. */
+  open: ReadonlySet<RailSection>;
+  onOpen: (node: string, section: RailSection, open: boolean) => void;
   onSelect: (id: string) => void;
   anchor: (key: string) => ReactNode;
 }
 
-export function RailNode({ data }: NodeProps<Node<RailData, 'rail'>>) {
+export function RailNode({ id, data }: NodeProps<Node<RailData, 'rail'>>) {
+  const { onOpen } = data;
   return (
-    <div className="afx-rail-node nodrag nowheel" style={{ width: RAIL_W, minHeight: data.minHeight }}>
+    <div className="afx-rail-node nodrag nowheel" style={{ width: RAIL_W }}>
       <Handle type="target" position={Position.Left} className="gx-port" />
       <div className="afx-rail-title">Board</div>
-      <BoardRail board={data.view} posts={data.posts} onSelect={data.onSelect} anchor={data.anchor} />
-    </div>
-  );
-}
-
-export interface EntryData extends Record<string, unknown> {
-  label: string;
-}
-
-export function EntryNode({ data }: NodeProps<Node<EntryData, 'entry'>>) {
-  return (
-    <div className="afx-entry" data-testid={`flow-entry-${data.label}`}>
-      {data.label}
-      <Handle type="source" position={Position.Right} className="gx-port" />
-      <Handle type="target" position={Position.Right} className="gx-port" />
+      <BoardRail
+        board={data.view}
+        posts={data.posts}
+        onSelect={data.onSelect}
+        anchor={data.anchor}
+        limit={RAIL_LIMIT}
+        open={data.open}
+        onOpen={(section, open) => onOpen(id ?? RAIL, section, open)}
+      />
     </div>
   );
 }
