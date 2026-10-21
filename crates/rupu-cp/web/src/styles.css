@@ -1509,7 +1509,7 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
 
 /* A zoom chip / reset control slides in from the top-right corner. */
 .cp-chart-chip {
-  animation: cp-chart-chip-in 220ms var(--ease-out) both;
+  animation: cp-chart-chip-in 220ms var(--ease-out) backwards;
 }
 @keyframes cp-chart-chip-in {
   from { opacity: 0; transform: translateY(-4px) scale(0.97); }
@@ -1523,7 +1523,8 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
    column, and a hot cell lifts under the pointer. */
 .cp-heat-cell {
   transform-origin: bottom;
-  animation: cp-heat-in 420ms var(--ease-out) both;
+  /* backwards, not both: a held end value would block the hover lift */
+  animation: cp-heat-in 420ms var(--ease-out) backwards;
   animation-delay: calc(min(var(--i, 0), 120) * 6ms);
   transition:
     transform 140ms var(--ease-out),

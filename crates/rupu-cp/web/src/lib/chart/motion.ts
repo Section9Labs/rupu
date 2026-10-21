@@ -50,12 +50,15 @@ export function cubicBezier([x1, y1, x2, y2]: [number, number, number, number]):
   };
 }
 
-/** `true` from the second frame after mount: the class switch (`cp-in`) that
- *  starts every CSS draw-in. Two frames so the initial styles are committed
- *  before the transition starts. */
-export function useDrawIn(): boolean {
+/** `true` from the second frame after `ready` first turns true: the class
+ *  switch (`cp-in`) that starts every CSS draw-in. A chart that mounts empty
+ *  passes `ready = false` until its data arrives, so the draw-in plays on the
+ *  data rather than on an empty frame. Two frames so the initial styles are
+ *  committed before the transition starts. */
+export function useDrawIn(ready = true): boolean {
   const [drawn, setDrawn] = useState(false);
   useEffect(() => {
+    if (!ready || drawn) return;
     let b = 0;
     const a = requestAnimationFrame(() => {
       b = requestAnimationFrame(() => setDrawn(true));
@@ -64,16 +67,18 @@ export function useDrawIn(): boolean {
       cancelAnimationFrame(a);
       cancelAnimationFrame(b);
     };
-  }, []);
+  }, [ready, drawn]);
   return drawn;
 }
 
-/** The width of the element `ref` points at, tracked as it resizes. Falls back
- *  to `fallback` until measured (and where there is no ResizeObserver). */
-export function useMeasuredWidth(ref: React.RefObject<HTMLElement | null>, fallback: number): number {
+/** The width of the element the returned callback ref is attached to,
+ *  tracked as it resizes. Falls back to `fallback` until measured (and where
+ *  there is no ResizeObserver). A callback ref, so an element that mounts
+ *  later (after an empty state) is still measured. */
+export function useMeasuredWidth(fallback: number): [number, (el: HTMLElement | null) => void] {
   const [w, setW] = useState(fallback);
+  const [el, setEl] = useState<HTMLElement | null>(null);
   useLayoutEffect(() => {
-    const el = ref.current;
     if (!el) return;
     const measure = () => {
       const next = Math.round(el.getBoundingClientRect().width);
@@ -84,8 +89,8 @@ export function useMeasuredWidth(ref: React.RefObject<HTMLElement | null>, fallb
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [ref]);
-  return w;
+  }, [el]);
+  return [w, setEl];
 }
 
 /** Interpolate two equal-shaped series sets; `null` when their shapes differ
@@ -107,8 +112,10 @@ const easeInOut = cubicBezier(EASE_IN_OUT);
 
 /** The values to draw for `target`: when new data arrives with the same shape
  *  (a live refresh), the marks morph to it over ~420ms; a new shape (more or
- *  fewer buckets or series) is drawn as is. Reduced motion never morphs. */
-export function useMorphedSeries(target: number[][]): number[][] {
+ *  fewer buckets or series) is drawn as is, and so is anything while
+ *  `instant` (first data replacing a placeholder). Reduced motion never
+ *  morphs. */
+export function useMorphedSeries(target: number[][], instant = false): number[][] {
   const [shown, setShown] = useState(target);
   const shownRef = useRef(target);
   const signature = JSON.stringify(target);
@@ -116,7 +123,7 @@ export function useMorphedSeries(target: number[][]): number[][] {
     const from = shownRef.current;
     const next = target;
     const sameShape = lerpSeries(from, next, 1) !== null;
-    if (!sameShape || prefersReducedMotion()) {
+    if (!sameShape || instant || prefersReducedMotion()) {
       shownRef.current = next;
       setShown(next);
       return;
@@ -136,9 +143,10 @@ export function useMorphedSeries(target: number[][]): number[][] {
     // on every render, so identity would morph forever.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature]);
-  // A new shape is drawn as is on the render it arrives, never through a
-  // frame of the old one (callers index the result by the new shape).
-  return lerpSeries(shown, target, 1) !== null ? shown : target;
+  // A new shape (or an instant change) is drawn as is on the render it
+  // arrives, never through a frame of the old one (callers index the result
+  // by the new shape).
+  return !instant && lerpSeries(shown, target, 1) !== null ? shown : target;
 }
 
 /** Where the stylus sits at time fraction `t` of the sweep: x on the plot and

@@ -183,19 +183,25 @@ export function ChartTooltip({
   rows: TipRow[];
   footer?: React.ReactNode;
 }) {
+  // While it fades out, keep the last place and content it showed, so it
+  // doesn't collapse to an empty box gliding to the corner.
+  const last = useRef({ x, y, title, rows, footer });
+  if (open) last.current = { x, y, title, rows, footer };
+  const shown = open ? { x, y, title, rows, footer } : last.current;
   const half = 100;
-  const cx = Math.max(half, Math.min(width - half, x));
+  const cx = Math.max(half, Math.min(width - half, shown.x));
   return (
     <div
       className={cn('cp-chart-tip', open && 'cp-on', appear && 'cp-appear')}
-      style={{ transform: `translate(${cx}px, ${y}px)` }}
-      role="status"
-      aria-hidden={!open}
+      style={{ transform: `translate(${cx}px, ${shown.y}px)` }}
+      // a visual echo of the plot under the pointer, not a live region: the
+      // chart's own label and the page's tables carry the data for assistive tech
+      aria-hidden
     >
       <div style={{ transform: 'translate(-50%, calc(-100% - 14px))' }}>
         <div className="cp-chart-tip-card min-w-[176px] whitespace-nowrap rounded-[10px] border border-border-strong bg-surface/95 px-3 py-2 text-note shadow-lg backdrop-blur-sm">
-          <div className="mb-1 font-semibold text-ink">{title}</div>
-          {rows.map((r) => (
+          <div className="mb-1 font-semibold text-ink">{shown.title}</div>
+          {shown.rows.map((r) => (
             <div
               key={r.key}
               className={cn(
@@ -218,7 +224,7 @@ export function ChartTooltip({
               </span>
             </div>
           ))}
-          {footer && <div className="mt-1.5 text-ink-mute">{footer}</div>}
+          {shown.footer && <div className="mt-1.5 text-ink-mute">{shown.footer}</div>}
         </div>
       </div>
     </div>
@@ -388,7 +394,7 @@ export function Sparkline({
           <path d={line} fill="none" strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" style={{ stroke: color }} />
         </g>
       </g>
-      <circle className="cp-chart-ring" cx={lastX} cy={lastY} r={3} fill="none" strokeWidth={1.25} style={{ stroke: color, opacity: 1 }} />
+      <circle className="cp-chart-ring" cx={lastX} cy={lastY} r={3} fill="none" strokeWidth={1.25} style={{ stroke: color }} />
       <circle cx={lastX} cy={lastY} r={2.4} strokeWidth={1.25} style={{ fill: color, stroke: panel }} />
     </svg>
   );

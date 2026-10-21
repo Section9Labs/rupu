@@ -1413,6 +1413,7 @@ export default function RunDetail() {
           data-testid="usage-timeline-chrome"
         >
           <RunUsageTimeline
+            key={id}
             series={(usageFromGraph ? null : liveUsage?.points) ?? series}
             separators
             live={isRunning}

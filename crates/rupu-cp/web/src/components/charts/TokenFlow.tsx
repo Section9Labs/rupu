@@ -79,10 +79,10 @@ export interface TokenFlowProps {
 
 export default function TokenFlow({ points, stages = true, live = false, className }: TokenFlowProps) {
   const colors = useThemeColors();
-  const boxRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
-  const width = useMeasuredWidth(boxRef, DEFAULT_W);
-  const drawn = useDrawIn();
+  const [width, boxRef] = useMeasuredWidth(DEFAULT_W);
+  // the draw-in plays when the turns arrive, not on the empty first frame
+  const drawn = useDrawIn(points.length > 0);
   const uid = useId().replace(/:/g, '');
   const hover = useHoverIndex();
   const [focusSeries, setFocusSeries] = useState<SeriesKey | null>(null);
@@ -91,6 +91,18 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
   const [drag, setDrag] = useState<{ x0: number; x1: number } | null>(null);
 
   const n = points.length;
+  // A zoom the data no longer covers (another run, fewer turns) is dropped.
+  const zoomed = zoom && zoom[1] <= n - 1 ? zoom : null;
+  useEffect(() => {
+    if (zoom && !zoomed) setZoom(null);
+  }, [zoom, zoomed]);
+  // The first data replaces the empty placeholder window: snap to it rather
+  // than morph out of the placeholder (which would read as a zoom-out).
+  const hadData = useRef(false);
+  const firstData = n > 0 && !hadData.current;
+  useEffect(() => {
+    if (n > 0) hadData.current = true;
+  }, [n]);
   const cIn = colors.get('chart.1');
   const cOut = colors.get('chart.2');
   const cCache = colors.get('chart.5');
@@ -111,7 +123,7 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
 
   // The window (in point-index space) we're heading to, and its scales.
   const full: [number, number] = n > 1 ? [0, n - 1] : [-1, 1];
-  const goal = zoom ?? full;
+  const goal = zoomed ?? full;
   const goalPer = turnsPerBin(goal[1] - goal[0] + 1, maxBins);
   const goalRows = useMemo(() => binFlow(points, goal[0], goal[1], goalPer), [points, goal[0], goal[1], goalPer]); // eslint-disable-line react-hooks/exhaustive-deps
   const upGoal = tightScale(Math.max(0, ...goalRows.map((r) => r.context)) * 1.03, 3, 5);
@@ -119,10 +131,11 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
 
   // The window and both scale maxima glide together to the goal (zoom,
   // reset, a live run's new turns); see useMorphedSeries.
-  const [[va, vb, upMax, dnMax]] = useMorphedSeries([[goal[0], goal[1], upGoal.max, dnGoal.max]]);
+  const [[va, vb, upMax, dnMax]] = useMorphedSeries([[goal[0], goal[1], upGoal.max, dnGoal.max]], firstData);
   const span = Math.max(1e-6, vb - va);
   const xOf = (idx: number) => L + ((idx - va) / span) * pw;
-  const per = turnsPerBin(Math.min(span, goal[1] - goal[0]) + 1, maxBins);
+  // binned for the window actually shown, so a zoom never bins every turn
+  const per = turnsPerBin(span + 1, maxBins);
   const rows = useMemo(() => binFlow(points, va - per, vb + per, per), [points, va, vb, per]);
   const yUp = (v: number) => base - (v / upMax) * UP_H;
   const yDn = (v: number) => dnTop + (v / dnMax) * DN_H;
@@ -683,7 +696,7 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
         />
 
         {/* zoom chip */}
-        {(zoom || brushWin) && (
+        {(zoomed || brushWin) && (
           <div className="pointer-events-none absolute right-0 flex justify-end" style={{ top: T - 30 }}>
             <div className="cp-chart-chip pointer-events-auto inline-flex items-center gap-2 rounded-full border border-border bg-surface px-2.5 py-1 text-note tabular-nums text-ink-dim shadow-sm">
               {brushWin ? (
@@ -691,10 +704,10 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
                   Zoom to turns {fmtInt(brushWin[0] + 1)}–{fmtInt(Math.min(n, brushWin[1] + 1))}
                 </span>
               ) : (
-                zoom && (
+                zoomed && (
                   <>
                     <span>
-                      Turns {fmtInt(zoom[0] + 1)}–{fmtInt(zoom[1] + 1)}
+                      Turns {fmtInt(zoomed[0] + 1)}–{fmtInt(zoomed[1] + 1)}
                       <span className="text-ink-mute"> of {fmtInt(n)}</span>
                     </span>
                     <button

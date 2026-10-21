@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import TokenFlow from './TokenFlow';
 import { ThemeProvider } from '../theme/ThemeProvider';
@@ -51,5 +51,37 @@ describe('TokenFlow', () => {
   it('shows the empty state with no turns', () => {
     wrap(<TokenFlow points={[]} />);
     expect(screen.getByText(/No per-turn usage yet/)).toBeInTheDocument();
+  });
+
+  it('measures its width even when it mounts before any turns arrive', () => {
+    // the run page renders the chart empty, then hands it the turns
+    const rect = vi
+      .spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+      .mockReturnValue({ width: 1000, height: 300, top: 0, left: 0, right: 1000, bottom: 300, x: 0, y: 0, toJSON: () => ({}) } as DOMRect);
+    try {
+      const { container, rerender } = wrap(<TokenFlow points={[]} />);
+      rerender(
+        <ThemeProvider>
+          <TokenFlow points={pts} />
+        </ThemeProvider>,
+      );
+      const svg = container.querySelector('svg[role="img"]') as SVGSVGElement;
+      expect(svg.getAttribute('viewBox')?.startsWith('0 0 1000 ')).toBe(true);
+    } finally {
+      rect.mockRestore();
+    }
+  });
+
+  it('drops a zoom the data no longer covers', () => {
+    const { rerender } = wrap(<TokenFlow points={pts} />);
+    fireEvent.click(screen.getByRole('button', { name: /verify.*16k/ }));
+    expect(screen.getByText(/Turns 13–20/)).toBeInTheDocument();
+    rerender(
+      <ThemeProvider>
+        <TokenFlow points={pts.slice(0, 6)} />
+      </ThemeProvider>,
+    );
+    expect(screen.queryByText(/Turns 13–20/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /Reset/ })).toBeNull();
   });
 });

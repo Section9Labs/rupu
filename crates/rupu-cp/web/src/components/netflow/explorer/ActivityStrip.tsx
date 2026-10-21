@@ -59,9 +59,10 @@ export function tickLabel(ms: number, spanMs: number): string {
 
 export function ActivityStrip({ histogram, onZoom, appliedWindow }: ActivityStripProps) {
   const colors = useThemeColors();
-  const chartRef = useRef<HTMLDivElement>(null);
-  const width = useMeasuredWidth(chartRef, 700);
-  const drawn = useDrawIn();
+  const chartRef = useRef<HTMLDivElement | null>(null);
+  const [width, measureRef] = useMeasuredWidth(700);
+  // the draw-in plays once there are flows to draw
+  const drawn = useDrawIn(histogram.buckets.length > 0 && histogram.from !== null);
   const hover = useHoverIndex();
   const uid = useId().replace(/:/g, '');
   const [drag, setDrag] = useState<DragState | null>(null);
@@ -191,7 +192,10 @@ export function ActivityStrip({ histogram, onZoom, appliedWindow }: ActivityStri
         )}
       </div>
       <div
-        ref={chartRef}
+        ref={(el) => {
+          chartRef.current = el;
+          measureRef(el);
+        }}
         role="img"
         aria-label="Recorded flows over the full retained range; drag to zoom"
         onPointerDown={onPointerDown}

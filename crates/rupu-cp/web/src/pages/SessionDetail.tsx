@@ -449,7 +449,7 @@ export default function SessionDetailPage() {
           </summary>
           <div className="mt-3 space-y-4">
             <section className="rounded-xl border border-border bg-panel px-5 pb-3 pt-4 shadow-card">
-              <RunUsageTimeline series={series} live={sessionLive} />
+              <RunUsageTimeline key={session.session_id} series={series} live={sessionLive} />
             </section>
 
             <dl className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-panel shadow-card">

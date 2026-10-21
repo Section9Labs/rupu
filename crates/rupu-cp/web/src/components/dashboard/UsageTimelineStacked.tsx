@@ -195,6 +195,6 @@ export default function UsageTimelineStacked({
 /** A cost tick: whole dollars on a round axis, cents only for sub-$10 steps. */
 function costTick(v: number): string {
   if (v >= 1000) return `$${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)}k`;
-  if (v < 10 && v % 1 !== 0) return `$${v.toFixed(2)}`;
+  if (v % 1 !== 0) return `$${v.toFixed(2)}`;
   return `$${Math.round(v)}`;
 }

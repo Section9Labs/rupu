@@ -288,9 +288,9 @@ export function Chart({
 }: ChartProps) {
   const colors = useThemeColors();
   const svgRef = useRef<SVGSVGElement>(null);
-  const boxRef = useRef<HTMLDivElement>(null);
-  const width = useMeasuredWidth(boxRef, DEFAULT_W);
-  const drawn = useDrawIn();
+  const [width, boxRef] = useMeasuredWidth(DEFAULT_W);
+  // the draw-in plays when there is data, not on an empty first frame
+  const drawn = useDrawIn(dates.length > 0 && series.length > 0);
   const hover = useHoverIndex();
   const [focus, setFocus] = useState<string | null>(null);
   const uid = useId().replace(/:/g, '');
@@ -302,17 +302,20 @@ export function Chart({
   const plot = plotFor(width, height);
   const xTickY = height - 10;
 
-  // Same-shaped new data morphs into place.
-  const values = useMorphedSeries(series.map((s) => s.values));
   const raw = series.map((s) => s.values);
   const tot = totals(raw);
   const dataMax = stacked ? (tot.length ? Math.max(...tot) : 0) : seriesMax(raw);
   const scale = tightScale(dataMax * 1.02, 3, 5);
+  // Same-shaped new data morphs into place, and the scale's top morphs with
+  // it, so marks never overshoot the plot mid-morph.
+  const morphed = useMorphedSeries([...raw, [scale.max]]);
+  const values = morphed.slice(0, -1);
+  const shownMax = morphed[morphed.length - 1]?.[0] ?? scale.max;
   const xs = xsFor(n, plot);
   const tops = cumulativeTops(values);
   const peak = peakIndex(stacked ? tot : raw.length ? raw[0].map((_, i) => Math.max(...raw.map((s) => s[i] ?? 0))) : []);
   const hasData = n > 0 && series.length > 0;
-  const yv = (v: number) => yOf(v, scale.max, plot);
+  const yv = (v: number) => yOf(v, shownMax, plot);
 
   /** y of series `si`'s mark at bucket `i`. */
   const markY = (si: number, i: number) => yv(stacked ? tops[si]?.[i] ?? 0 : values[si]?.[i] ?? 0);
@@ -486,6 +489,7 @@ export function Chart({
           {scale.ticks.map((t, k) => {
             const y = yv(t);
             const isBase = t === 0;
+            if (y < plot.yTop - 6) return null;
             return (
               <g key={t}>
                 <line
@@ -771,16 +775,20 @@ function AnimatedFigure({ value }: { value: React.ReactNode }) {
   const decimals = parsed && parsed[1].includes('.') ? parsed[1].split('.')[1].length : 0;
   const [n, setN] = useState<number | null>(() => (target != null && !prefersReducedMotion() ? 0 : target));
 
+  // a new value glides from the one on screen, never back from 0
+  const shownRef = useRef(n);
+  shownRef.current = n;
   useEffect(() => {
     if (target == null || prefersReducedMotion()) {
       setN(target);
       return;
     }
     let raf = 0;
+    const from = shownRef.current ?? 0;
     const start = performance.now();
     const tick = (now: number) => {
       const t = Math.min(1, (now - start) / COUNT_MS);
-      setN(target * easeOutCubic(t));
+      setN(from + (target - from) * easeOutCubic(t));
       if (t < 1) raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
