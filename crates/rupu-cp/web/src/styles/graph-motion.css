@@ -1202,6 +1202,13 @@
 .tl-band[data-row='round'] { top: 2px; }
 .tl-band[data-row='step'] { top: 20px; }
 .tl-band[data-alt='1'] { background: color-mix(in srgb, rgb(var(--c-brand-500)) 20%, transparent); }
+.tl-band[data-inferred='true'] {
+  border-left: 1px dashed rgb(var(--c-ink-mute) / 0.7);
+  background: linear-gradient(to right, transparent, color-mix(in srgb, rgb(var(--c-brand-500)) 10%, transparent) 48px);
+}
+.tl-band[data-inferred='true'][data-alt='1'] {
+  background: linear-gradient(to right, transparent, color-mix(in srgb, rgb(var(--c-brand-500)) 20%, transparent) 48px);
+}
 .tl-band-label { padding: 0 6px; font-size: 11px; white-space: nowrap; color: rgb(var(--c-ink-dim)); }
 .tl-tick {
   position: absolute; bottom: 3px; width: 2px; height: 8px; border-radius: 1px;

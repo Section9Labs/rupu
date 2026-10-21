@@ -4,6 +4,7 @@
 // `fixtures.ts`' `at(min)`.
 
 import type { BoardView, RunEvent, RunGraphResponse, SpaceMessage, SpaceParticipant } from '../api';
+import type { RunRecordInput } from './runLayer';
 import type { GraphNode, RunGraphModel } from '../runGraphModel';
 import { at } from './fixtures';
 
@@ -59,11 +60,15 @@ export const RUN_EVENTS: RunEvent[] = [
   { ...base, type: 'unit_completed', step_id: 'probe', index: 1, unit_key: '/api/tokens', success: true, tokens_in: 1, tokens_out: 1 },
   { ...base, type: 'step_completed', step_id: 'probe', success: true, duration_ms: 600_000 },
   { ...base, type: 'step_started', step_id: 'report', kind: 'step', agent: 'finding-writer' },
+  {
+    ...base, type: 'agent_started', step_id: 'report', agent: 'finding-writer',
+    agent_run_id: 'run_01M5ACMEREPORT', transcript_path: '/t/report.jsonl',
+  },
   { ...base, type: 'step_completed', step_id: 'report', success: true, duration_ms: 300_000 },
   { ...base, type: 'run_completed', status: 'completed', finished_at: at(20) },
 ];
 
-export const RUN_RECORD: Pick<RunGraphResponse, 'run' | 'step_results' | 'units'> = {
+export const RUN_RECORD: RunRecordInput = {
   run: { id: RUN_ID, workflow_name: 'acme-shop-auth', status: 'completed', started_at: at(0), finished_at: at(20) } as RunGraphResponse['run'],
   step_results: [
     { run_id: RUN_ID, step_id: 'collect', success: true, finished_at: at(5) },
@@ -74,14 +79,23 @@ export const RUN_RECORD: Pick<RunGraphResponse, 'run' | 'step_results' | 'units'
     { step_id: 'probe', index: 0, item: '/api/login', run_id: RUN_ID, transcript_path: '/t/p0.jsonl', output: '', success: true, finished_at: at(12) },
     { step_id: 'probe', index: 1, item: '/api/tokens', run_id: RUN_ID, transcript_path: '/t/p1.jsonl', output: '', success: true, finished_at: at(14) },
   ],
+  // The server's folds over the whole event log.
+  step_identities: { collect: { codename: 'amber-quay/kestrel', agent: 'endpoint-collector' } },
+  subrun_identities: { sub_01M5ACMEWREN1: { codename: 'amber-quay/kestrel>wren#1', agent: 'scope-checker' } },
 };
 
 export const RUN_PARTICIPANTS: SpaceParticipant[] = [
-  // Found by its agent run: this participant names no step.
-  { address: 'collect', agent: 'endpoint-collector', run_id: 'run_01M5ACMECOLLECT', kind: 'workflow_step', live: false },
+  // Names no step: found by its codename in the recorded step identities.
+  {
+    address: 'collect', codename: 'amber-quay/kestrel', agent: 'endpoint-collector', run_id: 'run_01M5ACMECOLLECT',
+    kind: 'workflow_step', live: false,
+  },
   { address: 'probe#0', agent: 'auth-prober', run_id: 'run_01M5ACMEP0', step_id: 'probe', unit: '0', kind: 'workflow_step', live: false },
   { address: 'probe#1', agent: 'auth-prober', run_id: 'run_01M5ACMEP1', step_id: 'probe', unit: '1', kind: 'workflow_step', live: false },
-  { address: 'report', agent: 'finding-writer', run_id: 'run_01M5ACMEREPORT', step_id: 'report', kind: 'workflow_step', live: false },
+  // Names no step and no codename: found by its agent run (agent_started).
+  { address: 'report', agent: 'finding-writer', run_id: 'run_01M5ACMEREPORT', kind: 'workflow_step', live: false },
+  // collect's sub-agent: found through the server's fold of its codename.
+  { address: 'wren#1', agent: 'scope-checker', run_id: 'sub_01M5ACMEWREN1', kind: 'subagent', live: false },
 ];
 
 function msg(m: Partial<SpaceMessage> & Pick<SpaceMessage, 'id' | 'kind' | 'from' | 'body'>): SpaceMessage {
@@ -90,6 +104,10 @@ function msg(m: Partial<SpaceMessage> & Pick<SpaceMessage, 'id' | 'kind' | 'from
 
 export const RUN_MESSAGES: SpaceMessage[] = [
   msg({ id: 'msg_r3', ts: at(3), kind: 'post', post_kind: 'claim', from: 'collect', body: 'claim: package-lock.json' }),
+  msg({
+    id: 'msg_r7', ts: at(4), kind: 'direct', from: 'wren#1', to: 'collect', body: 'No admin routes in the staging map.',
+    delivery: { resolved: ['collect'] },
+  }),
   msg({
     id: 'msg_r4', ts: at(10), kind: 'operator', from: 'operator', to: 'broadcast', body: 'Skip the staging admin routes tonight.',
     delivery: { resolved: ['collect', 'probe#0', 'probe#1', 'report'] },

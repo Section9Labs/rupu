@@ -4,19 +4,22 @@
 // timeline the page replays (a band per step, ticks per message). Pure; no
 // React. The agentiflow map's message model (`flowMessage`) and arc routing
 // (`flowEdges`) are reused as they are; this only says which card an
-// address is.
+// address is and when each step ran.
 //
-// Run events carry no time of their own. A step's start is the last known
-// time before its `step_started` in the event log: the run's start, then
-// each step's and unit's recorded end (step results, unit checkpoints). That
-// is when it was launched (a step starts as the steps before it end), never
-// later. A step with no start event appears at its recorded end, with no
-// band; one with neither is shown whole (unless pending) rather than placed
-// by guess.
+// When a step ran. Run events carry no time of their own, but a finished
+// step's record has its `finished_at` and its `step_completed` event the
+// `duration_ms` the runner timed from the step's (latest attempt's) start,
+// so its start is `finished_at − duration_ms`: exact. A step with no
+// duration (running, failed, or its completion event outside the page's
+// event window) gets a band from a lower bound, marked `inferred`: the last
+// known time before its `step_started` in the event log (the run's start,
+// exact starts, each step's and unit's recorded end). A step with neither a
+// start event nor a duration appears at its recorded end, with no band; one
+// with no time at all is shown whole (unless pending), never placed by guess.
 
 import type { RunEvent, RunGraphResponse, SpaceMessage, SpaceParticipant } from '../api';
 import { OPERATOR } from '../messages';
-import type { RunGraphModel } from '../runGraphModel';
+import type { GraphNode, RunGraphModel } from '../runGraphModel';
 import type { TimelineBand, TimelineItem } from '../timeline/timeline';
 import {
   ARC_REST_LIMIT,
@@ -32,6 +35,16 @@ import {
 /** The run's own space (and board) id. */
 export const RUN_SPACE = 'run';
 
+/** What the layer reads of `GET /api/runs/:id/graph`: the recorded ends and
+ *  the identities the server folded from the whole event log. */
+export type RunRecordInput = Pick<
+  RunGraphResponse,
+  'run' | 'step_results' | 'units' | 'step_identities' | 'unit_identities' | 'subrun_identities'
+>;
+
+/** A step as the timeline needs it. */
+export type LayerStep = Pick<GraphNode, 'id' | 'state'>;
+
 export interface RunLayer {
   messages: FlowMessage[];
   /** The run's board: its view, its posts, each writer's card. */
@@ -40,6 +53,20 @@ export interface RunLayer {
   /** Cards, messages and board items with no time: shown through a replay. */
   untimed: string[];
 }
+
+/** The run events the layer reads (times, starts and ends, agent runs). */
+export const LAYER_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'run_started',
+  'run_completed',
+  'run_failed',
+  'step_started',
+  'step_completed',
+  'step_failed',
+  'step_skipped',
+  'unit_started',
+  'unit_completed',
+  'agent_started',
+]);
 
 export const claimItemKey = (key: string, acquiredAt: string) => `claim:${RUN_SPACE}:${key}:${acquiredAt}`;
 export const directiveItemKey = (id: string) => `directive:${RUN_SPACE}:${id}`;
@@ -61,19 +88,49 @@ function time(v: unknown): number | null {
   return Number.isFinite(t) ? t : null;
 }
 
-/** A participant's step: its own `step_id`, else the step its agent run
- *  started in (`agent_started`); a sub-agent's (`a>b`) is its nearest listed
- *  hop's. An address no step answers to is off canvas. */
-function resolver(model: RunGraphModel, participants: SpaceParticipant[], events: RunEvent[]): Resolve {
+/** An address's step card. A participant's step is its own `step_id`; else
+ *  the step whose recorded identity carries its codename (or its nearest
+ *  ancestor hop's: a sub-agent `a>b` lands on `a`'s step), the codename
+ *  being the participant's own or, for a dispatched sub-agent, the server's
+ *  fold of it (`subrun_identities`); else the step its agent run started in
+ *  (`agent_started`, as far as the event window reaches). The server's folds
+ *  cover the whole event log, so they come before the window. An address no
+ *  step answers to is off canvas. */
+export function runResolver(
+  stepIds: ReadonlySet<string>,
+  participants: SpaceParticipant[],
+  events: RunEvent[],
+  record?: RunRecordInput,
+): Resolve {
   const byAddress = new Map(participants.map((p) => [p.address, p]));
+  const stepOfCodename = new Map<string, string>();
+  const name = (codename: string | undefined, step: string) => {
+    if (codename && stepIds.has(step) && !stepOfCodename.has(codename)) stepOfCodename.set(codename, step);
+  };
+  for (const [step, id] of Object.entries(record?.step_identities ?? {})) name(id.codename, step);
+  for (const [step, units] of Object.entries(record?.unit_identities ?? {})) {
+    for (const id of Object.values(units)) name(id.codename, step);
+  }
+  for (const r of record?.step_results ?? []) name(r.codename, r.step_id);
+  for (const u of record?.units ?? []) name(u.codename, u.step_id);
   const stepOfRun = new Map<string, string>();
   for (const e of events) {
     if (e.type === 'agent_started' && typeof e.agent_run_id === 'string' && typeof e.step_id === 'string') {
       stepOfRun.set(e.agent_run_id, e.step_id);
     }
   }
-  const step = (id: string | undefined) => (id && model.nodeById(id) ? id : null);
-  const ofParticipant = (p: SpaceParticipant) => step(p.step_id) ?? step(stepOfRun.get(p.run_id));
+  const step = (id: string | undefined) => (id && stepIds.has(id) ? id : null);
+  const byCodename = (codename: string | undefined): string | null => {
+    for (let a = codename; a; a = a.includes('>') ? a.slice(0, a.lastIndexOf('>')) : undefined) {
+      const s = stepOfCodename.get(a);
+      if (s) return s;
+    }
+    return null;
+  };
+  const ofParticipant = (p: SpaceParticipant) =>
+    step(p.step_id) ??
+    byCodename(p.codename ?? record?.subrun_identities?.[p.run_id]?.codename) ??
+    step(stepOfRun.get(p.run_id));
   return (address) => {
     if (address === OPERATOR) return OPERATOR;
     const p = byAddress.get(address);
@@ -88,11 +145,13 @@ function resolver(model: RunGraphModel, participants: SpaceParticipant[], events
   };
 }
 
-function stepTimeline(
-  model: RunGraphModel,
+/** Each step's band and arrival, each unit's arrival (see the header). */
+export function stepTimeline(
+  steps: LayerStep[],
   events: RunEvent[],
-  record: Pick<RunGraphResponse, 'run' | 'step_results' | 'units'> | undefined,
+  record?: RunRecordInput,
 ): { items: TimelineItem[]; bands: TimelineBand[]; untimed: string[] } {
+  const known = new Set(steps.map((s) => s.id));
   const stepEnd = new Map<string, number>();
   for (const r of record?.step_results ?? []) {
     const t = time(r.finished_at);
@@ -101,19 +160,27 @@ function stepTimeline(
   const unitEnd = new Map<string, number>();
   for (const u of record?.units ?? []) {
     const t = time(u.finished_at);
-    if (t === null) continue;
-    unitEnd.set(`${u.step_id}:${u.index}`, t);
-    // A fan-out with no step result yet: its last unit's end.
-    if (!record?.step_results.some((r) => r.step_id === u.step_id && time(r.finished_at) !== null)) {
-      stepEnd.set(u.step_id, Math.max(stepEnd.get(u.step_id) ?? -Infinity, t));
+    if (t !== null) unitEnd.set(`${u.step_id}:${u.index}`, t);
+  }
+  // The latest completion's duration, timed from that attempt's start.
+  const duration = new Map<string, number>();
+  for (const e of events) {
+    if (e.type === 'step_completed' && typeof e.step_id === 'string' && typeof e.duration_ms === 'number') {
+      duration.set(e.step_id, e.duration_ms);
     }
   }
+  const exactStart = new Map<string, number>();
+  for (const [id, d] of duration) {
+    const end = stepEnd.get(id);
+    if (end !== undefined && known.has(id)) exactStart.set(id, end - d);
+  }
 
-  let known = time(record?.run.started_at);
-  const see = (t: number | null) => {
-    if (t !== null) known = known === null ? t : Math.max(known, t);
+  // The lower bound: the last known time before each start event.
+  let bound = time(record?.run.started_at);
+  const see = (t: number | null | undefined) => {
+    if (t != null) bound = bound === null ? t : Math.max(bound, t);
   };
-  const stepStart = new Map<string, number>();
+  const lowerStart = new Map<string, number>();
   const items: TimelineItem[] = [];
   const unitSeen = new Set<string>();
   for (const e of events) {
@@ -123,25 +190,26 @@ function stepTimeline(
         see(time(e.started_at));
         break;
       case 'step_started':
-        if (stepId && !stepStart.has(stepId) && known !== null && model.nodeById(stepId)) stepStart.set(stepId, known);
+        if (!stepId || !known.has(stepId)) break;
+        see(exactStart.get(stepId));
+        // A resumed step's latest attempt.
+        if (bound !== null) lowerStart.set(stepId, bound);
         break;
       case 'unit_started': {
         const key = `unit:${stepId}:${String(e.index)}`;
-        if (stepId && !unitSeen.has(key) && known !== null) {
+        if (stepId && !unitSeen.has(key) && bound !== null) {
           unitSeen.add(key);
-          items.push({ key, at: known, kind: 'unit' });
+          items.push({ key, at: bound, kind: 'unit' });
         }
         break;
       }
       case 'unit_completed':
-        see(unitEnd.get(`${stepId}:${String(e.index)}`) ?? null);
+        see(unitEnd.get(`${stepId}:${String(e.index)}`));
         break;
       case 'step_completed':
       case 'step_failed':
       case 'step_skipped':
-        if (stepId) {
-          see(stepEnd.get(stepId) ?? null);
-        }
+        if (stepId) see(stepEnd.get(stepId));
         break;
       case 'run_completed':
       case 'run_failed':
@@ -153,20 +221,69 @@ function stepTimeline(
   const bands: TimelineBand[] = [];
   const untimed: string[] = [];
   const stepItems: TimelineItem[] = [];
-  for (const n of model.nodes) {
-    const from = stepStart.get(n.id);
+  for (const s of steps) {
+    const end = stepEnd.get(s.id);
+    const exact = exactStart.get(s.id);
+    const lower = lowerStart.get(s.id);
+    const from = exact ?? lower;
     if (from !== undefined) {
-      stepItems.push({ key: n.id, at: from, kind: 'step' });
-      const end = stepEnd.get(n.id);
-      bands.push({ key: n.id, label: n.id, from, to: end !== undefined && end >= from ? end : null, row: 'step' });
-      continue;
-    }
-    const end = stepEnd.get(n.id);
-    if (end !== undefined) stepItems.push({ key: n.id, at: end, kind: 'step' });
-    else if (n.state !== 'pending') untimed.push(n.id);
+      stepItems.push({ key: s.id, at: from, kind: 'step' });
+      const band: TimelineBand = { key: s.id, label: s.id, from, to: end !== undefined && end >= from ? end : null, row: 'step' };
+      if (exact === undefined) band.inferred = true;
+      bands.push(band);
+    } else if (end !== undefined) stepItems.push({ key: s.id, at: end, kind: 'step' });
+    else if (s.state !== 'pending') untimed.push(s.id);
   }
   bands.sort((a, b) => a.from - b.from);
   return { items: [...stepItems, ...items], bands, untimed };
+}
+
+/** The space's messages, endpoints through `resolve`. */
+export function runMessages(log: SpaceMessage[], resolve: Resolve): FlowMessage[] {
+  const times = borrowedTimes(log);
+  const messages = log.map((m, i) => flowMessage(m, RUN_SPACE, resolve, times[i]));
+  if (messages.length > ARC_REST_LIMIT) for (const m of messages) m.atRest = m.kind === 'operator';
+  return messages.sort((a, b) => a.at - b.at);
+}
+
+/** The board, its posts, and each claim owner's and directive author's card. */
+export function runBoard(view: BoardSource | null, messages: FlowMessage[], resolve: Resolve): FlowBoardSpace {
+  const writers = new Map<string, string>();
+  if (view && !('kind' in view)) {
+    for (const c of view.claims) writers.set(c.owner, resolve(c.owner));
+    for (const d of view.directives) writers.set(d.author, resolve(d.author));
+  }
+  return { view, posts: messages.filter((m) => m.kind === 'post' || m.kind === 'mention'), writers };
+}
+
+/** The layer from its parts (the page memoizes each part on its own inputs). */
+export function composeRunLayer(
+  steps: { items: TimelineItem[]; bands: TimelineBand[]; untimed: string[] },
+  messages: FlowMessage[],
+  board: FlowBoardSpace,
+): RunLayer {
+  const items = [...steps.items];
+  const untimed = [...steps.untimed];
+  for (const m of messages) {
+    if (m.atKnown) items.push({ key: m.id, at: m.at, kind: 'message', sub: m.kind });
+    else untimed.push(m.id);
+  }
+  const view = board.view;
+  if (view && !('kind' in view)) {
+    for (const c of view.claims) {
+      const key = claimItemKey(c.key, c.acquired_at);
+      const at = time(c.acquired_at);
+      if (at !== null) items.push({ key, at, kind: 'board' });
+      else untimed.push(key);
+    }
+    for (const d of view.directives) {
+      const key = directiveItemKey(d.id);
+      const at = time(d.ts);
+      if (at !== null) items.push({ key, at, kind: 'board' });
+      else untimed.push(key);
+    }
+  }
+  return { messages, board, timeline: { items, bands: steps.bands }, untimed };
 }
 
 export function buildRunLayer(
@@ -174,47 +291,10 @@ export function buildRunLayer(
   events: RunEvent[],
   space: { participants: SpaceParticipant[]; messages: SpaceMessage[] },
   board: BoardSource | null,
-  opts?: { record?: Pick<RunGraphResponse, 'run' | 'step_results' | 'units'> },
+  opts?: { record?: RunRecordInput },
 ): RunLayer {
-  const resolve = resolver(model, space.participants, events);
-  const times = borrowedTimes(space.messages);
-  const messages = space.messages.map((m, i) => flowMessage(m, RUN_SPACE, resolve, times[i]));
-  if (messages.length > ARC_REST_LIMIT) for (const m of messages) m.atRest = m.kind === 'operator';
-  messages.sort((a, b) => a.at - b.at);
-
-  const writers = new Map<string, string>();
-  if (board && !('kind' in board)) {
-    for (const c of board.claims) writers.set(c.owner, resolve(c.owner));
-    for (const d of board.directives) writers.set(d.author, resolve(d.author));
-  }
-  const posts = messages.filter((m) => m.kind === 'post' || m.kind === 'mention');
-
-  const steps = stepTimeline(model, events, opts?.record);
-  const items = [...steps.items];
-  const untimed = [...steps.untimed];
-  for (const m of messages) {
-    if (m.atKnown) items.push({ key: m.id, at: m.at, kind: 'message', sub: m.kind });
-    else untimed.push(m.id);
-  }
-  if (board && !('kind' in board)) {
-    for (const c of board.claims) {
-      const key = claimItemKey(c.key, c.acquired_at);
-      const at = time(c.acquired_at);
-      if (at !== null) items.push({ key, at, kind: 'board' });
-      else untimed.push(key);
-    }
-    for (const d of board.directives) {
-      const key = directiveItemKey(d.id);
-      const at = time(d.ts);
-      if (at !== null) items.push({ key, at, kind: 'board' });
-      else untimed.push(key);
-    }
-  }
-
-  return {
-    messages,
-    board: { view: board, posts, writers },
-    timeline: { items, bands: steps.bands },
-    untimed,
-  };
+  const record = opts?.record;
+  const resolve = runResolver(new Set(model.nodes.map((n) => n.id)), space.participants, events, record);
+  const messages = runMessages(space.messages, resolve);
+  return composeRunLayer(stepTimeline(model.nodes, events, record), messages, runBoard(board, messages, resolve));
 }

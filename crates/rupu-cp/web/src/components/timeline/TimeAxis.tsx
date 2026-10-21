@@ -92,7 +92,8 @@ export function TimeAxis({
               className="tl-band"
               data-row={b.row ?? 'round'}
               data-alt={i % 2}
-              title={b.label}
+              data-inferred={b.inferred ? 'true' : undefined}
+              title={b.inferred ? `${b.label} · start inferred` : b.label}
               style={{ left: pct(b.from), width: `calc(${pct(to)} - ${pct(b.from)})` }}
             >
               <span className="tl-band-label">{b.label}</span>

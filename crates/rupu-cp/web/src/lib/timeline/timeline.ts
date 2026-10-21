@@ -21,6 +21,9 @@ export interface TimelineBand {
   to: number | null;
   /** Which row the axis draws it on (default `round`). */
   row?: 'round' | 'step';
+  /** `from` is a lower bound, not a recorded start: the axis draws its
+   *  leading edge faded and dashed. */
+  inferred?: boolean;
 }
 
 /** The span covering every item, band and (when given) now. */

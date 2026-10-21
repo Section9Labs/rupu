@@ -88,4 +88,28 @@ describe('TimeAxis', () => {
     fireEvent.keyDown(slider, { key: 'Home' });
     expect(onScrub.mock.calls.map((c) => c[0])).toEqual([9900, 0]);
   });
+
+  it('an_inferred_band_says_its_start_is_inferred', () => {
+    render(
+      <ThemeProvider>
+        <TimeAxis
+          bands={[
+            { key: 'a', label: 'collect', from: 0, to: 4000, row: 'step' },
+            { key: 'b', label: 'report', from: 4000, to: null, row: 'step', inferred: true },
+          ]}
+          items={[]}
+          bounds={{ start: 0, end: 10000 }}
+          t={null}
+          live
+          onScrub={() => {}}
+          onReplay={() => {}}
+          onRelease={() => {}}
+        />
+      </ThemeProvider>,
+    );
+    const exact = screen.getByTitle('collect');
+    expect(exact).not.toHaveAttribute('data-inferred');
+    const inferred = screen.getByTitle('report · start inferred');
+    expect(inferred).toHaveAttribute('data-inferred', 'true');
+  });
 });
