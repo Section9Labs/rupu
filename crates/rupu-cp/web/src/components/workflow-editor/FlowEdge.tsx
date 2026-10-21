@@ -1,9 +1,10 @@
 // FlowEdge — the workflow editor's connector, and the line a connection draws
 // while it is being dragged (FlowConnectionLine).
 //
-// A plain edge is a gradient from its source step's kind color to its
-// target's (a branch arm keeps its then/else color). It draws itself from
-// source to target when it appears — a new connection reads as made, not
+// A plain edge is a curve whose gradient runs from its source step's kind
+// color into its target's (a branch arm keeps its then/else color), over a
+// soft halo, the way the run graph draws a path the run took. It draws itself
+// from source to target when it appears — a new connection reads as made, not
 // swapped in — and a soft light travels along it toward the step it feeds,
 // brighter and quicker on the edge you selected. Motion lives in
 // styles/graph-motion.css (`wfx-e-*`); colors arrive resolved in `data`.
@@ -11,7 +12,7 @@
 import { memo, useId } from 'react';
 import {
   EdgeText,
-  getSmoothStepPath,
+  getBezierPath,
   type ConnectionLineComponentProps,
   type Edge,
   type EdgeProps,
@@ -47,15 +48,7 @@ function FlowEdgeView({
   labelBgBorderRadius,
   interactionWidth = 20,
 }: EdgeProps<FlowFlowEdge>) {
-  const [path, labelX, labelY] = getSmoothStepPath({
-    sourceX,
-    sourceY,
-    sourcePosition,
-    targetX,
-    targetY,
-    targetPosition,
-    borderRadius: 12,
-  });
+  const [path, labelX, labelY] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
   const gid = svgId('wfx-g', useId());
   const width = Number(style?.strokeWidth ?? 2);
   const from = data?.from ?? String(style?.stroke ?? 'currentColor');
@@ -69,6 +62,7 @@ function FlowEdgeView({
           <stop offset="1" stopColor={to} />
         </linearGradient>
       </defs>
+      <path className="wfx-e-halo" d={path} style={{ stroke: `url(#${gid})` }} />
       <path
         className="wfx-e-base"
         d={path}
@@ -110,14 +104,13 @@ export function FlowConnectionLine({
   toPosition,
   connectionStatus,
 }: ConnectionLineComponentProps) {
-  const [path] = getSmoothStepPath({
+  const [path] = getBezierPath({
     sourceX: fromX,
     sourceY: fromY,
     sourcePosition: fromPosition,
     targetX: toX,
     targetY: toY,
     targetPosition: toPosition,
-    borderRadius: 12,
   });
   const tone =
     connectionStatus === 'valid'

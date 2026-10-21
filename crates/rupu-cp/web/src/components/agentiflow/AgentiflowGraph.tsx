@@ -20,15 +20,17 @@
 
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronRight, ChevronDown } from 'lucide-react';
+import { ChevronRight } from 'lucide-react';
 import TimeRail, { type TimeAnchor } from './TimeRail';
 import { AgentName } from '../codename/AgentName';
-import { StatusPill } from '../StatusPill';
+import { RunLine, StatusCapsule, StatusGlyph } from '../graph/NodeFrame';
 import { Badge } from '../ui/Badge';
 import { useThemeMode } from '../codename/useThemeMode';
 import { parseCodename, crewTint } from '../../lib/codename';
 import { unitPillStatus, budgetStateTone, stopReasonTone, STOP_TONE_TEXT, formatSpendUsd, formatSpendTokens, STOP_TONE_BADGE } from '../../lib/agentiflow';
 import { cn } from '../../lib/cn';
+import { useStateCue } from '../../lib/graph/runMotion';
+import type { StepState } from '../../lib/runGraphModel';
 import { relativeTime, absoluteTime } from '../../lib/time';
 import { api } from '../../lib/api';
 import type { AgentiflowDetail, AgentiflowUnit, AgentiflowEvent, RunGraphResponse, StepNodeDto } from '../../lib/api';
@@ -52,24 +54,32 @@ const SUB_TOP_GAP = 4; // breathing room between the unit card and its sub-flow
 // run fits under the cap and renders exactly as before — no scroll, no rail.
 const PANE_MAX_VH = 70;
 
-type Palette = ReturnType<typeof palette>;
-function palette(mode: 'light' | 'dark') {
-  return mode === 'dark'
-    ? { lane: '#3a3a40', mute: '#71717a', err: '#f87171', ok: '#4ade80', warn: '#fbbf24', brand: '#a78bfa' }
-    : { lane: '#d4d4d8', mute: '#a1a1aa', err: '#dc2626', ok: '#16a34a', warn: '#d97706', brand: '#7c3aed' };
-}
-
-/** A nested step's live state, folded from the sub-run's step_results. */
-type NestState = 'done' | 'failed' | 'running' | 'awaiting' | 'pending' | 'skipped';
-
-const NEST_VIS: Record<NestState, { glyph: string; label: string; key: keyof Omit<Palette, 'lane'> }> = {
-  done: { glyph: '✓', label: 'done', key: 'ok' },
-  failed: { glyph: '✕', label: 'failed', key: 'err' },
-  running: { glyph: '⟳', label: 'running', key: 'brand' },
-  awaiting: { glyph: '⏸', label: 'awaiting', key: 'warn' },
-  pending: { glyph: '•', label: 'pending', key: 'mute' },
-  skipped: { glyph: '⤼', label: 'skipped', key: 'mute' },
+// Colors are theme tokens (styles.css); the gutter paints them through
+// `style`, since SVG presentation attributes don't resolve `var()`. A crew's
+// tint (the codename palette, themed per mode) is the one non-token color: it
+// names who a line belongs to.
+const C = {
+  mute: 'rgb(var(--c-ink-mute))',
+  failed: 'rgb(var(--c-status-failed))',
+  done: 'rgb(var(--c-status-done))',
+  brand: 'rgb(var(--c-brand-500))',
 };
+
+/** A unit's status as a run-graph state, for the shared capsule and glyph:
+ *  the same reading `unitPillStatus` gives the Fleet list (a `done` unit that
+ *  did not succeed is failed; a state a newer server invented is pending). */
+function unitStepState(unit: Pick<AgentiflowUnit, 'status'>): StepState {
+  switch (unitPillStatus(unit)) {
+    case 'running':
+      return 'running';
+    case 'failed':
+      return 'failed';
+    case 'completed':
+      return 'done';
+    default:
+      return 'pending';
+  }
+}
 
 /** One nested step row inside an expanded workflow unit. */
 interface SubStepRow {
@@ -78,7 +88,7 @@ interface SubStepRow {
   agent?: string | null;
   codename?: string;
   codenameDerived?: boolean;
-  state: NestState;
+  state: StepState;
 }
 
 /** The sub-flow that hangs off an expanded workflow unit. */
@@ -100,9 +110,7 @@ interface UnitNode {
   unit: AgentiflowUnit;
   cy: number; // branch-row (card) center y
   tint: string; // crew tint (or mute)
-  dotFill: string | null; // null = hollow (pending)
-  dotRing: string | null; // colored ring (failed)
-  pulse: boolean; // running
+  state: StepState; // its status, read as a run-graph state
   blockTop: number; // top of the unit's block (card + any sub-flow)
   blockHeight: number; // ROW_H, plus the sub-flow when expanded
   sub?: SubFlow; // present only for an expanded workflow unit
@@ -138,7 +146,7 @@ function spur(x0: number, y0: number, x1: number, y1: number): string {
 }
 
 /** A workflow unit's step state, folded from the sub-run's step_results. */
-function deriveStepState(stepId: string, results: Map<string, { success?: boolean; skipped?: boolean }>): NestState {
+function deriveStepState(stepId: string, results: Map<string, { success?: boolean; skipped?: boolean }>): StepState {
   const r = results.get(stepId);
   if (!r) return 'pending'; // no terminal record for this step yet
   if (r.skipped) return 'skipped';
@@ -177,10 +185,9 @@ function toSubFlow(cache: SubCache | undefined, tint: string): SubFlow {
 
 export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }) {
   const mode = useThemeMode();
-  const pal = palette(mode);
   const { record } = detail;
   const leadCrew = parseCodename(record.codename).crew;
-  const leadTint = crewTint(leadCrew, mode) ?? pal.brand;
+  const leadTint = crewTint(leadCrew, mode) ?? C.brand;
 
   // Per-round collapse override (round → explicit expanded state). Without an
   // entry a round defaults to collapsed unless it is the last / live one, so a
@@ -215,9 +222,9 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   );
 
   const { nodes, totalH, anchors } = useMemo(
-    () => build(detail, mode, pal, expandedOverride, expandedUnits, subCache),
+    () => build(detail, mode, expandedOverride, expandedUnits, subCache),
     // detail identity + mode + the collapse/expand state drive the geometry.
-    [detail, mode, expandedOverride, expandedUnits, subCache], // eslint-disable-line react-hooks/exhaustive-deps
+    [detail, mode, expandedOverride, expandedUnits, subCache],
   );
 
   const lastY = nodes.length ? nodes[nodes.length - 1].nodeY : 0;
@@ -239,27 +246,26 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   }, [totalH]);
 
   return (
-    <div className="flex gap-2">
+    <div className="afx-flow flex gap-2">
       <div ref={flowRef} className="relative min-w-0 flex-1 overflow-auto" style={{ maxHeight: `${PANE_MAX_VH}vh` }}>
         <div className="relative" style={{ height: totalH }}>
         <svg
-          className="pointer-events-none absolute left-0 top-0"
+          className="pointer-events-none absolute left-0 top-0 overflow-visible"
           width={CARD_X}
           height={totalH}
           aria-hidden
         >
-          {/* The lead spine — one continuous line through every spine node. */}
+          {/* The lead spine — one continuous hairline through every spine
+              node, drawn down from the engagement's start. */}
           {nodes.length > 1 && (
             <line
-              className="afx-draw"
+              className="afx-spine afx-draw"
               pathLength={1}
               x1={SPINE_X}
               y1={firstY}
               x2={SPINE_X}
               y2={lastY}
-              stroke={leadTint}
-              strokeOpacity={0.5}
-              strokeWidth={2}
+              style={{ stroke: leadTint }}
             />
           )}
 
@@ -273,29 +279,20 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
             return (
               <g key={`branch-${n.key}`} className="afx-branch">
                 {/* fan-out from the round node to the lane top */}
-                <path d={spur(SPINE_X, n.nodeY, BRANCH_X, firstU.cy)} fill="none" stroke={pal.lane} strokeWidth={1.5} />
+                <path className="afx-lane afx-bdraw" pathLength={1} d={spur(SPINE_X, n.nodeY, BRANCH_X, firstU.cy)} />
                 {/* the lane itself */}
                 {n.units.length > 1 && (
-                  <line x1={BRANCH_X} y1={firstU.cy} x2={BRANCH_X} y2={lastU.cy} stroke={pal.lane} strokeWidth={1.5} />
+                  <line className="afx-lane afx-bdraw" pathLength={1} x1={BRANCH_X} y1={firstU.cy} x2={BRANCH_X} y2={lastU.cy} />
                 )}
                 {/* merge back into the next spine node */}
-                {next && (
-                  <path d={spur(BRANCH_X, lastU.cy, SPINE_X, next.nodeY)} fill="none" stroke={pal.lane} strokeWidth={1.5} strokeOpacity={0.7} />
-                )}
+                {next && <path className="afx-lane afx-merge afx-bdraw" pathLength={1} d={spur(BRANCH_X, lastU.cy, SPINE_X, next.nodeY)} />}
                 {/* per-unit tick + dot */}
                 {n.units.map((u) => (
-                  <g key={u.unit.unit_id}>
-                    <line x1={BRANCH_X} y1={u.cy} x2={CARD_X - 6} y2={u.cy} stroke={u.tint} strokeOpacity={0.6} strokeWidth={1.5} />
+                  <g key={u.unit.unit_id} data-testid="af-unit-dot" data-state={u.state}>
+                    <line className="afx-tick" x1={BRANCH_X} y1={u.cy} x2={CARD_X - 6} y2={u.cy} style={{ stroke: u.tint }} />
                     {/* a running unit breathes a ring out of its dot */}
-                    {u.pulse && <circle className="afx-ring" cx={BRANCH_X} cy={u.cy} r={4} fill="none" stroke={u.tint} strokeWidth={1.5} />}
-                    <circle
-                      cx={BRANCH_X}
-                      cy={u.cy}
-                      r={4}
-                      fill={u.dotFill ?? (mode === 'dark' ? '#141416' : '#ffffff')}
-                      stroke={u.dotRing ?? u.tint}
-                      strokeWidth={1.6}
-                    />
+                    {u.state === 'running' && <circle className="afx-ring" cx={BRANCH_X} cy={u.cy} r={4} style={{ stroke: u.tint }} />}
+                    <UnitDot u={u} />
                   </g>
                 ))}
               </g>
@@ -311,34 +308,26 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
               return (
                 <g key={n.key}>
                   {prevY < n.nodeY && (
-                    <line
-                      className="afx-light"
-                      pathLength={1}
-                      x1={SPINE_X}
-                      y1={prevY}
-                      x2={SPINE_X}
-                      y2={n.nodeY}
-                      stroke={leadTint}
-                      strokeWidth={3}
-                    />
+                    <>
+                      <line className="afx-light-halo" pathLength={1} x1={SPINE_X} y1={prevY} x2={SPINE_X} y2={n.nodeY} style={{ stroke: leadTint }} />
+                      <line className="afx-light" pathLength={1} x1={SPINE_X} y1={prevY} x2={SPINE_X} y2={n.nodeY} style={{ stroke: leadTint }} />
+                    </>
                   )}
-                  <circle className="afx-ring" cx={SPINE_X} cy={n.nodeY} r={5} fill="none" stroke={leadTint} strokeWidth={1.5} />
-                  <circle cx={SPINE_X} cy={n.nodeY} r={5} fill={leadTint} />
+                  <circle className="afx-ring" cx={SPINE_X} cy={n.nodeY} r={5} style={{ stroke: leadTint }} />
+                  <circle className="afx-node" cx={SPINE_X} cy={n.nodeY} r={5} style={{ fill: leadTint }} />
                 </g>
               );
             }
             const fill =
               n.kind === 'stop'
                 ? record.stop_reason
-                  ? stopTone(record.stop_reason, pal)
-                  : pal.mute
+                  ? stopTone(record.stop_reason)
+                  : C.mute
                 : leadTint;
             return (
               <g key={n.key}>
-                <circle cx={SPINE_X} cy={n.nodeY} r={NODE_R} fill={fill} />
-                {n.kind === 'start' && (
-                  <circle cx={SPINE_X} cy={n.nodeY} r={NODE_R + 3} fill="none" stroke={fill} strokeOpacity={0.35} strokeWidth={1.5} />
-                )}
+                <circle className="afx-node" cx={SPINE_X} cy={n.nodeY} r={NODE_R} style={{ fill }} />
+                {n.kind === 'start' && <circle className="afx-halo" cx={SPINE_X} cy={n.nodeY} r={NODE_R + 3} style={{ stroke: fill }} />}
               </g>
             );
           })}
@@ -364,12 +353,13 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
               <div className="flex items-center" style={{ height: ROW_H }}>
                 <UnitCard
                   unit={u.unit}
+                  state={u.state}
                   expandable={u.unit.kind === 'workflow'}
                   expanded={!!expandedUnits[u.unit.unit_id]}
                   onToggle={() => toggleUnit(u.unit.unit_id)}
                 />
               </div>
-              {u.sub && <SubFlowRows sub={u.sub} pal={pal} />}
+              {u.sub && <SubFlowRows sub={u.sub} />}
             </div>
           )),
         )}
@@ -380,9 +370,25 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
   );
 }
 
-function stopTone(reason: string, pal: Palette): string {
+/** A unit's dot on its round's lane: filled in its crew's tint once it has
+ *  started, hollow while pending, and ringed red when it failed. */
+function UnitDot({ u }: { u: UnitNode }) {
+  const hollow = u.state === 'pending' || u.state === 'failed';
+  return (
+    <circle
+      className="afx-dot"
+      data-hollow={hollow || undefined}
+      cx={BRANCH_X}
+      cy={u.cy}
+      r={4}
+      style={{ stroke: u.state === 'failed' ? C.failed : u.tint, fill: hollow ? undefined : u.tint }}
+    />
+  );
+}
+
+function stopTone(reason: string): string {
   const t = stopReasonTone(reason);
-  return t === 'ok' ? pal.ok : t === 'err' || t === 'warn' ? pal.err : pal.mute;
+  return t === 'ok' ? C.done : t === 'err' || t === 'warn' ? C.failed : C.mute;
 }
 
 // ---------------------------------------------------------------------------
@@ -392,7 +398,6 @@ function stopTone(reason: string, pal: Palette): string {
 function build(
   detail: AgentiflowDetail,
   mode: 'light' | 'dark',
-  pal: Palette,
   override: Record<number, boolean>,
   expandedUnits: Record<string, boolean>,
   subCache: Record<string, SubCache>,
@@ -442,17 +447,14 @@ function build(
   };
 
   const toUnitNode = (u: AgentiflowUnit, blockTop: number): UnitNode => {
-    const tint = crewTint(parseCodename(u.codename).crew, mode) ?? pal.mute;
-    const st = unitPillStatus(u);
+    const tint = crewTint(parseCodename(u.codename).crew, mode) ?? C.mute;
     const expanded = u.kind === 'workflow' && !!expandedUnits[u.unit_id];
     const sub = expanded ? toSubFlow(subCache[u.unit_id], tint) : undefined;
     return {
       unit: u,
       cy: blockTop + ROW_H / 2,
       tint,
-      dotFill: st === 'failed' ? null : st === 'pending' ? null : tint,
-      dotRing: st === 'failed' ? pal.err : null,
-      pulse: st === 'running',
+      state: unitStepState(u),
       blockTop,
       blockHeight: ROW_H + (sub ? subHeight(sub) : 0),
       sub,
@@ -581,8 +583,9 @@ function RowHead({
   if (node.kind === 'pulse') {
     return (
       <div className="flex h-[34px] items-center">
-        <span className="text-note text-ink-dim">
-          round {node.round ?? ''} running<span className="animate-pulse">…</span>
+        <span className="afx-live text-note text-ink-dim">
+          <StatusGlyph state="running" />
+          round {node.round ?? ''} running…
         </span>
       </div>
     );
@@ -606,17 +609,19 @@ function RowHead({
           <button
             type="button"
             onClick={() => onToggle(node.round!, expanded)}
-            className="-ml-1 inline-flex items-center rounded text-ink-mute hover:text-ink"
+            className="afx-toggle"
+            aria-expanded={expanded}
             aria-label={expanded ? `Collapse round ${node.round}` : `Expand round ${node.round}`}
             title={expanded ? 'Collapse round' : 'Expand round'}
           >
-            {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            <ChevronRight size={14} aria-hidden />
           </button>
         )}
         <span className="text-sm font-semibold text-ink">round {node.round}</span>
         {live ? (
-          <span className="text-meta text-ink-dim">
-            in progress<span className="animate-pulse">…</span>
+          <span className="afx-live text-meta text-ink-dim">
+            <StatusGlyph state="running" />
+            in progress…
           </span>
         ) : (
           <>
@@ -660,57 +665,68 @@ function RowHead({
 
 function UnitCard({
   unit,
+  state,
   expandable,
   expanded,
   onToggle,
 }: {
   unit: AgentiflowUnit;
+  state: StepState;
   expandable: boolean;
   expanded: boolean;
   onToggle: () => void;
 }) {
+  const { cue } = useStateCue(state);
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-x-2.5 gap-y-1 rounded-lg border border-border bg-surface/60 px-2.5 py-1.5">
-      {expandable && (
-        <button
-          type="button"
-          onClick={onToggle}
-          className="-ml-1 inline-flex shrink-0 items-center rounded text-ink-mute hover:text-ink"
-          aria-label={expanded ? `Collapse ${unit.codename} flow` : `Expand ${unit.codename} flow`}
-          title={expanded ? 'Collapse flow' : 'Expand flow'}
-        >
-          {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        </button>
-      )}
-      <AgentName codename={unit.codename} agent={unit.agent ?? undefined} derived={unit.codename_derived} showCrew />
-      <Badge tone="neutral" ring>
-        {unit.kind}
-      </Badge>
-      <StatusPill status={unitPillStatus(unit)} />
-      {unit.participant && <span className="truncate font-mono text-meta text-ink-mute">{unit.participant}</span>}
-      <span className="ml-auto flex shrink-0 items-center gap-2.5 text-meta text-ink-mute">
-        {unit.started_at && <span title={absoluteTime(unit.started_at)}>{relativeTime(unit.started_at)}</span>}
-        {unit.kind === 'workflow' ? (
-          // A dispatched workflow IS a full workflow run. Expand it inline to
-          // see its flow here, or open the full DAG on its own run page.
-          <Link
-            to={`/runs/${encodeURIComponent(unit.unit_id)}`}
-            className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
-            title="Open this workflow's run graph"
+    <div data-testid="af-unit" data-state={state} data-cue={cue ?? undefined} className="afx-unit gx-s">
+      <span className="afx-glow" aria-hidden />
+      <span className="afx-bloom" aria-hidden />
+      <span className="afx-lift" aria-hidden />
+      <div className="afx-card">
+        <span className="afx-flash" aria-hidden />
+        {expandable && (
+          <button
+            type="button"
+            onClick={onToggle}
+            className="afx-toggle"
+            aria-expanded={expanded}
+            aria-label={expanded ? `Collapse ${unit.codename} flow` : `Expand ${unit.codename} flow`}
+            title={expanded ? 'Collapse flow' : 'Expand flow'}
           >
-            open flow →
-          </Link>
-        ) : (
-          unit.transcript_path && (
-            <Link
-              to={`/transcript?path=${encodeURIComponent(unit.transcript_path)}&live=0`}
-              className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
-            >
-              transcript
-            </Link>
-          )
+            <ChevronRight size={14} aria-hidden />
+          </button>
         )}
-      </span>
+        <span className="afx-ident">
+          <AgentName codename={unit.codename} agent={unit.agent ?? undefined} derived={unit.codename_derived} showCrew />
+        </span>
+        <span className="afx-tag">{unit.kind}</span>
+        {unit.participant && <span className="min-w-0 truncate font-mono text-meta text-ink-mute">{unit.participant}</span>}
+        <span className="afx-meta">
+          {unit.started_at && <span title={absoluteTime(unit.started_at)}>{relativeTime(unit.started_at)}</span>}
+          {unit.kind === 'workflow' ? (
+            // A dispatched workflow IS a full workflow run. Expand it inline to
+            // see its flow here, or open the full DAG on its own run page.
+            <Link
+              to={`/runs/${encodeURIComponent(unit.unit_id)}`}
+              className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
+              title="Open this workflow's run graph"
+            >
+              open flow →
+            </Link>
+          ) : (
+            unit.transcript_path && (
+              <Link
+                to={`/transcript?path=${encodeURIComponent(unit.transcript_path)}&live=0`}
+                className="font-medium text-brand-600 hover:text-brand-700 hover:underline"
+              >
+                transcript
+              </Link>
+            )
+          )}
+          <StatusCapsule state={state} />
+        </span>
+        {state === 'running' && <RunLine />}
+      </div>
     </div>
   );
 }
@@ -718,59 +734,60 @@ function UnitCard({
 /** The nested sub-flow: a crew-tinted sub-spine with one row per workflow step,
  *  indented a level off the unit card. Lives entirely in HTML (the SVG gutter
  *  only draws the lead spine + round branches) so the main graph is untouched. */
-function SubFlowRows({ sub, pal }: { sub: SubFlow; pal: Palette }) {
+function SubFlowRows({ sub }: { sub: SubFlow }) {
   const rows = sub.state === 'loaded' ? Math.max(sub.steps.length, 1) : 1;
   const height = rows * SUB_ROW_H;
   return (
-    <div className="relative" style={{ marginTop: SUB_TOP_GAP, marginLeft: SUB_INDENT, height }}>
-      {/* the sub-spine */}
-      <div className="absolute top-0 bottom-0" style={{ left: 0, width: 2, background: sub.tint, opacity: 0.55 }} />
-      {sub.state === 'loading' && <SubNote pal={pal} text="loading flow…" tint={sub.tint} />}
-      {sub.state === 'error' && <SubNote pal={pal} text="couldn't load this flow" tint={pal.err} tone={pal.err} />}
-      {sub.state === 'loaded' && sub.steps.length === 0 && <SubNote pal={pal} text="no steps recorded" tint={sub.tint} />}
+    <div data-testid="af-subflow" className="relative" style={{ marginTop: SUB_TOP_GAP, marginLeft: SUB_INDENT, height }}>
+      {/* the sub-spine, revealed downward */}
+      <div className="afx-subspine" style={{ background: sub.tint }} aria-hidden />
+      {sub.state === 'loading' && <SubNote text="loading flow…" tint={sub.tint} />}
+      {sub.state === 'error' && <SubNote text="couldn't load this flow" error />}
+      {sub.state === 'loaded' && sub.steps.length === 0 && <SubNote text="no steps recorded" tint={sub.tint} />}
       {sub.state === 'loaded' &&
-        sub.steps.map((s, i) => <SubStep key={`${s.id}-${i}`} step={s} top={i * SUB_ROW_H} pal={pal} />)}
+        sub.steps.map((s, i) => <SubStep key={`${s.id}-${i}`} step={s} index={i} />)}
     </div>
   );
 }
 
-function SubNote({ text, tint, tone, pal }: { text: string; tint: string; tone?: string; pal: Palette }) {
+function SubNote({ text, tint, error }: { text: string; tint?: string; error?: boolean }) {
   return (
-    <div className="absolute flex items-center" style={{ top: 0, left: 0, right: 0, height: SUB_ROW_H, paddingLeft: 16 }}>
-      <span className="absolute" style={{ left: -4, top: SUB_ROW_H / 2 - 3.5, width: 7, height: 7, borderRadius: 9999, background: tint, opacity: 0.6 }} />
-      <span className="text-meta" style={{ color: tone ?? pal.mute }}>
+    <div className="afx-srow" style={{ top: 0, height: SUB_ROW_H }}>
+      <span className="afx-sdot" data-tone={error ? 'err' : 'tint'} style={error ? undefined : { color: tint }} aria-hidden />
+      <span className="afx-snote" data-tone={error ? 'err' : undefined}>
         {text}
       </span>
     </div>
   );
 }
 
-function SubStep({ step, top, pal }: { step: SubStepRow; top: number; pal: Palette }) {
-  const vis = NEST_VIS[step.state];
-  const color = pal[vis.key];
+function SubStep({ step, index }: { step: SubStepRow; index: number }) {
+  const { cue } = useStateCue(step.state);
   return (
-    <div className="absolute flex items-center gap-x-2 gap-y-1" style={{ top, left: 0, right: 0, height: SUB_ROW_H, paddingLeft: 16 }}>
+    <div
+      data-testid="af-substep"
+      data-state={step.state}
+      data-cue={cue ?? undefined}
+      className="afx-srow"
+      style={{ top: index * SUB_ROW_H, height: SUB_ROW_H, ['--i' as string]: Math.min(index, 10) }}
+    >
       {/* node on the sub-spine */}
-      <span
-        className={cn('absolute', step.state === 'running' && 'animate-pulse')}
-        style={{ left: -4, top: SUB_ROW_H / 2 - 3.5, width: 7, height: 7, borderRadius: 9999, background: color }}
-        aria-hidden
-      />
-      <span className="truncate text-note font-medium text-ink">{step.id}</span>
-      {step.kind !== 'step' && (
-        <Badge tone="neutral" ring>
-          {step.kind}
-        </Badge>
-      )}
-      {step.codename ? (
-        <AgentName codename={step.codename} agent={step.agent ?? undefined} derived={step.codenameDerived} />
-      ) : (
-        step.agent && <span className="truncate font-mono text-meta text-ink-mute">{step.agent}</span>
-      )}
-      <span className="ml-auto flex shrink-0 items-center gap-1 text-meta" style={{ color }}>
-        <span aria-hidden>{vis.glyph}</span>
-        {vis.label}
-      </span>
+      <span data-state={step.state} className="afx-sdot gx-s" aria-hidden />
+      <div className="afx-srow-body">
+        <span className="afx-sname" title={step.id}>
+          {step.id}
+        </span>
+        {step.kind !== 'step' && <span className="afx-tag">{step.kind}</span>}
+        {step.codename ? (
+          <span className="afx-ident">
+            <AgentName codename={step.codename} agent={step.agent ?? undefined} derived={step.codenameDerived} />
+          </span>
+        ) : (
+          step.agent && <span className="min-w-0 truncate font-mono text-meta text-ink-mute">{step.agent}</span>
+        )}
+        <StatusCapsule state={step.state} small />
+        {step.state === 'running' && <RunLine />}
+      </div>
     </div>
   );
 }

@@ -110,8 +110,12 @@ describe('AgentiflowGraph recursion', () => {
     expect(screen.getByText('enumerate-services')).toBeInTheDocument();
     // The for_each step carries its kind badge; the plain step does not.
     expect(screen.getByText('for_each')).toBeInTheDocument();
-    // Step status folds from the sub-run's step_results.
-    expect(screen.getByText('done')).toBeInTheDocument();
+    // Step status folds from the sub-run's step_results: the step that has a
+    // successful result is done, the one without any is still pending.
+    const steps = within(screen.getByTestId('af-subflow')).getAllByTestId('af-substep');
+    expect(steps.map((s) => s.getAttribute('data-state'))).toEqual(['done', 'pending']);
+    expect(within(steps[0]).getByText('done')).toBeInTheDocument();
+    expect(within(steps[1]).getByText('pending')).toBeInTheDocument();
 
     // Collapsing hides the steps again (and does not refetch).
     fireEvent.click(screen.getByRole('button', { name: /Collapse cobalt-harbor\/siskin#1 flow/ }));
@@ -153,6 +157,29 @@ describe('AgentiflowGraph recursion', () => {
     expect(screen.queryByText(/hidden/)).not.toBeInTheDocument();
     // One unit per round is mounted (the kind badge appears once per unit).
     expect(screen.getAllByText('agent')).toHaveLength(2);
+  });
+
+  it("reads each unit's status the way the Fleet list does", () => {
+    const mixed: Detail = {
+      ...DETAIL,
+      units: [
+        { ...DETAIL.units[0], unit_id: 'u_ok', status: { state: 'done', success: true } },
+        { ...DETAIL.units[0], unit_id: 'u_bad', status: { state: 'done', success: false } },
+        { ...DETAIL.units[0], unit_id: 'u_err', status: { state: 'failed', error: 'boom' } },
+        { ...DETAIL.units[0], unit_id: 'u_wait', status: { state: 'pending' } },
+        { ...DETAIL.units[0], unit_id: 'u_run', status: { state: 'running' } },
+      ],
+    };
+    render(
+      <MemoryRouter>
+        <AgentiflowGraph detail={mixed} />
+      </MemoryRouter>,
+    );
+    const cards = screen.getAllByTestId('af-unit');
+    expect(cards.map((c) => c.getAttribute('data-state'))).toEqual(['done', 'failed', 'failed', 'pending', 'running']);
+    // The loud states name themselves on the card; the running one says so.
+    expect(within(cards[4]).getByText('running')).toBeInTheDocument();
+    expect(within(cards[1]).getByText('failed')).toBeInTheDocument();
   });
 
   it('keeps an agent unit a leaf with a transcript link', () => {

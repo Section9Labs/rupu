@@ -619,7 +619,8 @@ function UnitRow({ unit, afId }: { unit: AgentiflowUnit; afId: string }) {
   const hasBody = inline != null || lazy;
   return (
     <li className="px-4 py-2.5">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      {/* text-ui sizes the codename: AgentName sets none of its own. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-ui">
         <AgentName
           codename={unit.codename}
           agent={unit.agent ?? undefined}

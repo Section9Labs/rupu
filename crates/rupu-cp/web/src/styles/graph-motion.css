@@ -1,7 +1,8 @@
 /* ──────────────────────────────────────────────────────────────────────────
  * Workflow-graph look and motion: the run graph (components/RunGraph.tsx,
- * components/graph/*, `gx-*`), the workflow editor's canvas (`wfx-*`) and the
- * agentiflow flow (`afx-*`). "Calm depth": cards are raised panels whose
+ * components/graph/*, `gx-*`) and the workflow editor's canvas (`wfx-*`); the
+ * agentiflow flow (`afx-*`) has its own sheet, agentiflow-flow.css, on these
+ * tokens and keyframes. "Calm depth": cards are raised panels whose
  * shadows read as light; status is a capsule whose glyph morphs between
  * states; only the live frontier moves continuously, and every move says
  * something about the run:
@@ -38,6 +39,7 @@
     0 24px 40px -14px rgb(var(--gx-sh) / 0.18);
   --gx-highlight: inset 0 1px 0 rgb(255 255 255 / 0.9);
   --gx-glow-rest: 0.5;
+  --gx-sil-shadow: drop-shadow(0 1px 1px rgb(15 23 42 / 0.05)) drop-shadow(0 4px 8px rgb(15 23 42 / 0.07));
 }
 [data-theme='dark'] {
   --gx-card: var(--c-surface);
@@ -46,6 +48,7 @@
   --gx-shadow-lift: 0 2px 4px rgb(var(--gx-sh) / 0.45), 0 14px 32px -8px rgb(var(--gx-sh) / 0.7);
   --gx-highlight: inset 0 1px 0 rgb(255 255 255 / 0.07);
   --gx-glow-rest: 0.4;
+  --gx-sil-shadow: drop-shadow(0 1px 1px rgb(0 0 0 / 0.4)) drop-shadow(0 4px 10px rgb(0 0 0 / 0.45));
 }
 
 /* Status color, by state, for anything marked .gx-s[data-state]. */
@@ -708,18 +711,47 @@
   animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
   transition: scale 180ms var(--ease-out);
 }
-.wfx-sil-shape { transition: stroke 220ms ease; }
+/* The silhouette takes the run graph's card: its surface, a resting shadow
+   that follows the shape, and a brand selection ring (the shape's own stroke
+   turns the kind's color). */
+.wfx-sil { filter: var(--gx-sil-shadow); }
+.wfx-sil-shape { fill: rgb(var(--gx-card)); transition: stroke 220ms ease; }
 .wfx-sil-glow {
+  stroke: rgb(var(--c-brand-500));
   opacity: 0;
   transition: opacity 200ms var(--ease-out);
 }
-.wfx-sil-glow[data-on] { opacity: 0.28; }
+.wfx-sil-glow[data-on] { opacity: 0.22; }
 .wfx-sil-lift {
-  fill: rgb(var(--c-ink) / 0.3);
-  filter: blur(8px);
+  fill: rgb(var(--gx-sh) / 0.35);
+  filter: blur(9px);
   translate: 0 4px;
   opacity: 0;
   transition: opacity 200ms var(--ease-out), translate 200ms var(--ease-out);
+}
+/* Type: the run graph's — a sans name, the kind as a tinted label. */
+.wfx-node .wfx-kindpill {
+  gap: 4px;
+  height: 16px;
+  padding: 0 6px 0 5px;
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+}
+.wfx-node .wfx-nid {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.wfx-node .wfx-agent { color: rgb(var(--c-ink-dim)); }
+/* Insets sit on the card's surface in both themes (the card is --c-surface in
+   dark, so a surface-colored row would vanish). */
+.wfx-node :is(.wfx-subrow, .wfx-expr) {
+  border-color: rgb(var(--c-ink) / 0.07);
+  background: rgb(var(--c-ink) / 0.035);
 }
 @media (hover: hover) and (pointer: fine) {
   .react-flow__node:hover .wfx-sil-lift { opacity: 0.45; }
@@ -753,26 +785,38 @@
    dashes on its `animated` edges. */
 .react-flow__edge.react-flow__edge-flow path.wfx-e-base {
   fill: none;
+  stroke-linecap: round;
   stroke-dasharray: 1 1;
   stroke-dashoffset: 0;
-  animation: rgx-draw 520ms var(--ease-out) backwards;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
   animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
   transition: stroke-width 160ms var(--ease-out);
 }
+.react-flow__edge.react-flow__edge-flow path.wfx-e-halo {
+  fill: none;
+  stroke-width: 6;
+  filter: blur(3px);
+  opacity: 0.16;
+  pointer-events: none;
+  animation: rgx-fade 400ms ease-out backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+  transition: opacity 200ms ease;
+}
+.react-flow__edge.react-flow__edge-flow.selected path.wfx-e-halo { opacity: 0.32; }
 .react-flow__edge.react-flow__edge-flow path.wfx-e-light {
   fill: none;
   stroke-linecap: round;
-  stroke-dasharray: 0.05 0.95;
+  stroke-dasharray: 0.08 1.1;
   pointer-events: none;
-  opacity: 0.5;
-  animation: rgx-travel 2.8s linear infinite;
+  opacity: 0.55;
+  animation: gx-travel 3.2s var(--ease-in-out) infinite;
   /* staggered phases, so the edges don't pulse in lockstep */
-  animation-delay: calc(var(--i, 0) * -0.41s);
+  animation-delay: calc(var(--i, 0) * -0.53s);
   transition: opacity 200ms ease;
 }
 .react-flow__edge.react-flow__edge-flow.selected path.wfx-e-light {
   opacity: 1;
-  animation-duration: 1.5s;
+  animation-duration: 1.8s;
 }
 
 /* The line a connection draws while dragged. */
@@ -796,18 +840,31 @@
 }
 
 /* ── workflow editor: palette ── */
+/* Palette cards are small editions of the canvas cards: the same surface,
+   resting shadow and highlight; hover lifts one (its lift shadow fades in),
+   pressing gives way. */
 .wfx-pcard {
+  position: relative;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
   transition:
     border-color 0.15s ease,
     translate 160ms var(--ease-out),
-    scale 120ms var(--ease-out),
-    box-shadow 160ms var(--ease-out);
+    scale 120ms var(--ease-out);
+}
+.wfx-pcard::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: var(--gx-shadow-lift);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
 }
 @media (hover: hover) and (pointer: fine) {
-  .wfx-pcard:not(:disabled):hover {
-    translate: 0 -1px;
-    box-shadow: 0 6px 16px -8px rgb(var(--c-ink) / 0.35);
-  }
+  .wfx-pcard:not(:disabled):hover { translate: 0 -1px; }
+  .wfx-pcard:not(:disabled):hover::after { opacity: 1; }
 }
 .wfx-pcard:not(:disabled):active { scale: 0.97; translate: none; }
 
@@ -836,49 +893,11 @@
   .wfx-sil-lift { translate: none; }
   .react-flow__edge.react-flow__edge-flow path.wfx-e-base { animation: rgx-fade 240ms ease-out backwards; }
   .react-flow__edge.react-flow__edge-flow path.wfx-e-light { display: none; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-halo { animation: none; }
   .wfx-cline-halo { animation: none; }
   .wfx-canvas .react-flow__handle { transition: none; }
   .wfx-pcard:not(:disabled):hover, .wfx-pcard:not(:disabled):active { translate: none; scale: none; }
 }
 @keyframes gx-bloom-fade {
   30% { opacity: 0.6; }
-}
-
-/* ── agentiflow flow (components/agentiflow/AgentiflowGraph.tsx) ── */
-/* The spine draws down from the engagement's start, the rows settle in after
-   it, a round's branch fades in with its units, and the live tail breathes,
-   with a light running down the spine into it. */
-.afx-draw {
-  stroke-dasharray: 1 1;
-  animation: rgx-draw 700ms var(--ease-out) backwards;
-}
-.afx-branch {
-  animation: rgx-fade 360ms ease-out 200ms backwards;
-}
-.afx-row {
-  animation: afx-row var(--rgx-enter) var(--ease-out) backwards;
-  animation-delay: calc(var(--i, 0) * 45ms + 80ms);
-}
-@keyframes afx-row {
-  from { opacity: 0; translate: 0 4px; }
-}
-.afx-ring {
-  transform-box: fill-box;
-  transform-origin: center;
-  animation: afx-ring 2.2s var(--ease-out) infinite;
-}
-@keyframes afx-ring {
-  0% { scale: 1; opacity: 0.8; }
-  70%, 100% { scale: 2.6; opacity: 0; }
-}
-.afx-light {
-  stroke-linecap: round;
-  stroke-dasharray: 0.18 0.82;
-  animation: rgx-travel 1.6s linear infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-  .afx-draw { animation: rgx-fade 240ms ease-out backwards; }
-  .afx-row { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
-  .afx-ring { animation: none; opacity: 0.35; }
-  .afx-light { display: none; }
 }
