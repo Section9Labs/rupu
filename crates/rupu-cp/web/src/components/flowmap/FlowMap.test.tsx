@@ -280,6 +280,16 @@ describe('FlowMap', () => {
     await waitFor(() => expect(within(dialog).getByText(/name: auth-sweep/)).toBeInTheDocument());
   });
 
+  it('a_workflow_a_deeper_child_generated_is_labelled_by_it_without_a_definition', async () => {
+    const lynx1 = CHILDREN.find((c) => c.run_id === RUN.lynx1)!;
+    children = CHILDREN.map((c) => (c.run_id === RUN.gannet1 ? { ...c, parent_run_id: RUN.lynx1, depth: 2 } : c));
+    mount();
+    await waitFor(() => expect(node(RUN.gannet1)).not.toBeNull());
+    const frame = node(RUN.gannet1)!;
+    expect(within(frame).getByTestId('flow-frame-pen')).toHaveTextContent(`written by ${lynx1.address}`);
+    expect(within(frame).queryByRole('button', { name: /definition/ })).toBeNull();
+  });
+
   it('a_poll_keeps_pan_expansion_and_replay', async () => {
     const restore = sizedPane();
     try {

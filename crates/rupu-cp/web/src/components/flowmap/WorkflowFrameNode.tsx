@@ -4,7 +4,8 @@
 // RunGraph's NODE_TYPES), the child space's arcs between them, and a compact
 // board strip along its foot. A workflow the lead generated is labelled
 // "written by the lead in round N" with a button that opens the definition it
-// wrote. Its first render asks for its graph (`onLoad`), so a frame loads
+// wrote; one a deeper child generated is labelled by that child (the flow's
+// generated route serves only the lead's, so it has no button). Its first render asks for its graph (`onLoad`), so a frame loads
 // when it first comes into view.
 
 import { memo, useEffect } from 'react';
@@ -24,6 +25,9 @@ export interface WorkflowFrameData extends Record<string, unknown> {
   child: RunChild;
   /** The round that launched it (the label of a generated one). */
   round: number;
+  /** Who launched it: `null` for the flow's lead, else the launching
+   *  child's address (a generated one's author). */
+  author: string | null;
   inferred: boolean;
   width: number;
   /** The inner graph's area under the header. */
@@ -53,6 +57,7 @@ function WorkflowFrameView({ data }: NodeProps<FrameFlowNode>) {
   }, [onLoad, c.run_id]);
   const spend = childSpend(c);
   const strip = data.board && (data.board.view || data.board.posts.length > 0);
+  const byLead = data.author === null;
   return (
     <div
       className="afx-frame gx-s"
@@ -67,15 +72,15 @@ function WorkflowFrameView({ data }: NodeProps<FrameFlowNode>) {
       <Handle type="source" position={Position.Right} className="gx-port" />
       <div className="afx-frame-head" style={{ height: FRAME_HEAD }}>
         {c.generated ? (
-          <span className="afx-frame-pen">
+          <span className="afx-frame-pen" data-testid="flow-frame-pen">
             <PenLine size={12} aria-hidden />
-            written by the lead in round {data.round}
+            {byLead ? `written by the lead in round ${data.round}` : `written by ${data.author}`}
           </span>
         ) : (
           <Workflow size={12} aria-hidden className="afx-frame-icon" />
         )}
         <b className="afx-frame-name">{c.name}</b>
-        {c.generated && c.handle && (
+        {c.generated && byLead && c.handle && (
           <button type="button" className="afx-frame-btn nodrag" onClick={() => data.onDefinition(c)}>
             <FileCode2 size={12} aria-hidden />
             definition

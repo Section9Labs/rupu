@@ -441,6 +441,15 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     },
     [navigate],
   );
+  // Who launched a child: the lead (null), else the launching child.
+  const authorOf = useCallback(
+    (c: RunChild): string | null => {
+      if (c.parent_run_id === record.id) return null;
+      const p = childById.get(c.parent_run_id);
+      return p?.address ?? p?.handle ?? p?.codename ?? c.parent_run_id;
+    },
+    [record.id, childById],
+  );
   const leadTint = crewTint(parseCodename(record.codename).crew, mode) ?? colors.get('brand.500');
 
   // --- nodes ---------------------------------------------------------------
@@ -551,6 +560,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             {
               child: n.child,
               round: n.round,
+              author: authorOf(n.child),
               inferred: n.inferred,
               width: box?.width ?? 480,
               graphHeight,
@@ -627,6 +637,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     onRailOpen,
     frameBoards,
     handlersOf,
+    authorOf,
     data.frameErrors,
     data.loadFrame,
     focus?.id,
