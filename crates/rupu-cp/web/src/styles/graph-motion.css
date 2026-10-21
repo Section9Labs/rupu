@@ -1208,9 +1208,10 @@
   animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
 }
 .tl-scrubber {
-  position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: rgb(var(--c-brand-500));
+  position: absolute; inset: 0; pointer-events: none;
   transition: transform 80ms var(--ease-in-out, cubic-bezier(0.77, 0, 0.175, 1));
 }
+.tl-scrubber-line { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: rgb(var(--c-brand-500)); }
 .tl-controls { display: flex; align-items: center; gap: 8px; }
 .tl-live {
   display: inline-flex; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px;

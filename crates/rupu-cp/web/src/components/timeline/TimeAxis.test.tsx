@@ -71,4 +71,21 @@ describe('TimeAxis', () => {
     mount(null, false, {});
     expect(screen.queryByRole('button', { name: 'Show all' })).toBeNull();
   });
+
+  it('a_scrubbed_mount_places_the_scrubber_without_measuring', () => {
+    mount(2500, false, {});
+    expect(screen.getByTestId('time-scrubber').style.transform).toBe('translateX(25%)');
+  });
+
+  it('from_live_only_a_move_back_starts_scrubbing', () => {
+    const onScrub = vi.fn();
+    mount(null, true, { onScrub });
+    const slider = screen.getByRole('slider');
+    fireEvent.keyDown(slider, { key: 'ArrowRight' });
+    fireEvent.keyDown(slider, { key: 'End' });
+    expect(onScrub).not.toHaveBeenCalled();
+    fireEvent.keyDown(slider, { key: 'ArrowLeft' });
+    fireEvent.keyDown(slider, { key: 'Home' });
+    expect(onScrub.mock.calls.map((c) => c[0])).toEqual([9900, 0]);
+  });
 });

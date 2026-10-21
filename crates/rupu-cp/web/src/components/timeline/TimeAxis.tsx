@@ -60,6 +60,8 @@ export function TimeAxis({
     else if (e.key === 'Home') next = bounds.start;
     else if (e.key === 'End') next = bounds.end;
     if (next === null) return;
+    // Live / whole: only a move away from the end starts scrubbing.
+    if (t === null && (e.key === 'End' || e.key === 'ArrowRight' || e.key === 'ArrowUp')) return;
     e.preventDefault();
     onScrub(Math.min(bounds.end, Math.max(bounds.start, next)));
   };
@@ -118,11 +120,14 @@ export function TimeAxis({
             />
           ))}
         {t !== null && (
-          <span
+          <div
             className="tl-scrubber"
-            style={{ transform: `translateX(${((t - bounds.start) / span) * (track.current?.getBoundingClientRect().width ?? 0)}px)` }}
+            data-testid="time-scrubber"
+            style={{ transform: `translateX(${((t - bounds.start) / span) * 100}%)` }}
             aria-hidden
-          />
+          >
+            <span className="tl-scrubber-line" />
+          </div>
         )}
       </div>
       <div className="tl-controls">
