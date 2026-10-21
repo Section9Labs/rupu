@@ -1682,7 +1682,7 @@ mod tests {
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.launcher.lock().unwrap().extend_from_slice(b);
+                self.0.lock().unwrap().extend_from_slice(b);
                 Ok(b.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
