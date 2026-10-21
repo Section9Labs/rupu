@@ -28,7 +28,10 @@ const MIN_LENS = 20; // the lens never shrinks below this (very long runs)
 // "Nice" tick steps, 5 minutes → 2 days, for the adaptive hour/day ticks.
 const STEPS_MS = [5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880].map((m) => m * 60_000);
 
+/** `hex` at alpha `a`. A tint that isn't a hex (a theme token's `rgb(var(…))`,
+ *  the flow's fallback when a crew has no tint) is mixed instead. */
 function hexA(hex: string, a: number): string {
+  if (!hex.startsWith('#')) return `color-mix(in srgb, ${hex} ${Math.round(a * 100)}%, transparent)`;
   const h = hex.replace('#', '');
   const full = h.length === 3 ? h.split('').map((c) => c + c).join('') : h;
   const n = parseInt(full, 16);

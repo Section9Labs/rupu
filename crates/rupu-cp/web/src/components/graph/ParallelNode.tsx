@@ -1,100 +1,75 @@
-// ParallelNode — a bordered container for a `parallel` step. Header shows the
-// aggregate roll-up (`parallel · {done}/{total}`); children render as stacked
-// chips, each colored by its own state (graph-pro mockup: the purple-bordered
-// container with side-by-side sub-steps).
+// ParallelNode — a `parallel` step: one card whose rows are its sub-steps,
+// each with its own status capsule (a running row is tinted and carries the
+// progress line) and, when it runs an agent, that agent's identity.
 
 import { memo } from 'react';
-import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
+import type { NodeProps, Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
-import { stateStyle } from './stepStyle';
-import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
-import { runKindAccent } from './kindBridge';
+import { useStateCue } from '../../lib/graph/runMotion';
 import { AgentIdentity } from '../codename/AgentIdentity';
+import { NodeFoot, NodeFrame, NodeHead, RunLine, StatusCapsule } from './NodeFrame';
 import WarnMark from './WarnMark';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** Entrance slot (see `useEntranceSlots`). */
+  slot?: number;
 }
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
+type Sub = NonNullable<GraphNode['parallel']>[number];
+
+function SubRow({ sub }: { sub: Sub }) {
+  const { cue } = useStateCue(sub.state);
+  return (
+    <div data-state={sub.state} data-cue={cue ?? undefined} className="gx-subrow gx-s">
+      <div className="gx-subrow-head">
+        <span className="gx-subname">{sub.id}</span>
+        <StatusCapsule state={sub.state} small />
+      </div>
+      <AgentIdentity
+        className="gx-ident gx-ident-sm"
+        codename={sub.codename}
+        derived={sub.codenameDerived}
+        agent={sub.agent}
+        provider={sub.provider}
+        model={sub.model}
+      />
+      {sub.state === 'running' && <RunLine />}
+    </div>
+  );
+}
 
 function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const { node } = data;
-  const colors = useThemeColors();
-  // Container identity: the SAME accent the editor paints 'parallel' with
-  // (sev.critical).
-  const accentKey = runKindAccent(node.kind);
-  const handleStyle = {
-    background: colors.alpha(accentKey, 0.5),
-    width: 6,
-    height: 6,
-    border: 'none',
-  } as const;
   const subs = node.parallel ?? [];
-  const total = subs.length;
   const done = subs.filter((s) => s.state === 'done').length;
-  const running = node.state === 'running';
   const box = nodeSize(node);
-
   return (
-    <div
-      data-testid="rg-container"
-      className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{
-        borderColor: colors.alpha(accentKey, 0.4),
-        background: colors.alpha(accentKey, 0.08),
-        width: box.width,
-        minHeight: box.height,
-      }}
+    <NodeFrame
+      state={node.state}
+      kind={node.kind}
+      slot={data.slot}
+      width={box.width}
+      minHeight={box.height}
+      testId="rg-container"
+      live={false}
     >
-      <Handle type="target" position={Position.Left} style={handleStyle} />
-
-      <div
-        className="mb-1.5 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
-        style={{ color: colors.get(accentKey) }}
-      >
-        <span className="truncate">parallel · {node.id}</span>
-        <span className="flex shrink-0 items-center gap-1.5">
-          <WarnMark warnings={node.warnings} />
-          <span className="tabular-nums">
-            {done}/{total} ✓
-          </span>
+      <NodeHead kind={node.kind} name={node.id} state={node.state}>
+        <WarnMark warnings={node.warnings} />
+        <span className="gx-count">
+          {done}/{subs.length}
         </span>
+      </NodeHead>
+      <div className="gx-subrows">
+        {subs.map((sub) => (
+          <SubRow key={sub.id} sub={sub} />
+        ))}
+        {subs.length === 0 && <div className="gx-sub">no sub-steps</div>}
       </div>
-
-      <div className="flex flex-col gap-1">
-        {subs.map((sub) => {
-          const ss = stateStyle(colors, sub.state);
-          return (
-            <div key={sub.id} className="rounded-[6px] border border-border bg-panel px-1.5 py-1">
-              <div className="flex items-center gap-1.5">
-                <span
-                  className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-                  style={{ background: ss.color }}
-                  aria-hidden
-                >
-                  {ss.glyph}
-                </span>
-                <span className="min-w-0 truncate text-note text-ink">{sub.id}</span>
-              </div>
-              {/* identity on its own lines (PARALLEL_SUBROW_ID_H) */}
-              <AgentIdentity
-                className="pl-[18px] text-meta text-ink-dim"
-                codename={sub.codename}
-                derived={sub.codenameDerived}
-                agent={sub.agent}
-                provider={sub.provider}
-                model={sub.model}
-              />
-            </div>
-          );
-        })}
-        {total === 0 && <div className="px-1 py-0.5 text-meta text-ink-mute">no sub-steps</div>}
-      </div>
-
-      <Handle type="source" position={Position.Right} style={handleStyle} />
-    </div>
+      <NodeFoot kind={node.kind} />
+    </NodeFrame>
   );
 }
 

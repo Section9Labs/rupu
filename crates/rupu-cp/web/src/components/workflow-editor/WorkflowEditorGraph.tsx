@@ -25,6 +25,7 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type EdgeTypes,
   type Node,
   type NodeChange,
   type NodeMouseHandler,
@@ -56,12 +57,16 @@ import LoopGroupNode, { type LoopGroupNodeData, loopGroupBox } from './nodes/Loo
 import LoopForm from './LoopForm';
 import { KIND_ACCENT } from './kindVisuals';
 import NodePalette, { NODE_KIND_MIME, NODE_SEED_MIME } from './NodePalette';
+import FlowEdge, { FlowConnectionLine } from './FlowEdge';
+import { useEntranceSlots } from '../../lib/graph/runMotion';
+import { mergeMeasured, type Size } from '../../lib/graph/measured';
 
 import '@xyflow/react/dist/style.css';
 
 // Memoized once at module scope so React Flow doesn't see a fresh object each
 // render (mirrors RunGraph).
 const NODE_TYPES: NodeTypes = { editable: EditableStepNode, loopGroup: LoopGroupNode };
+const EDGE_TYPES: EdgeTypes = { flow: FlowEdge };
 
 // ── Pure mutation helpers (exported for tests) ───────────────────────────────
 
@@ -568,16 +573,27 @@ function WorkflowEditorGraphInner({
     });
   }, [graph.edges]);
 
+  // The node objects are rebuilt from `graph` on every change (each drag
+  // frame included). Hand xyflow back the sizes it measured, or it drops every
+  // node's handles until it re-measures and every edge remounts for a frame;
+  // and mirror which nodes are mid-drag, so a dragged card can lift.
+  const [measured, setMeasured] = useState<ReadonlyMap<string, Size>>(() => new Map());
+  const [draggingIds, setDraggingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const positionsById = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n.position])), [graph.nodes]);
+  const slots = useEntranceSlots(positionsById);
+
   const nodes = useMemo<Node<NodeData>[]>(
     () =>
       graph.nodes.map((node) => ({
         id: node.id,
         type: 'editable',
         position: node.position,
-        data: { node, problems: problemsById[node.id] ?? [] },
+        data: { node, problems: problemsById[node.id] ?? [], slot: slots.get(node.id) ?? 0 },
         selected: node.id === selectedId || selectedIds.has(node.id),
+        ...(draggingIds.has(node.id) ? { dragging: true } : {}),
+        ...(measured.has(node.id) ? { measured: measured.get(node.id) } : {}),
       })),
-    [graph.nodes, problemsById, selectedId, selectedIds],
+    [graph.nodes, problemsById, selectedId, selectedIds, slots, draggingIds, measured],
   );
 
   // Loop group boundary nodes (Phase 3 Task 5) — one synthetic, non-
@@ -638,6 +654,8 @@ function WorkflowEditorGraphInner({
       const isSelected = selectedEdgeIds.has(e.id);
       const sourceKind = kindById.get(e.source);
       const accentKey = sourceKind ? KIND_ACCENT[sourceKind] : undefined;
+      const targetKind = kindById.get(e.target);
+      const targetKey = targetKind ? KIND_ACCENT[targetKind] : accentKey;
       // Plain (non-branch) edges get a kind-tinted arrowhead, matching the
       // stroke below.
       const markerColor = branchColor ?? colors.alpha(accentKey ?? 'inkMute', 0.55);
@@ -645,7 +663,7 @@ function WorkflowEditorGraphInner({
         id: e.id,
         source: e.source,
         target: e.target,
-        type: 'smoothstep',
+        type: 'flow',
         markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
       };
       // Anchor the edge at the branch node's matching arm handle.
@@ -660,9 +678,10 @@ function WorkflowEditorGraphInner({
       // Only set `selected` when true, so an unselected edge's emitted shape
       // stays as small as possible.
       if (isSelected) edge.selected = true;
-      // xyflow's built-in dashed flow animation, on every edge (branch arm or
-      // plain).
+      // Every edge flows (branch arm or plain): FlowEdge's travelling light,
+      // which replaces xyflow's built-in dashes (styles/graph-motion.css).
       edge.animated = true;
+      const slot = slots.get(e.source) ?? 0;
       if (e.label !== undefined) edge.label = e.label;
       if (branchColor !== undefined) {
         // Branch (true/false) arm — colored stroke, a touch bolder (mirrors
@@ -671,6 +690,7 @@ function WorkflowEditorGraphInner({
         // default `.selected` CSS treatment, so the selected emphasis is
         // earned here rather than through the stylesheet.
         edge.style = { stroke: branchColor, strokeWidth: isSelected ? 3.5 : 2.5 };
+        edge.data = { from: branchColor, to: branchColor, slot };
         edge.labelStyle = { fill: branchColor, fontWeight: 600 };
         // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
         // the arm's own accent (status.done / status.failed).
@@ -686,9 +706,16 @@ function WorkflowEditorGraphInner({
         // accent (mockup's `.edge`, upgraded from a flat muted stroke so
         // every edge — not just branch arms — reads as meaningful); bolder,
         // full-strength when selected.
+        const a = isSelected ? 0.9 : 0.55;
         edge.style = {
-          stroke: colors.alpha(accentKey ?? 'inkMute', isSelected ? 0.9 : 0.55),
+          stroke: colors.alpha(accentKey ?? 'inkMute', a),
           strokeWidth: isSelected ? 3 : 2,
+        };
+        // The line runs from the source's kind color into the target's.
+        edge.data = {
+          from: colors.alpha(accentKey ?? 'inkMute', a),
+          to: colors.alpha(targetKey ?? 'inkMute', a),
+          slot,
         };
         if (e.label !== undefined) {
           // Non-branch edges that carry a label (none produced by
@@ -702,11 +729,27 @@ function WorkflowEditorGraphInner({
       }
       return edge;
     });
-  }, [graph.edges, kindById, colors, selectedEdgeIds]);
+  }, [graph.edges, kindById, colors, selectedEdgeIds, slots]);
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
     (changes: NodeChange<Node>[]) => {
+      setMeasured((prev) => mergeMeasured(prev, changes));
+      const drags = changes.filter(
+        (c): c is Extract<NodeChange<Node>, { type: 'position' }> => c.type === 'position' && c.dragging !== undefined,
+      );
+      if (drags.length > 0) {
+        setDraggingIds((prev) => {
+          let next: Set<string> | undefined;
+          for (const c of drags) {
+            if (prev.has(c.id) === c.dragging) continue;
+            next ??= new Set(prev);
+            if (c.dragging) next.add(c.id);
+            else next.delete(c.id);
+          }
+          return next ?? prev;
+        });
+      }
       const removed = changes.flatMap((c) => (c.type === 'remove' ? [c.id] : []));
       if (removed.length > 0) {
         let g = graph;
@@ -1066,6 +1109,8 @@ function WorkflowEditorGraphInner({
         nodes={flowNodes}
         edges={edges}
         nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
+        connectionLineComponent={FlowConnectionLine}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -1086,10 +1131,10 @@ function WorkflowEditorGraphInner({
         <MiniMap
           pannable
           zoomable
-          className="!border-border !bg-panel"
-          maskColor={colors.alpha('ink', 0.08)}
-          nodeColor={colors.inkMute}
-          nodeStrokeColor={colors.border}
+          style={{ width: 150, height: 96 }}
+          maskColor={colors.alpha('bg', 0.55)}
+          nodeColor={(n) => (n.type === 'editable' ? colors.alpha(KIND_ACCENT[(n.data as NodeData).node.data.kind], 0.8) : 'transparent')}
+          nodeBorderRadius={4}
         />
         <Controls className="!border-border !bg-panel !shadow-card" showInteractive={false} />
       </ReactFlow>

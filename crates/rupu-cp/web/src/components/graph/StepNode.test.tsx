@@ -25,8 +25,8 @@ afterEach(cleanup);
 describe('StepNode', () => {
   it('keeps the status overlay legible on a FAILED step', () => {
     renderNode({ state: 'failed' });
-    // the status glyph + label must survive the kind repaint
-    expect(screen.getByText('✕')).toBeInTheDocument();
+    // the status glyph + word must survive the kind repaint
+    expect(document.querySelector('.gx-cap .gx-glyph')).toHaveAttribute('data-state', 'failed');
     expect(screen.getByText('failed')).toBeInTheDocument();
     // and the kind identity is present
     expect(screen.getByText('step')).toBeInTheDocument();
@@ -34,7 +34,7 @@ describe('StepNode', () => {
 
   it('renders a kind pill for the step kind', () => {
     renderNode({ kind: 'step' });
-    expect(screen.getByTestId('rg-kindpill')).toHaveTextContent('step');
+    expect(screen.getByTestId('rg-kindpill')).toHaveAttribute('title', 'step');
   });
 
   it('shows codename · agent, with provider/model on its own line', () => {
@@ -53,7 +53,7 @@ describe('StepNode', () => {
 
   it('reserves the taller agent box so the identity rows fit', () => {
     const { container } = renderNode({ agent: 'security-reviewer', codename: 'jade-reef/heron' });
-    const root = container.querySelector('.shadow-card') as HTMLElement;
+    const root = container.querySelector('[data-testid="rg-node"]') as HTMLElement;
     expect(root.style.minHeight).toBe(`${STEP_AGENT_H}px`);
     expect(nodeSize({ id: 'x', kind: 'step', state: 'pending', agent: 'a' } as GraphNode).height).toBe(STEP_AGENT_H);
     expect(nodeSize({ id: 'x', kind: 'step', state: 'pending' } as GraphNode).height).toBe(STEP_H);
@@ -93,13 +93,13 @@ describe('StepNode', () => {
       'host gpu-9 did not stream coverage\nunit 2: unit findings were not collected',
     );
     // the status overlay is exactly what the lifecycle said
-    expect(screen.getByText('✓')).toBeInTheDocument();
+    expect(document.querySelector('.gx-cap .gx-glyph')).toHaveAttribute('data-state', 'done');
     expect(screen.getByText('done')).toBeInTheDocument();
   });
 
   it('a FAILED step that also warned still reads failed', () => {
     renderNode({ state: 'failed', warnings: [{ message: 'partial coverage' }] });
-    expect(screen.getByText('✕')).toBeInTheDocument();
+    expect(document.querySelector('.gx-cap .gx-glyph')).toHaveAttribute('data-state', 'failed');
     expect(screen.getByText('failed')).toBeInTheDocument();
     expect(screen.getByTestId('rg-warn')).toHaveAttribute('aria-label', '1 warning');
   });
@@ -112,11 +112,11 @@ describe('StepNode', () => {
   it('keeps the marker inside the header row, so it adds no row to the node', () => {
     const { container } = renderNode({ state: 'done', agent: 'security-reviewer', warnings: [{ message: 'x' }] });
     const mark = screen.getByTestId('rg-warn');
-    // same flex row as the step name and its status label …
-    expect(mark.parentElement).toBe(screen.getByText('done').parentElement);
+    // same head row as the step name and its status capsule …
     expect(mark.parentElement).toBe(screen.getByText('build').parentElement);
+    expect(mark.parentElement).toBe(screen.getByText('done').closest('.gx-cap')!.parentElement);
     // … so the node has the same number of rows as an unwarned one.
-    const rows = (root: Element) => root.querySelector('.shadow-card')!.children.length;
+    const rows = (root: Element) => root.querySelector('[data-testid="rg-node"]')!.children.length;
     const warned = rows(container);
     cleanup();
     const clean = renderNode({ state: 'done', agent: 'security-reviewer' });

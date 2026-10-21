@@ -1,45 +1,44 @@
-// FanoutNode — a `for_each` step. Two presentations driven by unit count:
+// FanoutNode — a `for_each` step. Three presentations:
 //
-//   N ≤ 12 : inline grid of clickable unit squares (click → that unit's
-//            transcript via onOpenUnit).
-//   N > 12 : a collapsed card leading with `{done}/{total}` + a single
-//            % bar, `{failed} failed` in red when any failed, a small
-//            density-preview grid, and an "expand" affordance that opens
-//            the step's unit file-browser via onExpandFanout.
-//
-// Faithful to the fanout-loop mockup: big X / N, blue→green % bar, failures
-// broken out in red, density grid of colored squares. All colors are themed via
-// `useThemeColors()` so the card reads on both light and dark.
+//   no units yet  the card with a line saying where the fan-out stands;
+//   N ≤ 12        a grid of unit cells, each a button selecting that unit's
+//                 transcript, its glyph morphing as the unit runs and lands
+//                 (a landing cell pops once);
+//   N > 12        a summary card: done / total, the percentage, a progress
+//                 bar, the counts by state, a density preview of the first 60
+//                 units, and "expand all" opening the unit browser.
 
 import { memo } from 'react';
-import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
+import type { NodeProps, Node } from '@xyflow/react';
 import type { GraphNode, UnitView } from '../../lib/runGraphModel';
-import { stateStyle, glyphBg } from './stepStyle';
+import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
-import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
-import { runKindAccent } from './kindBridge';
+import { fanoutInlineCols, nodeSize, FANOUT_INLINE_THRESHOLD } from '../../lib/nodeSize';
+import { useStateCue } from '../../lib/graph/runMotion';
 import { memberLabel, parseCodename } from '../../lib/codename';
 import { cn } from '../../lib/cn';
 import { derivedTitle } from '../codename/CrewChip';
 import { RoleBadge } from '../codename/RoleBadge';
+import { NodeFoot, NodeFrame, NodeHead, StatusGlyph } from './NodeFrame';
 import WarnMark, { unitWarningSuffix } from './WarnMark';
 
 export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
+  /** Entrance slot (see `useEntranceSlots`). */
+  slot?: number;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
 
-const INLINE_THRESHOLD = FANOUT_INLINE_THRESHOLD;
 const PREVIEW_CELLS = 60;
 
-/** Compact crew-role header for a fan-out: role badge + role word + `×N`.
- *  Fan-out steps carry no step-level codename (instances live on units), so
- *  the role comes from the node's codename when set, else the first unit's.
- *  Per-unit names stay out of the node — they live in unit lists/selection,
- *  which keeps the header O(1) at hundreds–thousands of units. */
+/** Compact crew-role tag for a fan-out: role badge + role word + `×N`. Fan-out
+ *  steps carry no step-level codename (instances live on units), so the role
+ *  comes from the node's codename when set, else the first unit's. Per-unit
+ *  names stay out of the node — they live in unit titles and the unit browser,
+ *  which keeps the card O(1) at hundreds–thousands of units. */
 function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
   const named: { codename?: string; codenameDerived?: boolean } | undefined = node.codename
     ? node
@@ -54,10 +53,7 @@ function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
       data-testid="rg-fanout-role"
       title={derivedTitle(codename, derived)}
       data-derived={derived || undefined}
-      className={cn(
-        'inline-flex shrink-0 items-center gap-1 normal-case tracking-normal',
-        derived && 'opacity-60',
-      )}
+      className={cn('gx-role', derived && 'opacity-60')}
     >
       <RoleBadge role={role} size={10} />
       <span className="font-mono">
@@ -67,80 +63,64 @@ function FanoutRole({ node, total }: { node: GraphNode; total: number }) {
   );
 }
 
-/** Hover title for one unit square: `leaf · agent · provider/model · state`. */
+/** Hover title for one unit: `leaf · agent · provider/model · state`. */
 function unitTitle(node: GraphNode, u: UnitView, stateLabel: string): string {
   const who = u.codename ? memberLabel(u.codename, node.agent, u.provider, u.model) : u.key;
   return `${who} · ${stateLabel}${unitWarningSuffix(u.warnings)}`;
 }
 
+function UnitCell({ node, unit, onOpen }: { node: GraphNode; unit: UnitView; onOpen?: () => void }) {
+  const colors = useThemeColors();
+  const { cue } = useStateCue(unit.state);
+  return (
+    <button
+      type="button"
+      data-state={unit.state}
+      data-cue={cue ?? undefined}
+      title={unitTitle(node, unit, stateStyle(colors, unit.state).label)}
+      onClick={onOpen}
+      className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
+    >
+      <StatusGlyph state={unit.state} />
+    </button>
+  );
+}
+
 function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const { node, onOpenUnit, onExpandFanout } = data;
-  const colors = useThemeColors();
-  // Container identity: the SAME accent the editor paints 'for_each' with
-  // (brand.500 — violet). The empty-units placeholder card below stays
-  // state-driven (it has no fanout yet, so there is nothing to fan out with
-  // a kind identity) and the per-unit squares/progress gradient stay
-  // state-colored — only the container tint switches on kind.
-  const accentKey = runKindAccent(node.kind);
-  const handleStyle = {
-    background: colors.alpha(accentKey, 0.4),
-    width: 6,
-    height: 6,
-    border: 'none',
-  } as const;
   const fo = node.fanout;
-  const running = node.state === 'running';
   const box = nodeSize(node);
+  const frame = {
+    state: node.state,
+    kind: node.kind,
+    slot: data.slot,
+    width: box.width,
+    minHeight: box.height,
+  } as const;
 
   // No units to show. This is NOT always "awaiting" — a for_each over an empty
   // list completes with zero units, and a failed/skipped step never fans out.
-  // Render a card that reflects the step's actual state instead of a permanent
-  // blue "awaiting units…".
   if (!fo || fo.total === 0) {
-    const state = node.state;
-    const isErr = state === 'failed';
-    const isActive = state === 'running' || state === 'pending' || state === 'awaiting_approval';
-    const border = isErr
-      ? colors.alpha('status.failed', 0.4)
-      : isActive
-        ? colors.alpha('status.running', 0.4)
-        : colors.border;
-    const bg = isErr
-      ? colors.alpha('status.failed', 0.12)
-      : isActive
-        ? colors.alpha('status.running', 0.12)
-        : colors.panel;
-    const labelColor = isErr
-      ? colors.status.failed
-      : isActive
-        ? colors.status.running
-        : colors.inkMute;
     const message =
-      state === 'running'
+      node.state === 'running'
         ? 'starting units…'
-        : state === 'done'
+        : node.state === 'done'
           ? 'no units — nothing to fan out'
-          : state === 'failed'
+          : node.state === 'failed'
             ? 'failed before fan-out'
-            : state === 'skipped'
+            : node.state === 'skipped'
               ? 'skipped'
               : 'awaiting units…';
     return (
-      <div
-        className={['relative rounded-[12px] border px-3 py-2', running ? 'rg-pulse-run' : ''].join(' ')}
-        style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
-      >
-        <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div
-          className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
-          style={{ color: labelColor }}
-        >
-          <span className="truncate">for_each · {node.id}</span>
+      <NodeFrame {...frame} testId="rg-container">
+        <NodeHead kind={node.kind} name={node.id} state={node.state}>
           <WarnMark warnings={node.warnings} />
+        </NodeHead>
+        <div key={message} className="gx-body gx-sub gx-swap">
+          {message}
         </div>
-        <div className="mt-1 text-note text-ink-mute">{message}</div>
-        <Handle type="source" position={Position.Right} style={handleStyle} />
-      </div>
+        <NodeFoot kind={node.kind} />
+      </NodeFrame>
     );
   }
 
@@ -151,143 +131,77 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   const pending = fo.byState.pending + fo.byState.awaiting_approval + fo.byState.skipped;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
-  // ---- Small fan-out: inline clickable grid -------------------------------
-  if (total <= INLINE_THRESHOLD) {
-    const cols = Math.min(total, FANOUT_INLINE_COLS);
+  // The summary card says done / total in its body; the grid says it here.
+  const head = (count: boolean) => (
+    <NodeHead kind={node.kind} name={node.id} state={node.state}>
+      <WarnMark warnings={node.warnings} />
+      {count && (
+        <span className="gx-count" aria-label={`${done} of ${total} done`}>
+          {done}/{total}
+        </span>
+      )}
+    </NodeHead>
+  );
+
+  // ---- Small fan-out: a grid of unit cells --------------------------------
+  if (total <= FANOUT_INLINE_THRESHOLD) {
     return (
-      <div
-        data-testid="rg-container"
-        className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
-        style={{
-          borderColor: colors.alpha(accentKey, 0.4),
-          background: colors.alpha(accentKey, 0.12),
-          width: box.width,
-          minHeight: box.height,
-        }}
-      >
-        <Handle type="target" position={Position.Left} style={handleStyle} />
-        <div
-          className="mb-1 flex items-center justify-between gap-3 text-meta font-bold uppercase tracking-wide"
-          style={{ color: colors.get(accentKey) }}
-        >
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="truncate">for_each · {node.id} · {total}</span>
-            <FanoutRole node={node} total={total} />
-            <WarnMark warnings={node.warnings} />
-          </span>
-          <span className="tabular-nums">
-            {done} ✓
-            {failed > 0 && (
-              <span className="ml-1" style={{ color: colors.status.failed }}>· {failed} ✕</span>
-            )}
-          </span>
-        </div>
-        <div
-          className="grid gap-[3px]"
-          style={{ gridTemplateColumns: `repeat(${cols}, 15px)` }}
-        >
+      <NodeFrame {...frame} testId="rg-container" live={false}>
+        {head(true)}
+        <div className="gx-body gx-cells" style={{ gridTemplateColumns: `repeat(${fanoutInlineCols(total)}, 1fr)` }}>
           {fo.units.map((u) => (
-            <button
-              key={u.index}
-              type="button"
-              title={unitTitle(node, u, stateStyle(colors, u.state).label)}
-              onClick={() => onOpenUnit?.(node.id, u.index)}
-              className={cn(
-                'h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110',
-                u.warnings?.length && 'ring-2 ring-warn ring-offset-1 ring-offset-panel',
-              )}
-              style={{ background: glyphBg(colors, u.state) }}
-            />
+            <UnitCell key={u.index} node={node} unit={u} onOpen={() => onOpenUnit?.(node.id, u.index)} />
           ))}
         </div>
-        <Handle type="source" position={Position.Right} style={handleStyle} />
-      </div>
+        <NodeFoot kind={node.kind}>
+          {failed > 0 && <span className="gx-failcount">{failed} failed</span>}
+          <FanoutRole node={node} total={total} />
+        </NodeFoot>
+      </NodeFrame>
     );
   }
 
-  // ---- Large fan-out: collapsed X/N card ----------------------------------
+  // ---- Large fan-out: the summary card ------------------------------------
   const preview = fo.units.slice(0, PREVIEW_CELLS);
   return (
-    <div
-      data-testid="rg-container"
-      className={['relative rounded-[12px] border bg-panel px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
-      style={{ borderColor: colors.alpha(accentKey, 0.4), width: box.width, minHeight: box.height }}
-    >
-      <Handle type="target" position={Position.Left} style={handleStyle} />
-
-      <div
-        className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
-        style={{ color: colors.get(accentKey) }}
-      >
-        <span className="truncate">for_each · {node.id}</span>
-        <span className="flex shrink-0 items-center gap-1.5">
-          <WarnMark warnings={node.warnings} />
-          <FanoutRole node={node} total={total} />
-        </span>
+    <NodeFrame {...frame} testId="rg-container" live={false}>
+      {head(false)}
+      <div className="gx-body">
+        <div className="gx-big">
+          <span className="gx-big-n">{done}</span>
+          <span className="gx-sub">/ {total} units</span>
+          <span className="gx-pct">{pct}%</span>
+        </div>
+        <div className="gx-bar" data-live={node.state === 'running' || undefined}>
+          <span className="gx-bar-fill" style={{ scale: `${pct / 100} 1` }} />
+        </div>
+        <div className="gx-stats">
+          <span>
+            <b>{done}</b> done
+          </span>
+          <span>
+            <b>{runningUnits}</b> running
+          </span>
+          <span>
+            <b>{pending}</b> pending
+          </span>
+          {failed > 0 && <span className="gx-failcount">{failed} failed</span>}
+        </div>
+        <div className="gx-mini">
+          {preview.map((u) => (
+            <span key={u.index} data-state={u.state} className="gx-mini-cell gx-s" />
+          ))}
+        </div>
+        <button type="button" className="gx-link nodrag" onClick={() => onExpandFanout?.(node.id)}>
+          ▸ expand all {total}
+          {failed > 0 && ` · failed (${failed})`}
+          {runningUnits > 0 && ` · running (${runningUnits})`}
+        </button>
       </div>
-
-      <div className="mt-1 flex items-baseline gap-2">
-        <span className="text-[22px] font-bold leading-none text-ink tabular-nums">{done}</span>
-        <span className="text-note text-ink-mute">/ {total} units</span>
-        <span
-          className="ml-auto text-lead font-bold tabular-nums"
-          style={{ color: colors.get(accentKey) }}
-        >
-          {pct}%
-        </span>
-      </div>
-
-      <div
-        className="mt-1.5 h-[9px] overflow-hidden rounded-[5px]"
-        style={{ background: colors.surface }}
-      >
-        <div
-          className="h-full"
-          style={{
-            width: `${pct}%`,
-            background: `linear-gradient(90deg, ${colors.status.running}, ${colors.status.done})`,
-          }}
-        />
-      </div>
-
-      <div className="mt-1.5 flex flex-wrap gap-3 text-note text-ink-dim">
-        <span>
-          <b className="text-ink">{done}</b> done
-        </span>
-        <span>
-          <b className="text-ink">{runningUnits}</b> running
-        </span>
-        <span>
-          <b className="text-ink">{pending}</b> pending
-        </span>
-        {failed > 0 && (
-          <span className="font-bold" style={{ color: colors.status.failed }}>{failed} failed</span>
-        )}
-      </div>
-
-      <div className="mt-2 grid gap-[2px]" style={{ gridTemplateColumns: 'repeat(20, 9px)' }}>
-        {preview.map((u) => (
-          <span
-            key={u.index}
-            className="block h-[9px] w-[9px] rounded-[2px]"
-            style={{ background: glyphBg(colors, u.state) }}
-          />
-        ))}
-      </div>
-
-      <button
-        type="button"
-        onClick={() => onExpandFanout?.(node.id)}
-        className="mt-2 text-note font-medium hover:underline"
-        style={{ color: colors.get(accentKey) }}
-      >
-        ▸ expand all {total}
-        {failed > 0 && ` · failed (${failed})`}
-        {runningUnits > 0 && ` · running (${runningUnits})`}
-      </button>
-
-      <Handle type="source" position={Position.Right} style={handleStyle} />
-    </div>
+      <NodeFoot kind={node.kind}>
+        <FanoutRole node={node} total={total} />
+      </NodeFoot>
+    </NodeFrame>
   );
 }
 

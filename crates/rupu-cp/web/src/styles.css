@@ -213,10 +213,8 @@
 /* ------------------------------------------------------------------ */
 /* Run-graph node + edge animation (Task 11)                          */
 /* Faithful to the approved graph-pro / fanout-loop mockups:          */
-/*   • running node  → soft blue pulse ring                           */
-/*   • awaiting node → soft amber pulse ring                          */
-/*   • active edge   → blue "marching-ants" (xyflow paints the path,  */
-/*     so animate stroke-dashoffset on the SVG path itself)           */
+/*   • running → soft blue pulse ring (status pills reuse it)         */
+/*   • awaiting → soft amber pulse ring                               */
 /* ------------------------------------------------------------------ */
 /* Unified status palette (see lib/status.ts / tailwind `status.*`):
  *   running #3b82f6 (59,130,246) · awaiting #f59e0b (245,158,11) */
@@ -231,19 +229,7 @@
 .rg-pulse-run   { animation: rg-pulse-blue  1.7s ease-in-out infinite; }
 .rg-pulse-await { animation: rg-pulse-amber 1.7s ease-in-out infinite; }
 
-@keyframes rg-march {
-  to { stroke-dashoffset: -28; }
-}
-/* xyflow renders the edge as `path.react-flow__edge-path`; mark the live
- * frontier edge via a wrapper class on the <g> and animate the dashed
- * stroke so the ants march along the rendered curve. Animation only, no
- * color — the stroke is supplied by the edge's inline style (RunGraph's edge
- * memo) so the marching-ants can render in ANY per-kind accent. */
-.react-flow__edge.rg-edge-flow .react-flow__edge-path {
-  stroke-width: 2;
-  stroke-dasharray: 7 7;
-  animation: rg-march 0.7s linear infinite;
-}
+/* The run graph's edges and node glows live in styles/graph-motion.css. */
 
 /* Animated panel-loop back-edge marker (round-counter loop cue). */
 @keyframes rg-loop-spin {
