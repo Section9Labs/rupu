@@ -41,6 +41,8 @@ describe('TimeAxis', () => {
     fireEvent.pointerUp(track, { clientX: 150, pointerId: 1 });
     expect(onScrub).toHaveBeenNthCalledWith(1, 5000);
     expect(onScrub).toHaveBeenNthCalledWith(2, 7500);
+    fireEvent.pointerMove(track, { clientX: 20, pointerId: 1 });
+    expect(onScrub).toHaveBeenCalledTimes(2);
     fireEvent.click(screen.getByRole('button', { name: /replay/i }));
     expect(onReplay).toHaveBeenCalled();
     // scrubbed: no live pill
@@ -50,5 +52,23 @@ describe('TimeAxis', () => {
       </ThemeProvider>,
     );
     expect(screen.queryByText('live')).toBeNull();
+  });
+
+  it('keyboard_steps_the_scrubber', () => {
+    const onScrub = vi.fn();
+    mount(5000, false, { onScrub });
+    const slider = screen.getByRole('slider');
+    expect(slider).toHaveAttribute('aria-valuenow', '5000');
+    fireEvent.keyDown(slider, { key: 'ArrowRight' });
+    fireEvent.keyDown(slider, { key: 'ArrowLeft', shiftKey: true });
+    fireEvent.keyDown(slider, { key: 'Home' });
+    fireEvent.keyDown(slider, { key: 'End' });
+    expect(onScrub.mock.calls.map((c) => c[0])).toEqual([5100, 4000, 0, 10000]);
+    expect(screen.getByRole('button', { name: 'Show all' })).toBeInTheDocument();
+  });
+
+  it('show_all_is_hidden_while_not_scrubbed', () => {
+    mount(null, false, {});
+    expect(screen.queryByRole('button', { name: 'Show all' })).toBeNull();
   });
 });

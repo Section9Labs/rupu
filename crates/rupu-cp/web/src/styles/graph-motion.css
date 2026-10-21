@@ -1185,36 +1185,46 @@
   30% { opacity: 0.6; }
 }
 
-/* Timeline axis (components/timeline/TimeAxis): bands, message ticks, scrubber,
-   live pill. Arrivals ease out, the scrubber moves with transform only. */
+/* Timeline axis (components/timeline/TimeAxis): bands on two rows (rounds,
+   steps), message ticks, scrubber, live pill. Arrivals ease out; the scrubber
+   moves with transform only. */
 .tl-axis { display: flex; align-items: center; gap: 12px; }
 .tl-track {
-  position: relative; flex: 1; height: 28px; touch-action: none; cursor: ew-resize;
-  border-radius: 6px; background: var(--c-surface-2, transparent); overflow: hidden;
+  position: relative; flex: 1; height: 44px; touch-action: none; cursor: ew-resize;
+  border-radius: 6px; background: rgb(var(--c-surface)); overflow: hidden;
 }
+.tl-track:focus-visible { outline: 2px solid rgb(var(--c-brand-500)); outline-offset: 1px; }
 .tl-band {
-  position: absolute; top: 0; bottom: 0; display: flex; align-items: center; overflow: hidden;
-  background: color-mix(in srgb, var(--c-accent, currentColor) 8%, transparent);
+  position: absolute; height: 16px; display: flex; align-items: center; overflow: hidden;
+  background: color-mix(in srgb, rgb(var(--c-brand-500)) 10%, transparent);
   animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
 }
-.tl-band[data-alt='1'] { background: color-mix(in srgb, var(--c-accent, currentColor) 15%, transparent); }
-.tl-band-label { padding: 0 6px; font-size: 11px; white-space: nowrap; opacity: 0.8; }
+.tl-band[data-row='round'] { top: 2px; }
+.tl-band[data-row='step'] { top: 20px; }
+.tl-band[data-alt='1'] { background: color-mix(in srgb, rgb(var(--c-brand-500)) 20%, transparent); }
+.tl-band-label { padding: 0 6px; font-size: 11px; white-space: nowrap; color: rgb(var(--c-ink-dim)); }
 .tl-tick {
-  position: absolute; bottom: 3px; width: 2px; height: 10px; border-radius: 1px;
+  position: absolute; bottom: 3px; width: 2px; height: 8px; border-radius: 1px;
   animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
 }
 .tl-scrubber {
-  position: absolute; top: 0; bottom: 0; width: 2px; background: var(--c-accent, currentColor);
-  transition: translate 80ms var(--ease-in-out, cubic-bezier(0.77, 0, 0.175, 1));
+  position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: rgb(var(--c-brand-500));
+  transition: transform 80ms var(--ease-in-out, cubic-bezier(0.77, 0, 0.175, 1));
 }
 .tl-controls { display: flex; align-items: center; gap: 8px; }
 .tl-live {
   display: inline-flex; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px;
-  background: color-mix(in srgb, var(--c-status-running, currentColor) 18%, transparent);
+  color: rgb(var(--c-ink));
+  background: color-mix(in srgb, rgb(var(--c-status-running)) 18%, transparent);
   animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
 }
-.tl-live-time { opacity: 0.7; font-variant-numeric: tabular-nums; }
-.tl-btn { font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer; }
+.tl-live-time { color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums; }
+.tl-btn {
+  font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer;
+  color: rgb(var(--c-ink)); background: rgb(var(--c-panel)); border: 1px solid rgb(var(--c-border-strong));
+  transition: background-color 120ms var(--ease-out, ease-out), scale 120ms var(--ease-out, ease-out);
+}
+.tl-btn:hover { background: rgb(var(--c-surface-hover)); }
 .tl-btn:active { scale: 0.97; }
 @keyframes tl-reveal { from { opacity: 0; translate: 0 4px; } }
 @media (prefers-reduced-motion: reduce) {

@@ -19,6 +19,8 @@ export interface TimelineBand {
   from: number;
   /** `null` = still open (runs to now). */
   to: number | null;
+  /** Which row the axis draws it on (default `round`). */
+  row?: 'round' | 'step';
 }
 
 /** The span covering every item, band and (when given) now. */
@@ -27,15 +29,19 @@ export function timeBounds(
   bands: TimelineBand[],
   nowMs: number | null,
 ): { start: number; end: number } {
-  const ts: number[] = [];
-  for (const i of items) ts.push(i.at);
+  let start = Infinity;
+  let end = -Infinity;
+  const see = (v: number) => {
+    if (v < start) start = v;
+    if (v > end) end = v;
+  };
+  for (const i of items) see(i.at);
   for (const b of bands) {
-    ts.push(b.from);
-    if (b.to !== null) ts.push(b.to);
+    see(b.from);
+    if (b.to !== null) see(b.to);
   }
-  if (nowMs !== null) ts.push(nowMs);
-  if (ts.length === 0) return { start: 0, end: 0 };
-  return { start: Math.min(...ts), end: Math.max(...ts) };
+  if (nowMs !== null) see(nowMs);
+  return start === Infinity ? { start: 0, end: 0 } : { start, end };
 }
 
 /** Keys of the items at or before `t`; `null` = everything. */

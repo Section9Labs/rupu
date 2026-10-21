@@ -19,7 +19,6 @@ export function useTimeline({
 }: {
   items: TimelineItem[];
   bands: TimelineBand[];
-  live: boolean;
   nowMs: number | null;
 }): TimelineState {
   const [t, setT] = useState<number | null>(null);

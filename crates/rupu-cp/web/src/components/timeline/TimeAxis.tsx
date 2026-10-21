@@ -50,6 +50,19 @@ export function TimeAxis({
   };
 
   const clock = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const cur = t ?? bounds.end;
+
+  const onKey = (e: React.KeyboardEvent) => {
+    const step = span * (e.shiftKey ? 0.1 : 0.01);
+    let next: number | null = null;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') next = cur - step;
+    else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') next = cur + step;
+    else if (e.key === 'Home') next = bounds.start;
+    else if (e.key === 'End') next = bounds.end;
+    if (next === null) return;
+    e.preventDefault();
+    onScrub(Math.min(bounds.end, Math.max(bounds.start, next)));
+  };
 
   return (
     <div className="tl-axis">
@@ -57,6 +70,14 @@ export function TimeAxis({
         ref={track}
         data-testid="time-track"
         className="tl-track"
+        role="slider"
+        tabIndex={0}
+        aria-label="Timeline position"
+        aria-valuemin={bounds.start}
+        aria-valuemax={bounds.end}
+        aria-valuenow={cur}
+        aria-valuetext={clock(cur)}
+        onKeyDown={onKey}
         onPointerDown={(e) => {
           dragging.current = true;
           e.currentTarget.setPointerCapture?.(e.pointerId);
@@ -78,6 +99,7 @@ export function TimeAxis({
             <div
               key={b.key}
               className="tl-band"
+              data-row={b.row ?? 'round'}
               data-alt={i % 2}
               title={b.label}
               style={{ left: pct(b.from), width: `calc(${pct(to)} - ${pct(b.from)})` }}
@@ -95,14 +117,21 @@ export function TimeAxis({
               style={{ left: pct(i.at), background: colors.get(TICK_TOKEN[i.sub ?? 'post'] ?? 'chart.5') }}
             />
           ))}
-        {t !== null && <span className="tl-scrubber" style={{ left: pct(t) }} aria-hidden />}
+        {t !== null && (
+          <span
+            className="tl-scrubber"
+            style={{ transform: `translateX(${((t - bounds.start) / span) * (track.current?.getBoundingClientRect().width ?? 0)}px)` }}
+            aria-hidden
+          />
+        )}
       </div>
       <div className="tl-controls">
-        {live && t === null ? (
-          <span className="tl-live" aria-live="polite">
+        {live && t === null && (
+          <span className="tl-live">
             <span>live</span> <span className="tl-live-time">{clock(bounds.end)}</span>
           </span>
-        ) : (
+        )}
+        {t !== null && (
           <button type="button" className="tl-btn" onClick={onRelease}>
             {live ? 'Back to live' : 'Show all'}
           </button>

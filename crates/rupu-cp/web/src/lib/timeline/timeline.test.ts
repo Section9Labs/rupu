@@ -24,6 +24,11 @@ describe('timeline', () => {
     expect(timeBounds([], [], null)).toEqual({ start: 0, end: 0 });
   });
 
+  it('bounds_survive_a_huge_log', () => {
+    const big = Array.from({ length: 100_000 }, (_, k) => ({ key: `k${k}`, at: k, kind: 'message' as const }));
+    expect(timeBounds(big, [], null)).toEqual({ start: 0, end: 99_999 });
+  });
+
   it('replay_duration_is_clamped', () => {
     expect(replayDuration(0, 60_000)).toBe(6000);
     expect(replayDuration(0, 5 * 3600 * 1000)).toBe(16000);
@@ -52,7 +57,7 @@ describe('useTimeline', () => {
     delete (window as { matchMedia?: unknown }).matchMedia;
   });
 
-  const props = { items, bands: [], live: false, nowMs: null };
+  const props = { items, bands: [], nowMs: null };
 
   it('replay_runs_to_the_end_and_releases', () => {
     const { result } = renderHook(() => useTimeline(props));
@@ -76,6 +81,26 @@ describe('useTimeline', () => {
     rerender({ ...props, items: [...items, { key: 'd', at: 9500, kind: 'message' }] });
     expect(result.current.t).toBe(t);
     expect(result.current.playing).toBe(true);
+  });
+
+  it('unmount_mid_replay_cancels_the_frame', () => {
+    const { result, unmount } = renderHook(() => useTimeline(props));
+    act(() => result.current.replay());
+    (window.cancelAnimationFrame as ReturnType<typeof vi.fn>).mockClear();
+    unmount();
+    expect(window.cancelAnimationFrame).toHaveBeenCalled();
+  });
+
+  it('a_new_item_mid_replay_still_reaches_the_end', () => {
+    const { result, rerender } = renderHook((p) => useTimeline(p), { initialProps: props });
+    act(() => result.current.replay());
+    frame(1000);
+    rerender({ ...props, items: [...items, { key: 'd', at: 9500, kind: 'message' }] });
+    frame(1000);
+    expect(result.current.playing).toBe(true);
+    frame(100000);
+    expect(result.current.t).toBeNull();
+    expect(result.current.playing).toBe(false);
   });
 
   it('scrub_sets_t_and_release_clears_it', () => {
