@@ -33,7 +33,7 @@ describe('agentiflow flow api', () => {
       },
       {
         kind: 'round', ts: '2026-10-21T09:10:00Z', round: 2, started_at: '2026-10-21T09:06:00Z',
-        decision: 'probe auth', goals: [{ id: 'g1', met: false, current: 'half' }],
+        decision: 'probe auth', goals: [{ id: 'g1', met: false, current: 1 }],
         warnings: ['slow'], goals_met: 1, goals_total: 2, spent_usd: 0.2, spent_tokens: 200,
         outcome: 'ok',
       },
@@ -44,7 +44,7 @@ describe('agentiflow flow api', () => {
     expect(rounds[0].started_at).toBeUndefined();
     expect(rounds[0].goals).toBeUndefined();
     expect(rounds[1].decision).toBe('probe auth');
-    expect(rounds[1].goals?.[0]).toEqual({ id: 'g1', met: false, current: 'half' });
+    expect(rounds[1].goals?.[0]).toEqual({ id: 'g1', met: false, current: 1 });
     expect(rounds[1].warnings).toEqual(['slow']);
   });
 

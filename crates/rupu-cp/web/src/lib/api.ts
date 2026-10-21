@@ -968,7 +968,7 @@ export interface AgentiflowRoundEvent {
   ts?: string;
   started_at?: string;
   decision?: string;
-  goals?: { id: string; met: boolean; current: string }[];
+  goals?: { id: string; met: boolean; current: number }[];
   warnings?: string[];
   goals_met: number;
   goals_total: number;
