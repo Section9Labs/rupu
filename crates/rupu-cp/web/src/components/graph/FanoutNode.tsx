@@ -3,13 +3,14 @@
 //   no units yet  the card with a line saying where the fan-out stands;
 //   N ≤ 12        a grid of unit cells, each a button selecting that unit's
 //                 transcript, its glyph morphing as the unit runs and lands
-//                 (a landing cell pops once);
+//                 (a landing cell pops once); each carries a hidden handle
+//                 (`unit:<index>`) a message arc to or from that unit ends on;
 //   N > 12        a summary card: done / total, the percentage, a progress
 //                 bar, the counts by state, a density preview of the first 60
 //                 units, and "expand all" opening the unit browser.
 
 import { memo } from 'react';
-import type { NodeProps, Node } from '@xyflow/react';
+import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, UnitView } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
@@ -86,6 +87,9 @@ function UnitCell({ node, unit, onOpen }: { node: GraphNode; unit: UnitView; onO
       className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
     >
       <StatusGlyph state={unit.state} />
+      {/* Where a message arc to or from this unit ends (the run's message layer). */}
+      <Handle type="source" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
+      <Handle type="target" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
     </button>
   );
 }

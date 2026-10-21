@@ -15,6 +15,7 @@ import { useTimeline, type TimelineState } from '../timeline/useTimeline';
 import type { BoardSource, FlowMessage } from './flowModel';
 import {
   composeRunLayer,
+  fanoutsOf,
   LAYER_EVENT_TYPES,
   runBoard,
   runMessages,
@@ -113,8 +114,20 @@ export function useRunLayer({
     sameStep,
   );
   const stepIds = useMemo(() => new Set(steps.map((s) => s.id)), [steps]);
+  // The for_each steps and their units (keyed on their shape, so a unit's
+  // state change rebuilds nothing here).
+  const fanoutShape =
+    model?.nodes
+      .filter((n) => n.kind === 'for_each')
+      .map((n) => `${n.id}:${n.fanout?.total ?? 0}:${(n.fanout?.units ?? []).map((u) => `${u.index}=${u.key}`).join(',')}`)
+      .join('|') ?? '';
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const fanouts = useMemo(() => (model ? fanoutsOf(model) : undefined), [fanoutShape]);
   const rec = record ?? undefined;
-  const resolve = useMemo(() => runResolver(stepIds, participants, layerEvents, rec), [stepIds, participants, layerEvents, rec]);
+  const resolve = useMemo(
+    () => runResolver(stepIds, participants, layerEvents, rec, fanouts),
+    [stepIds, participants, layerEvents, rec, fanouts],
+  );
   const stepTimes = useMemo(() => stepTimeline(steps, layerEvents, rec), [steps, layerEvents, rec]);
   const messages = useMemo(() => runMessages(log.messages, resolve), [log, resolve]);
   const boardSpace = useMemo(() => runBoard(board, messages, resolve), [board, messages, resolve]);

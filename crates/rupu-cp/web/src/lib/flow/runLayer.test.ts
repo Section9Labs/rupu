@@ -15,10 +15,10 @@ const windowFrom = (step: string) => RUN_EVENTS.slice(RUN_EVENTS.findIndex((e) =
 
 describe('buildRunLayer', () => {
   it('run_messages_map_to_step_nodes', () => {
-    // Units of one step: a loop on the step's card.
-    expect(byId('msg_r1')).toMatchObject({ from: 'probe', to: ['probe'], space: RUN_SPACE, kind: 'direct' });
+    // Units of one for_each step: each end is its unit on the step's card.
+    expect(byId('msg_r1')).toMatchObject({ from: 'probe@unit:0', to: ['probe@unit:1'], space: RUN_SPACE, kind: 'direct' });
     // A unit to a participant found by its agent run (agent_started).
-    expect(byId('msg_r2')).toMatchObject({ from: 'probe', to: ['report'] });
+    expect(byId('msg_r2')).toMatchObject({ from: 'probe@unit:1', to: ['report'] });
     // A participant with no step id, found by its codename in the recorded
     // step identities.
     expect(byId('msg_r3')).toMatchObject({ from: 'collect', to: ['board'], kind: 'post' });
@@ -41,7 +41,11 @@ describe('buildRunLayer', () => {
 
   it('operator_broadcast_enters_offcanvas', () => {
     // The operator enters from its own off-canvas entry, reaching each step.
-    expect(byId('msg_r4')).toMatchObject({ from: 'operator', to: ['collect', 'probe', 'report'], kind: 'operator' });
+    expect(byId('msg_r4')).toMatchObject({
+      from: 'operator',
+      to: ['collect', 'probe@unit:0', 'probe@unit:1', 'report'],
+      kind: 'operator',
+    });
     // An undelivered address no step answers to is a dead end at its sender.
     const dead = byId('msg_r5');
     expect(dead.to).toEqual(['deadend:ghost#9']);

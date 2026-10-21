@@ -93,4 +93,43 @@ describe('MessageEdge', () => {
     expect(onSelect).toHaveBeenCalledTimes(2);
     expect(onSelect).toHaveBeenCalledWith('msg_005');
   });
+
+  it('an_arc_between_two_unit_squares_arches_from_one_to_the_other', () => {
+    mount('msg_009', 'card', {
+      source: 'card',
+      sourceX: 40,
+      sourceY: 100,
+      targetX: 120,
+      targetY: 100,
+      data: { message: find('msg_009'), highlighted: false, arriving: false, fromUnit: true, toUnit: true },
+    });
+    const d = screen.getByTestId('msg-arc-msg_009').getAttribute('d')!;
+    // From the first square's centre to the second's, rising over the grid.
+    expect(d.startsWith('M 40 100 C 40 ')).toBe(true);
+    expect(d.endsWith(', 120 100')).toBe(true);
+    const top = parseFloat(d.split(' ')[5]);
+    expect(top).toBeLessThan(100 - 16);
+  });
+
+  it('an_arc_from_a_unit_leaves_its_square_at_its_row', () => {
+    mount('msg_009', 'other', {
+      source: 'card',
+      sourceX: 60,
+      sourceY: 130,
+      targetX: 400,
+      targetY: 60,
+      data: {
+        message: find('msg_009'),
+        highlighted: false,
+        arriving: false,
+        fromUnit: true,
+        from: { x: 0, y: 80, width: 232, height: 100 },
+        to: { x: 400, y: 40, width: 220, height: 40 },
+      },
+    });
+    const d = screen.getByTestId('msg-arc-msg_009').getAttribute('d')!;
+    // It starts in the square and runs out along the square's row.
+    expect(d.startsWith('M 60 130 L ')).toBe(true);
+    expect(d).toContain(' 130 ');
+  });
 });

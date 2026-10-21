@@ -508,6 +508,12 @@
   .gx-cell:hover { scale: 1.06; }
 }
 .gx-cell:active { scale: 0.96; }
+/* A unit's message-arc end: an invisible point at the cell's centre. */
+.gx-cell { position: relative; }
+.gx-cell > .react-flow__handle.gx-unit-port {
+  top: 50%; left: 50%; width: 1px; height: 1px; min-width: 0; min-height: 0;
+  border: 0; background: none; opacity: 0; pointer-events: none; transform: none;
+}
 .gx-role { display: inline-flex; align-items: center; gap: 4px; min-width: 0; font-size: 10px; color: rgb(var(--c-ink-dim)); }
 .gx-big { display: flex; align-items: baseline; gap: 6px; }
 .gx-big-n { font-size: 24px; font-weight: 650; line-height: 1; letter-spacing: -0.02em; color: rgb(var(--c-ink)); }

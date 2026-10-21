@@ -18,6 +18,7 @@ import {
   isDeadEnd,
   isOutside,
   makeRoundAt,
+  splitUnit,
   type BoardSource,
   type FlowMessage,
   type FlowStructure,
@@ -32,6 +33,22 @@ export interface Anchor {
   node: string;
   /** A board item's anchor in that node (a claim key or message id). */
   handle?: string;
+  /** A fan-out unit's square on that card (`unitHandle`). */
+  unit?: number;
+}
+
+/** The handle a fan-out unit's square carries (FanoutNode). */
+export const unitHandle = (index: number) => `unit:${index}`;
+
+/** `anchor` of a unit endpoint's card, on the unit's square while the card
+ *  itself is drawn and shows it (`shows`), else as the card lands. */
+export function withUnit(
+  anchor: Anchor | null,
+  card: string,
+  unit: number,
+  shows: ((card: string, unit: number) => boolean) | undefined,
+): Anchor | null {
+  return anchor && anchor.node === card && !anchor.handle && shows?.(card, unit) ? { node: card, unit } : anchor;
 }
 
 export interface Router {
@@ -52,7 +69,12 @@ export const claimKey = (c: Pick<ClaimView, 'key' | 'acquired_at'>) => `claim:${
 
 export const boardKey = (m: FlowMessage) => (m.kind === 'retract' ? (m.message.refs?.retracts ?? m.id) : m.id);
 
-export function makeRouter(model: Pick<FlowStructure, 'nodes' | 'rounds'>, visible: ReadonlySet<string>): Router {
+export function makeRouter(
+  model: Pick<FlowStructure, 'nodes' | 'rounds'>,
+  visible: ReadonlySet<string>,
+  /** Whether a drawn card shows a fan-out unit as a square. */
+  showsUnit?: (card: string, unit: number) => boolean,
+): Router {
   const roundOf = new Map<string, number>();
   for (const n of model.nodes) if (n.kind !== 'lead') roundOf.set(n.id, n.round);
   for (const r of model.rounds) for (const id of r.childIds) roundOf.set(id, r.round);
@@ -62,6 +84,8 @@ export function makeRouter(model: Pick<FlowStructure, 'nodes' | 'rounds'>, visib
   const drawn = (node: string): Anchor | null => (visible.has(node) ? { node } : null);
 
   const anchorOf = (endpoint: string, m: FlowMessage): Anchor | null => {
+    const { card, unit } = splitUnit(endpoint);
+    if (unit !== null) return withUnit(anchorOf(card, m), card, unit, showsUnit);
     if (endpoint === LEAD) {
       const r = leadRound(m.at);
       return r === undefined ? null : drawn(`round:${r}`);
@@ -244,6 +268,9 @@ export interface Arc {
   source: string;
   target: string;
   targetHandle?: string;
+  /** A fan-out unit's square the arc leaves from / lands on. */
+  sourceUnit?: number;
+  targetUnit?: number;
   message: FlowMessage;
   highlighted: boolean;
   stub?: Stub;
@@ -271,11 +298,16 @@ export function messageArcs(messages: FlowMessage[], router: Router, o: ArcOptio
     const handleOf = (to: Anchor) => (to.handle ? o.anchors.get(`${to.node}|${to.handle}`) : undefined);
     const deadOf = (t: string) => m.undelivered.find((u) => u.to === t);
 
-    // From the operator or off the map: an entry at each card it reached.
+    // From the operator or off the map: an entry at each card it reached
+    // (once per card: two units of one step share their card's entry).
     if (isOutside(m.from)) {
+      const entered = new Set<string>();
       m.to.forEach((t, i) => {
         const to = router.anchorOf(t, m);
         if (!to) return;
+        const at = `${to.node}|${to.handle ?? ''}`;
+        if (entered.has(at)) return;
+        entered.add(at);
         out.push({
           ...base,
           id: `m:${m.space}:${m.id}:${to.node}:${i}`,
@@ -310,14 +342,19 @@ export function messageArcs(messages: FlowMessage[], router: Router, o: ArcOptio
       if (!to) return;
       // Two ends folded onto one card (a summary, a "+N more", an unloaded
       // frame) say nothing; a card's message to itself (units of one step)
-      // keeps its loop.
-      if (to.node === from.node && !to.handle && (m.from !== from.node || t !== to.node)) return;
+      // keeps its arc: between the units' squares when the card shows them,
+      // else a loop.
+      if (to.node === from.node && !to.handle && (splitUnit(m.from).card !== from.node || splitUnit(t).card !== to.node)) {
+        return;
+      }
       out.push({
         ...base,
         id: `m:${m.space}:${m.id}:${to.node}:${i}`,
         source: from.node,
         target: to.node,
         targetHandle: handleOf(to),
+        sourceUnit: from.unit,
+        targetUnit: to.unit,
         dead: deadOf(t),
       });
     });

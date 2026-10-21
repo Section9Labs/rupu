@@ -26,6 +26,8 @@ import {
   borrowedTimes,
   flowMessage,
   markAtRest,
+  unitEnd,
+  unitIndexOf,
   type BoardSource,
   type FlowBoardSpace,
   type FlowMessage,
@@ -95,42 +97,58 @@ function time(v: unknown): number | null {
  *  fold of it (`subrun_identities`); else the step its agent run started in
  *  (`agent_started`, as far as the event window reaches). The server's folds
  *  cover the whole event log, so they come before the window. An address no
- *  step answers to is off canvas. */
+ *  step answers to is off canvas. On a for_each step (`fanouts`) it is the
+ *  unit (`unitEnd`): the participant's `unit`, else the unit its codename or
+ *  agent run was recorded under. */
 export function runResolver(
   stepIds: ReadonlySet<string>,
   participants: SpaceParticipant[],
   events: RunEvent[],
   record?: RunRecordInput,
+  fanouts?: ReadonlyMap<string, GraphNode>,
 ): Resolve {
+  type At = { step: string; unit?: number };
   const byAddress = new Map(participants.map((p) => [p.address, p]));
-  const stepOfCodename = new Map<string, string>();
-  const name = (codename: string | undefined, step: string) => {
-    if (codename && stepIds.has(step) && !stepOfCodename.has(codename)) stepOfCodename.set(codename, step);
+  const stepOfCodename = new Map<string, At>();
+  const name = (codename: string | undefined, step: string, unit?: number) => {
+    if (codename && stepIds.has(step) && !stepOfCodename.has(codename)) stepOfCodename.set(codename, { step, unit });
   };
   for (const [step, id] of Object.entries(record?.step_identities ?? {})) name(id.codename, step);
   for (const [step, units] of Object.entries(record?.unit_identities ?? {})) {
-    for (const id of Object.values(units)) name(id.codename, step);
+    for (const [index, id] of Object.entries(units)) name(id.codename, step, Number(index));
   }
   for (const r of record?.step_results ?? []) name(r.codename, r.step_id);
-  for (const u of record?.units ?? []) name(u.codename, u.step_id);
-  const stepOfRun = new Map<string, string>();
+  for (const u of record?.units ?? []) name(u.codename, u.step_id, u.index);
+  const stepOfRun = new Map<string, At>();
   for (const e of events) {
     if (e.type === 'agent_started' && typeof e.agent_run_id === 'string' && typeof e.step_id === 'string') {
-      stepOfRun.set(e.agent_run_id, e.step_id);
+      stepOfRun.set(e.agent_run_id, { step: e.step_id, unit: typeof e.unit_index === 'number' ? e.unit_index : undefined });
     }
   }
-  const step = (id: string | undefined) => (id && stepIds.has(id) ? id : null);
-  const byCodename = (codename: string | undefined): string | null => {
+  const byCodename = (codename: string | undefined): At | null => {
     for (let a = codename; a; a = a.includes('>') ? a.slice(0, a.lastIndexOf('>')) : undefined) {
       const s = stepOfCodename.get(a);
       if (s) return s;
     }
     return null;
   };
-  const ofParticipant = (p: SpaceParticipant) =>
-    step(p.step_id) ??
-    byCodename(p.codename ?? record?.subrun_identities?.[p.run_id]?.codename) ??
-    step(stepOfRun.get(p.run_id));
+  /** A step's card, or its unit's when the step is a for_each with it. */
+  const card = (at: At | null | undefined, unitKey?: string): string | null => {
+    if (!at || !stepIds.has(at.step)) return null;
+    const node = fanouts?.get(at.step);
+    const unit = unitIndexOf(node, unitKey) ?? unitIndexOf(node, at.unit === undefined ? undefined : String(at.unit));
+    return unit === null ? at.step : unitEnd(at.step, unit);
+  };
+  const ofParticipant = (p: SpaceParticipant): string | null => {
+    const codename = p.codename ?? record?.subrun_identities?.[p.run_id]?.codename;
+    const recorded = byCodename(codename) ?? stepOfRun.get(p.run_id) ?? null;
+    if (p.step_id && stepIds.has(p.step_id)) {
+      // Its own step; the unit from its `unit`, else from what was recorded
+      // of it on that same step.
+      return card({ step: p.step_id, unit: recorded?.step === p.step_id ? recorded.unit : undefined }, p.unit);
+    }
+    return card(byCodename(codename)) ?? card(stepOfRun.get(p.run_id));
+  };
   return (address) => {
     if (address === OPERATOR) return OPERATOR;
     const p = byAddress.get(address);
@@ -140,7 +158,10 @@ export function runResolver(
       const q = byAddress.get(a);
       if (q) return ofParticipant(q) ?? OFFCANVAS;
     }
-    if (address.startsWith('step:')) return step(address.slice('step:'.length)) ?? OFFCANVAS;
+    if (address.startsWith('step:')) {
+      const step = address.slice('step:'.length);
+      return stepIds.has(step) ? step : OFFCANVAS;
+    }
     return OFFCANVAS;
   };
 }
@@ -238,6 +259,11 @@ export function stepTimeline(
   return { items: [...stepItems, ...items], bands, untimed };
 }
 
+/** The run's for_each steps by id (whose units an address can land on). */
+export function fanoutsOf(model: RunGraphModel): Map<string, GraphNode> {
+  return new Map(model.nodes.filter((n) => n.kind === 'for_each').map((n) => [n.id, n]));
+}
+
 /** The space's messages, endpoints through `resolve`. */
 export function runMessages(log: SpaceMessage[], resolve: Resolve): FlowMessage[] {
   const times = borrowedTimes(log);
@@ -294,7 +320,7 @@ export function buildRunLayer(
   opts?: { record?: RunRecordInput },
 ): RunLayer {
   const record = opts?.record;
-  const resolve = runResolver(new Set(model.nodes.map((n) => n.id)), space.participants, events, record);
+  const resolve = runResolver(new Set(model.nodes.map((n) => n.id)), space.participants, events, record, fanoutsOf(model));
   const messages = runMessages(space.messages, resolve);
   return composeRunLayer(stepTimeline(model.nodes, events, record), messages, runBoard(board, messages, resolve));
 }

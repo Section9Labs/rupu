@@ -11,7 +11,15 @@ import type { RunGraphModel } from '../../lib/runGraphModel';
 import type { Pos } from '../../lib/graphLayout';
 import type { Size } from '../../lib/graph/measured';
 import { KIND_FILTERS, type KindFilter } from '../../lib/messages';
-import { BOARD, isDeadEnd, isOutside, type BoardSource, type FlowMessage } from '../../lib/flow/flowModel';
+import {
+  BOARD,
+  isDeadEnd,
+  isOutside,
+  showsUnit,
+  splitUnit,
+  type BoardSource,
+  type FlowMessage,
+} from '../../lib/flow/flowModel';
 import {
   RAIL,
   RAIL_LIMIT,
@@ -21,6 +29,8 @@ import {
   messageArcs,
   messageCounts,
   railWindow,
+  unitHandle,
+  withUnit,
   type Anchor,
   type RailSection,
   type Router,
@@ -31,6 +41,9 @@ import { useStableList } from '../../lib/flow/useStableList';
 import type { MessageFlowEdge } from '../flowmap/MessageEdge';
 
 const sameId = (a: FlowMessage, b: FlowMessage) => a.id === b.id;
+/** An arc between two unit squares of one card. */
+export const unitLoop = (a: { source: string; target: string; sourceUnit?: number; targetUnit?: number }) =>
+  a.source === a.target && a.sourceUnit != null && a.targetUnit != null;
 const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
 /** The rail sits this far right of the rightmost card: one wide gutter, so
  *  board arcs stay short. */
@@ -57,10 +70,14 @@ export interface RunGraphOverlay {
 }
 
 /** The run graph's arc router: a message endpoint is its step's card (a
- *  step not yet revealed is not drawn) or its item on the board rail; the
- *  operator, an address off the map and a dead end are no card (stubs). */
-function runRouter(visible: ReadonlySet<string>): Router {
+ *  step not yet revealed is not drawn), a fan-out unit's square on it, or
+ *  its item on the board rail; the operator, an address off the map and a
+ *  dead end are no card (stubs). */
+function runRouter(visible: ReadonlySet<string>, model: RunGraphModel): Router {
+  const shows = (card: string, unit: number) => showsUnit(model.nodeById(card), unit);
   const anchorOf = (endpoint: string, m: FlowMessage): Anchor | null => {
+    const { card, unit } = splitUnit(endpoint);
+    if (unit !== null) return withUnit(anchorOf(card, m), card, unit, shows);
     if (isOutside(endpoint) || isDeadEnd(endpoint)) return null;
     if (endpoint === BOARD) return { node: RAIL, handle: boardKey(m) };
     return visible.has(endpoint) ? { node: endpoint } : null;
@@ -142,7 +159,7 @@ export function useRunLayerCanvas(
     for (const n of model.nodes) if (isShown(n.id)) v.add(n.id);
     return v;
   }, [model, isShown]);
-  const router = useMemo(() => runRouter(visible), [visible]);
+  const router = useMemo(() => runRouter(visible, model), [visible, model]);
   const counts = useMemo(() => messageCounts(shown, router), [shown, router]);
 
   const selected = overlay?.selected ?? null;
@@ -214,10 +231,12 @@ export function useRunLayerCanvas(
             id: a.id,
             source: a.source,
             target: a.target,
-            targetHandle: a.targetHandle,
+            sourceHandle: a.sourceUnit != null ? unitHandle(a.sourceUnit) : undefined,
+            targetHandle: a.targetHandle ?? (a.targetUnit != null ? unitHandle(a.targetUnit) : undefined),
             type: 'message',
-            // Under the cards at rest; a lit arc lifts over them.
-            zIndex: a.highlighted ? 20 : 0,
+            // Under the cards at rest; a lit arc, or one between the unit
+            // squares of one card (drawn over it), lifts over them.
+            zIndex: a.highlighted || unitLoop(a) ? 20 : 0,
             data: {
               message: a.message,
               highlighted: a.highlighted,
@@ -229,6 +248,8 @@ export function useRunLayerCanvas(
               stub: a.stub,
               label: a.label,
               dead: a.dead,
+              fromUnit: a.sourceUnit != null || undefined,
+              toUnit: a.targetUnit != null || undefined,
               tip: a.id === tipArc || undefined,
             },
           }) satisfies MessageFlowEdge,

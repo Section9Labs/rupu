@@ -38,6 +38,10 @@ export interface MessageEdgeData extends Record<string, unknown> {
   /** Show the body without hover: the arc of the selected message that
    *  carries its tip. */
   tip?: boolean;
+  /** The arc leaves from / lands on a fan-out unit's square (its handle's
+   *  point, xyflow's source / target point), on the `from` / `to` card. */
+  fromUnit?: boolean;
+  toUnit?: boolean;
 }
 
 export type MessageFlowEdge = Edge<MessageEdgeData, 'message'>;
@@ -73,6 +77,28 @@ function loop(from: Pt): { d: string; mid: Pt } {
 
 const slotOf = (key: string) => Math.abs(spreadOf(key)) % 3;
 
+/** Two unit squares of one card: an arch over the grid from one square to
+ *  the other (a unit's message to itself: a small loop over its square). */
+export function unitArch(a: Pt, b: Pt): { d: string; mid: Pt } {
+  if (Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1) {
+    return {
+      d: `M ${f(a.x - 4)} ${f(a.y - 6)} C ${f(a.x - 14)} ${f(a.y - 30)}, ${f(a.x + 14)} ${f(a.y - 30)}, ${f(a.x + 4)} ${f(a.y - 6)}`,
+      mid: { x: a.x, y: a.y - 24 },
+    };
+  }
+  const top = Math.min(a.y, b.y) - (16 + Math.abs(b.x - a.x) * 0.12);
+  return {
+    d: `M ${f(a.x)} ${f(a.y)} C ${f(a.x)} ${f(top)}, ${f(b.x)} ${f(top)}, ${f(b.x)} ${f(b.y)}`,
+    mid: { x: (a.x + b.x) / 2, y: top + (Math.min(a.y, b.y) - top) * 0.25 },
+  };
+}
+
+/** A card's box narrowed to the row at `y` (a unit's square): an arc enters
+ *  and leaves it at that height. */
+const rowOf = (b: Box, y: number): Box => ({ x: b.x, y: y - 1, width: b.width, height: 2 });
+const sameBox = (a: Box, b: Box | undefined) =>
+  !!b && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height;
+
 function MessageEdgeView({
   id,
   source,
@@ -106,11 +132,27 @@ function MessageEdgeView({
     shownD = d;
     tip = ps[ps.length - 1];
     far = stub === 'enter' ? ps[0] : ps[ps.length - 1];
+  } else if (source === target && data.fromUnit && data.toUnit) {
+    full = unitArch({ x: sourceX, y: sourceY }, { x: targetX, y: targetY });
+    shownD = full.d;
+    tip = { x: targetX, y: targetY };
   } else if (source === target && !targetHandleId) {
     const l = data.from ? topLoop(data.from) : null;
     full = l ?? loop({ x: sourceX, y: sourceY });
     shownD = full.d;
     tip = l?.start ?? { x: sourceX, y: sourceY };
+  } else if (data.fromUnit || data.toUnit) {
+    // The cards' sides at the units' rows, then into the squares.
+    const from = data.fromUnit && data.from ? rowOf(data.from, sourceY) : source0;
+    const to = data.toUnit && data.to ? rowOf(data.to, targetY) : targetHandleId && !data.toUnit ? point : (data.to ?? point);
+    const obstacles = (data.obstacles ?? []).filter((o) => !sameBox(o, data.from) && !sameBox(o, data.to));
+    let ps = routeArc(from, to, spreadOf(message.id), obstacles);
+    if (data.fromUnit) ps = [{ x: sourceX, y: sourceY }, ...ps];
+    if (data.toUnit) ps = [...ps, { x: targetX, y: targetY }];
+    full = { d: roundedPath(ps, ARC_RADIUS), mid: pointAt(ps, 0.5) };
+    const cut = dead ? cutAt(ps, DEAD_AT) : ps;
+    shownD = dead ? roundedPath(cut, ARC_RADIUS) : full.d;
+    tip = cut[cut.length - 1];
   } else {
     const ps = routeArc(source0, targetHandleId ? point : (data.to ?? point), spreadOf(message.id), data.obstacles);
     full = { d: roundedPath(ps, ARC_RADIUS), mid: pointAt(ps, 0.5) };

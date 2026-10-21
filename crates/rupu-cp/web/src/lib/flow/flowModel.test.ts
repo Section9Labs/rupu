@@ -278,11 +278,12 @@ describe('flow model', () => {
       to: [RUN.owl1],
       undelivered: [{ to: RUN.owl1, address: 'owl#1', reason: 'unknown_participant' }],
     });
-    // A workflow child's space resolves to its frame's inner step nodes.
+    // A workflow child's space resolves to its frame's inner step nodes (a
+    // for_each step's units to their units on it).
     expect(msg(m, 'msg_009')).toMatchObject({
       space: RUN.gannet1,
-      from: `${RUN.gannet1}/probe`,
-      to: [`${RUN.gannet1}/probe`],
+      from: `${RUN.gannet1}/probe@unit:6`,
+      to: [`${RUN.gannet1}/probe@unit:5`],
     });
     expect(msg(m, 'msg_012')?.to).toEqual([`${RUN.gannet1}/review`]);
     expect(msg(m, 'msg_008')).toMatchObject({ space: RUN.gannet1, to: ['board'] });
@@ -302,7 +303,7 @@ describe('flow model', () => {
     ]);
     const strip = m.board.frames.get(RUN.gannet1)!;
     expect(strip.posts.map((p) => p.id)).toEqual(['msg_008']);
-    expect([...strip.writers]).toEqual([['probe#6', `${RUN.gannet1}/probe`]]);
+    expect([...strip.writers]).toEqual([['probe#6', `${RUN.gannet1}/probe@unit:6`]]);
 
     // A step the frame's graph lacks resolves to the frame itself.
     const noStep = fixtureInput();
@@ -350,14 +351,15 @@ describe('flow model', () => {
       },
     ];
     const sm = buildFlowModel(subs);
-    expect(msg(sm, 'msg_950')).toMatchObject({ from: `${RUN.gannet1}/probe`, to: [`${RUN.gannet1}/review`] });
-    // Not listed itself: still its parent hop's step.
-    expect(msg(sm, 'msg_951')?.from).toBe(`${RUN.gannet1}/probe`);
+    // A unit's sub-agent lands on its unit (the unit's square on the card).
+    expect(msg(sm, 'msg_950')).toMatchObject({ from: `${RUN.gannet1}/probe@unit:5`, to: [`${RUN.gannet1}/review`] });
+    // Not listed itself: still its parent hop's step (and unit).
+    expect(msg(sm, 'msg_951')?.from).toBe(`${RUN.gannet1}/probe@unit:7`);
     // A parent hop with no step is the frame; no listed hop is off canvas.
     expect(msg(sm, 'msg_952')).toMatchObject({ from: RUN.gannet1, to: ['offcanvas'] });
     // A listed sub-agent that is a child resolves to its own card first; one
     // that isn't, to its parent's step.
-    expect(msg(sm, 'msg_953')).toMatchObject({ from: 'sub_01M5GWREN5', to: [`${RUN.gannet1}/probe`] });
+    expect(msg(sm, 'msg_953')).toMatchObject({ from: 'sub_01M5GWREN5', to: [`${RUN.gannet1}/probe@unit:5`] });
   });
 
   it('ends_resolve_to_cards_dead_ends_or_the_outside_never_a_guess', () => {

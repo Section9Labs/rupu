@@ -161,6 +161,45 @@ describe('RunGraph overlay', () => {
     expect(onSelect).toHaveBeenCalledWith('msg_r1');
   });
 
+  it('messages_between_units_end_on_their_squares', () => {
+    render(<RunGraph model={RUN_MODEL} positions={RUN_POSITIONS} overlay={overlay()} />);
+    // probe#0 -> probe#1: from one unit's square to the other's, over the card.
+    const between = arcs().find((e) => e.id.startsWith('m:run:msg_r1:'))!;
+    expect(between).toMatchObject({ source: 'probe', target: 'probe', sourceHandle: 'unit:0', targetHandle: 'unit:1', zIndex: 20 });
+    expect(between.data).toMatchObject({ fromUnit: true, toUnit: true });
+    // probe#1 -> report: leaves from probe#1's square.
+    const out = arcs().find((e) => e.id.startsWith('m:run:msg_r2:'))!;
+    expect(out).toMatchObject({ source: 'probe', target: 'report', sourceHandle: 'unit:1' });
+    expect(out.targetHandle).toBeUndefined();
+    // Each unit square carries the handles they end on.
+    const probe = screen.getByTestId('node-probe');
+    expect(probe.querySelectorAll('.gx-unit-port')).toHaveLength(4);
+  });
+
+  it('a_unit_folded_into_a_large_fanout_ends_on_its_card', () => {
+    // 13 units: the card shows a summary, no squares.
+    const units = Array.from({ length: 13 }, (_, i) => ({ index: i, key: `/api/e${i}`, agent: 'auth-prober', state: 'done' as const }));
+    const nodes = RUN_MODEL.nodes.map((n) =>
+      n.id === 'probe' ? { ...n, fanout: { total: 13, byState: { ...n.fanout!.byState, done: 13 }, units } } : n,
+    );
+    const model = { ...RUN_MODEL, nodes, nodeById: (id: string) => nodes.find((n) => n.id === id) };
+    const l = buildRunLayer(model, RUN_EVENTS, { participants: RUN_PARTICIPANTS, messages: RUN_MESSAGES }, RUN_BOARD, {
+      record: RUN_RECORD,
+    });
+    render(
+      <RunGraph
+        model={model}
+        positions={RUN_POSITIONS}
+        overlay={{ messages: l.messages, board: l.board.view, writers: l.board.writers, revealed: null }}
+      />,
+    );
+    const between = arcs().find((e) => e.id.startsWith('m:run:msg_r1:'))!;
+    expect(between).toMatchObject({ source: 'probe', target: 'probe' });
+    expect(between.sourceHandle).toBeUndefined();
+    expect(between.targetHandle).toBeUndefined();
+    expect(screen.getByTestId('node-probe').querySelectorAll('.gx-unit-port')).toHaveLength(0);
+  });
+
   it('a_busy_run_badges_its_cards_and_counts_its_messages', () => {
     // Past ARC_REST_LIMIT only the operator's arcs are drawn at rest: the
     // cards still say how many messages each sent or received, and the

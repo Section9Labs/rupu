@@ -111,8 +111,8 @@ describe('RunDetail layer', () => {
     renderAt(`/runs/${RUN_ID}`);
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toHaveAttribute('data-overlay', 'on'));
     // The messages land on the steps' cards.
-    await waitFor(() => expect(screen.getByTestId('overlay-arcs')).toHaveTextContent('msg_r2:probe->report'));
-    expect(screen.getByTestId('overlay-arcs')).toHaveTextContent('msg_r4:operator->collect+probe+report');
+    await waitFor(() => expect(screen.getByTestId('overlay-arcs')).toHaveTextContent('msg_r2:probe@unit:1->report'));
+    expect(screen.getByTestId('overlay-arcs')).toHaveTextContent('msg_r4:operator->collect+probe@unit:0+probe@unit:1+report');
     await waitFor(() => expect(screen.getByTestId('overlay-board')).toHaveTextContent('view'));
     expect(board).toHaveBeenCalledWith(RUN_ID, expect.objectContaining({ host: undefined }));
     // The time axis sits above the graph, with a band per step.

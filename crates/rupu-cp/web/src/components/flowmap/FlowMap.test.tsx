@@ -288,6 +288,27 @@ describe('FlowMap', () => {
     expect(document.querySelector('.afx-msg-tip')).toBeNull();
   });
 
+  it('a_frames_messages_between_units_end_on_their_squares', async () => {
+    // gannet#1's probe with eight units: probe#5..#7 are squares on its card.
+    const units = Array.from({ length: 8 }, (_, index) => ({
+      ...(GANNET_RESPONSE.units[0] as object),
+      index,
+      item: `/api/e${index}`,
+      run_id: `run_01M5GPROBE${index}`,
+    }));
+    vi.mocked(api.getRunGraph).mockResolvedValue({ ...GANNET_RESPONSE, units } as unknown as RunGraphResponse);
+    mount();
+    await waitFor(() => expect(node(`${RUN.gannet1}/probe`)!.querySelectorAll('button.gx-cell')).toHaveLength(8));
+    await waitFor(() => expect(screen.getByTestId('msg-arc-msg_009')).toBeInTheDocument());
+    const arc = (rf.edges as Edge[]).find((e) => e.id.startsWith(`m:${RUN.gannet1}:msg_009:`))!;
+    expect(arc).toMatchObject({
+      source: `${RUN.gannet1}/probe`,
+      target: `${RUN.gannet1}/probe`,
+      sourceHandle: 'unit:6',
+      targetHandle: 'unit:5',
+    });
+  });
+
   it('generated_frame_opens_its_definition', async () => {
     mount();
     await waitFor(() => expect(node(RUN.gannet1)).not.toBeNull());

@@ -38,6 +38,7 @@ import {
   buildFlowStructure,
   withFlowMessages,
   FLOW_SPACE,
+  showsUnit,
   type BoardSource,
   type FlowBoardSpace,
   type FlowMessage,
@@ -56,8 +57,10 @@ import {
   messageCounts,
   passesFilters,
   railWindow,
+  unitHandle,
   type RailSection,
 } from '../../lib/flow/flowEdges';
+import { unitLoop } from '../run/RunLayerCanvas';
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
 import { useArrivals } from '../../lib/flow/useArrivals';
@@ -298,7 +301,16 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const r of structure.rounds) if (r.collapsed && isShown(`round:${r.round}`)) v.add(`summary:${r.round}`);
     return v;
   }, [structure, isShown]);
-  const router = useMemo(() => makeRouter(structure, visible), [structure, visible]);
+  // Each loaded frame's inner cards, for the units their squares show.
+  const innerCards = useMemo(() => {
+    const m = new Map<string, NonNullable<FlowNodeRef['graph']>['nodes'][number]>();
+    for (const n of structure.nodes) if (n.kind === 'frame' && n.graph) for (const s of n.graph.nodes) m.set(`${n.id}/${s.id}`, s);
+    return m;
+  }, [structure]);
+  const router = useMemo(
+    () => makeRouter(structure, visible, (card, unit) => showsUnit(innerCards.get(card), unit)),
+    [structure, visible, innerCards],
+  );
   const routerRef = useRef(router);
   routerRef.current = router;
 
@@ -739,10 +751,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             id: a.id,
             source: a.source,
             target: a.target,
-            targetHandle: a.targetHandle,
+            sourceHandle: a.sourceUnit != null ? unitHandle(a.sourceUnit) : undefined,
+            targetHandle: a.targetHandle ?? (a.targetUnit != null ? unitHandle(a.targetUnit) : undefined),
             type: 'message',
-            // Under the cards at rest (they are opaque); a lit arc lifts over them.
-            zIndex: a.highlighted ? 20 : 0,
+            // Under the cards at rest (they are opaque); a lit arc, or one
+            // between the unit squares of one card (drawn over it), lifts.
+            zIndex: a.highlighted || unitLoop(a) ? 20 : 0,
             data: {
               message: a.message,
               highlighted: a.highlighted,
@@ -754,6 +768,8 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               stub: a.stub,
               label: a.label,
               dead: a.dead,
+              fromUnit: a.sourceUnit != null || undefined,
+              toUnit: a.targetUnit != null || undefined,
               tip: a.id === tipArc || undefined,
             },
           }) satisfies MessageFlowEdge,

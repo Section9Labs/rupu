@@ -17,7 +17,8 @@ import {
   type SpaceParticipant,
 } from '../api';
 import { LEAD, OPERATOR, rowKind, type RowKind } from '../messages';
-import type { RunGraphModel } from '../runGraphModel';
+import type { GraphNode, RunGraphModel } from '../runGraphModel';
+import { FANOUT_INLINE_THRESHOLD } from '../nodeSize';
 import type { TimelineBand, TimelineItem } from '../timeline/timeline';
 
 /** The latest finished rounds kept expanded; the running one is too. */
@@ -41,6 +42,33 @@ export const deadEnd = (address: string) => `${DEAD_END}${address}`;
 export const isDeadEnd = (endpoint: string) => endpoint.startsWith(DEAD_END);
 /** An endpoint drawn as a short entry at the card it reaches, not a node. */
 export const isOutside = (endpoint: string) => endpoint === OPERATOR || endpoint === OFFCANVAS;
+
+/** A fan-out unit's endpoint: `<card>@unit:<index>`, the card being the
+ *  for_each step's (`<step>` on the run page, `<frame>/<step>` on the map).
+ *  An arc lands on the unit's square while the card shows its units, else
+ *  on the card. */
+const UNIT_MARK = '@unit:';
+export const unitEnd = (card: string, index: number) => `${card}${UNIT_MARK}${index}`;
+/** `endpoint`'s card, and its unit when it names one. */
+export function splitUnit(endpoint: string): { card: string; unit: number | null } {
+  const at = endpoint.lastIndexOf(UNIT_MARK);
+  if (at < 0) return { card: endpoint, unit: null };
+  const unit = Number(endpoint.slice(at + UNIT_MARK.length));
+  return Number.isInteger(unit) ? { card: endpoint.slice(0, at), unit } : { card: endpoint, unit: null };
+}
+/** A for_each step's unit by the participant's `unit` (its key, or its
+ *  index as a string); `null` when the step has no such unit. */
+export function unitIndexOf(node: GraphNode | undefined, unit: string | undefined): number | null {
+  if (!node || node.kind !== 'for_each' || unit == null) return null;
+  const u = node.fanout?.units.find((x) => x.key === unit || String(x.index) === unit);
+  return u ? u.index : null;
+}
+/** Whether a card draws `index` as a square (its inline grid; a large
+ *  fan-out's summary card draws none). The run graph's FanoutNode rule. */
+export function showsUnit(node: GraphNode | undefined, index: number): boolean {
+  const fo = node?.kind === 'for_each' ? node.fanout : undefined;
+  return !!fo && fo.total > 0 && fo.total <= FANOUT_INLINE_THRESHOLD && fo.units.some((u) => u.index === index);
+}
 
 export type BoardSource = BoardView | MessagesUnavailable;
 
@@ -310,13 +338,19 @@ function resolver(
   // The frame itself until its graph is loaded, or when the graph has no
   // such step.
   const inner = (step: string) => (graph?.nodeById(step) ? `${space.id}/${step}` : space.id);
+  // A step agent's card, or its unit's square on a for_each card.
+  const stepCard = (q: SpaceParticipant & { step_id: string }): string => {
+    const card = inner(q.step_id);
+    const unit = card === space.id ? null : unitIndexOf(graph?.nodeById(q.step_id), q.unit);
+    return unit === null ? card : unitEnd(card, unit);
+  };
   // A step agent's sub-agent (`probe#5>wren#1`) through its nearest listed
-  // ancestor hop: that hop's step, else the frame.
+  // ancestor hop: that hop's step (or unit), else the frame.
   const viaHop = (address: string): string | null => {
     for (let a = address; a.includes('>'); ) {
       a = a.slice(0, a.lastIndexOf('>'));
       const q = byAddress.get(a);
-      if (q) return q.step_id ? inner(q.step_id) : space.id;
+      if (q) return q.step_id ? stepCard({ ...q, step_id: q.step_id }) : space.id;
     }
     return null;
   };
@@ -324,7 +358,7 @@ function resolver(
     if (address === OPERATOR) return OPERATOR;
     if (address === LEAD) return LEAD;
     const p = byAddress.get(address);
-    if (frame && p?.step_id) return inner(p.step_id);
+    if (frame && p?.step_id) return stepCard({ ...p, step_id: p.step_id });
     // A run with its own card keeps its arcs.
     if (p && childIds.has(p.run_id)) return p.run_id;
     if (frame) {
