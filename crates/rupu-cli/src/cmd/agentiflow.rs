@@ -2328,13 +2328,11 @@ mod tests {
     async fn a_dropped_start_still_reaps_its_child() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pid_file = tmp.path().join("pid");
-        let exe = tmp.path().join("fake-rupu");
-        write(
-            &exe,
-            &format!("#!/bin/sh\necho $$ > {}\nsleep 0.3\n", pid_file.display()),
+        // `exec_ready_script`: no ETXTBSY from a test thread forking mid-write.
+        let exe = crate::test_support::exec_ready_script(
+            &tmp.path().join("fake-rupu"),
+            &format!("echo $$ > {}\nsleep 0.3\n", pid_file.display()),
         );
-        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .unwrap();
         let global = tmp.path().join("home");
         let start = start_detached(&exe, "acme", "af_01DROP", &global, None);
         assert!(
