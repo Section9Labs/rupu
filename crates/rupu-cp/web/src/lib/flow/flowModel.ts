@@ -271,11 +271,12 @@ function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel 
     if (address === LEAD) return LEAD;
     const p = byAddress.get(address);
     if (frame && p?.step_id) return inner(p.step_id);
+    // A run with its own card keeps its arcs.
+    if (p && childIds.has(p.run_id)) return p.run_id;
     if (frame) {
       const hop = viaHop(address);
       if (hop) return hop;
     }
-    if (p && childIds.has(p.run_id)) return p.run_id;
     if (frame && address.startsWith('step:')) return inner(address.slice('step:'.length));
     return OFFCANVAS;
   };

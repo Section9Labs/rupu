@@ -327,13 +327,24 @@ describe('flow model', () => {
           ...gannet.participants,
           { address: 'probe#5>wren#1', agent: 'route-crawler', run_id: 'sub_01M5GWREN1', kind: 'subagent', live: false },
           { address: 'nest#1', agent: 'helper', run_id: 'run_01M5GNEST1', kind: 'workflow_step', live: false },
+          { address: 'probe#6>wren#5', agent: 'token-replayer', run_id: 'sub_01M5GWREN5', kind: 'subagent', live: false },
         ],
         messages: [
           ...gannet.messages,
           sub('msg_950', 'probe#5>wren#1', 'review#3'),
           sub('msg_951', 'probe#7>wren#2', 'probe#7'),
           sub('msg_952', 'nest#1>wren#4', 'ghost#1>wren#9'),
+          sub('msg_953', 'probe#6>wren#5', 'probe#5>wren#1'),
         ],
+      },
+    ];
+    // `probe#6>wren#5` is also a listed child (of the step agent, which
+    // isn't one), so it has its own card.
+    subs.children = [
+      ...CHILDREN,
+      {
+        ...CHILDREN.find((c) => c.run_id === RUN.wren1)!,
+        handle: 'wren#5', run_id: 'sub_01M5GWREN5', parent_run_id: 'run_01M5GPROBE6', round: 1,
       },
     ];
     const sm = buildFlowModel(subs);
@@ -342,6 +353,9 @@ describe('flow model', () => {
     expect(msg(sm, 'msg_951')?.from).toBe(`${RUN.gannet1}/probe`);
     // A parent hop with no step is the frame; no listed hop is off canvas.
     expect(msg(sm, 'msg_952')).toMatchObject({ from: RUN.gannet1, to: ['offcanvas'] });
+    // A listed sub-agent that is a child resolves to its own card first; one
+    // that isn't, to its parent's step.
+    expect(msg(sm, 'msg_953')).toMatchObject({ from: 'sub_01M5GWREN5', to: [`${RUN.gannet1}/probe`] });
   });
 
   it('density_rules_apply_at_scale', () => {
