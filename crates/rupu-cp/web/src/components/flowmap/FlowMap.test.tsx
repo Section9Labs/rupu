@@ -280,6 +280,7 @@ describe('FlowMap', () => {
       fireEvent.keyDown(track(), { key: 'ArrowRight', shiftKey: true });
       const t = tNow();
       expect(screen.getByTestId('time-scrubber')).toBeInTheDocument();
+      const scrubbed = placed;
 
       // A poll brings a child launched in round 0 at minute 4, and round 3's
       // end (round 4 opens), which would fold round 1 were it not selected.
@@ -306,8 +307,8 @@ describe('FlowMap', () => {
       expect(node('summary:0')).toBeNull();
       expect(ids()).toContain(RUN.gannet1);
       expect(ids()).not.toContain('summary:1');
-      // The pan holds: the poll moved nothing.
-      expect(rf.instance.setViewport).toHaveBeenCalledTimes(placed);
+      // The poll moved nothing.
+      expect(rf.instance.setViewport).toHaveBeenCalledTimes(scrubbed);
       // Unselected, round 1 folds as the newer rounds push it out.
       fireEvent.keyDown(track(), { key: 'End' });
       fireEvent.click(node('round:1')!);
@@ -424,5 +425,28 @@ describe('FlowMap', () => {
     expect(node('round:2')).not.toBeNull();
     expect(node(RUN.kite1)).not.toBeNull();
     expect(screen.getByTestId('msg-arc-msg_015')).toBeInTheDocument();
+  });
+
+  it('rounds_are_reached_by_navigator_stepper_and_keys', async () => {
+    const restore = sizedPane();
+    try {
+      mount();
+      await waitFor(() => expect(node('round:3')).not.toBeNull());
+      expect(screen.getByTestId('round-nav')).toBeInTheDocument();
+      expect(screen.getByRole('group', { name: 'Rounds' })).toHaveTextContent(/round 0 \/ 3/);
+      rf.instance.setViewport.mockClear();
+      // A button move is smooth (or a jump under reduced motion).
+      fireEvent.click(screen.getByRole('button', { name: 'Next round' }));
+      expect(rf.instance.setViewport).toHaveBeenCalledTimes(1);
+      // j / k on the focused map jump, with no animation.
+      const canvas = screen.getByLabelText(/Flow map/);
+      fireEvent.keyDown(canvas, { key: 'j' });
+      expect(rf.instance.setViewport).toHaveBeenCalledTimes(2);
+      expect(rf.instance.setViewport.mock.calls[1]).toHaveLength(1);
+      fireEvent.keyDown(canvas, { key: 'x' });
+      expect(rf.instance.setViewport).toHaveBeenCalledTimes(2);
+    } finally {
+      restore();
+    }
   });
 });

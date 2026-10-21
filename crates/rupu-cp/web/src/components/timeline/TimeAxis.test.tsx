@@ -112,4 +112,32 @@ describe('TimeAxis', () => {
     const inferred = screen.getByTitle('report · start inferred');
     expect(inferred).toHaveAttribute('data-inferred', 'true');
   });
+
+  it('with_onPick_a_tap_names_what_it_hit_and_a_drag_scrubs', () => {
+    const onScrub = vi.fn();
+    const onPick = vi.fn();
+    render(
+      <ThemeProvider>
+        <TimeAxis bands={bands} items={items} bounds={{ start: 0, end: 10000 }} t={null} live={false}
+          onScrub={onScrub} onReplay={() => {}} onRelease={() => {}} onPick={onPick} />
+      </ThemeProvider>,
+    );
+    const track = screen.getByTestId('time-track');
+    track.getBoundingClientRect = () => ({ left: 0, width: 1000, top: 0, height: 20, right: 1000, bottom: 20, x: 0, y: 0, toJSON: () => ({}) });
+    // A tap on the band: no scrub, the band.
+    fireEvent.pointerDown(track, { clientX: 400, pointerId: 1 });
+    fireEvent.pointerUp(track, { clientX: 401, pointerId: 1 });
+    expect(onPick).toHaveBeenLastCalledWith({ kind: 'band', key: 'r1' });
+    // On the tick (at 200px): the message.
+    fireEvent.pointerDown(track, { clientX: 202, pointerId: 1 });
+    fireEvent.pointerUp(track, { clientX: 202, pointerId: 1 });
+    expect(onPick).toHaveBeenLastCalledWith({ kind: 'message', key: 'm1' });
+    expect(onScrub).not.toHaveBeenCalled();
+    // A drag scrubs and names nothing.
+    fireEvent.pointerDown(track, { clientX: 100, pointerId: 1 });
+    fireEvent.pointerMove(track, { clientX: 150, pointerId: 1 });
+    fireEvent.pointerUp(track, { clientX: 150, pointerId: 1 });
+    expect(onScrub).toHaveBeenLastCalledWith(1500);
+    expect(onPick).toHaveBeenCalledTimes(2);
+  });
 });

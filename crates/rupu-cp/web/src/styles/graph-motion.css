@@ -1378,6 +1378,40 @@
    the canvas. The spine draws down as the map arrives and its live end
    breathes; a frame arrives like a card. */
 .afx-canvas { height: max(520px, 72vh); }
+.afx-canvas:focus-visible { outline: 2px solid rgb(var(--c-brand-500) / 0.5); outline-offset: 2px; }
+
+/* The round navigator: a slim scrollbar of rounds on the canvas's left edge
+ * (clear of the controls below it; the map's left edge sits right of it). */
+.afx-nav {
+  position: absolute; z-index: 5; left: 10px; top: 56px; bottom: 132px; width: 10px;
+  border-radius: 5px; background: rgb(var(--c-ink) / 0.05); cursor: pointer; touch-action: none;
+}
+.afx-nav-mark {
+  position: absolute; left: 2px; right: 2px; border-radius: 1px;
+  background: rgb(var(--gx-c, var(--c-ink-mute)) / 0.85);
+}
+.afx-nav-mark[data-state='done'] { background: rgb(var(--gx-c) / 0.45); }
+.afx-nav-view {
+  position: absolute; left: -2px; right: -2px; min-height: 4px; border-radius: 4px; pointer-events: none;
+  border: 1.5px solid rgb(var(--c-ink) / 0.55); background: rgb(var(--c-ink) / 0.06);
+}
+/* The replay stopped following the operator's pan: take it back. */
+.afx-follow {
+  position: absolute; z-index: 5; top: 10px; left: 50%; translate: -50% 0;
+  padding: 3px 12px; border: 1px solid rgb(var(--c-brand-500) / 0.5); border-radius: 999px;
+  background: rgb(var(--c-panel)); color: rgb(var(--c-brand-500)); font-size: 11px; font-weight: 600;
+  box-shadow: var(--gx-shadow-rest); cursor: pointer;
+  animation: rgx-fade 200ms var(--ease-out) backwards;
+}
+.afx-follow:hover { background: rgb(var(--c-surface-hover)); }
+.afx-follow:active { scale: 0.97; }
+/* Previous / next round in the toolbar. */
+.afx-stepper { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: rgb(var(--c-ink-dim)); }
+.afx-stepper .afx-pill { display: inline-grid; place-items: center; padding: 3px 6px; }
+.afx-stepper .afx-pill:disabled { opacity: 0.4; cursor: default; }
+.afx-stepper-at { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.afx-stepper-at b { color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-stepper-keys { padding: 0 5px; border: 1px solid rgb(var(--c-border)); border-radius: 4px; font-size: 10px; color: rgb(var(--c-ink-mute)); }
 .afx-note { font-size: 12px; color: rgb(var(--c-warn)); }
 .afx-head {
   display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px;
@@ -1578,4 +1612,6 @@
   .afx-frame > .gx-glow { animation: none; }
   .afx-meter > i { transition: none; }
   .afx-panel-chev { transition: none; }
+  .afx-follow { animation: none; }
+  .afx-follow:active { scale: none; }
 }

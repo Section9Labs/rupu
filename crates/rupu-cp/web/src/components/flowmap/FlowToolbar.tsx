@@ -1,5 +1,7 @@
-// FlowToolbar — which message kinds the map shows, and whose messages.
+// FlowToolbar — which message kinds the map shows, and whose messages; the
+// round stepper (`children`) sits at its end.
 
+import type { ReactNode } from 'react';
 import { KIND_FILTERS, type KindFilter } from '../../lib/messages';
 
 export default function FlowToolbar({
@@ -8,6 +10,7 @@ export default function FlowToolbar({
   participants,
   onKinds,
   onParticipant,
+  children,
 }: {
   kinds: ReadonlySet<KindFilter>;
   /** `null`: everyone. */
@@ -15,6 +18,7 @@ export default function FlowToolbar({
   participants: string[];
   onKinds: (next: Set<KindFilter>) => void;
   onParticipant: (next: string | null) => void;
+  children?: ReactNode;
 }) {
   return (
     <div className="afx-toolbar">
@@ -52,6 +56,7 @@ export default function FlowToolbar({
           </option>
         ))}
       </select>
+      {children}
     </div>
   );
 }

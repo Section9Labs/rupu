@@ -40,6 +40,7 @@ import {
   type BoardSource,
   type FlowBoardSpace,
   type FlowNodeRef,
+  type FlowRound,
   type FlowSpace,
 } from '../../lib/flow/flowModel';
 import {
@@ -66,6 +67,8 @@ import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
 import { MINIMAP_MIN_PANE, usePaneWidth } from '../../lib/graph/usePaneWidth';
+import { useCamera } from '../../lib/graph/useCamera';
+import { roundAt, scrollTo } from '../../lib/flow/camera';
 import type { StepState } from '../../lib/runGraphModel';
 import { crewTint, parseCodename } from '../../lib/codename';
 import { stateStyle } from '../graph/stepStyle';
@@ -85,6 +88,7 @@ import WorkflowFrameNode from './WorkflowFrameNode';
 import { LeadNode, RailNode, SpineNode } from './MapNodes';
 import { GoalsPanel, HeaderStrip, MapSummary } from './FlowPanels';
 import MoreNode from './MoreNode';
+import { RoundNavigator, RoundStepper, type RoundsGeometry } from './RoundNav';
 
 import '@xyflow/react/dist/style.css';
 
@@ -97,6 +101,9 @@ const MINIMAP = { width: 150, height: 96 };
 const MINIMAP_CLEAR = MINIMAP.width + 30;
 /** The map's top sits below the canvas's summary chip. */
 const TOP = 48;
+/** The map's left edge sits clear of the round navigator. */
+const LEFT = 40;
+
 /** The spine sits this far left of the round cards. */
 const SPINE_X = -28;
 /** The rail's top: clear of the summary chip at the canvas's top right. */
@@ -106,7 +113,7 @@ const EMPTY_OPEN: ReadonlySet<RailSection> = new Set();
 const FIT = { maxZoom: 1.0, minZoom: 0.15 };
 const fitPadding = (minimap: boolean): FitViewOptions['padding'] => ({
   top: `${TOP}px`,
-  left: '24px',
+  left: `${LEFT}px`,
   bottom: '24px',
   right: minimap ? `${MINIMAP_CLEAR}px` : '24px',
 });
@@ -182,6 +189,15 @@ function runKindOfRef(n: FlowNodeRef | undefined): RunKind {
   if (n?.kind === 'more') return 'for_each';
   return 'step';
 }
+
+/** A round's state on the navigator: the live one runs; a finished one is
+ *  failed when a child it launched failed. */
+function roundState(r: FlowRound, liveRound: number | null, childById: ReadonlyMap<string, RunChild>): StepState {
+  if (r.round === liveRound) return 'running';
+  if (r.endedAt === null && liveRound === null && r.childIds.length === 0) return 'pending';
+  return r.childIds.some((id) => childById.get(id)?.status === 'failed') ? 'failed' : 'done';
+}
+
 
 function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   const ka = Object.keys(a);
@@ -714,13 +730,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     const h = el.clientHeight;
     if (w === 0 || h === 0) return;
     const left = layout.operator.x - 24;
-    const room = w - 24 - (showMinimap ? MINIMAP_CLEAR : 24);
+    const room = w - LEFT - (showMinimap ? MINIMAP_CLEAR : 24);
     const fitZoom = Math.min(1, Math.max(FIT.minZoom, room / (layout.width - left)));
     if (!placed.current) {
       placed.current = true;
       placedWidth.current = layout.width;
       const y = running ? -(lastRoundPos.y * fitZoom) + h * 0.35 : TOP;
-      void rf.setViewport({ x: -left * fitZoom + 24, y: Math.min(TOP, y), zoom: fitZoom });
+      void rf.setViewport({ x: -left * fitZoom + LEFT, y: Math.min(TOP, y), zoom: fitZoom });
       return;
     }
     if (panned.current) return;
@@ -729,7 +745,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       placedWidth.current = layout.width;
       const vp = rf.getViewport();
       if (fitZoom < vp.zoom) {
-        void rf.setViewport({ x: -left * fitZoom + 24, y: vp.y * (fitZoom / vp.zoom), zoom: fitZoom }, { duration: 320 });
+        void rf.setViewport({ x: -left * fitZoom + LEFT, y: vp.y * (fitZoom / vp.zoom), zoom: fitZoom }, { duration: 320 });
         return;
       }
     }
@@ -758,6 +774,75 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [listSelected]);
 
+  // --- moving through the rounds (navigator, stepper, j/k, the axis) -------
+  const camera = useCamera();
+  const geo = useMemo<RoundsGeometry>(() => {
+    const tops: number[] = [];
+    const labels: number[] = [];
+    for (const r of model.rounds) {
+      const p = layout.positions.get(`round:${r.round}`);
+      if (p) {
+        tops.push(p.y);
+        labels.push(r.round);
+      }
+    }
+    return { tops, end: layout.height, labels };
+  }, [model, layout]);
+  const roundStates = useMemo(
+    () => model.rounds.filter((r) => layout.positions.has(`round:${r.round}`)).map((r) => roundState(r, liveRound, childById)),
+    [model, layout, liveRound, childById],
+  );
+  /** The operator moved the camera: live follow stops. */
+  const tookOver = useCallback(() => {
+    panned.current = true;
+  }, []);
+  const goRound = useCallback(
+    (index: number, how: 'smooth' | 'jump') => {
+      const top = geo.tops[Math.max(0, Math.min(geo.tops.length - 1, index))];
+      const h = pane.current?.clientHeight ?? 0;
+      if (top === undefined || h === 0) return;
+      tookOver();
+      camera(scrollTo(top, rf.getViewport(), h, 0.2), how);
+    },
+    [geo, camera, rf, tookOver],
+  );
+  const onPaneKey = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key !== 'j' && e.key !== 'k') return;
+      if ((e.target as HTMLElement).closest('input, select, textarea, [contenteditable]')) return;
+      const vp = rf.getViewport();
+      const h = pane.current?.clientHeight ?? 0;
+      const cur = roundAt(geo.tops, (-vp.y + h * 0.2) / vp.zoom);
+      e.preventDefault();
+      goRound(cur + (e.key === 'j' ? 1 : -1), 'jump');
+    },
+    [rf, geo, goRound],
+  );
+  // A tap on the axis: a round band brings its round up, a message tick its arc.
+  const onPick = useCallback(
+    (pick: { kind: 'message' | 'band'; key: string }) => {
+      if (pick.kind === 'band') {
+        const i = geo.labels.indexOf(Number(pick.key.slice('round:'.length)));
+        if (i >= 0) goRound(i, 'smooth');
+        return;
+      }
+      const m = model.messages.find((x) => x.id === pick.key);
+      const el = pane.current;
+      if (!m || !el) return;
+      const ps = router
+        .endsOf(m)
+        .map((id) => layout.positions.get(id))
+        .filter((p): p is NonNullable<typeof p> => !!p);
+      if (ps.length === 0) return;
+      const vp = rf.getViewport();
+      const cx = ps.reduce((a, p) => a + p.x + p.width / 2, 0) / ps.length;
+      const cy = ps.reduce((a, p) => a + p.y + p.height / 2, 0) / ps.length;
+      tookOver();
+      camera({ x: el.clientWidth / 2 - cx * vp.zoom, y: el.clientHeight / 2 - cy * vp.zoom, zoom: vp.zoom });
+    },
+    [geo, goRound, model, router, layout, rf, camera, tookOver],
+  );
+
   // --- the panels ----------------------------------------------------------
   const participantNames = useMemo(() => {
     const s = new Set<string>();
@@ -782,6 +867,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         onScrub={tl.scrub}
         onReplay={tl.replay}
         onRelease={tl.release}
+        onPick={onPick}
       />
       <FlowToolbar
         kinds={kinds}
@@ -789,14 +875,23 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         participants={participantNames}
         onKinds={setKinds}
         onParticipant={setParticipant}
-      />
+      >
+        <RoundStepper geo={geo} pane={pane} onGo={goRound} />
+      </FlowToolbar>
       {data.childrenError && (
         <div className="afx-note" role="status">
           couldn't read this flow's children: {data.childrenError}
         </div>
       )}
-      <div ref={pane} className="gx-canvas afx-canvas relative w-full overflow-hidden rounded-xl border border-border shadow-card">
+      <div
+        ref={pane}
+        className="gx-canvas afx-canvas relative w-full overflow-hidden rounded-xl border border-border shadow-card"
+        tabIndex={0}
+        aria-label="Flow map (j / k: next / previous round)"
+        onKeyDown={onPaneKey}
+      >
         <MapSummary list={children} messages={shownMessages.length} />
+        <RoundNavigator geo={geo} states={roundStates} pane={pane} onGo={goRound} />
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -811,7 +906,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             setSelectedMsg(null);
           }}
           onMoveStart={(e) => {
-            if (e) panned.current = true;
+            if (e) tookOver();
           }}
           nodesDraggable={false}
           nodesConnectable={false}

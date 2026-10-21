@@ -71,3 +71,26 @@ export function countAtOrBefore(sorted: readonly TimelineItem[], t: number): num
 export function replayDuration(start: number, end: number): number {
   return Math.min(16000, Math.max(6000, ((end - start) / 1000) * 40));
 }
+
+/** What a tap on the axis at `t` names: a message tick within `slack` of it
+ *  (the nearest), else the band (of `row`, when given) that covers `t`;
+ *  `null` over nothing. `slack` is in ms (a few pixels' worth of the axis). */
+export function pickAt(
+  items: readonly TimelineItem[],
+  bands: readonly TimelineBand[],
+  t: number,
+  slack: number,
+  end: number,
+): { kind: 'message' | 'band'; key: string } | null {
+  let best: TimelineItem | null = null;
+  for (const i of items) {
+    if (i.kind !== 'message' || Math.abs(i.at - t) > slack) continue;
+    if (!best || Math.abs(i.at - t) < Math.abs(best.at - t)) best = i;
+  }
+  if (best) return { kind: 'message', key: best.key };
+  for (let k = bands.length - 1; k >= 0; k--) {
+    const b = bands[k];
+    if (b.from <= t && t <= (b.to ?? end)) return { kind: 'band', key: b.key };
+  }
+  return null;
+}

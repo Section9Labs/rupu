@@ -4,7 +4,12 @@
 
 import { useRef } from 'react';
 import { useThemeColors } from '../../lib/useThemeColors';
-import type { TimelineBand, TimelineItem } from '../../lib/timeline/timeline';
+import { pickAt, type TimelineBand, type TimelineItem } from '../../lib/timeline/timeline';
+
+/** A pointer that moves less than this between down and up is a tap. */
+const TAP_PX = 4;
+/** A tap names a message tick this close to it. */
+const TICK_SLACK_PX = 5;
 import { messagePaint } from '../../lib/flow/messagePaint';
 
 export function TimeAxis({
@@ -16,6 +21,7 @@ export function TimeAxis({
   onScrub,
   onReplay,
   onRelease,
+  onPick,
 }: {
   bands: TimelineBand[];
   items: TimelineItem[];
@@ -25,10 +31,15 @@ export function TimeAxis({
   onScrub: (t: number) => void;
   onReplay: () => void;
   onRelease: () => void;
+  /** With it, a tap (no drag) on a band or a message tick names it instead
+   *  of scrubbing; a drag still scrubs. */
+  onPick?: (pick: { kind: 'message' | 'band'; key: string }) => void;
 }) {
   const colors = useThemeColors();
   const track = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
+  /** Where a pointer went down, while it may still be a tap. */
+  const down = useRef<number | null>(null);
   const span = Math.max(1, bounds.end - bounds.start);
   const pct = (at: number) => `${Math.min(100, Math.max(0, ((at - bounds.start) / span) * 100))}%`;
 
@@ -70,17 +81,33 @@ export function TimeAxis({
         aria-valuetext={clock(cur)}
         onKeyDown={onKey}
         onPointerDown={(e) => {
-          dragging.current = true;
           e.currentTarget.setPointerCapture?.(e.pointerId);
+          if (onPick) {
+            down.current = e.clientX;
+            return;
+          }
+          dragging.current = true;
           onScrub(timeAt(e.clientX));
         }}
         onPointerMove={(e) => {
+          if (down.current !== null && Math.abs(e.clientX - down.current) >= TAP_PX) {
+            down.current = null;
+            dragging.current = true;
+          }
           if (dragging.current) onScrub(timeAt(e.clientX));
         }}
-        onPointerUp={() => {
+        onPointerUp={(e) => {
+          if (down.current !== null && onPick) {
+            const w = track.current?.getBoundingClientRect().width ?? 0;
+            const slack = w > 0 ? (TICK_SLACK_PX / w) * span : 0;
+            const pick = pickAt(items, bands, timeAt(e.clientX), slack, bounds.end);
+            if (pick) onPick(pick);
+          }
+          down.current = null;
           dragging.current = false;
         }}
         onPointerCancel={() => {
+          down.current = null;
           dragging.current = false;
         }}
       >
