@@ -869,6 +869,283 @@
 .wfx-pcard:not(:disabled):active { scale: 0.97; translate: none; }
 
 
+/* ── workflow editor: leaving ── */
+/* A deleted card or edge fades out from a copy of its last frame
+   (workflow-editor/exitGhosts.tsx); a card also settles back a little, the
+   reverse of its arrival. The copy plays nothing of its own. The curve is the
+   symmetric one: --ease-out's front-loaded drop would leave a 160ms exit
+   unseen after its first frames. */
+.wfx-ghosts { position: absolute; left: 0; top: 0; pointer-events: none; }
+.wfx-ghost-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+}
+.wfx-ghost {
+  pointer-events: none !important;
+  animation: wfx-exit-fade 160ms var(--ease-in-out) forwards;
+}
+/* (xyflow pins a node's origin to its corner; settle toward the middle) */
+.wfx-ghosts .wfx-ghost-node { transform-origin: center; animation-name: wfx-exit; }
+.wfx-ghost, .wfx-ghost * { transition: none !important; }
+.wfx-ghost * { animation: none !important; }
+@keyframes wfx-exit {
+  to { opacity: 0; scale: 0.94; }
+}
+@keyframes wfx-exit-fade {
+  to { opacity: 0; }
+}
+
+/* ── workflow editor: loop groups ── */
+/* A loop is a faint tray its member cards sit in, arriving with the first of
+   them; its name rides a raised chip astride the top edge, which lifts on
+   hover and gives way when pressed, and the tray firms up while you point at
+   it. A loop the selection picks out (or whose form is open) takes the brand
+   ring a selected card wears; one with problems turns red. */
+.wfx-loop {
+  position: relative;
+  border-radius: 18px;
+  border: 1.5px dashed rgb(var(--c-brand-500) / 0.38);
+  background: rgb(var(--c-brand-500) / 0.03);
+  box-shadow: inset 0 1px 3px rgb(var(--gx-sh) / 0.05);
+  pointer-events: none;
+  animation: rgx-fade 420ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+  transition: border-color 200ms ease, background-color 200ms ease;
+}
+.wfx-loop::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border-radius: 22px;
+  border: 3px solid rgb(var(--c-brand-500) / 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms var(--ease-out);
+}
+.wfx-loop[data-selected] {
+  border-color: rgb(var(--c-brand-500) / 0.7);
+  background: rgb(var(--c-brand-500) / 0.05);
+}
+.wfx-loop[data-selected]::after { opacity: 1; }
+.wfx-loop[data-error] {
+  border-color: rgb(var(--c-status-failed) / 0.6);
+  background: rgb(var(--c-status-failed) / 0.04);
+}
+.wfx-loop[data-error]::after { border-color: rgb(var(--c-status-failed) / 0.16); }
+
+.wfx-loop-label,
+.wfx-loop-run {
+  position: absolute;
+  top: -11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px 0 8px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--c-brand-500) / 0.3);
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.wfx-loop-label {
+  left: 12px;
+  max-width: calc(100% - 2rem);
+  overflow: hidden;
+  color: rgb(var(--c-brand-500));
+  cursor: pointer;
+  pointer-events: auto;
+  transition:
+    border-color 150ms ease,
+    translate 160ms var(--ease-out),
+    scale 120ms var(--ease-out);
+}
+.wfx-loop-label::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: var(--gx-shadow-lift);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+.wfx-loop-label:disabled { cursor: default; }
+.wfx-loop-icon { flex: none; }
+.wfx-loop-name { flex: none; font-weight: 650; letter-spacing: -0.005em; }
+.wfx-loop-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: rgb(var(--c-ink-mute)); }
+.wfx-loop-warn { display: inline-flex; flex: none; }
+.wfx-loop[data-error] .wfx-loop-label {
+  border-color: rgb(var(--c-status-failed) / 0.45);
+  color: rgb(var(--c-status-failed));
+}
+.wfx-loop[data-selected] .wfx-loop-label { border-color: rgb(var(--c-brand-500) / 0.6); }
+@media (hover: hover) and (pointer: fine) {
+  .wfx-loop-label:not(:disabled):hover { translate: 0 -1px; border-color: rgb(var(--c-brand-500) / 0.55); }
+  .wfx-loop-label:not(:disabled):hover::after { opacity: 1; }
+  .wfx-loop:not([data-selected]):not([data-error]):has(.wfx-loop-label:not(:disabled):hover) {
+    border-color: rgb(var(--c-brand-500) / 0.6);
+    background: rgb(var(--c-brand-500) / 0.045);
+  }
+}
+.wfx-loop-label:not(:disabled):active { scale: 0.97; translate: none; }
+.wfx-loop-label:focus-visible {
+  outline: none;
+  box-shadow: var(--gx-shadow-rest), 0 0 0 3px rgb(var(--c-brand-500) / 0.3);
+}
+/* The live iteration count, in the status color of where the loop stands. */
+.wfx-loop-run {
+  right: 12px;
+  border-color: rgb(var(--gx-c) / 0.4);
+  color: rgb(var(--gx-c));
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* ── workflow editor: toolbar ── */
+/* The canvas toolbar is a raised panel like the controls; its buttons are
+   flat on it, warm on hover and give way when pressed; the step finder's
+   results rise into place. */
+.wfx-toolbar {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 11px;
+  background: rgb(var(--gx-card) / 0.94);
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  backdrop-filter: blur(6px);
+}
+.wfx-tbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  background: rgb(var(--gx-card));
+  color: rgb(var(--c-ink-dim));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+  box-shadow: 0 1px 1px rgb(var(--gx-sh) / 0.04), var(--gx-highlight);
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    scale 120ms var(--ease-out);
+}
+/* In dark the toolbar is the card surface; a button sits a step above it. */
+[data-theme='dark'] .wfx-tbtn:not([data-tone]) {
+  border-color: rgb(var(--c-border-strong) / 0.7);
+  background: rgb(var(--c-surface-hover));
+}
+.wfx-tbtn[data-tone='info'] {
+  border-color: rgb(var(--c-info) / 0.3);
+  background: rgb(var(--c-info-bg));
+  color: rgb(var(--c-info));
+}
+.wfx-tbtn:disabled { cursor: not-allowed; opacity: 0.5; }
+@media (hover: hover) and (pointer: fine) {
+  .wfx-tbtn:not(:disabled):hover {
+    border-color: rgb(var(--c-border-strong));
+    background: rgb(var(--c-surface-hover));
+    color: rgb(var(--c-ink));
+  }
+  .wfx-tbtn[data-tone='info']:not(:disabled):hover {
+    border-color: rgb(var(--c-info) / 0.5);
+    background: rgb(var(--c-info) / 0.14);
+    color: rgb(var(--c-info));
+  }
+}
+.wfx-tbtn:not(:disabled):active { scale: 0.96; }
+.wfx-tbtn:focus-visible,
+.wfx-tfind:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.25);
+}
+.wfx-tsep { width: 1px; height: 16px; margin: 0 3px; background: rgb(var(--c-border)); }
+.wfx-tfind {
+  width: 7.5rem;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  background: rgb(var(--c-ink) / 0.035);
+  color: rgb(var(--c-ink));
+  font: inherit;
+  font-size: 12px;
+  box-shadow: inset 0 1px 2px rgb(var(--gx-sh) / 0.06);
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+.wfx-tfind::placeholder { color: rgb(var(--c-ink-mute)); }
+.wfx-tfind:focus { border-color: rgb(var(--c-brand-500) / 0.5); background: rgb(var(--gx-card)); }
+.wfx-tfind:disabled { cursor: not-allowed; opacity: 0.5; }
+.wfx-tmenu {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 9px;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-lift), var(--gx-highlight);
+  animation: wfx-rise 160ms var(--ease-out) backwards;
+}
+.wfx-tmenu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 12px;
+  color: rgb(var(--c-ink));
+  transition: background-color 120ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-tmenu-item:hover { background: rgb(var(--c-surface-hover)); }
+}
+.wfx-tmenu-item:focus-visible { outline: none; background: rgb(var(--c-brand-500) / 0.1); }
+
+/* ── workflow editor: palette detail ── */
+/* The picked block's detail is a raised card under the grid: it rises into
+   place when a block is picked; its example sits in an inset; its Add button
+   is a raised brand control that gives way when pressed. */
+.wfx-palette-rail .wfx-palette-detail {
+  padding: 11px 11px 12px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 11px;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  animation: wfx-rise 200ms var(--ease-out) backwards;
+}
+.wfx-palette-rail .wfx-detail-example {
+  border-color: rgb(var(--c-ink) / 0.07);
+  background: rgb(var(--c-ink) / 0.035);
+  box-shadow: inset 0 1px 2px rgb(var(--gx-sh) / 0.05);
+}
+.wfx-palette-rail .wfx-detail-addbtn {
+  box-shadow:
+    0 1px 2px rgb(var(--c-brand-700) / 0.3),
+    0 4px 10px -4px rgb(var(--c-brand-500) / 0.45);
+  transition: background-color 150ms ease, scale 120ms var(--ease-out);
+}
+.wfx-palette-rail .wfx-detail-addbtn:not(:disabled):active { scale: 0.97; }
+.wfx-palette-rail .wfx-detail-addbtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.3);
+}
+@keyframes wfx-rise {
+  from { opacity: 0; translate: 0 4px; }
+}
+
 /* ── reduced motion: fades, no travel, no breathing ── */
 @media (prefers-reduced-motion: reduce) {
   .gx-node { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
@@ -897,6 +1174,12 @@
   .wfx-cline-halo { animation: none; }
   .wfx-canvas .react-flow__handle { transition: none; }
   .wfx-pcard:not(:disabled):hover, .wfx-pcard:not(:disabled):active { translate: none; scale: none; }
+  .wfx-ghosts .wfx-ghost-node { animation-name: wfx-exit-fade; }
+  .wfx-loop { animation-delay: 0ms; }
+  .wfx-loop-label:not(:disabled):hover, .wfx-loop-label:not(:disabled):active { translate: none; scale: none; }
+  .wfx-tbtn:not(:disabled):active,
+  .wfx-palette-rail .wfx-detail-addbtn:not(:disabled):active { scale: none; }
+  .wfx-tmenu, .wfx-palette-rail .wfx-palette-detail { animation-name: rgx-fade; }
 }
 @keyframes gx-bloom-fade {
   30% { opacity: 0.6; }

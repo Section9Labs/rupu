@@ -740,11 +740,10 @@
 /* ── Blocks-tab detail card ── */
 /* Rendered below the grid/connector chips when a block or connector is
  * `selected` (rail variant only). Title + kind badge, blurb, `*`-marked
- * required fields, a short example, and the primary "Add to canvas" CTA. */
+ * required fields, a short example, and the primary "Add to canvas" CTA.
+ * Its card surface and motion live in styles/graph-motion.css. */
 .wfx-palette-detail {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid rgb(var(--c-border));
+  margin-top: 12px;
   display: flex;
   flex-direction: column;
   gap: 8px;
