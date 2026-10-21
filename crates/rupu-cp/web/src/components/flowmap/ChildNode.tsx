@@ -8,7 +8,7 @@
 import { memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { Node, NodeProps } from '@xyflow/react';
-import { Bot, CircleDashed, CornerDownRight, Mail, ScrollText, Workflow, type LucideIcon } from 'lucide-react';
+import { Bot, CircleDashed, CornerDownRight, ScrollText, Workflow, type LucideIcon } from 'lucide-react';
 import type { ChildKind, RunChild } from '../../lib/api';
 import type { StepState } from '../../lib/runGraphModel';
 import { formatDuration } from '../../lib/duration';
@@ -16,6 +16,7 @@ import { formatTokens } from '../../lib/usage';
 import { CARD_H, CARD_W } from '../../lib/flow/flowLayout';
 import { AgentIdentity } from '../codename/AgentIdentity';
 import { NodeFrame, StatusCapsule } from '../graph/NodeFrame';
+import { MessageCount } from '../graph/MessageCount';
 import type { RunKind } from '../graph/kindBridge';
 
 /** A child kind as the run graph paints it: the accent of the run kind it
@@ -59,16 +60,7 @@ export function childSpend(c: Pick<RunChild, 'tokens' | 'duration_ms'>): string 
   return parts.join(' · ');
 }
 
-/** The message-count badge a card carries (its arcs are drawn on hover). */
-export function MessageCount({ n }: { n: number }) {
-  if (n === 0) return null;
-  return (
-    <span className="gx-count afx-mcount" title={`${n} message${n === 1 ? '' : 's'}`} data-testid="flow-mcount">
-      <Mail size={11} aria-hidden />
-      {n}
-    </span>
-  );
-}
+export { MessageCount } from '../graph/MessageCount';
 
 export function InferredMark() {
   return (

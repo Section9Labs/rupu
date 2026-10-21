@@ -15,6 +15,10 @@ export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Entrance slot (see `useEntranceSlots`). */
   slot?: number;
+  /** Messages the step's agents sent or received (the run's message layer). */
+  messages?: number;
+  /** An end of the selected (or hovered) message. */
+  lit?: boolean;
 }
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
@@ -51,12 +55,13 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
       state={node.state}
       kind={node.kind}
       slot={data.slot}
+      lit={data.lit}
       width={box.width}
       minHeight={box.height}
       testId="rg-container"
       live={false}
     >
-      <NodeHead kind={node.kind} name={node.id} state={node.state}>
+      <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
         <WarnMark warnings={node.warnings} />
         <span className="gx-count">
           {done}/{subs.length}

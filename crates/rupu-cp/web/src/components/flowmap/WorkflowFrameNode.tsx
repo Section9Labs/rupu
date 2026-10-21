@@ -17,7 +17,8 @@ import { STRIP_LIMIT, type RailSection } from '../../lib/flow/flowEdges';
 import { FRAME_HEAD } from '../../lib/flow/flowLayout';
 import { StatusCapsule } from '../graph/NodeFrame';
 import BoardRail from './BoardRail';
-import { InferredMark, MessageCount, childSpend, childState } from './ChildNode';
+import { InferredMark, childSpend, childState } from './ChildNode';
+import { MessageCount } from '../graph/MessageCount';
 
 export interface WorkflowFrameData extends Record<string, unknown> {
   child: RunChild;

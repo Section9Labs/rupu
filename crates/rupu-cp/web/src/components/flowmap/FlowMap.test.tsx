@@ -246,6 +246,10 @@ describe('FlowMap', () => {
     // Its own space's arcs and board strip.
     await waitFor(() => expect(screen.getByTestId('msg-arc-msg_011')).toBeInTheDocument());
     expect(within(node(RUN.gannet1)!).getByText('/api/tokens')).toBeInTheDocument();
+    // Each inner step carries its own message count (the frame's head counts
+    // only the flow's space): probe's units wrote all five of the frame's.
+    expect(within(node(`${RUN.gannet1}/probe`)!).getByTestId('flow-mcount')).toHaveTextContent('5');
+    expect(within(node(`${RUN.gannet1}/collect`)!).queryByTestId('flow-mcount')).toBeNull();
     rerenderWith({ ...FLOW });
     await waitFor(() => expect(api.getAgentiflowChildren).toHaveBeenCalledTimes(2));
     expect(api.getRunGraph).toHaveBeenCalledTimes(1);

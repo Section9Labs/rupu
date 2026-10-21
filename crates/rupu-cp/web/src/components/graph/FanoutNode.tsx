@@ -28,6 +28,10 @@ export interface FanoutNodeData extends Record<string, unknown> {
   onExpandFanout?: (stepId: string) => void;
   /** Entrance slot (see `useEntranceSlots`). */
   slot?: number;
+  /** Messages the step's agents sent or received (the run's message layer). */
+  messages?: number;
+  /** An end of the selected (or hovered) message. */
+  lit?: boolean;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
@@ -94,6 +98,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     state: node.state,
     kind: node.kind,
     slot: data.slot,
+    lit: data.lit,
     width: box.width,
     minHeight: box.height,
   } as const;
@@ -113,7 +118,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
               : 'awaiting units…';
     return (
       <NodeFrame {...frame} testId="rg-container">
-        <NodeHead kind={node.kind} name={node.id} state={node.state}>
+        <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
           <WarnMark warnings={node.warnings} />
         </NodeHead>
         <div key={message} className="gx-body gx-sub gx-swap">
@@ -133,7 +138,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
 
   // The summary card says done / total in its body; the grid says it here.
   const head = (count: boolean) => (
-    <NodeHead kind={node.kind} name={node.id} state={node.state}>
+    <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
       <WarnMark warnings={node.warnings} />
       {count && (
         <span className="gx-count" aria-label={`${done} of ${total} done`}>

@@ -558,7 +558,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               node(
                 id,
                 flowKind(s.kind),
-                { node: s, slot: slots.get(id) ?? 0, onOpenUnit: h.open, onExpandFanout: h.expand },
+                {
+                  node: s,
+                  slot: slots.get(id) ?? 0,
+                  onOpenUnit: h.open,
+                  onExpandFanout: h.expand,
+                  messages: counts.get(id),
+                },
                 { zIndex: 1 },
               ),
             );

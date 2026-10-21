@@ -19,6 +19,7 @@ import {
   boardKey,
   claimMessages,
   messageArcs,
+  messageCounts,
   railWindow,
   type Anchor,
   type RailSection,
@@ -71,6 +72,21 @@ function runRouter(visible: ReadonlySet<string>): Router {
   };
 }
 
+export interface RunLayerCanvas {
+  nodes: Node[];
+  edges: Edge[];
+  onEnter: NodeMouseHandler;
+  onLeave: NodeMouseHandler;
+  /** Each step card's message count (the messages revealed now). */
+  counts: ReadonlyMap<string, number>;
+  /** The cards the selected message touches: lit. */
+  lit: ReadonlySet<string>;
+  /** The messages revealed now. */
+  shown: number;
+}
+
+const NO_LIT: ReadonlySet<string> = new Set();
+
 /** The layer on the canvas: the rail, the entries and the message arcs. */
 export function useRunLayerCanvas(
   overlay: RunGraphOverlay | undefined,
@@ -78,7 +94,7 @@ export function useRunLayerCanvas(
   positions: Map<string, Pos>,
   measured: ReadonlyMap<string, Size>,
   focus: string | null,
-): { nodes: Node[]; edges: Edge[]; onEnter: NodeMouseHandler; onLeave: NodeMouseHandler } | null {
+): RunLayerCanvas | null {
   const [hover, setHover] = useState<string | null>(null);
   const onEnter = useCallback<NodeMouseHandler>((_e, n) => setHover(n.id), []);
   const onLeave = useCallback<NodeMouseHandler>(() => setHover(null), []);
@@ -127,8 +143,13 @@ export function useRunLayerCanvas(
     return v;
   }, [model, isShown]);
   const router = useMemo(() => runRouter(visible), [visible]);
+  const counts = useMemo(() => messageCounts(shown, router), [shown, router]);
 
   const selected = overlay?.selected ?? null;
+  const lit = useMemo(() => {
+    const m = selected ? shown.find((x) => x.id === selected) : undefined;
+    return m ? new Set(router.endsOf(m)) : NO_LIT;
+  }, [selected, shown, router]);
   const onSelect = overlay?.onSelect;
   const select = useCallback((id: string) => onSelect?.(id), [onSelect]);
   const anchor = useCallback(
@@ -212,5 +233,9 @@ export function useRunLayerCanvas(
     [arcs, arrivals, claimIds, select, positions, obstacles],
   );
 
-  return useMemo(() => (on ? { nodes, edges, onEnter, onLeave } : null), [on, nodes, edges, onEnter, onLeave]);
+  const shownCount = shown.length;
+  return useMemo(
+    () => (on ? { nodes, edges, onEnter, onLeave, counts, lit, shown: shownCount } : null),
+    [on, nodes, edges, onEnter, onLeave, counts, lit, shownCount],
+  );
 }

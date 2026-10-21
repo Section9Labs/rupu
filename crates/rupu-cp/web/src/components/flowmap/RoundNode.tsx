@@ -13,7 +13,7 @@ import type { StepState } from '../../lib/runGraphModel';
 import { formatSpendShort } from '../../lib/agentiflow';
 import { CARD_H, CARD_W } from '../../lib/flow/flowLayout';
 import { NodeFrame, StatusCapsule } from '../graph/NodeFrame';
-import { MessageCount } from './ChildNode';
+import { MessageCount } from '../graph/MessageCount';
 
 export interface RoundNodeData extends Record<string, unknown> {
   round: FlowRound;

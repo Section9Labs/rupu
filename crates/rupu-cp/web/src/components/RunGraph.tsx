@@ -110,8 +110,9 @@ const MINIMAP_MIN_NODES = 6;
 /** The summary's order: what needs a look first. */
 const SUMMARY_ORDER: GraphNode['state'][] = ['running', 'awaiting_approval', 'failed', 'paused', 'done', 'pending', 'skipped'];
 
-/** `2 running · 1 needs you · 1 failed …` over the canvas: the run at a glance. */
-function GraphSummary({ nodes }: { nodes: readonly GraphNode[] }) {
+/** `2 running · 1 needs you · 1 failed …` over the canvas: the run at a
+ *  glance; with a message layer, `· N messages` (the ones revealed now). */
+function GraphSummary({ nodes, messages }: { nodes: readonly GraphNode[]; messages?: number }) {
   const counts = new Map<GraphNode['state'], number>();
   for (const n of nodes) counts.set(n.state, (counts.get(n.state) ?? 0) + 1);
   const items = SUMMARY_ORDER.filter((s) => counts.has(s));
@@ -123,6 +124,11 @@ function GraphSummary({ nodes }: { nodes: readonly GraphNode[] }) {
           <b>{counts.get(s)}</b> {STATE_WORD[s]}
         </span>
       ))}
+      {messages != null && messages > 0 && (
+        <span className="gx-summary-item" data-testid="rg-summary-messages">
+          <b>{messages}</b> message{messages === 1 ? '' : 's'}
+        </span>
+      )}
     </div>
   );
 }
@@ -178,6 +184,9 @@ export function runEdges(
 
 interface NodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** Its message count, with a message layer. */
+  messages?: number;
+  lit?: boolean;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
   slot: number;
@@ -274,6 +283,9 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
   }, []);
 
   const revealed = overlay?.revealed ?? null;
+  const layer = useRunLayerCanvas(overlay, model, positions, measured, selectedId);
+  const counts = layer?.counts;
+  const lit = layer?.lit;
   const stepNodes = useMemo<Node<NodeData>[]>(() => {
     return model.nodes.map((node) => {
       const pos = positions.get(node.id);
@@ -281,7 +293,15 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         id: node.id,
         type: flowKind(node.kind),
         position: pos ? { x: pos.x, y: pos.y } : { x: 0, y: 0 },
-        data: { node, onOpenUnit: handleOpenUnit, onExpandFanout, slot: slots.get(node.id) ?? 0, gate },
+        data: {
+          node,
+          onOpenUnit: handleOpenUnit,
+          onExpandFanout,
+          slot: slots.get(node.id) ?? 0,
+          gate,
+          messages: counts?.get(node.id),
+          lit: lit?.has(node.id) || undefined,
+        },
         draggable: false,
         selectable: true,
         selected: node.id === selectedId,
@@ -289,7 +309,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         ...(revealed && !revealed.has(node.id) ? { hidden: true } : {}),
       };
     });
-  }, [model, positions, slots, measured, selectedId, handleOpenUnit, onExpandFanout, gate, revealed]);
+  }, [model, positions, slots, measured, selectedId, handleOpenUnit, onExpandFanout, gate, revealed, counts, lit]);
 
   const runFlowEdges = useMemo(() => {
     const edges = runEdges(model, colors, slots);
@@ -297,7 +317,6 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
     return edges.map((e) => (revealed.has(e.source) && revealed.has(e.target) ? e : { ...e, hidden: true }));
   }, [model, colors, slots, revealed]);
 
-  const layer = useRunLayerCanvas(overlay, model, positions, measured, selectedId);
   const pane = useRef<HTMLDivElement>(null);
   const paneWidth = usePaneWidth(pane);
   const showMinimap = model.nodes.length > MINIMAP_MIN_NODES && paneWidth >= MINIMAP_MIN_PANE;
@@ -353,7 +372,10 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
       ref={pane}
       className={`gx-canvas relative ${overlay ? 'h-[540px]' : 'h-[460px]'} w-full overflow-hidden rounded-xl border border-border shadow-card`}
     >
-      <GraphSummary nodes={revealed ? model.nodes.filter((n) => revealed.has(n.id)) : model.nodes} />
+      <GraphSummary
+        nodes={revealed ? model.nodes.filter((n) => revealed.has(n.id)) : model.nodes}
+        messages={layer?.shown}
+      />
       {replayActive && !follow && (
         <button type="button" className="afx-follow" onClick={() => setFollow(true)}>
           Follow

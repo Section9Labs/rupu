@@ -161,6 +161,42 @@ describe('RunGraph overlay', () => {
     expect(onSelect).toHaveBeenCalledWith('msg_r1');
   });
 
+  it('a_busy_run_badges_its_cards_and_counts_its_messages', () => {
+    // Past ARC_REST_LIMIT only the operator's arcs are drawn at rest: the
+    // cards still say how many messages each sent or received, and the
+    // summary chip how many there are.
+    const busy = [
+      ...RUN_MESSAGES,
+      ...Array.from({ length: 10 }, (_, i) => ({ ...RUN_MESSAGES[5], id: `msg_x${i}` })),
+    ];
+    const l = buildRunLayer(RUN_MODEL, RUN_EVENTS, { participants: RUN_PARTICIPANTS, messages: busy }, RUN_BOARD, {
+      record: RUN_RECORD,
+    });
+    render(
+      <RunGraph
+        model={RUN_MODEL}
+        positions={RUN_POSITIONS}
+        overlay={{ messages: l.messages, board: l.board.view, writers: l.board.writers, revealed: null }}
+      />,
+    );
+    expect(busy.length).toBeGreaterThan(12);
+    expect(arcPairs().every((p) => p.startsWith('msg_r4:'))).toBe(true);
+    const badge = (step: string) => within(screen.getByTestId(`node-${step}`)).queryByTestId('flow-mcount');
+    // report: msg_r2, msg_r4, msg_r5, msg_r6 and the ten copies of msg_r6.
+    expect(badge('report')).toHaveTextContent('14');
+    expect(badge('probe')).toHaveTextContent('3');
+    expect(badge('collect')).toHaveTextContent('3');
+    expect(screen.getByTestId('rg-summary-messages')).toHaveTextContent(`${busy.length} messages`);
+  });
+
+  it('a_selected_message_lights_both_its_cards', () => {
+    render(<RunGraph model={RUN_MODEL} positions={RUN_POSITIONS} overlay={{ ...overlay(), selected: 'msg_r2' }} />);
+    const lit = rf.nodes.filter((n) => (n.data as { lit?: boolean }).lit).map((n) => n.id);
+    expect(lit).toEqual(['probe', 'report']);
+    expect(screen.getByTestId('node-report').querySelector('[data-lit]')).not.toBeNull();
+    expect(screen.getByTestId('node-collect').querySelector('[data-lit]')).toBeNull();
+  });
+
   it('reveal_hides_what_has_not_happened_yet', () => {
     // As of minute 4: collect ran, the claim and its post landed.
     const at4 = new Set(['collect', 'msg_r3', `claim:run:package-lock.json:${RUN_BOARD.claims[0].acquired_at}`]);
