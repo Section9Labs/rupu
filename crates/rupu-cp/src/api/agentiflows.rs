@@ -971,7 +971,7 @@ async fn get_agentiflow_children(
     if !run_dir.is_dir() {
         return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
     }
-    let children = tokio::task::spawn_blocking({
+    let response = tokio::task::spawn_blocking({
         let id = id.clone();
         move || {
             use crate::api::children;
@@ -990,7 +990,7 @@ async fn get_agentiflow_children(
     })
     .await
     .map_err(|e| ApiError::internal(format!("reading agentiflow {id} children panicked: {e}")))?;
-    Ok(Json(crate::api::children::ChildrenResponse { children }))
+    Ok(Json(response))
 }
 
 /// A flow's legacy `units/*/unit.json` mirrors as children-tree rows

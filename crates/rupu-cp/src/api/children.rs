@@ -24,7 +24,8 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Run directories walked, at most: a guard against a hand-edited tree, far
-/// above any real launch tree (depth is capped at 5).
+/// above any real launch tree (depth is capped at 5). Past it the response
+/// says `truncated`, so a client can say what it isn't drawing.
 const MAX_RUNS_WALKED: usize = 2000;
 
 /// One child, as the run detail shows it.
@@ -87,6 +88,11 @@ pub(crate) fn excerpt(output: &str) -> Option<String> {
 #[derive(Debug, Serialize)]
 pub struct ChildrenResponse {
     pub children: Vec<ChildDto>,
+    /// The walk stopped at its cap ([`MAX_RUNS_WALKED`] run directories):
+    /// the runs it didn't reach were not read, so their children (if any)
+    /// are missing. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 async fn get_run_children(
@@ -101,10 +107,10 @@ async fn get_run_children(
         return Err(ApiError::bad_request(format!("`{id}` is not a run id")));
     }
     let store = s.run_store.clone();
-    let children = tokio::task::spawn_blocking(move || children_of(&store, &id))
+    let response = tokio::task::spawn_blocking(move || children_of(&store, &id))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(ChildrenResponse { children }))
+    Ok(Json(response))
 }
 
 fn from_entry(e: ChildEntry, parent: &str) -> ChildDto {
@@ -176,7 +182,7 @@ fn legacy_subagent(transcript: &Path, sub_run_id: &str, parent: &str, depth: u32
 /// Every child of `run_id` and of its steps' agent runs, and theirs, in
 /// launch order per parent (parents breadth-first). A child an attempt took
 /// on from an earlier one is listed once, as its latest record says.
-pub fn children_of(store: &RunStore, run_id: &str) -> Vec<ChildDto> {
+pub fn children_of(store: &RunStore, run_id: &str) -> ChildrenResponse {
     let mut parents: VecDeque<Parent> = VecDeque::from([Parent::root(run_id)]);
     for rec in store.read_step_results(run_id).unwrap_or_default() {
         parents.push_back(Parent::root(&rec.run_id));
@@ -184,7 +190,11 @@ pub fn children_of(store: &RunStore, run_id: &str) -> Vec<ChildDto> {
             parents.push_back(Parent::root(&item.run_id));
         }
     }
-    walk_children(store, parents)
+    let (children, truncated) = walk_children(store, parents, MAX_RUNS_WALKED);
+    ChildrenResponse {
+        children,
+        truncated,
+    }
 }
 
 /// A flow's direct children from its OWN `children.jsonl` ledger (W7),
@@ -203,14 +213,22 @@ pub fn ledger_units(af_dir: &Path, af_id: &str) -> Vec<ChildDto> {
 /// `children.jsonl` and legacy `sub/`), in the same shape. Reuses the same
 /// breadth-first walk as [`children_of`]. A `units` entry is kept as given; the
 /// caller dedups the direct level, the walk dedups the descendants.
-pub fn with_descendants(store: &RunStore, units: Vec<ChildDto>) -> Vec<ChildDto> {
+pub fn with_descendants(store: &RunStore, units: Vec<ChildDto>) -> ChildrenResponse {
+    with_descendants_capped(store, units, MAX_RUNS_WALKED)
+}
+
+fn with_descendants_capped(store: &RunStore, units: Vec<ChildDto>, cap: usize) -> ChildrenResponse {
     let mut parents: VecDeque<Parent> = VecDeque::new();
     for u in &units {
         parents.push_back(Parent::below(u));
     }
-    let mut out = units;
-    out.extend(walk_children(store, parents));
-    out
+    let mut children = units;
+    let (below, truncated) = walk_children(store, parents, cap);
+    children.extend(below);
+    ChildrenResponse {
+        children,
+        truncated,
+    }
 }
 
 /// A run whose children [`walk_children`] reads.
@@ -247,8 +265,15 @@ impl Parent {
 /// Breadth-first over `parents`, collecting every child of every kind, in
 /// launch order per parent (parents breadth-first). A child a later attempt
 /// took on under the same handle is listed once, as its latest record says.
-fn walk_children(store: &RunStore, mut parents: VecDeque<Parent>) -> Vec<ChildDto> {
+/// At most `cap` run directories are read; the flag says whether a run was
+/// left unread for it (its children are then missing).
+fn walk_children(
+    store: &RunStore,
+    mut parents: VecDeque<Parent>,
+    cap: usize,
+) -> (Vec<ChildDto>, bool) {
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut truncated = false;
     let mut out = Vec::new();
     // Each handle's latest record: where it is in `out`, and when it started.
     let mut latest: std::collections::HashMap<String, (usize, chrono::DateTime<chrono::Utc>)> =
@@ -259,9 +284,14 @@ fn walk_children(store: &RunStore, mut parents: VecDeque<Parent>) -> Vec<ChildDt
         round,
     }) = parents.pop_front()
     {
-        if parent.is_empty() || !seen.insert(parent.clone()) || seen.len() > MAX_RUNS_WALKED {
+        if parent.is_empty() || seen.contains(&parent) {
             continue;
         }
+        if seen.len() >= cap {
+            truncated = true;
+            continue;
+        }
+        seen.insert(parent.clone());
         let ledgered = ledger::read(&store.root.join(&parent));
         let known: BTreeSet<String> = ledgered.iter().map(|e| e.started.run_id.clone()).collect();
         for e in ledgered {
@@ -293,11 +323,13 @@ fn walk_children(store: &RunStore, mut parents: VecDeque<Parent>) -> Vec<ChildDt
         }
     }
     let keep: BTreeSet<usize> = latest.values().map(|&(i, _)| i).collect();
-    out.into_iter()
+    let out = out
+        .into_iter()
         .enumerate()
         .filter(|(i, c)| c.handle.is_none() || keep.contains(i))
         .map(|(_, c)| c)
-        .collect()
+        .collect();
+    (out, truncated)
 }
 
 #[cfg(test)]
@@ -352,6 +384,7 @@ mod tests {
         );
 
         let got: Vec<(String, String, String)> = children_of(&store, "run_wf")
+            .children
             .into_iter()
             .map(|c| (c.handle.unwrap_or_default(), c.run_id, c.status))
             .collect();
@@ -381,7 +414,9 @@ mod tests {
         );
 
         let got = with_descendants(&store, ledger_units(&af_dir, "af_x"));
+        assert!(!got.truncated);
         let rows: Vec<(&str, &str, &str)> = got
+            .children
             .iter()
             .map(|c| (c.run_id.as_str(), c.parent_run_id.as_str(), c.kind.as_str()))
             .collect();
@@ -393,6 +428,40 @@ mod tests {
                 ("run_sub", "run_recon", "subagent"),
             ]
         );
+    }
+
+    /// Past the walk's cap, the runs it didn't reach are not read and the
+    /// response says so, rather than dropping their children silently.
+    #[test]
+    fn a_walk_past_its_cap_says_it_is_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = RunStore::new(tmp.path().join("runs"));
+        let af_dir = tmp.path().join("agentiflows").join("af_x");
+        ledger::append(&af_dir, &started("u_1", ChildKind::Agent, "run_u1", 1));
+        ledger::append(&af_dir, &started("u_2", ChildKind::Agent, "run_u2", 1));
+        for (unit, handle, sub) in [("run_u1", "s_1", "sub_1"), ("run_u2", "s_2", "sub_2")] {
+            ledger::append(
+                &store.root.join(unit),
+                &started(handle, ChildKind::Subagent, sub, 2),
+            );
+        }
+        let ids = |r: &ChildrenResponse| -> Vec<String> {
+            r.children.iter().map(|c| c.run_id.clone()).collect()
+        };
+
+        let whole = with_descendants_capped(&store, ledger_units(&af_dir, "af_x"), 10);
+        assert!(!whole.truncated);
+        assert_eq!(ids(&whole), ["run_u1", "run_u2", "sub_1", "sub_2"]);
+
+        let cut = with_descendants_capped(&store, ledger_units(&af_dir, "af_x"), 1);
+        assert!(cut.truncated);
+        assert_eq!(ids(&cut), ["run_u1", "run_u2", "sub_1"]);
+        let json = serde_json::to_value(&cut).unwrap();
+        assert_eq!(json["truncated"], serde_json::json!(true));
+        assert!(serde_json::to_value(&whole)
+            .unwrap()
+            .get("truncated")
+            .is_none());
     }
 
     #[test]
@@ -442,7 +511,7 @@ mod tests {
             }),
         );
 
-        let got = children_of(&store, "run_root");
+        let got = children_of(&store, "run_root").children;
         let rows: Vec<(&str, &str, &str, &str, bool)> = got
             .iter()
             .map(|c| {
