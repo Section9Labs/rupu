@@ -260,8 +260,9 @@ describe('flow model', () => {
     expect(msg(m, 'msg_901')).toMatchObject({
       kind: 'directive',
       from: 'lead',
-      to: ['board', 'offcanvas'],
-      undelivered: [{ to: 'offcanvas', address: 'role:ghost', reason: 'no_live_participant' }],
+      // Nobody answers to the address: a dead end at the sender, never off map.
+      to: ['board', 'deadend:role:ghost'],
+      undelivered: [{ to: 'deadend:role:ghost', address: 'role:ghost', reason: 'no_live_participant' }],
     });
     expect(msg(m, 'msg_902')).toMatchObject({ from: 'offcanvas', to: ['lead'] });
     expect(msg(m, 'msg_903')).toMatchObject({ kind: 'broadcast', from: RUN.kite1, to: ['offcanvas'] });
@@ -357,8 +358,62 @@ describe('flow model', () => {
     expect(msg(sm, 'msg_953')).toMatchObject({ from: 'sub_01M5GWREN5', to: [`${RUN.gannet1}/probe`] });
   });
 
+  it('ends_resolve_to_cards_dead_ends_or_the_outside_never_a_guess', () => {
+    // A pre-F1 flow has no participant registry: an address is the child
+    // that went by it, so its arcs land on that child's card (or its round's
+    // summary), never off the map.
+    const input = fixtureInput();
+    const legacy: SpaceMessage[] = [
+      { id: 'msg_960', ts: at(100), kind: 'post', from: 'kite#1', to: null, body: 'legacy post', delivery: { resolved: [] }, seen: [] },
+      { id: 'msg_961', ts: at(101), kind: 'direct', from: 'nobody#1', to: 'lead', body: 'unknown sender', delivery: { resolved: ['lead'] }, seen: [] },
+    ];
+    input.spaces = [{ id: 'flow', participants: [], messages: legacy }];
+    const m = buildFlowModel(input);
+    expect(msg(m, 'msg_960')).toMatchObject({ from: RUN.kite1, to: ['board'] });
+    // An address neither a participant nor a child: off the map.
+    expect(msg(m, 'msg_961')).toMatchObject({ from: 'offcanvas', to: ['lead'] });
+
+    // An undelivered recipient with a card keeps its card (the dead end
+    // points at it); one with none is a dead end at the sender.
+    const f = buildFlowModel(fixtureInput());
+    expect(msg(f, 'msg_017')?.undelivered[0].to).toBe(RUN.owl1);
+    const u = fixtureInput();
+    u.spaces = [
+      {
+        ...u.spaces[0],
+        messages: [
+          {
+            id: 'msg_962', ts: at(100), kind: 'broadcast', from: 'kite#1', to: 'broadcast', body: 'anyone?',
+            delivery: { resolved: [], undelivered: [{ to: 'broadcast', reason: 'no_live_participant' }] }, seen: [],
+          },
+        ],
+      },
+    ];
+    expect(msg(buildFlowModel(u), 'msg_962')).toMatchObject({
+      to: ['deadend:broadcast'],
+      undelivered: [{ to: 'deadend:broadcast', address: 'broadcast', reason: 'no_live_participant' }],
+    });
+  });
+
+  it('past_the_limit_only_operator_arcs_rest', () => {
+    // The fixture's flow space has 13 messages, one past ARC_REST_LIMIT: only
+    // the operator's stays drawn at rest, and a message to the operator does
+    // too.
+    const input = fixtureInput();
+    const toOperator: SpaceMessage = {
+      id: 'msg_970', ts: at(100), kind: 'direct', from: 'kite#1', to: 'operator', body: 'need a decision',
+      delivery: { resolved: ['operator'] }, seen: [],
+    };
+    input.spaces = [{ ...input.spaces[0], messages: [...input.spaces[0].messages, toOperator] }, input.spaces[1]];
+    const m = buildFlowModel(input);
+    expect(m.messages.filter((x) => x.space === 'flow').length).toBeGreaterThan(ARC_REST_LIMIT);
+    expect(m.messages.filter((x) => x.space === 'flow' && x.atRest).map((x) => x.id)).toEqual(['msg_007', 'msg_970']);
+    // The frame's five stay at rest.
+    expect(m.messages.filter((x) => x.space !== 'flow').every((x) => x.atRest)).toBe(true);
+  });
+
   it('density_rules_apply_at_scale', () => {
-    expect([KEEP_EXPANDED_ROUNDS, MAX_CARDS_PER_ROUND, ARC_REST_LIMIT]).toEqual([2, 8, 40]);
+    expect([KEEP_EXPANDED_ROUNDS, MAX_CARDS_PER_ROUND, ARC_REST_LIMIT]).toEqual([2, 8, 12]);
     const input = bigFlow();
     const m = buildFlowModel(input);
 

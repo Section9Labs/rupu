@@ -42,10 +42,10 @@ describe('buildRunLayer', () => {
   it('operator_broadcast_enters_offcanvas', () => {
     // The operator enters from its own off-canvas entry, reaching each step.
     expect(byId('msg_r4')).toMatchObject({ from: 'operator', to: ['collect', 'probe', 'report'], kind: 'operator' });
-    // An address no step answers to goes off canvas, as its dead end.
+    // An undelivered address no step answers to is a dead end at its sender.
     const dead = byId('msg_r5');
-    expect(dead.to).toEqual(['offcanvas']);
-    expect(dead.undelivered).toEqual([{ to: 'offcanvas', address: 'ghost#9', reason: 'unknown_participant' }]);
+    expect(dead.to).toEqual(['deadend:ghost#9']);
+    expect(dead.undelivered).toEqual([{ to: 'deadend:ghost#9', address: 'ghost#9', reason: 'unknown_participant' }]);
     // A workflow run has no lead.
     expect(byId('msg_r6')).toMatchObject({ from: 'offcanvas', to: ['report'] });
   });

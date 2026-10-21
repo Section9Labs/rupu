@@ -25,8 +25,9 @@ export const KEEP_EXPANDED_ROUNDS = 2;
 /** Cards a round shows before the rest fold into "+N more". */
 export const MAX_CARDS_PER_ROUND = 8;
 /** Above this many messages in one space (the flow's, or a frame's), only
- *  that space's operator arcs are drawn at rest. */
-export const ARC_REST_LIMIT = 40;
+ *  that space's arcs to or from the operator are drawn at rest; the badge
+ *  counts, hover and selection carry the rest. */
+export const ARC_REST_LIMIT = 12;
 
 /** The flow's own space (and board) id. */
 export const FLOW_SPACE = 'flow';
@@ -34,6 +35,12 @@ export const FLOW_SPACE = 'flow';
 export const BOARD = 'board';
 /** Where an address no node answers to goes. */
 export const OFFCANVAS = 'offcanvas';
+/** An undelivered recipient no node answers to: a dead end at its sender. */
+export const DEAD_END = 'deadend:';
+export const deadEnd = (address: string) => `${DEAD_END}${address}`;
+export const isDeadEnd = (endpoint: string) => endpoint.startsWith(DEAD_END);
+/** An endpoint drawn as a short entry at the card it reaches, not a node. */
+export const isOutside = (endpoint: string) => endpoint === OPERATOR || endpoint === OFFCANVAS;
 
 export type BoardSource = BoardView | MessagesUnavailable;
 
@@ -104,7 +111,8 @@ export interface FlowNodeRef {
 }
 
 export interface FlowUndelivered {
-  /** The node the dead end is drawn at. */
+  /** The node the dead end is drawn toward, or `deadend:<address>` (a stub
+   *  at the sender) when no node is it. */
   to: string;
   /** The address it was sent to. */
   address: string;
@@ -116,7 +124,8 @@ export interface FlowMessage {
   kind: RowKind;
   /** A node id, `'operator'` or `'offcanvas'`. */
   from: string;
-  /** Node ids, `'board'`, `'operator'`, or `'offcanvas'` for an unknown address. */
+  /** Node ids, `'board'`, `'operator'`, `'offcanvas'` for an unknown
+   *  address, or `deadend:<address>` for an undelivered one no node is. */
   to: string[];
   undelivered: FlowUndelivered[];
   /** Drawn without hover or selection. */
@@ -277,7 +286,12 @@ export type Resolve = (address: string) => string;
 /** A space's addresses to node ids: participants to their run (a workflow
  *  child's step agents to `<child>/<step>`), `lead`, `operator`, else
  *  off canvas. */
-function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel | undefined): Resolve {
+function resolver(
+  space: FlowSpace,
+  childIds: Set<string>,
+  graph: RunGraphModel | undefined,
+  childByAddress: ReadonlyMap<string, string>,
+): Resolve {
   const byAddress = new Map(space.participants.map((p) => [p.address, p]));
   const frame = space.id !== FLOW_SPACE;
   // The frame itself until its graph is loaded, or when the graph has no
@@ -305,8 +319,21 @@ function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel 
       if (hop) return hop;
     }
     if (frame && address.startsWith('step:')) return inner(address.slice('step:'.length));
+    // A space with no participant registry (a pre-F1 flow's board): the
+    // child that went by the address.
+    if (!frame && !p) {
+      const child = childByAddress.get(address);
+      if (child) return child;
+    }
     return OFFCANVAS;
   };
+}
+
+/** Drawn at rest: every message of a quiet space, else only those to or
+ *  from the operator. */
+export function markAtRest(list: FlowMessage[]): void {
+  if (list.length <= ARC_REST_LIMIT) return;
+  for (const m of list) m.atRest = m.kind === 'operator' || m.from === OPERATOR || m.to.includes(OPERATOR);
 }
 
 const BOARD_KINDS: ReadonlySet<RowKind> = new Set(['post', 'mention', 'directive', 'retract']);
@@ -315,11 +342,11 @@ const BOARD_KINDS: ReadonlySet<RowKind> = new Set(['post', 'mention', 'directive
  *  also landing on the board, every undelivered recipient its own end. */
 export function flowMessage(m: SpaceMessage, space: string, resolve: Resolve, at: number | null): FlowMessage {
   const kind = rowKind(m);
-  const undelivered = (m.delivery?.undelivered ?? []).map((u) => ({
-    to: resolve(u.to),
-    address: u.to,
-    reason: u.reason,
-  }));
+  const undelivered = (m.delivery?.undelivered ?? []).map((u) => {
+    const node = resolve(u.to);
+    // Nobody to point at: the dead end stays at the sender.
+    return { to: isOutside(node) ? deadEnd(u.to) : node, address: u.to, reason: u.reason };
+  });
   let to = (m.delivery?.resolved ?? []).map(resolve);
   if (BOARD_KINDS.has(kind)) to = [BOARD, ...to];
   to = [...to, ...undelivered.map((u) => u.to)];
@@ -478,12 +505,14 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
 
   // --- messages and boards ---------------------------------------------
   const childIds = new Set(byId.keys());
+  const childByAddress = new Map<string, string>();
+  for (const c of children) if (c.address && !childByAddress.has(c.address)) childByAddress.set(c.address, c.run_id);
   const resolvers = new Map<string, Resolve>();
   const resolverOf = (spaceId: string) => {
     let r = resolvers.get(spaceId);
     if (!r) {
       const space = input.spaces.find((s) => s.id === spaceId) ?? { id: spaceId, participants: [], messages: [] };
-      r = resolver(space, childIds, input.childGraphs.get(spaceId));
+      r = resolver(space, childIds, input.childGraphs.get(spaceId), childByAddress);
       resolvers.set(spaceId, r);
     }
     return r;
@@ -492,7 +521,7 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     .flatMap((s) => {
       const times = borrowedTimes(s.messages);
       const list = s.messages.map((m, i) => flowMessage(m, s.id, resolverOf(s.id), times[i]));
-      if (list.length > ARC_REST_LIMIT) for (const m of list) m.atRest = m.kind === 'operator';
+      markAtRest(list);
       return list;
     })
     .sort((a, b) => a.at - b.at);

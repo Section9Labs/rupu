@@ -22,10 +22,10 @@ import { OPERATOR } from '../messages';
 import type { GraphNode, RunGraphModel } from '../runGraphModel';
 import type { TimelineBand, TimelineItem } from '../timeline/timeline';
 import {
-  ARC_REST_LIMIT,
   OFFCANVAS,
   borrowedTimes,
   flowMessage,
+  markAtRest,
   type BoardSource,
   type FlowBoardSpace,
   type FlowMessage,
@@ -242,7 +242,7 @@ export function stepTimeline(
 export function runMessages(log: SpaceMessage[], resolve: Resolve): FlowMessage[] {
   const times = borrowedTimes(log);
   const messages = log.map((m, i) => flowMessage(m, RUN_SPACE, resolve, times[i]));
-  if (messages.length > ARC_REST_LIMIT) for (const m of messages) m.atRest = m.kind === 'operator';
+  markAtRest(messages);
   return messages.sort((a, b) => a.at - b.at);
 }
 
