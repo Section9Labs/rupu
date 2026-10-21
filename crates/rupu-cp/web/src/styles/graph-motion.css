@@ -1444,6 +1444,11 @@
   animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
 }
 .afx-frame[data-state='running'] { border-color: rgb(var(--c-status-running) / 0.6); }
+.afx-frame > .gx-glow { left: 20%; right: 20%; bottom: -10px; height: 28px; }
+.afx-frame[data-state='running'] > .gx-glow {
+  opacity: var(--gx-glow-rest);
+  animation: gx-breathe 2.8s var(--ease-in-out) infinite;
+}
 .afx-frame[data-state='failed'] { border-color: rgb(var(--c-status-failed) / 0.6); }
 .afx-frame-head {
   display: flex; align-items: center; gap: 8px; padding: 0 14px; min-width: 0;
@@ -1533,5 +1538,6 @@
   .afx-spine-line { animation: rgx-fade 240ms ease-out backwards; }
   .afx-spine-ring { animation: none; opacity: 0; }
   .afx-frame { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-frame > .gx-glow { animation: none; }
   .afx-meter > i { transition: none; }
 }

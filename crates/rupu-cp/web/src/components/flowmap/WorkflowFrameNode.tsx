@@ -55,6 +55,8 @@ function WorkflowFrameView({ data }: NodeProps<FrameFlowNode>) {
       data-testid="flow-frame"
       style={{ width: data.width, ['--i' as string]: data.slot }}
     >
+      {/* The run graph's under-glow: a running frame breathes like a running card. */}
+      <span className="gx-glow" aria-hidden />
       {/* First, so an edge with no handle id lands here, not on a strip item. */}
       <Handle type="target" position={Position.Left} className="gx-port" />
       <Handle type="source" position={Position.Right} className="gx-port" />

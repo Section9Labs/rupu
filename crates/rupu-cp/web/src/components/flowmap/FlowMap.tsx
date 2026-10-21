@@ -9,8 +9,9 @@
 //
 // The canvas is the run graph's (RunGraph): the same xyflow setup, cards,
 // edges, controls, background and minimap rule. `buildFlowModel` decides what
-// is drawn (density), `layoutFlow` where; this file wires them to xyflow and
-// to the timeline (what is revealed at `t`), the filters and the selection.
+// is drawn (density), `layoutFlow` where, `flowEdges` which arcs land on
+// which cards; this file wires them to xyflow and to the timeline (what is
+// revealed at `t`), the filters and the selection.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -30,14 +31,31 @@ import {
   type NodeMouseHandler,
   type NodeTypes,
 } from '@xyflow/react';
+import { useNavigate } from 'react-router-dom';
 import { api, apiErrorMessage, type AgentiflowDetail, type RunChild } from '../../lib/api';
-import { buildFlowModel, BOARD, FLOW_SPACE, OFFCANVAS, type FlowMessage, type FlowNodeRef } from '../../lib/flow/flowModel';
+import {
+  buildFlowModel,
+  FLOW_SPACE,
+  OFFCANVAS,
+  type BoardSource,
+  type FlowBoardSpace,
+  type FlowNodeRef,
+} from '../../lib/flow/flowModel';
+import {
+  RAIL,
+  boardAnchorKeys,
+  claimMessages,
+  makeRouter,
+  messageArcs,
+  messageCounts,
+  passesFilters,
+} from '../../lib/flow/flowEdges';
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
-import { revealed, timeBounds } from '../../lib/timeline/timeline';
-import { KIND_FILTERS, LEAD, OPERATOR, type KindFilter } from '../../lib/messages';
+import { timeBounds, type TimelineItem } from '../../lib/timeline/timeline';
+import { KIND_FILTERS, OPERATOR, type KindFilter } from '../../lib/messages';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
@@ -133,20 +151,6 @@ function FrameSpace({
 
 const isUnfinished = (c: RunChild | undefined) => c?.status === 'running' || c?.status === 'pending';
 
-/** Whether a message passes the toolbar's filters. */
-function passes(m: FlowMessage, kinds: ReadonlySet<KindFilter>, participant: string | null): boolean {
-  const k = KIND_FILTERS.find((f) => f.kinds.includes(m.message.kind));
-  if (k && !kinds.has(k.key)) return false;
-  if (participant === null) return true;
-  const msg = m.message;
-  return (
-    msg.from === participant ||
-    msg.to === participant ||
-    (msg.delivery?.resolved ?? []).includes(participant) ||
-    (msg.delivery?.undelivered ?? []).some((u) => u.to === participant)
-  );
-}
-
 function stateOfRef(n: FlowNodeRef | undefined, liveRound: number | null): StepState {
   if (!n) return 'pending';
   if (n.child) return childState(n.child);
@@ -160,10 +164,29 @@ function runKindOfRef(n: FlowNodeRef | undefined): RunKind {
   return 'step';
 }
 
+function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every((k) => Object.is(a[k], b[k]));
+}
+
+/** How many of `sorted` (by `at`) are at or before `t`. */
+function countAtOrBefore(sorted: readonly TimelineItem[], t: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid].at <= t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace: MessageSpace }) {
   const colors = useThemeColors();
   const mode = useThemeMode();
   const rf = useReactFlow();
+  const navigate = useNavigate();
   const { record } = detail;
 
   const data = useFlowData(detail, { running, flowSpace });
@@ -171,27 +194,42 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const [kinds, setKinds] = useState<ReadonlySet<KindFilter>>(ALL_KINDS);
   const [participant, setParticipant] = useState<string | null>(null);
   const [selectedMsg, setSelectedMsg] = useState<string | null>(null);
-  const [focusNode, setFocusNode] = useState<string | null>(null);
+  /** The clicked card, and the round it is in (kept open while focused). */
+  const [focus, setFocus] = useState<{ id: string; round: number | undefined } | null>(null);
   const [hoverNode, setHoverNode] = useState<string | null>(null);
   const [measured, setMeasured] = useState<ReadonlyMap<string, Size>>(() => new Map());
   const [definition, setDefinition] = useState<
     { child: RunChild; yaml: string | null; error: string | null } | null
   >(null);
 
+  // A focused card's round stays expanded through polls that would fold it.
+  const focusRound = focus?.round;
+  const open = useMemo(
+    () => (focusRound === undefined ? expanded : new Set(expanded).add(`round:${focusRound}`)),
+    [expanded, focusRound],
+  );
   const { children, spaces, boards, childGraphs } = data;
   const model = useMemo(
-    () => buildFlowModel({ detail, children, spaces, boards, childGraphs }, { expanded }),
-    [detail, children, spaces, boards, childGraphs, expanded],
+    () => buildFlowModel({ detail, children, spaces, boards, childGraphs }, { expanded: open }),
+    [detail, children, spaces, boards, childGraphs, open],
   );
   const layout = useMemo(() => layoutFlow(model, measured), [model, measured]);
 
   // --- the timeline --------------------------------------------------------
+  // The reveal is keyed on how many items are at or before `t`, so a replay
+  // frame that reveals nothing new changes nothing below it.
   const { items, bands } = model.timeline;
   const nowMs = useMemo(() => (running ? Date.now() : null), [running, detail]);
   const tl = useTimeline({ items, bands, nowMs });
   const bounds = useMemo(() => timeBounds(items, bands, nowMs), [items, bands, nowMs]);
+  const sortedItems = useMemo(() => [...items].sort((a, b) => a.at - b.at), [items]);
   const itemKeys = useMemo(() => new Set(items.map((i) => i.key)), [items]);
-  const shownSet = useMemo(() => (tl.t === null ? null : revealed(items, tl.t)), [items, tl.t]);
+  const revealCount = tl.t === null ? null : countAtOrBefore(sortedItems, tl.t);
+  const replaying = tl.t !== null;
+  const shownSet = useMemo(
+    () => (revealCount === null ? null : new Set(sortedItems.slice(0, revealCount).map((i) => i.key))),
+    [sortedItems, revealCount],
+  );
   const isShown = useCallback(
     (key: string) => shownSet === null || !itemKeys.has(key) || shownSet.has(key),
     [shownSet, itemKeys],
@@ -199,18 +237,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
 
   // --- what is on the canvas ----------------------------------------------
   const refById = useMemo(() => new Map(model.nodes.map((n) => [n.id, n])), [model]);
-  const roundOfChild = useMemo(() => {
-    const m = new Map<string, number>();
-    for (const r of model.rounds) for (const id of r.childIds) m.set(id, r.round);
-    return m;
-  }, [model]);
+  const childById = useMemo(() => new Map(children.map((c) => [c.run_id, c])), [children]);
   const liveRound = running ? (model.rounds.find((r) => r.endedAt === null)?.round ?? null) : null;
   const visible = useMemo(() => {
-    const v = new Set<string>(['lead', 'spine', 'rail']);
+    const v = new Set<string>(['lead', 'spine', RAIL]);
     for (const n of model.nodes) {
       if (n.kind === 'lead') continue;
-      const roundKey = `round:${n.round}`;
-      if (!isShown(roundKey)) continue;
+      if (!isShown(`round:${n.round}`)) continue;
       if ((n.kind === 'child' || n.kind === 'frame') && !isShown(n.id)) continue;
       v.add(n.id);
       if (n.kind === 'frame' && n.graph) for (const s of n.graph.nodes) v.add(`${n.id}/${s.id}`);
@@ -218,96 +251,103 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const r of model.rounds) if (r.collapsed && isShown(`round:${r.round}`)) v.add(`summary:${r.round}`);
     return v;
   }, [model, isShown]);
+  const router = useMemo(() => makeRouter(model, visible), [model, visible]);
+  const routerRef = useRef(router);
+  routerRef.current = router;
 
-  /** The card a message endpoint lands on, as drawn now (null: not drawn). */
-  const anchorOf = useCallback(
-    (endpoint: string, m: FlowMessage): { node: string; handle?: string } | null => {
-      if (endpoint === LEAD) {
-        const r = model.rounds.find((x) => (x.endedAt ?? Infinity) >= m.at) ?? model.rounds[model.rounds.length - 1];
-        return r && visible.has(`round:${r.round}`) ? { node: `round:${r.round}` } : null;
-      }
-      if (endpoint === OPERATOR) return { node: 'operator' };
-      if (endpoint === OFFCANVAS) return { node: 'offcanvas' };
-      if (endpoint === BOARD) {
-        const key = m.kind === 'retract' ? (m.message.refs?.retracts ?? m.id) : m.id;
-        return m.space === FLOW_SPACE ? { node: 'rail', handle: key } : visible.has(m.space) ? { node: m.space, handle: key } : null;
-      }
-      if (visible.has(endpoint)) return { node: endpoint };
-      const slash = endpoint.indexOf('/');
-      if (slash > 0) return anchorOf(endpoint.slice(0, slash), m);
-      const round = refById.get(endpoint)?.round ?? roundOfChild.get(endpoint);
-      if (round === undefined) return null;
-      const r = model.rounds.find((x) => x.round === round);
-      const id = r?.collapsed ? `summary:${round}` : r && r.hidden > 0 ? `more:${round}` : `round:${round}`;
-      return visible.has(id) ? { node: id } : null;
-    },
-    [model, visible, refById, roundOfChild],
-  );
-
-  // Messages revealed at `t` (filters aside), and the ones that just landed.
+  // Messages revealed at `t` (filters aside).
   const shownMessages = useMemo(() => model.messages.filter((m) => isShown(m.id)), [model, isShown]);
+  const listed = useMemo(
+    () => shownMessages.filter((m) => passesFilters(m, kinds, participant)),
+    [shownMessages, kinds, participant],
+  );
+  const counts = useMemo(() => messageCounts(shownMessages, router), [shownMessages, router]);
+
+  // The packets: a message that lands after the map has its spaces read (a
+  // live one, or one a replay reveals) travels once. What the first read of
+  // a space brings is the map's starting state, not news.
+  const spaceRead =
+    flowSpace.loaded || flowSpace.status === 'unavailable' || flowSpace.status === 'error' || flowSpace.space === 'absent';
   const seen = useRef<Set<string> | null>(null);
-  const arrivedAt = useRef(new Map<string, number>());
-  const arriving = useMemo(() => {
-    const now = Date.now();
-    const ids = new Set(shownMessages.map((m) => m.id));
-    if (seen.current !== null) {
-      for (const id of ids) if (!seen.current.has(id)) arrivedAt.current.set(id, now);
-    }
-    seen.current = ids;
-    return (id: string) => now - (arrivedAt.current.get(id) ?? -Infinity) < ARRIVE_MS;
-  }, [shownMessages]);
-
-  const listed = useMemo(() => shownMessages.filter((m) => passes(m, kinds, participant)), [shownMessages, kinds, participant]);
-
-  // Each card's message count, over what is revealed.
-  const counts = useMemo(() => {
-    const c = new Map<string, number>();
+  const seenSpaces = useRef(new Set<string>());
+  const [arrivals, setArrivals] = useState<ReadonlyMap<string, number>>(() => new Map());
+  useEffect(() => {
+    if (!spaceRead) return;
+    const prev = seen.current;
+    const fresh: string[] = [];
     for (const m of shownMessages) {
-      const at = new Set<string>();
-      for (const e of [m.from, ...m.to]) {
-        const a = anchorOf(e, m);
-        if (a && a.node !== 'rail') at.add(a.node);
-      }
-      for (const id of at) c.set(id, (c.get(id) ?? 0) + 1);
+      if (prev && !prev.has(m.id) && seenSpaces.current.has(m.space)) fresh.push(m.id);
     }
-    return c;
-  }, [shownMessages, anchorOf]);
+    for (const m of shownMessages) seenSpaces.current.add(m.space);
+    seen.current = new Set(shownMessages.map((m) => m.id));
+    if (fresh.length === 0) return;
+    const until = Date.now() + ARRIVE_MS;
+    setArrivals((a) => {
+      const next = new Map(a);
+      for (const id of fresh) next.set(id, until);
+      return next;
+    });
+  }, [shownMessages, spaceRead]);
+  useEffect(() => {
+    if (arrivals.size === 0) return;
+    let first = Infinity;
+    for (const until of arrivals.values()) first = Math.min(first, until);
+    const timer = setTimeout(
+      () =>
+        setArrivals((a) => {
+          const now = Date.now();
+          const next = new Map([...a].filter(([, until]) => until > now));
+          return next.size === a.size ? a : next;
+        }),
+      Math.max(0, first - Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [arrivals]);
 
   // --- the board rail and frame strips, as of `t` -------------------------
   const boardAsOf = useCallback(
-    (spaceId: string, view: (typeof model.board)['view']) => {
-      if (!view || 'kind' in view) return view;
+    (spaceId: string, view: BoardSource | null): BoardSource | null => {
+      if (!view || 'kind' in view || shownSet === null) return view;
       return {
         ...view,
         claims: view.claims.filter((c) => isShown(`claim:${spaceId}:${c.key}:${c.acquired_at}`)),
         directives: view.directives.filter((d) => isShown(`directive:${spaceId}:${d.id}`)),
       };
     },
-    [isShown],
+    [isShown, shownSet],
   );
-  const railView = boardAsOf(FLOW_SPACE, model.board.view);
-  const railPosts = model.board.posts.filter((p) => isShown(p.id));
-  /** The anchors each board shows, `<node>|<key>`. */
-  const anchors = useMemo(() => {
-    const s = new Set<string>();
-    const add = (node: string, view: typeof railView, posts: FlowMessage[]) => {
-      if (view && !('kind' in view)) {
-        for (const c of view.claims) s.add(`${node}|claim:${c.key}:${c.acquired_at}`);
-        for (const d of view.directives) s.add(`${node}|${d.id}`);
-      }
-      for (const p of posts) s.add(`${node}|${p.id}`);
-    };
-    add('rail', railView, railPosts);
+  const railView = useMemo(() => boardAsOf(FLOW_SPACE, model.board.view), [boardAsOf, model]);
+  const railPosts = useMemo(
+    () => (shownSet === null ? model.board.posts : model.board.posts.filter((p) => isShown(p.id))),
+    [model, isShown, shownSet],
+  );
+  const frameBoards = useMemo(() => {
+    const m = new Map<string, FlowBoardSpace>();
     for (const [f, b] of model.board.frames) {
-      if (visible.has(f)) add(f, boardAsOf(f, b.view), b.posts.filter((p) => isShown(p.id)));
+      m.set(f, {
+        ...b,
+        view: boardAsOf(f, b.view),
+        posts: shownSet === null ? b.posts : b.posts.filter((p) => isShown(p.id)),
+      });
     }
+    return m;
+  }, [model, boardAsOf, isShown, shownSet]);
+  const anchors = useMemo(() => {
+    const s = new Set(boardAnchorKeys(RAIL, railView, railPosts));
+    for (const [f, b] of frameBoards) if (visible.has(f)) for (const k of boardAnchorKeys(f, b.view, b.posts)) s.add(k);
     return s;
-  }, [railView, railPosts, model, visible, boardAsOf, isShown]);
+  }, [railView, railPosts, frameBoards, visible]);
   const anchor = useCallback(
     (key: string) => <Handle key={`a:${key}`} id={key} type="target" position={Position.Left} className="afx-anchor" />,
     [],
   );
+  const claims = useMemo(() => {
+    const atRest = (spaceId: string) => model.messages.filter((m) => m.space === spaceId).every((m) => m.atRest);
+    return [
+      ...claimMessages(FLOW_SPACE, railView, model.board.writers, atRest(FLOW_SPACE)),
+      ...[...frameBoards].flatMap(([f, b]) => claimMessages(f, b.view, b.writers, atRest(f))),
+    ];
+  }, [model, railView, frameBoards]);
 
   // --- selection -----------------------------------------------------------
   const [listSelected, setListSelected] = useState(0);
@@ -317,22 +357,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     if (id) setListSelected((n) => n + 1);
   }, []);
 
-  /** The cards a message touches, as drawn. */
-  const endsOf = useCallback(
-    (m: FlowMessage) => [m.from, ...m.to].map((e) => anchorOf(e, m)?.node).filter((x): x is string => !!x),
-    [anchorOf],
-  );
-  const roundOfNode = useCallback(
-    (id: string): number | undefined => {
-      if (id.startsWith('round:') || id.startsWith('more:') || id.startsWith('summary:')) return Number(id.split(':')[1]);
-      const base = id.includes('/') ? id.slice(0, id.indexOf('/')) : id;
-      return refById.get(base)?.round ?? roundOfChild.get(base);
-    },
-    [refById, roundOfChild],
-  );
-
-  // --- nodes ---------------------------------------------------------------
-  const slots = useEntranceSlots(layout.positions);
+  // --- callbacks the cards hold (stable, so the cards' memos hold) --------
   const onExpand = useCallback((round: number) => {
     setExpanded((s) => new Set(s).add(`round:${round}`));
   }, []);
@@ -347,26 +372,70 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     },
     [record.id],
   );
-  const childById = useMemo(() => new Map(children.map((c) => [c.run_id, c])), [children]);
+  // A frame's fan-out and panel controls: a unit opens its transcript (the
+  // run's page when it has none yet); "expand all" opens the run's page,
+  // where the whole fan-out is browsed.
+  const graphsRef = useRef(childGraphs);
+  graphsRef.current = childGraphs;
+  const frameHandlers = useRef(
+    new Map<string, { open: (step: string, index: number) => void; expand: (step: string) => void }>(),
+  );
+  const handlersOf = useCallback(
+    (frame: string) => {
+      let h = frameHandlers.current.get(frame);
+      if (!h) {
+        const runPage = `/runs/${encodeURIComponent(frame)}`;
+        h = {
+          open: (step, index) => {
+            const node = graphsRef.current.get(frame)?.nodeById(step);
+            const unit = node?.fanout?.units.find((u) => u.index === index);
+            if (unit?.transcriptPath) {
+              navigate(`/transcript?path=${encodeURIComponent(unit.transcriptPath)}&live=${unit.state === 'running' ? 1 : 0}`);
+            } else navigate(runPage);
+          },
+          expand: () => navigate(runPage),
+        };
+        frameHandlers.current.set(frame, h);
+      }
+      return h;
+    },
+    [navigate],
+  );
   const leadTint = crewTint(parseCodename(record.codename).crew, mode) ?? colors.get('brand.500');
 
+  // --- nodes ---------------------------------------------------------------
+  const slots = useEntranceSlots(layout.positions);
+  // A card keeps its previous `data` while nothing in it changed, so its
+  // memo skips the render (a pure cache: the same input gives the same data).
+  const dataCache = useRef(new Map<string, Record<string, unknown>>());
   const nodes = useMemo<Node[]>(() => {
-    const out: Node[] = [];
-    const pos = (id: string) => {
-      const p = layout.positions.get(id);
-      return p ? { x: p.x, y: p.y } : { x: 0, y: 0 };
+    const cache = dataCache.current;
+    const stable = (id: string, d: Record<string, unknown>) => {
+      const prev = cache.get(id);
+      if (prev && shallowEqual(prev, d)) return prev;
+      cache.set(id, d);
+      return d;
     };
-    const common = (id: string) => ({
-      id,
-      position: pos(id),
-      draggable: false,
-      measured: measured.get(id),
-      hidden: !visible.has(id),
-    });
-    const roundYs = model.rounds.map((r) => {
+    const out: Node[] = [];
+    const node = (id: string, type: string, d: Record<string, unknown>, extra: Partial<Node> = {}): Node => {
+      const p = layout.positions.get(id);
+      return {
+        id,
+        type,
+        position: p ? { x: p.x, y: p.y } : { x: 0, y: 0 },
+        draggable: false,
+        measured: measured.get(id),
+        hidden: !visible.has(id),
+        selected: id === focus?.id,
+        data: stable(id, d),
+        ...extra,
+      };
+    };
+    const dots: number[] = [];
+    for (const r of model.rounds) {
       const p = layout.positions.get(`round:${r.round}`);
-      return p ? p.y + Math.min(p.height, 60) / 2 : 0;
-    });
+      if (p && visible.has(`round:${r.round}`)) dots.push(p.y + Math.min(p.height, 60) / 2);
+    }
     out.push({
       id: 'spine',
       type: 'spine',
@@ -374,61 +443,45 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       draggable: false,
       selectable: false,
       zIndex: -1,
-      data: {
-        height: layout.height,
-        dots: model.rounds.filter((r) => visible.has(`round:${r.round}`)).map((r) => roundYs[model.rounds.indexOf(r)]),
-        live: running && tl.t === null,
-        tint: leadTint,
-      },
+      data: stable('spine', { height: layout.height, dots, live: running && !replaying, tint: leadTint }),
     });
-    out.push({
-      ...common('lead'),
-      type: 'lead',
-      selectable: false,
-      data: { codename: record.codename, agent: detail.def?.lead ?? null, startedAt: record.started_at },
-    });
+    out.push(
+      node('lead', 'lead', { codename: record.codename, agent: detail.def?.lead ?? null, startedAt: record.started_at }, { selectable: false }),
+    );
     for (const r of model.rounds) {
       const id = `round:${r.round}`;
-      out.push({
-        ...common(id),
-        type: 'round',
-        data: {
+      out.push(
+        node(id, 'round', {
           round: r,
           live: r.round === liveRound,
           launched: r.childIds.length,
           messages: counts.get(id) ?? 0,
           slot: slots.get(id) ?? 0,
-        },
-      });
+        }),
+      );
       if (r.collapsed) {
         const sid = `summary:${r.round}`;
-        out.push({
-          ...common(sid),
-          type: 'summary',
-          data: {
+        out.push(
+          node(sid, 'summary', {
             variant: 'summary',
             round: r.round,
             children: r.childIds.map((c) => childById.get(c)).filter((c): c is RunChild => !!c),
             onExpand,
             slot: slots.get(sid) ?? 0,
-          },
-        });
+          }),
+        );
       }
     }
     for (const n of model.nodes) {
       if (n.kind === 'child' && n.child) {
-        out.push({
-          ...common(n.id),
-          type: 'child',
-          data: { child: n.child, inferred: n.inferred, messages: counts.get(n.id) ?? 0, slot: slots.get(n.id) ?? 0 },
-        });
+        out.push(
+          node(n.id, 'child', { child: n.child, inferred: n.inferred, messages: counts.get(n.id) ?? 0, slot: slots.get(n.id) ?? 0 }),
+        );
       } else if (n.kind === 'more') {
         const r = model.rounds.find((x) => x.round === n.round)!;
         const inRound = new Set(r.childIds);
-        out.push({
-          ...common(n.id),
-          type: 'more',
-          data: {
+        out.push(
+          node(n.id, 'more', {
             variant: 'more',
             round: n.round,
             // The round's top-level children not drawn as cards.
@@ -438,11 +491,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               .filter((c): c is RunChild => !!c && !inRound.has(c.parent_run_id)),
             onExpand,
             slot: slots.get(n.id) ?? 0,
-          },
-        });
+          }),
+        );
       } else if (n.kind === 'frame' && n.child) {
         const box = layout.frames.get(n.id);
-        let graphHeight = (box?.height ?? 220) - FRAME_HEAD;
+        let graphHeight = Math.max(80, (box?.height ?? 220) - FRAME_HEAD - 40);
         if (n.graph) {
           let bottom = 0;
           for (const s of n.graph.nodes) {
@@ -450,80 +503,61 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             if (p) bottom = Math.max(bottom, p.y + p.height);
           }
           graphHeight = bottom - (box?.y ?? 0) - FRAME_HEAD + FRAME_PAD;
-        } else {
-          graphHeight = Math.max(80, graphHeight - 40);
         }
-        const frameBoard = model.board.frames.get(n.id) ?? null;
-        out.push({
-          ...common(n.id),
-          type: 'frame',
-          zIndex: 0,
-          data: {
-            child: n.child,
-            round: n.round,
-            inferred: n.inferred,
-            width: box?.width ?? 480,
-            graphHeight,
-            loaded: !!n.graph,
-            error: data.frameErrors.get(n.id) ?? null,
-            board: frameBoard && {
-              ...frameBoard,
-              view: boardAsOf(n.id, frameBoard.view),
-              posts: frameBoard.posts.filter((p) => isShown(p.id)),
+        out.push(
+          node(
+            n.id,
+            'frame',
+            {
+              child: n.child,
+              round: n.round,
+              inferred: n.inferred,
+              width: box?.width ?? 480,
+              graphHeight,
+              loaded: !!n.graph,
+              error: data.frameErrors.get(n.id) ?? null,
+              board: frameBoards.get(n.id) ?? null,
+              messages: counts.get(n.id) ?? 0,
+              onLoad: data.loadFrame,
+              onDefinition,
+              onSelectMessage: selectMessage,
+              anchor,
+              slot: slots.get(n.id) ?? 0,
             },
-            messages: counts.get(n.id) ?? 0,
-            onLoad: data.loadFrame,
-            onDefinition,
-            onSelectMessage: selectMessage,
-            anchor,
-            slot: slots.get(n.id) ?? 0,
-          },
-        });
+            { zIndex: 0 },
+          ),
+        );
         if (n.graph) {
+          const h = handlersOf(n.id);
           for (const s of n.graph.nodes) {
             const id = `${n.id}/${s.id}`;
-            out.push({
-              ...common(id),
-              type: flowKind(s.kind),
-              zIndex: 1,
-              data: { node: s, slot: slots.get(id) ?? 0 },
-            });
+            out.push(
+              node(
+                id,
+                flowKind(s.kind),
+                { node: s, slot: slots.get(id) ?? 0, onOpenUnit: h.open, onExpandFanout: h.expand },
+                { zIndex: 1 },
+              ),
+            );
           }
         }
       }
     }
-    out.push({
-      id: 'rail',
-      type: 'rail',
-      // Below the canvas's summary chip, which sits over the top-right.
-      position: { x: layout.railX, y: RAIL_TOP },
-      draggable: false,
-      selectable: false,
-      measured: measured.get('rail'),
-      data: { view: railView, posts: railPosts, minHeight: Math.max(0, layout.height - RAIL_TOP), onSelect: selectMessage, anchor },
-    });
+    out.push(
+      node(
+        RAIL,
+        'rail',
+        { view: railView, posts: railPosts, minHeight: Math.max(0, layout.height - RAIL_TOP), onSelect: selectMessage, anchor },
+        // Below the canvas's summary chip, which sits over the top-right.
+        { position: { x: layout.railX, y: RAIL_TOP }, selectable: false, hidden: false, selected: false },
+      ),
+    );
     const ends = new Set(model.messages.flatMap((m) => [m.from, ...m.to]));
-    if (ends.has(OPERATOR)) {
-      out.push({
-        id: 'operator',
-        type: 'entry',
-        position: { x: layout.operator.x, y: layout.operator.y },
-        draggable: false,
-        selectable: false,
-        data: { label: 'operator' },
-      });
-    }
-    if (ends.has(OFFCANVAS)) {
-      out.push({
-        id: 'offcanvas',
-        type: 'entry',
-        position: { x: layout.operator.x, y: layout.operator.y + 40 },
-        draggable: false,
-        selectable: false,
-        data: { label: 'off map' },
-      });
-    }
-    return out.map((n) => (n.id === focusNode ? { ...n, selected: true } : n));
+    const entry = (id: string, label: string, y: number) =>
+      node(id, 'entry', { label }, { position: { x: layout.operator.x, y }, selectable: false, hidden: false, selected: false });
+    if (ends.has(OPERATOR)) out.push(entry('operator', 'operator', layout.operator.y));
+    if (ends.has(OFFCANVAS)) out.push(entry('offcanvas', 'off map', layout.operator.y + 40));
+    return out;
   }, [
     model,
     layout,
@@ -533,35 +567,32 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     counts,
     liveRound,
     running,
-    tl.t,
+    replaying,
     leadTint,
     record,
     detail.def,
     childById,
     refById,
-    roundOfChild,
     onExpand,
     onDefinition,
     selectMessage,
     anchor,
-    boardAsOf,
-    isShown,
     railView,
     railPosts,
+    frameBoards,
+    handlersOf,
     data.frameErrors,
     data.loadFrame,
-    focusNode,
+    focus?.id,
   ]);
 
   // --- edges ---------------------------------------------------------------
-  const edges = useMemo<Edge[]>(() => {
+  const treeEdges = useMemo<Edge[]>(() => {
     const out: Edge[] = [];
     // The tree: a round into what it launched, a child into its children.
     const tree = (source: string, target: string, sRef: FlowNodeRef | undefined, tRef: FlowNodeRef | undefined) => {
       if (!visible.has(source) || !visible.has(target)) return;
       const tone = edgeTone(stateOfRef(sRef, liveRound), tRef ? stateOfRef(tRef, liveRound) : 'pending');
-      const fromKey = runKindAccent(runKindOfRef(sRef));
-      const toKey = runKindAccent(runKindOfRef(tRef));
       out.push({
         id: `t:${source}->${target}`,
         source,
@@ -570,8 +601,8 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         className: tone === 'live' ? 'rg-edge-flow' : undefined,
         data: {
           tone,
-          from: colors.get(fromKey),
-          to: colors.get(toKey),
+          from: colors.get(runKindAccent(runKindOfRef(sRef))),
+          to: colors.get(runKindAccent(runKindOfRef(tRef))),
           light: colors.status.running,
           slot: slots.get(source) ?? 0,
         },
@@ -587,91 +618,45 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const n of model.nodes) {
       if (n.kind === 'frame' && n.graph && visible.has(n.id)) out.push(...runEdges(n.graph, colors, slots, `${n.id}/`));
     }
-    // The messages.
-    const focus = [focusNode, hoverNode].filter((x): x is string => !!x);
-    const focusRound = focusNode?.startsWith('round:') ? Number(focusNode.slice(6)) : null;
-    const msg = (m: FlowMessage, targets: string[], onSelect?: (id: string) => void) => {
-      if (!passes(m, kinds, participant)) return;
-      const from = anchorOf(m.from, m);
-      if (!from) return;
-      const ends = endsOf(m);
-      const touched = focus.some((f) => ends.includes(f));
-      const inRound = focusRound !== null && ends.some((e) => roundOfNode(e) === focusRound);
-      const highlighted = m.id === selectedMsg || touched;
-      if (!m.atRest && !highlighted && !inRound) return;
-      targets.forEach((t, i) => {
-        const to = anchorOf(t, m);
-        if (!to) return;
-        const handle = to.handle && anchors.has(`${to.node}|${to.handle}`) ? to.handle : undefined;
-        out.push({
-          id: `m:${m.space}:${m.id}:${to.node}:${i}`,
-          source: from.node,
-          target: to.node,
-          targetHandle: handle,
-          type: 'message',
-          zIndex: highlighted ? 20 : 10,
-          data: { message: m, highlighted, arriving: arriving(m.id), onSelect },
-        } satisfies MessageFlowEdge);
-      });
-    };
-    for (const m of shownMessages) msg(m, m.to, selectMessage);
-    // Each claim, from the card that holds it to its place on the board.
-    for (const [spaceId, b] of [[FLOW_SPACE, model.board] as const, ...model.board.frames]) {
-      const view = boardAsOf(spaceId, b.view);
-      if (!view || 'kind' in view) continue;
-      const atRest = model.messages.filter((m) => m.space === spaceId).every((m) => m.atRest);
-      for (const c of view.claims) {
-        const writer = b.writers.get(c.owner);
-        if (!writer) continue;
-        const at = Date.parse(c.acquired_at);
-        const claim: FlowMessage = {
-          id: `claim:${c.key}:${c.acquired_at}`,
-          kind: 'post',
-          from: writer,
-          to: [BOARD],
-          undelivered: [],
-          atRest,
-          space: spaceId,
-          at: Number.isFinite(at) ? at : 0,
-          atKnown: Number.isFinite(at),
-          body: `claim: ${c.key_known ? c.key : '(key not recorded)'} · ${c.state}`,
-          message: {
-            id: `claim:${c.key}:${c.acquired_at}`,
-            ts: c.acquired_at,
-            kind: 'post',
-            post_kind: 'claim',
-            from: c.owner,
-            to: null,
-            body: c.key,
-            delivery: { resolved: [] },
-            seen: [],
-          },
-        };
-        msg(claim, [BOARD]);
-      }
-    }
     return out;
-  }, [
-    model,
-    visible,
-    liveRound,
-    colors,
-    slots,
-    refById,
-    focusNode,
-    hoverNode,
-    kinds,
-    participant,
-    anchorOf,
-    endsOf,
-    roundOfNode,
-    selectedMsg,
-    anchors,
-    arriving,
-    shownMessages,
-    selectMessage,
-    boardAsOf,
-  ]);
+  }, [model, visible, liveRound, colors, slots, refById]);
+
+  const arcs = useMemo(
+    () =>
+      messageArcs([...shownMessages, ...claims], router, {
+        kinds,
+        participant,
+        focus: focus?.id ?? null,
+        hover: hoverNode,
+        selected: selectedMsg,
+        anchors,
+      }),
+    [shownMessages, claims, router, kinds, participant, focus?.id, hoverNode, selectedMsg, anchors],
+  );
+  const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
+  const edges = useMemo<Edge[]>(
+    () => [
+      ...treeEdges,
+      ...arcs.map(
+        (a) =>
+          ({
+            id: a.id,
+            source: a.source,
+            target: a.target,
+            targetHandle: a.targetHandle,
+            type: 'message',
+            zIndex: a.highlighted ? 20 : 10,
+            data: {
+              message: a.message,
+              highlighted: a.highlighted,
+              arriving: arrivals.has(a.message.id),
+              onSelect: claimIds.has(a.message.id) ? undefined : selectMessage,
+            },
+          }) satisfies MessageFlowEdge,
+      ),
+    ],
+    [treeEdges, arcs, arrivals, claimIds, selectMessage],
+  );
 
   // --- interaction ---------------------------------------------------------
   const onNodesChange = useCallback((changes: NodeChange[]) => {
@@ -679,7 +664,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, []);
   const onNodeClick = useCallback<NodeMouseHandler>((_e, n) => {
     if (n.type === 'spine' || n.type === 'rail' || n.type === 'lead') return;
-    setFocusNode((cur) => (cur === n.id ? null : n.id));
+    setFocus((cur) => (cur?.id === n.id ? null : { id: n.id, round: routerRef.current.roundOfNode(n.id) }));
   }, []);
   const onNodeEnter = useCallback<NodeMouseHandler>((_e, n) => setHoverNode(n.id), []);
   const onNodeLeave = useCallback<NodeMouseHandler>(() => setHoverNode(null), []);
@@ -709,8 +694,9 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       void rf.setViewport({ x: -left * fitZoom + 24, y: Math.min(24, y), zoom: fitZoom });
       return;
     }
+    if (panned.current) return;
     // The map grew wider (a frame's graph loaded): keep its width in view.
-    if (layout.width > placedWidth.current && !panned.current) {
+    if (layout.width > placedWidth.current) {
       placedWidth.current = layout.width;
       const vp = rf.getViewport();
       if (fitZoom < vp.zoom) {
@@ -718,10 +704,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         return;
       }
     }
-    if (!followKey || panned.current) return;
+    if (!followKey) return;
     const vp = rf.getViewport();
     void rf.setViewport({ x: vp.x, y: Math.min(24, -(lastRoundPos.y * vp.zoom) + h * 0.35), zoom: vp.zoom }, { duration: 320 });
-    // Only a new newest round (or the first placement) moves the viewport.
+    // Only a new newest round, a wider map or the first placement moves it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [followKey, lastRoundPos !== undefined, rf.viewportInitialized, data.childrenLoaded, layout.width]);
 
@@ -730,9 +716,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     if (!selectedMsg || listSelected === 0) return;
     const m = model.messages.find((x) => x.id === selectedMsg);
     if (!m) return;
-    const ends = endsOf(m).filter((e) => layout.positions.has(e));
-    if (ends.length === 0) return;
-    const ps = ends.map((e) => layout.positions.get(e)!);
+    const ps = router
+      .endsOf(m)
+      .map((e) => layout.positions.get(e))
+      .filter((p): p is NonNullable<typeof p> => !!p);
+    if (ps.length === 0) return;
     const cx = ps.reduce((a, p) => a + p.x + p.width / 2, 0) / ps.length;
     const cy = ps.reduce((a, p) => a + p.y + p.height / 2, 0) / ps.length;
     panned.current = true;
@@ -792,7 +780,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           onNodeMouseEnter={onNodeEnter}
           onNodeMouseLeave={onNodeLeave}
           onPaneClick={() => {
-            setFocusNode(null);
+            setFocus(null);
             setSelectedMsg(null);
           }}
           onMoveStart={(e) => {
