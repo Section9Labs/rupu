@@ -20,13 +20,19 @@ import {
   RUN_PARTICIPANTS,
 } from '../lib/flow/runFixtures';
 
-const seen = vi.hoisted(() => ({ overlay: undefined as RunGraphOverlay | undefined, renders: 0 }));
+const seen = vi.hoisted(() => ({
+  overlay: undefined as RunGraphOverlay | undefined,
+  renders: 0,
+  /** Whether the graph's first render already had its layer. */
+  first: null as boolean | null,
+}));
 
 vi.mock('../components/RunGraph', () => ({
   __esModule: true,
   default: (props: { overlay?: RunGraphOverlay }) => {
     seen.overlay = props.overlay;
     seen.renders += 1;
+    if (seen.first === null) seen.first = !!props.overlay;
     return (
       <div data-testid="run-graph-mock" data-overlay={props.overlay ? 'on' : 'none'}>
         {props.overlay && (
@@ -83,6 +89,7 @@ function renderAt(entry: string) {
 beforeEach(() => {
   seen.overlay = undefined;
   seen.renders = 0;
+  seen.first = null;
 });
 afterEach(() => {
   cleanup();
@@ -150,5 +157,30 @@ describe('RunDetail layer', () => {
     expect(within(panel).getByText(/host h-abc has no board route/)).toBeInTheDocument();
     // The posts are messages: still listed.
     expect(within(panel).getByText('claim: package-lock.json')).toBeInTheDocument();
+  });
+
+  it('the_graph_is_drawn_once_the_space_is_known', async () => {
+    // The probe answers after the graph loaded: the graph waits, then is
+    // drawn with its layer from its first render (no height or axis jump).
+    stub('present');
+    let answer: (v: Awaited<ReturnType<typeof api.getMessages>>) => void = () => {};
+    vi.mocked(api.getMessages).mockImplementationOnce(() => new Promise((r) => (answer = r)));
+    renderAt(`/runs/${RUN_ID}`);
+    await waitFor(() => expect(api.getRunGraph).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByTestId('run-graph-mock')).toBeNull();
+    expect(screen.getByText('Loading run…')).toBeInTheDocument();
+    answer({ kind: 'ok', view: view('present') });
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
+    expect(seen.first).toBe(true);
+    expect(screen.getByTestId('time-track')).toBeInTheDocument();
+  });
+
+  it('a_slow_probe_does_not_hold_the_graph', async () => {
+    stub('present');
+    vi.mocked(api.getMessages).mockImplementation(() => new Promise(() => {}));
+    renderAt(`/runs/${RUN_ID}`);
+    await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument(), { timeout: 3000 });
+    expect(screen.getByTestId('run-graph-mock')).toHaveAttribute('data-overlay', 'none');
   });
 });

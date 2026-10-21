@@ -193,6 +193,10 @@ function eventStepId(ev: RunEvent): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
+/** The longest the graph waits for the message-space probe before it is
+ *  drawn without the layer (a slow remote host). */
+const SPACE_PROBE_GRACE_MS = 1500;
+
 /** How often a requested retry polls the run record for the resume taking it. */
 const RETRY_POLL_MS = 1500;
 
@@ -618,6 +622,18 @@ export default function RunDetail() {
     { route: 'runs', id, host },
     { live: isRunning && !!run, load: true, reading: tab === 'messages' },
   );
+  // Whether the run has a space decides the graph's height and whether the
+  // time axis sits above it, so the graph waits for the probe's answer (for
+  // at most SPACE_PROBE_GRACE_MS): it is drawn once, at its final place, and
+  // never jumps when the answer lands.
+  const [probeGraceOver, setProbeGraceOver] = useState(false);
+  useEffect(() => {
+    setProbeGraceOver(false);
+    const timer = setTimeout(() => setProbeGraceOver(true), SPACE_PROBE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [id, host]);
+  const spaceKnown =
+    messages.space !== null || messages.status === 'unavailable' || messages.status === 'error' || probeGraceOver;
   // The graph's message and board layer, its time axis and its panels.
   const runLayer = useRunLayer({
     id,
@@ -980,8 +996,8 @@ export default function RunDetail() {
     );
   }
 
-  // Loading: we need both run and model.
-  if (!run || !model) {
+  // Loading: we need both run and model, and to know whether it has a space.
+  if (!run || !model || !spaceKnown) {
     return (
       <div className="p-8">
         <BackLink />
