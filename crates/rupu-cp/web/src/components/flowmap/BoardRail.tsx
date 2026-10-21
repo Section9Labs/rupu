@@ -59,7 +59,7 @@ export default function BoardRail({
             <h3 className="afx-rail-h">Claims</h3>
             {board.claims.length === 0 && <div className="afx-rail-empty">none</div>}
             {board.claims.map((c, i) => (
-              <div key={`${c.key}/${c.owner}/${i}`} className="afx-rail-item" data-state={c.state}>
+              <div key={`${c.key}/${c.owner}/${i}`} className="afx-rail-item" data-state={c.state} style={{ ['--i' as string]: i }}>
                 <div className="afx-rail-line">
                   <span className="afx-rail-key">{c.key_known ? c.key : 'claim (key not recorded)'}</span>
                   <span className="afx-rail-state">{c.state}</span>
@@ -76,12 +76,13 @@ export default function BoardRail({
           <section>
             <h3 className="afx-rail-h">Directives</h3>
             {board.directives.length === 0 && <div className="afx-rail-empty">none</div>}
-            {board.directives.map((d: DirectiveView) => (
+            {board.directives.map((d: DirectiveView, i) => (
               <button
                 key={d.id}
                 type="button"
                 className="afx-rail-item afx-rail-btn"
                 data-retracted={d.retracted}
+                style={{ ['--i' as string]: i }}
                 onClick={() => onSelect(d.id)}
               >
                 <div className="afx-rail-line">
@@ -98,8 +99,8 @@ export default function BoardRail({
       <section>
         <h3 className="afx-rail-h">Posts</h3>
         {posts.length === 0 && <div className="afx-rail-empty">none</div>}
-        {posts.map((p) => (
-          <button key={p.id} type="button" className="afx-rail-item afx-rail-btn" onClick={() => onSelect(p.id)}>
+        {posts.map((p, i) => (
+          <button key={p.id} type="button" className="afx-rail-item afx-rail-btn" style={{ ['--i' as string]: i }} onClick={() => onSelect(p.id)}>
             <div className="afx-rail-line">
               {who(p.message.from)}
               {p.message.post_kind && <span className="afx-rail-sub">{p.message.post_kind}</span>}

@@ -18,6 +18,7 @@ describe('messagePaint', () => {
       'status.awaiting',
       'inkMute',
     ]);
+    expect(messagePaint('from-the-future', colors).stroke).toBe('chart.5');
     expect(deadPaint(colors)).toEqual({ stroke: 'status.failed', dash: '3 5' });
   });
 });

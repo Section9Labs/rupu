@@ -9,11 +9,9 @@ export interface Paint {
   dash?: string;
 }
 
-export function messagePaint(kind: RowKind, colors: ThemeColors): Paint {
+/** An unknown kind (a newer server's) is painted as a direct message. */
+export function messagePaint(kind: RowKind | (string & {}), colors: ThemeColors): Paint {
   switch (kind) {
-    case 'direct':
-    case 'mention':
-      return { stroke: colors.get('chart.5') };
     case 'broadcast':
       return { stroke: colors.get('chart.1') };
     case 'post':
@@ -24,6 +22,8 @@ export function messagePaint(kind: RowKind, colors: ThemeColors): Paint {
       return { stroke: colors.get('status.awaiting') };
     case 'retract':
       return { stroke: colors.inkMute };
+    default:
+      return { stroke: colors.get('chart.5') };
   }
 }
 

@@ -15,6 +15,8 @@ export interface MessageEdgeData extends Record<string, unknown> {
   highlighted: boolean;
   /** Plays the packet once, as the message lands. */
   arriving: boolean;
+  /** Selects the message (its list row). */
+  onSelect?: (id: string) => void;
 }
 
 export type MessageFlowEdge = Edge<MessageEdgeData, 'message'>;
@@ -82,7 +84,13 @@ function MessageEdgeView({ id, source, target, sourceX, sourceY, targetX, target
       data-dead={dead ? 'true' : undefined}
     >
       <path className="afx-msg-halo" d={shown.d} pathLength={1} stroke={stroke} />
-      <path className="afx-msg-base" d={shown.d} pathLength={1} stroke={stroke} />
+      {dead ? (
+        // Dashed in real units (no pathLength), so the dash survives; it
+        // fades in rather than drawing.
+        <path className="afx-msg-dashed" d={shown.d} stroke={stroke} strokeDasharray={deadPaint(colors).dash} />
+      ) : (
+        <path className="afx-msg-base" d={shown.d} pathLength={1} stroke={stroke} />
+      )}
       {arriving && !dead && <path className="afx-msg-packet" d={shown.d} pathLength={1} stroke={stroke} />}
       {dead && (
         <g className="afx-msg-dead" transform={`translate(${f(tip.x)} ${f(tip.y)})`} stroke={deadPaint(colors).stroke}>
@@ -94,8 +102,20 @@ function MessageEdgeView({ id, source, target, sourceX, sourceY, targetX, target
         data-testid={`msg-arc-${message.id}`}
         className="afx-msg-hit"
         d={full.d}
+        tabIndex={0}
+        role="button"
+        aria-label={`${message.kind} message from ${message.message.from_codename ?? message.message.from}`}
         onMouseEnter={() => setHover(true)}
         onMouseLeave={() => setHover(false)}
+        onFocus={() => setHover(true)}
+        onBlur={() => setHover(false)}
+        onClick={() => data.onSelect?.(message.id)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            data.onSelect?.(message.id);
+          }
+        }}
       />
       {hover && (
         <foreignObject

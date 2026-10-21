@@ -5,7 +5,6 @@
 import { useRef } from 'react';
 import { useThemeColors } from '../../lib/useThemeColors';
 import type { TimelineBand, TimelineItem } from '../../lib/timeline/timeline';
-import type { RowKind } from '../../lib/messages';
 import { messagePaint } from '../../lib/flow/messagePaint';
 
 export function TimeAxis({
@@ -106,7 +105,7 @@ export function TimeAxis({
             <span
               key={i.key}
               className="tl-tick"
-              style={{ left: pct(i.at), background: messagePaint((i.sub ?? 'post') as RowKind, colors).stroke }}
+              style={{ left: pct(i.at), background: messagePaint(i.sub ?? 'post', colors).stroke }}
             />
           ))}
         {t !== null && (

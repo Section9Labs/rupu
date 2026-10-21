@@ -1244,12 +1244,12 @@
   stroke-dasharray: 1 1;
   opacity: 0.5;
   animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
-  transition: opacity 200ms ease, stroke-width 200ms ease;
+  transition: opacity 200ms ease;
 }
+.afx-msg-dashed { stroke-width: 1.5; opacity: 0.6; animation: rgx-fade var(--rgx-draw) var(--ease-out) backwards; transition: opacity 200ms ease; }
 .afx-msg-halo { stroke-width: 6; filter: blur(3px); opacity: 0; transition: opacity 240ms ease; }
-.afx-msg[data-highlighted='true'] .afx-msg-base { opacity: 1; stroke-width: 2; }
+.afx-msg[data-highlighted='true'] :is(.afx-msg-base, .afx-msg-dashed) { opacity: 1; }
 .afx-msg[data-highlighted='true'] .afx-msg-halo { opacity: 0.28; }
-.afx-msg[data-dead='true'] .afx-msg-base { stroke-dasharray: 3 5; }
 .afx-msg-packet {
   stroke-width: 3.5;
   stroke-dasharray: 0.07 1.2;
@@ -1262,7 +1262,8 @@
 }
 .afx-msg-dead { animation: rgx-fade 300ms ease-out 200ms backwards; }
 .afx-msg-dead path { stroke-width: 1.5; }
-.afx-msg-hit { stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: default; }
+.afx-msg-hit { stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: default; outline: none; }
+.afx-msg-hit:focus-visible { stroke: rgb(var(--c-brand-500) / 0.25); }
 .afx-msg-tip {
   width: max-content;
   max-width: 260px;

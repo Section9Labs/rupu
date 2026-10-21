@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { Position, type EdgeProps } from '@xyflow/react';
 import MessageEdge, { type MessageFlowEdge } from './MessageEdge';
@@ -58,6 +58,10 @@ describe('MessageEdge', () => {
     expect(dead.container.querySelector('.afx-msg-dead')).not.toBeNull();
     fireEvent.mouseEnter(screen.getByTestId(`msg-arc-${undelivered.id}`));
     expect(screen.getByTestId('msg-reason')).toHaveTextContent(/\S/);
+    // The dead arc is a real dash (not solid, not the draw-in's '1 1').
+    const dash = dead.container.querySelector('.afx-msg-dashed')!.getAttribute('stroke-dasharray');
+    expect(dash).toBe('3 5');
+    expect(dead.container.querySelector('.afx-msg-base')).toBeNull();
   });
 
   it('a_self_arc_is_a_loop_and_arriving_runs_a_packet', () => {
@@ -74,5 +78,19 @@ describe('MessageEdge', () => {
     expect(d).toMatch(/^M ?50[ ,]50 C/);
     expect(container.querySelector('.afx-msg-packet')).not.toBeNull();
     expect(container.querySelector('.afx-msg')).toHaveAttribute('data-highlighted', 'true');
+  });
+
+  it('click_and_keyboard_select_the_arc_and_focus_shows_the_body', () => {
+    const onSelect = vi.fn();
+    mount('msg_005', 'x', { data: { message: find('msg_005'), highlighted: false, arriving: false, onSelect } });
+    const hit = screen.getByTestId('msg-arc-msg_005');
+    fireEvent.focus(hit);
+    expect(screen.getByText(/reset tokens go through it/)).toBeInTheDocument();
+    fireEvent.blur(hit);
+    expect(screen.queryByText(/reset tokens go through it/)).toBeNull();
+    fireEvent.click(hit);
+    fireEvent.keyDown(hit, { key: 'Enter' });
+    expect(onSelect).toHaveBeenCalledTimes(2);
+    expect(onSelect).toHaveBeenCalledWith('msg_005');
   });
 });
