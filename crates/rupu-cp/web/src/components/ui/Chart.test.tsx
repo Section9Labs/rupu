@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
-import { Chart, tooltipModel, type ChartSeries } from './Chart';
+import { Chart, placeRefLabels, plotFor, spacedTicks, tooltipModel, type ChartSeries } from './Chart';
 import { ThemeProvider } from '../theme/ThemeProvider';
 
 afterEach(cleanup);
@@ -144,5 +144,45 @@ describe('Chart', () => {
     expect(container.querySelector('[data-chart-band]')).toBeNull();
     const svg = container.querySelector('svg');
     expect(svg?.getAttribute('style') ?? '').toContain('crosshair');
+  });
+});
+
+describe('chart layout at true pixel size', () => {
+  const plot = plotFor(1000, 220, false);
+  const xs = (n: number) => Array.from({ length: n }, (_, i) => plot.x0 + ((plot.x1 - plot.x0) * i) / (n - 1));
+
+  it('draws the svg 1:1 with its box, so labels keep their designed size', () => {
+    const { container } = wrap(<Chart dates={dates} series={series} height={220} />);
+    const svg = container.querySelector('svg') as SVGSVGElement;
+    // jsdom has no layout: the chart falls back to its 480px design width.
+    expect(svg.getAttribute('viewBox')).toBe('0 0 480 220');
+    expect(svg.getAttribute('height')).toBe('220');
+  });
+
+  it('spaces x ticks at least the minimum gap apart, keeping first and last', () => {
+    const x = xs(2400);
+    const ticks = spacedTicks(x, 2395, 56);
+    expect(ticks[0]).toBe(0);
+    expect(ticks[ticks.length - 1]).toBe(2399);
+    for (let k = 1; k < ticks.length; k++) expect(x[ticks[k]] - x[ticks[k - 1]]).toBeGreaterThanOrEqual(56);
+    // the peak right next to the last tick is dropped rather than overlapping it
+    expect(ticks).not.toContain(2395);
+  });
+
+  it('keeps the label of the wider segment when two step labels collide', () => {
+    const x = xs(2400);
+    const placed = placeRefLabels(
+      [
+        { index: 0, label: 'enumerate' },
+        { index: 2, label: 'assess' },
+        { index: 1500, label: 'verify' },
+        { index: 2390, label: 'report' },
+      ],
+      x,
+      plot,
+    );
+    expect(placed.map((p) => p.text)).toEqual(['assess', 'verify', 'report']);
+    // a label at the right edge flips to end-anchored so it stays inside the plot
+    expect(placed[2].anchor).toBe('end');
   });
 });

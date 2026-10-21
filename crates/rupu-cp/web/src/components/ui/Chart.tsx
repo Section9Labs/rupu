@@ -15,7 +15,7 @@
 // (stacking order); the last series is the top of the stack (the attention
 // band) and owns the now-pulse.
 
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
 import { cn } from '../../lib/cn';
 import { useDragSelection } from '../dashboard/useDragSelection';
@@ -35,13 +35,120 @@ import {
   type Plot,
 } from '../../lib/chart/area';
 
-const VB_W = 480;
-const VB_H = 176;
-/** The default plot box (area / line / column). */
-const PLOT: Plot = { x0: 48, x1: 466, y0: 148, yTop: 26 };
-/** Composed charts reserve a right margin for the second axis' tick labels. */
-const COMPOSED_PLOT: Plot = { x0: 48, x1: 432, y0: 148, yTop: 26 };
-const XTICK_Y = 164;
+/** Width the chart is laid out at before (or without) a measured container —
+ *  the dashboard tile's width, and what jsdom tests render at. */
+const DEFAULT_W = 480;
+/** Default plot height in CSS pixels. */
+const DEFAULT_H = 176;
+/** Margins around the plot box, in CSS pixels. The SVG is drawn 1:1 with its
+ *  container (never a fixed viewBox stretched to fit), so type, strokes and
+ *  dots keep their designed size on any width. */
+const PAD = { left: 48, right: 14, composedRight: 48, top: 26, bottom: 28 };
+/** Smallest gap between two x-tick labels, and between two reference-line
+ *  labels, in CSS pixels. */
+const MIN_TICK_GAP = 56;
+const MIN_REF_LABEL_GAP = 8;
+/** Approximate advance of one monospace glyph at the 9-10px label sizes. */
+const MONO_CHAR_W = 6;
+
+/** The plot box for a `w`×`h` chart. */
+export function plotFor(w: number, h: number, composed: boolean): Plot {
+  return {
+    x0: PAD.left,
+    x1: Math.max(PAD.left + 1, w - (composed ? PAD.composedRight : PAD.right)),
+    y0: h - PAD.bottom,
+    yTop: PAD.top,
+  };
+}
+
+/** x-tick indices for `n` buckets at x positions `xs`: the first and the last,
+ *  the `peak` when there is room, and evenly spaced ticks in between, keeping
+ *  every label at least `minGap` px from its neighbours. Pure, for testing. */
+export function spacedTicks(xs: number[], peak: number, minGap = MIN_TICK_GAP): number[] {
+  const n = xs.length;
+  if (n === 0) return [];
+  if (n === 1) return [0];
+  const span = xs[n - 1] - xs[0];
+  const slots = Math.max(1, Math.floor(span / (minGap * 2)));
+  const candidates = [0, n - 1];
+  if (peak > 0 && peak < n - 1) candidates.push(peak);
+  for (let k = 1; k < slots; k++) candidates.push(Math.round(((n - 1) * k) / slots));
+  const kept: number[] = [];
+  for (const i of [...new Set(candidates)]) {
+    if (kept.every((j) => Math.abs(xs[i] - xs[j]) >= minGap)) kept.push(i);
+  }
+  return kept.sort((a, b) => a - b);
+}
+
+/** A reference-line label laid out on the plot: where its text sits and which
+ *  way it anchors, or `null` when it would collide with the previous one. */
+export interface PlacedRefLabel {
+  index: number;
+  text: string;
+  x: number;
+  anchor: 'start' | 'middle' | 'end';
+}
+
+/** Lay out reference-line labels left to right: shorten long ones and keep
+ *  them inside the plot. When two would overlap, the one naming the wider
+ *  segment (the span to the next line) keeps its label and the other is
+ *  dropped (its dashed line still draws). Pure, for testing. */
+export function placeRefLabels(
+  refs: { index: number; label?: string }[],
+  xs: number[],
+  plot: Plot,
+): PlacedRefLabel[] {
+  const sorted = [...refs]
+    .filter((r) => r.label && r.index >= 0 && r.index < xs.length)
+    .sort((a, b) => a.index - b.index);
+  const kept: { label: PlacedRefLabel; left: number; right: number; span: number }[] = [];
+  sorted.forEach((r, k) => {
+    const raw = r.label as string;
+    const text = raw.length > 12 ? `${raw.slice(0, 11)}…` : raw;
+    const w = text.length * MONO_CHAR_W;
+    const x = xs[r.index];
+    const nextX = k + 1 < sorted.length ? xs[sorted[k + 1].index] : plot.x1;
+    let anchor: PlacedRefLabel['anchor'] = 'start';
+    let left = x + 4;
+    if (left + w > plot.x1) {
+      anchor = 'end';
+      left = x - 4 - w;
+    }
+    const entry = {
+      label: { index: r.index, text, x: anchor === 'start' ? x + 4 : x - 4, anchor },
+      left,
+      right: left + w,
+      span: nextX - x,
+    };
+    const prev = kept[kept.length - 1];
+    if (prev && left < prev.right + MIN_REF_LABEL_GAP) {
+      if (entry.span > prev.span) kept[kept.length - 1] = entry;
+      return;
+    }
+    kept.push(entry);
+  });
+  return kept.map((k) => k.label);
+}
+
+/** The width of the element `ref` points at, tracked as it resizes. Falls back
+ *  to `fallback` until measured (and where there is no ResizeObserver). */
+function useMeasuredWidth(ref: React.RefObject<HTMLElement | null>, fallback: number): number {
+  const [w, setW] = useState(fallback);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const measure = () => {
+      const next = Math.round(el.getBoundingClientRect().width);
+      if (next > 0) setW(next);
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return w;
+}
 /** 1px seam between stacked column segments (app-screens §Charts). */
 const SEAM = 1;
 
@@ -124,6 +231,8 @@ export interface ChartProps {
   tooltipLabels?: string[];
   /** Accessible name for the plot. */
   ariaLabel?: string;
+  /** Plot height in CSS pixels (default 176). The width always follows the container. */
+  height?: number;
   className?: string;
 }
 
@@ -240,10 +349,13 @@ export function Chart({
   selectKeys,
   tooltipLabels,
   ariaLabel,
+  height = DEFAULT_H,
   className,
 }: ChartProps) {
   const colors = useThemeColors();
   const svgRef = useRef<SVGSVGElement>(null);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const width = useMeasuredWidth(boxRef, DEFAULT_W);
   const [hover, setHover] = useState<number | null>(null);
   const [drawn, setDrawn] = useState(false);
   const uid = useId().replace(/:/g, '');
@@ -261,7 +373,8 @@ export function Chart({
   const keys = selectKeys ?? dates;
   const valueSeries = series.map((s) => s.values);
   const composed = kind === 'composed';
-  const plot = composed ? COMPOSED_PLOT : PLOT;
+  const plot = plotFor(width, height, composed);
+  const xTickY = height - 12;
   // Area + column stack (scale on the per-bucket total); line/composed overlay
   // (scale on the largest single value, series never summed).
   const stacked = kind === 'area' || kind === 'column';
@@ -301,8 +414,10 @@ export function Chart({
   const markY = (si: number, i: number) =>
     yOf(stacked ? tops[si][i] : valueSeries[si][i], scaleOf(series[si]).max, plot);
 
-  // x-ticks: first, peak, last (deduped, in order).
-  const tickIdx = [...new Set([0, peak, n - 1].filter((i) => i >= 0 && i < n))].sort((a, b) => a - b);
+  // x-ticks: first, last, the peak and evenly spaced ones between, never closer
+  // than MIN_TICK_GAP px.
+  const tickIdx = spacedTicks(xc, peak);
+  const refLabels = hasData && refLines ? placeRefLabels(refLines, xc, plot) : [];
 
   // The now-pulse series: the top of the stack, or (composed) the hero area.
   const topSeries = series.length - 1;
@@ -343,7 +458,7 @@ export function Chart({
     if (!svg || !hasData) return null;
     const r = svg.getBoundingClientRect();
     if (r.width === 0) return null; // jsdom / not laid out
-    const px = ((e.clientX - r.left) / r.width) * VB_W;
+    const px = ((e.clientX - r.left) / r.width) * width;
     return nearestIndex(xc, px);
   };
 
@@ -407,12 +522,12 @@ export function Chart({
         </div>
       )}
 
-      <div className="relative">
+      <div ref={boxRef} className="relative">
         <svg
           ref={svgRef}
-          viewBox={`0 0 ${VB_W} ${VB_H}`}
+          viewBox={`0 0 ${width} ${height}`}
           width="100%"
-          height="auto"
+          height={height}
           className="block overflow-visible"
           style={onSelectRange ? { cursor: 'crosshair' } : undefined}
           role="img"
@@ -613,30 +728,31 @@ export function Chart({
           {/* dashed vertical reference lines (step/turn boundaries) */}
           {hasData &&
             refLines?.map((r) =>
-              r.index >= 0 && r.index < n ? (
-                <g key={`ref-${r.index}`}>
-                  <line
-                    x1={xc[r.index]}
-                    y1={plot.yTop}
-                    x2={xc[r.index]}
-                    y2={plot.y0}
-                    style={{ stroke: colors.border, strokeDasharray: '3 3' }}
-                    strokeWidth={1}
-                  />
-                  {r.label && (
-                    <text
-                      x={xc[r.index]}
-                      y={plot.yTop + 8}
-                      textAnchor="middle"
-                      className="font-mono"
-                      style={{ fill: colors.inkMute, fontSize: 9 }}
-                    >
-                      {r.label.length > 12 ? `${r.label.slice(0, 11)}…` : r.label}
-                    </text>
-                  )}
-                </g>
+              r.index > 0 && r.index < n ? (
+                <line
+                  key={`ref-${r.index}`}
+                  x1={xc[r.index]}
+                  y1={plot.yTop}
+                  x2={xc[r.index]}
+                  y2={plot.y0}
+                  style={{ stroke: colors.border, strokeDasharray: '3 3' }}
+                  strokeWidth={1}
+                />
               ) : null,
             )}
+
+          {refLabels.map((l) => (
+            <text
+              key={`refl-${l.index}`}
+              x={l.x}
+              y={plot.yTop + 8}
+              textAnchor={l.anchor}
+              className="font-mono"
+              style={{ fill: colors.inkMute, fontSize: 9 }}
+            >
+              {l.text}
+            </text>
+          ))}
 
           {/* peak marker (stacked kinds only — an overlaid chart has no single
               "total" to label) */}
@@ -711,7 +827,7 @@ export function Chart({
             <text
               key={`x-${i}`}
               x={xc[i]}
-              y={XTICK_Y}
+              y={xTickY}
               textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
               className="font-mono"
               style={{ fill: colors.inkDim, fontSize: 10 }}
@@ -750,7 +866,7 @@ export function Chart({
         {tip && (
           <div
             className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-[112%] whitespace-nowrap rounded-lg border border-border-strong bg-surface px-2.5 py-2 text-note shadow-lg"
-            style={{ left: `${(hoverX / VB_W) * 100}%`, top: `${(hoverTopY / VB_H) * 100}%` }}
+            style={{ left: `${(hoverX / width) * 100}%`, top: `${(hoverTopY / height) * 100}%` }}
             role="status"
           >
             <div className="mb-1 font-semibold text-ink">
