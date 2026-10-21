@@ -26,6 +26,10 @@ import {
   type RunRecordInput,
 } from './runLayer';
 import { useStableList } from './useStableList';
+import { newestAt } from './camera';
+
+/** What a replay follows on the run graph: the newest step. */
+const FOLLOW_KINDS: ReadonlySet<string> = new Set(['step']);
 
 const sameStep = (a: LayerStep, b: LayerStep) => a.id === b.id && a.state === b.state;
 const sameParticipant = (a: SpaceParticipant, b: SpaceParticipant) =>
@@ -46,6 +50,9 @@ export interface RunLayerView {
   select(id: string | null): void;
   /** The space's labels for the Messages list. */
   spaces: Map<string, string>;
+  /** While a replay (or a scrub) shows a time: the newest step revealed,
+   *  which the graph's camera follows. */
+  follow: string | null;
 }
 
 export function useRunLayer({
@@ -131,6 +138,7 @@ export function useRunLayer({
     () => (count === null ? null : new Set([...sorted.slice(0, count).map((i) => i.key), ...(untimed ?? [])])),
     [sorted, count, untimed],
   );
+  const follow = timeline.t === null ? null : (newestAt(sorted, timeline.t, FOLLOW_KINDS)?.key ?? null);
   const shown = useMemo(
     () => (layer ? (revealed ? layer.messages.filter((m) => revealed.has(m.id)) : layer.messages) : []),
     [layer, revealed],
@@ -142,5 +150,5 @@ export function useRunLayer({
   const spaces = useMemo(() => new Map([[RUN_SPACE, 'run']]), []);
 
   if (!layer) return null;
-  return { layer, timeline, bounds, revealed, shown, selected, select, spaces };
+  return { layer, timeline, bounds, revealed, shown, selected, select, spaces, follow };
 }

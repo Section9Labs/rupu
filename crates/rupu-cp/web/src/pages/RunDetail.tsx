@@ -649,6 +649,7 @@ export default function RunDetail() {
   const layerRevealed = runLayer?.revealed ?? null;
   const layerSelected = runLayer?.selected ?? null;
   const layerSelect = runLayer?.select;
+  const layerFollow = runLayer?.follow ?? null;
   const graphOverlay = useMemo<RunGraphOverlay | undefined>(
     () =>
       layerData
@@ -660,9 +661,10 @@ export default function RunDetail() {
             selected: layerSelected,
             onSelect: layerSelect,
             caughtUp,
+            follow: layerFollow,
           }
         : undefined,
-    [layerData, layerRevealed, layerSelected, layerSelect, caughtUp],
+    [layerData, layerRevealed, layerSelected, layerSelect, caughtUp, layerFollow],
   );
   const messageLinks = useMemo<MessageLinks>(() => {
     const openAt = (address: string, msgId: string) => {

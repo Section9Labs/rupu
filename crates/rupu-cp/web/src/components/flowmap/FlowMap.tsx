@@ -39,6 +39,7 @@ import {
   FLOW_SPACE,
   type BoardSource,
   type FlowBoardSpace,
+  type FlowMessage,
   type FlowNodeRef,
   type FlowRound,
   type FlowSpace,
@@ -68,7 +69,8 @@ import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
 import { MINIMAP_MIN_PANE, usePaneWidth } from '../../lib/graph/usePaneWidth';
 import { useCamera } from '../../lib/graph/useCamera';
-import { roundAt, scrollTo } from '../../lib/flow/camera';
+import { bringIntoView, newestAt, roundAt, scrollTo } from '../../lib/flow/camera';
+import type { TimelineItem } from '../../lib/timeline/timeline';
 import type { StepState } from '../../lib/runGraphModel';
 import { crewTint, parseCodename } from '../../lib/codename';
 import { stateStyle } from '../graph/stepStyle';
@@ -103,7 +105,8 @@ const MINIMAP_CLEAR = MINIMAP.width + 30;
 const TOP = 48;
 /** The map's left edge sits clear of the round navigator. */
 const LEFT = 40;
-
+/** What a replay follows on the map: the newest round or child. */
+const FOLLOW_KINDS: ReadonlySet<string> = new Set(['round', 'child']);
 /** The spine sits this far left of the round cards. */
 const SPINE_X = -28;
 /** The rail's top: clear of the summary chip at the canvas's top right. */
@@ -198,6 +201,8 @@ function roundState(r: FlowRound, liveRound: number | null, childById: ReadonlyM
   return r.childIds.some((id) => childById.get(id)?.status === 'failed') ? 'failed' : 'done';
 }
 
+/** A router lookup that needs no message (a child's or a round's card). */
+const NO_MESSAGE = {} as FlowMessage;
 
 function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
   const ka = Object.keys(a);
@@ -792,9 +797,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     () => model.rounds.filter((r) => layout.positions.has(`round:${r.round}`)).map((r) => roundState(r, liveRound, childById)),
     [model, layout, liveRound, childById],
   );
-  /** The operator moved the camera: live follow stops. */
+  /** The operator moved the camera: live follow and replay follow stop. */
   const tookOver = useCallback(() => {
     panned.current = true;
+    setReplayFollow(false);
   }, []);
   const goRound = useCallback(
     (index: number, how: 'smooth' | 'jump') => {
@@ -842,6 +848,34 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     },
     [geo, goRound, model, router, layout, rf, camera, tookOver],
   );
+
+  // --- replay follows what appears ----------------------------------------
+  // While a replay plays (or the axis is scrubbed) the camera brings the
+  // newest revealed round or child into view, unless the operator moved it
+  // since the replay began; the "Follow" pill takes it back.
+  const [replayFollow, setReplayFollow] = useState(true);
+  useEffect(() => {
+    if (replaying) setReplayFollow(true);
+  }, [replaying]);
+  const followItem = tl.t === null ? null : newestAt<TimelineItem>(sortedItems, tl.t, FOLLOW_KINDS);
+  const followNode = followItem
+    ? visible.has(followItem.key)
+      ? followItem.key
+      : (router.anchorOf(followItem.key, NO_MESSAGE)?.node ?? null)
+    : null;
+  useEffect(() => {
+    const el = pane.current;
+    if (!followNode || !replayFollow || !el) return;
+    const box = layout.positions.get(followNode);
+    if (!box) return;
+    const next = bringIntoView(box, rf.getViewport(), { width: el.clientWidth, height: el.clientHeight }, {
+      reserveRight: showMinimap ? MINIMAP_CLEAR : 0,
+      anchor: { x: 0.5, y: 0.45 },
+    });
+    if (next) camera(next);
+    // A new item to follow, or follow taken back, moves it; nothing else.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followNode, replayFollow]);
 
   // --- the panels ----------------------------------------------------------
   const participantNames = useMemo(() => {
@@ -892,6 +926,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       >
         <MapSummary list={children} messages={shownMessages.length} />
         <RoundNavigator geo={geo} states={roundStates} pane={pane} onGo={goRound} />
+        {replaying && !replayFollow && (
+          <button type="button" className="afx-follow" onClick={() => setReplayFollow(true)}>
+            Follow
+          </button>
+        )}
         <ReactFlow
           nodes={nodes}
           edges={edges}

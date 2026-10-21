@@ -280,7 +280,9 @@ describe('FlowMap', () => {
       fireEvent.keyDown(track(), { key: 'ArrowRight', shiftKey: true });
       const t = tNow();
       expect(screen.getByTestId('time-scrubber')).toBeInTheDocument();
-      const scrubbed = placed;
+      // A scrub starts a replay, which follows its newest card again.
+      const scrubbed = rf.instance.setViewport.mock.calls.length;
+      expect(scrubbed).toBeGreaterThanOrEqual(placed);
 
       // A poll brings a child launched in round 0 at minute 4, and round 3's
       // end (round 4 opens), which would fold round 1 were it not selected.
@@ -445,6 +447,29 @@ describe('FlowMap', () => {
       expect(rf.instance.setViewport.mock.calls[1]).toHaveLength(1);
       fireEvent.keyDown(canvas, { key: 'x' });
       expect(rf.instance.setViewport).toHaveBeenCalledTimes(2);
+    } finally {
+      restore();
+    }
+  });
+
+  it('a_replay_follows_until_the_operator_moves_the_camera', async () => {
+    const restore = sizedPane();
+    try {
+      mount();
+      await waitFor(() => expect(node('round:3')).not.toBeNull());
+      fireEvent.keyDown(track(), { key: 'Home' });
+      expect(screen.queryByRole('button', { name: 'Follow' })).toBeNull();
+      // The operator pans mid-replay: following stops, the pill offers it back.
+      rf.onMoveStart?.({ type: 'mousedown' });
+      const pill = await screen.findByRole('button', { name: 'Follow' });
+      fireEvent.click(pill);
+      expect(screen.queryByRole('button', { name: 'Follow' })).toBeNull();
+      // Out of the replay: no pill.
+      rf.onMoveStart?.({ type: 'mousedown' });
+      await screen.findByRole('button', { name: 'Follow' });
+      fireEvent.keyDown(track(), { key: 'End' });
+      fireEvent.click(screen.getByRole('button', { name: 'Show all' }));
+      expect(screen.queryByRole('button', { name: 'Follow' })).toBeNull();
     } finally {
       restore();
     }

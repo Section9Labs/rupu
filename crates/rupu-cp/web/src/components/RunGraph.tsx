@@ -54,6 +54,8 @@ import { mergeMeasured, type Size } from '../lib/graph/measured';
 import MessageEdge from './flowmap/MessageEdge';
 import { RailNode } from './flowmap/MapNodes';
 import { MINIMAP_MIN_PANE, usePaneWidth } from '../lib/graph/usePaneWidth';
+import { useCamera } from '../lib/graph/useCamera';
+import { bringIntoView } from '../lib/flow/camera';
 import { useRunLayerCanvas, type RunGraphOverlay } from './run/RunLayerCanvas';
 
 export type { RunGraphOverlay } from './run/RunLayerCanvas';
@@ -303,6 +305,29 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
   const nodes = useMemo<Node[]>(() => (layer ? [...stepNodes, ...layer.nodes] : stepNodes), [stepNodes, layer]);
   const edges = useMemo<Edge[]>(() => (layer ? [...runFlowEdges, ...layer.edges] : runFlowEdges), [runFlowEdges, layer]);
 
+  // A replay (or a scrub) follows the newest revealed step, unless the
+  // operator moved the camera since it began; "Follow" takes it back.
+  const camera = useCamera();
+  const replayActive = !!overlay && overlay.revealed !== null;
+  const [follow, setFollow] = useState(true);
+  useEffect(() => {
+    if (replayActive) setFollow(true);
+  }, [replayActive]);
+  const followStep = replayActive ? (overlay?.follow ?? null) : null;
+  useEffect(() => {
+    const el = pane.current;
+    if (!followStep || !follow || !el) return;
+    const box = positions.get(followStep);
+    if (!box) return;
+    const next = bringIntoView(box, rf.getViewport(), { width: el.clientWidth, height: el.clientHeight }, {
+      reserveRight: showMinimap ? 180 : 0,
+      anchor: { x: 0.6, y: 0.5 },
+    });
+    if (next) camera(next);
+    // A new step to follow, or follow taken back, moves it; nothing else.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [followStep, follow]);
+
   // The layer arrives after the graph (its space loads after it): frame it
   // once it is on the canvas, so the rail and the entries are in view.
   const rf = useReactFlow();
@@ -329,6 +354,11 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
       className={`gx-canvas relative ${overlay ? 'h-[540px]' : 'h-[460px]'} w-full overflow-hidden rounded-xl border border-border shadow-card`}
     >
       <GraphSummary nodes={revealed ? model.nodes.filter((n) => revealed.has(n.id)) : model.nodes} />
+      {replayActive && !follow && (
+        <button type="button" className="afx-follow" onClick={() => setFollow(true)}>
+          Follow
+        </button>
+      )}
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -336,6 +366,9 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
         edgeTypes={EDGE_TYPES}
         onNodeClick={handleNodeClick}
         onNodesChange={onNodesChange}
+        onMoveStart={(e) => {
+          if (e && replayActive) setFollow(false);
+        }}
         onNodeMouseEnter={layer ? layer.onEnter : undefined}
         onNodeMouseLeave={layer ? layer.onLeave : undefined}
         nodesDraggable={false}

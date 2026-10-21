@@ -50,6 +50,9 @@ export interface RunGraphOverlay {
   onSelect?(id: string | null): void;
   /** The space's log was read whole: messages landing after this travel. */
   caughtUp?: boolean;
+  /** While the replay shows a time: the newest revealed step, which the
+   *  camera follows. */
+  follow?: string | null;
 }
 
 /** The run graph's arc router: a message endpoint is its step's card (a
