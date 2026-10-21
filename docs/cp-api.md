@@ -274,7 +274,7 @@ none, and a body that isn't the expected JSON is a 400.
 | GET | `/api/runs/:id/log` | SSE of the run's step events. | `host`. See [Server-sent events](#server-sent-events). |
 | GET | `/api/runs/:id/usage` | Live usage: totals, per-step, per-call points. | `host`, `since`, `epoch` — pass back the previous response's `epoch` to receive only new points. |
 | GET | `/api/runs/:id/usage-timeline` | Tokens per model call (`TurnPoint`). | `host`. |
-| GET | `/api/runs/:id/children` | Every child the run launched with `dispatch` (all kinds), from the run's and its steps' children ledgers (`children.jsonl`) and their children's, each with its `parent_run_id` and `depth`. Pre-ledger sub-agents are read from `sub/` and marked `legacy`. | Local runs only (no `host`). |
+| GET | `/api/runs/:id/children` | Every child the run launched with `dispatch` (all kinds), from the run's and its steps' children ledgers (`children.jsonl`) and their children's, each with its `parent_run_id` and `depth`. Pre-ledger sub-agents are read from `sub/` and marked `legacy`. Each child carries `round` (the agentiflow lead round that launched it; a child deeper in the tree takes its root ancestor's; absent for a child launched outside a lead and for one launched before rounds were recorded), `generated` (true for a workflow dispatched from a file `workflows.generate` wrote) and `output_excerpt` (the first 240 characters of its output). | Local runs only (no `host`). |
 | GET | `/api/runs/:id/autoflow` | Autoflow provenance: repo, issue, claim, prior cycles. | 404 means the run has no autoflow context. |
 | GET | `/api/runs/:id/coverage` | **Host-internal.** The run's raw `coverage.jsonl` (`application/x-ndjson`); empty when none. | Read by a coordinator merging a remote unit's findings (`run.coverage_stream` feature). |
 | GET | `/api/runs/:id/source` | A line-numbered slice of a file in the run's workspace (`SourceSlice`). | `path` (workspace-relative), `line`, `context` (default 20, max 200), `host`. A missing, binary, > 2 MiB or remote file is 200 with `available: false` and a `reason`. 400 on path traversal. |
@@ -721,9 +721,31 @@ Local host only, except the message space ([Messages](#messages)), which takes `
 | GET | `/api/agentiflows` | All agentiflow runs, newest first (`{rows}`). | |
 | GET | `/api/agentiflows/:id` | One run: record, definition, budget, events, units, lead transcripts (`AgentiflowDetail`). | 404 unknown or malformed id. |
 | GET | `/api/agentiflows/:id/messages` | The run's message space (`MessagesView`). | See [Messages](#messages). |
+| GET | `/api/agentiflows/:id/board` | The run's board: `BoardView` (below). | Local only (`?host=` is a 501). 404 unknown id. A run with no board answers empty lists. |
+| GET | `/api/agentiflows/:id/generated/:handle` | The workflow definition the lead wrote and dispatched as child `handle`: `{handle, name, file_name, yaml}`. | Local only. 404 when `handle` is no child of this run, is not a generated workflow (`generated` is false on its `ChildDto`), or its file is gone; 403 when its recorded file is not a regular file under the run's own `generated/` directory (a `generated/` that is a symlink or not a directory counts). |
 | POST | `/api/agentiflows/:id/steer` | Message the lead, or stop the run. | Body `SteerRequest {message, now?, stop?}`. Without `stop`: the alias of `POST /api/agentiflows/:id/messages {to: "lead", body: message, urgent: now}`, with its answers (`202 {id, delivery}`). With `stop: true`: queues a graceful stop → `200 {queued: true}`; 400 empty message; 404 unknown run; 409 when nothing would read it — the run isn't `running`, or its recorded coordinator process is gone (a dead coordinator leaves `running` on disk until the reaper closes it); 501 without `rupu cp serve`. |
 | POST | `/api/agentiflows` | Launch a run detached, as `rupu agentiflow run --detach` does. | Body `{definition, scope_kind?, scope_id?, working_dir?}`. The run starts in the directory `scope_kind` (`global`\|`project`, with `scope_id` the project's workspace id) picks, or the absolute `working_dir`, or the control plane's own; the two are exclusive. The id is minted before the spawn and the answer waits for the run to record itself: `202 {id, status: "started"}`, or `202 {id, status: "pending", log}` when it is still starting after 30 s. Before anything starts, the definition is looked up from that directory (project first, then global) and checked as the CLI checks it: 404 not found; 400 a file that does not parse, an unknown engagement profile, a validation rule, a bad `working_dir` or `scope_kind`; 404 a scope that doesn't hold it. A run whose process exits before it starts (a lead agent that does not load, no credential) is a 400 carrying its log, and leaves no run directory. `?host=<remote>` is a 501 (local only); 501 without `rupu cp serve`. |
 | POST | `/api/agentiflows/:id/stop` | Stop a running agentiflow. | Body `{now?}` (or none; a body that isn't one, e.g. `{"now": "true"}`, is a 400). Without `now`, the graceful stop `steer {stop: true}` queues, answered as `steer` answers it: `200 {queued: true}`; 409 when nothing would read it (see `steer`). With `now: true`, the hard stop `rupu agentiflow stop --now` runs: the coordinator and every unit still running are signalled (SIGKILL after a grace) and the run is recorded failed, answered once done with `200 {stopped: true, status, stop_reason}` (`operator_stop:now`); a `running` record whose coordinator died is closed out the same way. 404 unknown run; 409 a run that is not `running`; `?host=<remote>` 501; 501 without `rupu cp serve`. |
+
+Rounds and children (read it with `GET /api/agentiflows/:id`). The `round` events in `events` carry, beyond the round number and counts: `started_at`; `decision` (the round's own last assistant reply, at most 600 characters cut on a word boundary and ended with `…`; omitted when the round produced no reply text, so a failed round never shows an earlier round's decision; a round whose context was compacted keeps its decision); `goals` (`[{id, met, current}]` as the round *started*, so the state after round N is round N+1's `goals`, and after the last round the record's `goals`); and `warnings` (the round digest's warnings; omitted when empty). Each `units` row carries `round` and `generated` like a child. A run recorded before these fields shows less, never a guess: no `decision`, no `goals`, and units without a `round` are placed by inference and marked so by clients.
+
+### Board
+
+`BoardView` is the wire shape of `GET /api/agentiflows/:id/board`, `GET /api/runs/:id/board`, the hidden `rupu __board <id>` and the MCP tools `agentiflows.board` / `runs.board`:
+
+```json
+{
+  "claims": [{"key": "…", "key_known": true, "owner": "heron#2", "acquired_at": "…",
+              "lease_expires_at": "…", "ended_at": null, "state": "held"}],
+  "directives": [{"id": "…", "author": "lead", "ts": "…", "body": "…", "addressed_to": "role:recon",
+                  "retracted": false, "retracted_at": null}],
+  "journal": true
+}
+```
+
+`claims` is every acquisition the space's claim journal (`board/claims.jsonl`, see [messaging.md](messaging.md#the-claim-journal)) recorded, released and expired ones included. `state` is `held`, `released` or `expired`; `ended_at` is when a released or expired claim ended. `directives` keeps retracted ones, with `retracted` and, when the retraction recorded a time, `retracted_at`. `journal` is false for a space written before the journal: `claims` then holds only the claims live now, each `held` with `key_known: false` (its raw key was never recorded, so `key` is the claim file's stem). An empty or absent board is empty lists, not an error.
+
+`GET /api/runs/:id/board` serves a workflow run or standalone run (a `run_…` id; anything else is a 404), with `host`. A remote host is asked over HTTP when its `/api/host/info` lists the `run.board` feature (otherwise a 501, "upgrade rupu there"), over SSH through `rupu __board <id>` after the same `rupu __features` gate as `run.messages`, and a tunnel or bucket host is a 501.
 
 ### Agentiflow definitions
 
