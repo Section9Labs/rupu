@@ -153,6 +153,8 @@ beforeEach(() => {
   vi.spyOn(api, 'getRunBoard').mockResolvedValue({ kind: 'ok', board: GANNET_BOARD });
   vi.spyOn(api, 'getRunGraph').mockResolvedValue(GANNET_RESPONSE);
   vi.spyOn(api, 'subscribeRunLog').mockReturnValue(() => {});
+  vi.spyOn(api, 'subscribeEvents').mockReturnValue(() => {});
+  vi.spyOn(api, 'readRunLog').mockResolvedValue([]);
   vi.spyOn(api, 'subscribeMessages').mockReturnValue(() => {});
   vi.spyOn(api, 'getMessages').mockImplementation(async (route) => ({
     kind: 'ok',

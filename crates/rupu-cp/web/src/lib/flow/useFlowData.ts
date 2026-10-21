@@ -6,6 +6,12 @@
 // then followed only while that child runs. A frame's messages come through
 // `setFrameSpace` from a `useMessageSpace` the map holds per loaded frame
 // (hooks can't be called per list item here).
+//
+// A frame holds no connection of its own (the browser allows about six per
+// host, and the page already holds the shared firehose and the flow's
+// message stream): a running child's events so far are read once from its
+// log (`readRunLog`, closed once replayed), then followed through the shared
+// firehose; its board and messages are re-read on the detail tick.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -200,13 +206,39 @@ export function useFlowData(
         setFrameBoards((m) => (m.has(f) ? m : new Map(m).set(f, boardUnavailable(e))));
       },
     );
+    const push = (ev: RunEvent) => {
+      events.push(ev);
+      if (events.length > FRAME_MAX_EVENTS) events.splice(0, events.length - FRAME_MAX_EVENTS);
+      if (!timer) timer = setTimeout(rebuild, FRAME_FLUSH_MS);
+    };
+    // Live: the firehose's lines for this run, held until the log's replay
+    // is in (a line in both is kept once).
+    let held: RunEvent[] | null = live ? [] : null;
     const unsubscribe = live
-      ? api.subscribeRunLog(f, (ev) => {
-          events.push(ev);
-          if (events.length > FRAME_MAX_EVENTS) events.splice(0, events.length - FRAME_MAX_EVENTS);
-          if (!timer) timer = setTimeout(rebuild, FRAME_FLUSH_MS);
+      ? api.subscribeEvents((ev) => {
+          if (ev.run_id !== f) return;
+          if (held) held.push(ev);
+          else push(ev);
         })
       : null;
+    if (live) {
+      api.readRunLog(f, { signal: ctl.signal }).then(
+        (history) => {
+          if (ctl.signal.aborted) return;
+          const replayed = new Set(history.map((e) => JSON.stringify(e)));
+          const late = (held ?? []).filter((e) => !replayed.has(JSON.stringify(e)));
+          held = null;
+          for (const e of [...history, ...late]) push(e);
+        },
+        () => {
+          // No history: follow what the firehose brings from now on.
+          if (ctl.signal.aborted) return;
+          const late = held ?? [];
+          held = null;
+          for (const e of late) push(e);
+        },
+      );
+    }
     return () => {
       ctl.abort();
       if (timer) clearTimeout(timer);

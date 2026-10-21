@@ -3980,6 +3980,57 @@ export const api = {
   },
 
   /**
+   * A local run's events so far, read once from its log stream: the stream
+   * replays the whole log first, so it is closed once it has been quiet for
+   * `quietMs` after opening (or its last frame), when it ends, or after
+   * `maxMs`. Holds no connection after it resolves — for a view that follows
+   * the run through the shared firehose instead of a stream of its own.
+   * Rejects only when the stream fails before delivering anything.
+   */
+  readRunLog(id: string, opts?: { quietMs?: number; maxMs?: number; signal?: AbortSignal }): Promise<RunEvent[]> {
+    const quietMs = opts?.quietMs ?? 400;
+    const maxMs = opts?.maxMs ?? 10_000;
+    return new Promise((resolve, reject) => {
+      const events: RunEvent[] = [];
+      const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log`);
+      let quiet: ReturnType<typeof setTimeout> | null = null;
+      const cap = setTimeout(() => done(), maxMs);
+      const close = () => {
+        es.close();
+        if (quiet) clearTimeout(quiet);
+        clearTimeout(cap);
+        opts?.signal?.removeEventListener('abort', onAbort);
+      };
+      const done = () => {
+        close();
+        resolve(events);
+      };
+      const onAbort = () => {
+        close();
+        reject(new DOMException('aborted', 'AbortError'));
+      };
+      const settle = () => {
+        if (quiet) clearTimeout(quiet);
+        quiet = setTimeout(done, quietMs);
+      };
+      opts?.signal?.addEventListener('abort', onAbort);
+      es.onopen = settle;
+      es.onmessage = (m) => {
+        events.push(JSON.parse(m.data) as RunEvent);
+        settle();
+      };
+      es.addEventListener('end', done);
+      es.onerror = () => {
+        if (events.length > 0) done();
+        else {
+          close();
+          reject(new Error(`couldn't read run ${id}'s events`));
+        }
+      };
+    });
+  },
+
+  /**
    * "Load history" counterpart to `subscribeEvents` — recent events
    * aggregated from recent runs' `events.jsonl`, newest-first. This is what
    * makes the Live Events page non-empty on load, before any live SSE frame

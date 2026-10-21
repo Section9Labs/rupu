@@ -160,17 +160,19 @@ function OwnSpace(props: FlowMapProps) {
   return <FlowMapBody {...props} flowSpace={space} />;
 }
 
-/** A loaded workflow child's own message space, handed up to the map. */
+/** A loaded workflow child's own message space, handed up to the map. It
+ *  holds no stream: while the child runs, each `tick` (the detail poll)
+ *  reads what was logged since, and the tick after it ends reads the rest. */
 function FrameSpace({
   runId,
-  live,
+  tick,
   onSpace,
 }: {
   runId: string;
-  live: boolean;
+  tick: unknown;
   onSpace: (runId: string, space: FlowSpace | null) => void;
 }) {
-  const s = useMessageSpace({ route: 'runs', id: runId }, { live, load: true, reading: false });
+  const s = useMessageSpace({ route: 'runs', id: runId }, { live: false, load: true, reading: false, tick });
   const present = s.space === 'present';
   useEffect(() => {
     onSpace(runId, present ? { id: runId, participants: s.participants, messages: s.log.messages, caughtUp: s.caughtUp } : null);
@@ -983,7 +985,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         </ReactFlow>
       </div>
       {data.loadedFrames.map((f) => (
-        <FrameSpace key={f} runId={f} live={isUnfinished(childById.get(f))} onSpace={data.setFrameSpace} />
+        <FrameSpace
+          key={f}
+          runId={f}
+          tick={isUnfinished(childById.get(f)) ? detail : undefined}
+          onSpace={data.setFrameSpace}
+        />
       ))}
       {/* `items-start`: a folded panel keeps its width, and only its header's height. */}
       <div className="grid items-start gap-3 lg:grid-cols-[3fr_2fr]">

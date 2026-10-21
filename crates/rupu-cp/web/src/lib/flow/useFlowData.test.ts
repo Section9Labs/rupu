@@ -28,13 +28,28 @@ function mockApi(children = CHILDREN) {
   const getBoard = vi.spyOn(api, 'getAgentiflowBoard').mockResolvedValue({ kind: 'ok', board: FLOW_BOARD });
   const getRunBoard = vi.spyOn(api, 'getRunBoard').mockResolvedValue({ kind: 'ok', board: GANNET_BOARD });
   const getRunGraph = vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
+  // A frame follows its child through the shared firehose (every run's
+  // events), after reading the child's log once; it never opens a stream
+  // of its own.
   let onEvent: ((e: RunEvent) => void) | null = null;
   const unsubscribe = vi.fn();
-  const subscribe = vi.spyOn(api, 'subscribeRunLog').mockImplementation((_id, cb) => {
+  const subscribe = vi.spyOn(api, 'subscribeEvents').mockImplementation((cb) => {
     onEvent = cb;
     return unsubscribe;
   });
-  return { getChildren, getBoard, getRunBoard, getRunGraph, subscribe, unsubscribe, emit: (e: RunEvent) => onEvent?.(e) };
+  const readLog = vi.spyOn(api, 'readRunLog').mockResolvedValue([]);
+  const ownStream = vi.spyOn(api, 'subscribeRunLog');
+  return {
+    getChildren,
+    getBoard,
+    getRunBoard,
+    getRunGraph,
+    subscribe,
+    unsubscribe,
+    readLog,
+    ownStream,
+    emit: (e: Omit<RunEvent, 'run_id'> & { run_id?: string }) => onEvent?.({ ...e, run_id: e.run_id ?? RUN.gannet1 } as RunEvent),
+  };
 }
 
 describe('useFlowData', () => {
@@ -76,6 +91,8 @@ describe('useFlowData', () => {
     expect(m.getRunGraph).toHaveBeenCalledTimes(1);
     expect(m.getRunGraph).toHaveBeenCalledWith(RUN.gannet1);
     expect(m.subscribe).toHaveBeenCalledTimes(1);
+    expect(m.readLog).toHaveBeenCalledWith(RUN.gannet1, expect.anything());
+    expect(m.ownStream).not.toHaveBeenCalled();
     expect(result.current.boards.get(RUN.gannet1)).toEqual(GANNET_BOARD);
     expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('pending');
 
@@ -84,6 +101,10 @@ describe('useFlowData', () => {
     await waitFor(() => expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('running'), {
       timeout: 2500,
     });
+    // Another run's line on the firehose is not this frame's.
+    act(() => m.emit({ type: 'step_completed', run_id: 'run_other', step_id: 'collect' } as RunEvent));
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('running');
     // An event that changes nothing the map draws keeps the same model, so
     // the map isn't rebuilt.
     const before = result.current.childGraphs;
@@ -109,6 +130,25 @@ describe('useFlowData', () => {
     expect(m.getRunGraph).toHaveBeenCalledTimes(2);
   });
 
+  it('a_running_frame_starts_from_its_log_then_the_firehose', async () => {
+    const running = CHILDREN.map((c) => (c.run_id === RUN.gannet1 ? { ...c, status: 'running' as const } : c));
+    const m = mockApi(running);
+    const started = { type: 'step_started', run_id: RUN.gannet1, step_id: 'collect' } as RunEvent;
+    let replay: (events: RunEvent[]) => void = () => {};
+    m.readLog.mockImplementation(() => new Promise((r) => (replay = r)));
+    const { result } = renderHook(() => useFlowData(DETAIL, { running: true }));
+    await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
+    act(() => result.current.loadFrame(RUN.gannet1));
+    await waitFor(() => expect(result.current.childGraphs.get(RUN.gannet1)).toBeDefined());
+    // The firehose brings a line while the log is still replaying; the
+    // replay holds it too.
+    act(() => m.emit(started));
+    await act(async () => replay([started]));
+    await waitFor(() => expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('running'), {
+      timeout: 2500,
+    });
+  });
+
   it('frame_spaces_join_the_flow_space', async () => {
     mockApi();
     const { result } = renderHook(() => useFlowData(DETAIL, { running: false }));
@@ -129,6 +169,8 @@ describe('useFlowData', () => {
     const { result } = renderHook(() => useFlowData(DETAIL, { running: true }));
     await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
     act(() => result.current.loadFrame(RUN.gannet1));
+    await waitFor(() => expect(m.readLog).toHaveBeenCalled());
+    await act(async () => {});
     act(() =>
       m.emit({ type: 'unit_started', step_id: 'probe', index: 0, unit_key: '/api/login', agent: 'auth-prober', transcript_path: '/t' } as RunEvent),
     );
