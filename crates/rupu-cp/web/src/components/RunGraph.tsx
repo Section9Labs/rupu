@@ -16,7 +16,7 @@
 // hidden. The arcs and rail are the agentiflow map's (flowmap/), routed by
 // `flowEdges`.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   type FitViewOptions,
@@ -53,6 +53,7 @@ import { edgeTone, useEntranceSlots } from '../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../lib/graph/measured';
 import MessageEdge from './flowmap/MessageEdge';
 import { RailNode } from './flowmap/MapNodes';
+import { MINIMAP_MIN_PANE, usePaneWidth } from '../lib/graph/usePaneWidth';
 import { useRunLayerCanvas, type RunGraphOverlay } from './run/RunLayerCanvas';
 
 export type { RunGraphOverlay } from './run/RunLayerCanvas';
@@ -295,7 +296,9 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
   }, [model, colors, slots, revealed]);
 
   const layer = useRunLayerCanvas(overlay, model, positions, measured, selectedId);
-  const showMinimap = model.nodes.length > MINIMAP_MIN_NODES;
+  const pane = useRef<HTMLDivElement>(null);
+  const paneWidth = usePaneWidth(pane);
+  const showMinimap = model.nodes.length > MINIMAP_MIN_NODES && paneWidth >= MINIMAP_MIN_PANE;
   const fitOptions = showMinimap ? FIT_WITH_MINIMAP : FIT_OPTIONS;
   const nodes = useMemo<Node[]>(() => (layer ? [...stepNodes, ...layer.nodes] : stepNodes), [stepNodes, layer]);
   const edges = useMemo<Edge[]>(() => (layer ? [...runFlowEdges, ...layer.edges] : runFlowEdges), [runFlowEdges, layer]);
@@ -322,6 +325,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
 
   return (
     <div
+      ref={pane}
       className={`gx-canvas relative ${overlay ? 'h-[540px]' : 'h-[460px]'} w-full overflow-hidden rounded-xl border border-border shadow-card`}
     >
       <GraphSummary nodes={revealed ? model.nodes.filter((n) => revealed.has(n.id)) : model.nodes} />

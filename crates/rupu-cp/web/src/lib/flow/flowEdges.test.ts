@@ -104,6 +104,14 @@ describe('flowEdges', () => {
     ]);
   });
 
+  it('an_arriving_message_is_drawn_while_it_lands', () => {
+    const offRest = { ...model, messages: model.messages.map((m) => ({ ...m, atRest: false })) };
+    const router = makeRouter(offRest, drawn(offRest));
+    const arcs = messageArcs(offRest.messages, router, opts({ arriving: new Map([['msg_014', 1]]) }));
+    expect(arcs.map((a) => a.message.id)).toEqual(['msg_014']);
+    expect(arcs[0].highlighted).toBe(false);
+  });
+
   it('filters_and_board_handles', () => {
     const router = makeRouter(model, drawn(model));
     const onlyDirect = messageArcs(model.messages, router, opts({ kinds: new Set(['direct']) }));

@@ -173,8 +173,9 @@ export function useRunLayerCanvas(
         hover,
         selected,
         anchors,
+        arriving: arrivals,
       }),
-    [shown, claims, router, focus, hover, selected, anchors],
+    [shown, claims, router, focus, hover, selected, anchors, arrivals],
   );
   const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
   // The step cards an arc keeps clear of.

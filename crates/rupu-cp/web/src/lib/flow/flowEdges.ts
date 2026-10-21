@@ -224,6 +224,9 @@ export interface ArcOptions {
   hover: string | null;
   /** The selected message. */
   selected: string | null;
+  /** Messages landing now (live, or revealed by a replay): drawn while their
+   *  packet travels, at rest or not. */
+  arriving?: { has(id: string): boolean };
   /** The board anchors drawn now, `<node>|<key>` → the handle it lands on
    *  (`boardAnchors`); a key not in it lands on the board itself. */
   anchors: ReadonlyMap<string, string>;
@@ -263,7 +266,7 @@ export function messageArcs(messages: FlowMessage[], router: Router, o: ArcOptio
     const touched = lit.some((f) => ends.includes(f));
     const inRound = focusRound !== null && ends.some((e) => router.roundOfNode(e) === focusRound);
     const highlighted = m.id === o.selected || touched;
-    if (!m.atRest && !highlighted && !inRound) continue;
+    if (!m.atRest && !highlighted && !inRound && !o.arriving?.has(m.id)) continue;
     const base = { message: m, highlighted };
     const handleOf = (to: Anchor) => (to.handle ? o.anchors.get(`${to.node}|${to.handle}`) : undefined);
     const deadOf = (t: string) => m.undelivered.find((u) => u.to === t);
