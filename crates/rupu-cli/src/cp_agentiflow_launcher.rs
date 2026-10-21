@@ -87,7 +87,12 @@ mod tests {
     async fn a_child_that_exits_before_starting_is_not_started_and_leaves_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let launcher = SubprocessAgentiflowLauncher {
-            exe: "/usr/bin/false".into(),
+            // `false` is /usr/bin/false on macOS, /bin/false on Alpine (musl CI).
+            exe: ["/usr/bin/false", "/bin/false"]
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .find(|p| p.exists())
+                .expect("a `false` binary"),
             global_dir: tmp.path().to_path_buf(),
         };
         let err = launcher

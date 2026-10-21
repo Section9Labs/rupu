@@ -144,7 +144,9 @@ impl WaitSource {
                     fired.insert(i, json!({ "status": "failed", "unpersisted": true }));
                 }
                 (Kind::Settled, Located::Store(store)) => {
-                    if crate::sse::run_is_settled(Arc::clone(store), c.target.clone()).await {
+                    let settled =
+                        crate::sse::run_is_settled(Arc::clone(store), c.target.clone()).await;
+                    if settled {
                         let status = load(Arc::clone(store), &c.target).await.map(|r| r.status);
                         fired.insert(i, json!({ "status": status }));
                     }
