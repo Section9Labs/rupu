@@ -167,5 +167,22 @@ describe('RunGraph overlay', () => {
     expect(arcPairs().map((p) => p.split(':')[0])).toEqual(expect.arrayContaining(['msg_r3', 'claim']));
     expect(arcPairs().some((p) => p.startsWith('msg_r2'))).toBe(false);
     expect(within(screen.getByTestId('node-rail')).getByText('claim: package-lock.json')).toBeInTheDocument();
+    // The summary counts the steps shown so far.
+    expect(screen.getByTestId('rg-summary')).toHaveTextContent('1 done');
+  });
+
+  it('a_claim_writer_off_canvas_gets_its_entry', () => {
+    // No message touches off canvas, but a claim's owner no step answers to
+    // is there: its arc needs the entry it leaves from.
+    const board = { ...RUN_BOARD, claims: [{ ...RUN_BOARD.claims[0], owner: 'ghost#2' }] };
+    render(
+      <RunGraph
+        model={RUN_MODEL}
+        positions={RUN_POSITIONS}
+        overlay={{ messages: [], board, writers: new Map([['ghost#2', 'offcanvas']]), revealed: null }}
+      />,
+    );
+    expect(rf.nodes.map((n) => n.id)).toContain('offcanvas');
+    expect(arcPairs()).toEqual([`claim:package-lock.json:${RUN_BOARD.claims[0].acquired_at}:offcanvas->rail`]);
   });
 });

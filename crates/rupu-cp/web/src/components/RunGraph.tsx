@@ -20,9 +20,7 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  Handle,
   MiniMap,
-  Position,
   ReactFlow,
   ReactFlowProvider,
   useReactFlow,
@@ -51,22 +49,11 @@ import RunEdge, { type RunFlowEdge } from './graph/RunEdge';
 import { parseCodename } from '../lib/codename';
 import { edgeTone, useEntranceSlots } from '../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../lib/graph/measured';
-import { KIND_FILTERS, OPERATOR, type KindFilter } from '../lib/messages';
-import { BOARD, OFFCANVAS, type BoardSource, type FlowMessage } from '../lib/flow/flowModel';
-import {
-  RAIL,
-  boardAnchorKeys,
-  boardKey,
-  claimMessages,
-  messageArcs,
-  type Anchor,
-  type Router,
-} from '../lib/flow/flowEdges';
-import { boardAt, RUN_SPACE } from '../lib/flow/runLayer';
-import { useArrivals } from '../lib/flow/useArrivals';
-import { RAIL_GAP } from '../lib/flow/flowLayout';
-import MessageEdge, { type MessageFlowEdge } from './flowmap/MessageEdge';
+import MessageEdge from './flowmap/MessageEdge';
 import { EntryNode, RailNode } from './flowmap/MapNodes';
+import { useRunLayerCanvas, type RunGraphOverlay } from './run/RunLayerCanvas';
+
+export type { RunGraphOverlay } from './run/RunLayerCanvas';
 
 import '@xyflow/react/dist/style.css';
 
@@ -104,10 +91,7 @@ export const NODE_TYPES: NodeTypes = {
 const EDGE_TYPES: EdgeTypes = { run: RunEdge, message: MessageEdge };
 /** The layer's own nodes: the board rail and the operator / off-canvas entries. */
 const LAYER_NODE_TYPES: NodeTypes = { ...NODE_TYPES, rail: RailNode, entry: EntryNode };
-const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
 const FIT_OPTIONS = { padding: 0.2, maxZoom: 1.0, minZoom: 0.2 };
-/** The entries sit this far left of the leftmost card. */
-const ENTRY_GAP = 170;
 
 /** A graph this small fits the canvas; the minimap only earns its place past it. */
 const MINIMAP_MIN_NODES = 6;
@@ -189,23 +173,6 @@ interface NodeData extends Record<string, unknown> {
   gate?: GateControl;
 }
 
-/** The run's message and board layer (RunDetail, when the run has a space). */
-export interface RunGraphOverlay {
-  /** The run's messages, endpoints on step ids (`buildRunLayer`). */
-  messages: FlowMessage[];
-  /** The run's board; the unavailable shape says why there is none. */
-  board: BoardSource | null;
-  /** Each claim owner's (and directive author's) card, by address. */
-  writers?: ReadonlyMap<string, string>;
-  /** What the replay has revealed (step ids, message ids, board item keys);
-   *  `null` = the whole run, as today. */
-  revealed: Set<string> | null;
-  selected?: string | null;
-  onSelect?(id: string | null): void;
-  /** The space's log was read whole: messages landing after this travel. */
-  caughtUp?: boolean;
-}
-
 /** A transcript selection emitted by clicking a step node or a fan-out unit. */
 export interface NodeSelection {
   path: string | null;
@@ -232,23 +199,6 @@ export default function RunGraph(props: Props) {
       <RunGraphInner {...props} />
     </ReactFlowProvider>
   );
-}
-
-/** The run graph's arc router: a message endpoint is its step's card (a
- *  step not yet revealed is not drawn), the operator's or the off-canvas
- *  entry, or its item on the board rail. */
-function runRouter(visible: ReadonlySet<string>): Router {
-  const anchorOf = (endpoint: string, m: FlowMessage): Anchor | null => {
-    if (endpoint === OPERATOR) return { node: 'operator' };
-    if (endpoint === OFFCANVAS) return { node: 'offcanvas' };
-    if (endpoint === BOARD) return { node: RAIL, handle: boardKey(m) };
-    return visible.has(endpoint) ? { node: endpoint } : null;
-  };
-  return {
-    anchorOf,
-    endsOf: (m) => [m.from, ...m.to].map((e) => anchorOf(e, m)?.node).filter((x): x is string => !!x),
-    roundOfNode: () => undefined,
-  };
 }
 
 function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectNode, gate, overlay }: Props) {
@@ -364,7 +314,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
     <div
       className={`gx-canvas relative ${overlay ? 'h-[540px]' : 'h-[460px]'} w-full overflow-hidden rounded-xl border border-border shadow-card`}
     >
-      <GraphSummary nodes={model.nodes} />
+      <GraphSummary nodes={revealed ? model.nodes.filter((n) => revealed.has(n.id)) : model.nodes} />
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -402,135 +352,4 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
       </ReactFlow>
     </div>
   );
-}
-
-/** The layer on the canvas: the rail, the entries and the message arcs. */
-function useRunLayerCanvas(
-  overlay: RunGraphOverlay | undefined,
-  model: RunGraphModel,
-  positions: Map<string, Pos>,
-  measured: ReadonlyMap<string, Size>,
-  focus: string | null,
-): { nodes: Node[]; edges: Edge[]; onEnter: NodeMouseHandler; onLeave: NodeMouseHandler } | null {
-  const [hover, setHover] = useState<string | null>(null);
-  const onEnter = useCallback<NodeMouseHandler>((_e, n) => setHover(n.id), []);
-  const onLeave = useCallback<NodeMouseHandler>(() => setHover(null), []);
-  const revealed = overlay?.revealed ?? null;
-  const isShown = useCallback((key: string) => revealed === null || revealed.has(key), [revealed]);
-
-  const messages = overlay?.messages;
-  const shown = useMemo(() => (messages ?? []).filter((m) => isShown(m.id)), [messages, isShown]);
-  const arrivals = useArrivals(shown, overlay?.caughtUp ? RUN_SPACE : '');
-
-  const board = overlay?.board ?? null;
-  const railView = useMemo(() => boardAt(board, revealed), [board, revealed]);
-  const posts = useMemo(() => shown.filter((m) => m.kind === 'post' || m.kind === 'mention'), [shown]);
-  const anchors = useMemo(() => new Set(boardAnchorKeys(RAIL, railView, posts)), [railView, posts]);
-  const writers = overlay?.writers;
-  const claims = useMemo(
-    () =>
-      claimMessages(
-        RUN_SPACE,
-        railView,
-        writers ?? new Map(),
-        (messages ?? []).every((m) => m.atRest),
-      ),
-    [railView, writers, messages],
-  );
-
-  const visible = useMemo(() => {
-    const v = new Set<string>([RAIL, 'operator', 'offcanvas']);
-    for (const n of model.nodes) if (isShown(n.id)) v.add(n.id);
-    return v;
-  }, [model, isShown]);
-  const router = useMemo(() => runRouter(visible), [visible]);
-
-  const selected = overlay?.selected ?? null;
-  const onSelect = overlay?.onSelect;
-  const select = useCallback((id: string) => onSelect?.(id), [onSelect]);
-  const anchor = useCallback(
-    (key: string) => <Handle key={`a:${key}`} id={key} type="target" position={Position.Left} className="afx-anchor" />,
-    [],
-  );
-
-  // The rail right of every card, the entries left of them.
-  const box = useMemo(() => {
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (const p of positions.values()) {
-      minX = Math.min(minX, p.x);
-      minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x + p.width);
-      maxY = Math.max(maxY, p.y + p.height);
-    }
-    return minX === Infinity ? { minX: 0, minY: 0, maxX: 0, maxY: 0 } : { minX, minY, maxX, maxY };
-  }, [positions]);
-
-  const ends = useMemo(() => new Set((messages ?? []).flatMap((m) => [m.from, ...m.to])), [messages]);
-  const on = !!overlay;
-  const nodes = useMemo<Node[]>(() => {
-    if (!on) return [];
-    const out: Node[] = [
-      {
-        id: RAIL,
-        type: 'rail',
-        position: { x: box.maxX + RAIL_GAP, y: box.minY },
-        draggable: false,
-        selectable: false,
-        measured: measured.get(RAIL),
-        data: { view: railView, posts, minHeight: Math.max(0, box.maxY - box.minY), onSelect: select, anchor },
-      },
-    ];
-    const entry = (id: string, label: string, y: number): Node => ({
-      id,
-      type: 'entry',
-      position: { x: box.minX - ENTRY_GAP, y },
-      draggable: false,
-      selectable: false,
-      measured: measured.get(id),
-      data: { label },
-    });
-    if (ends.has(OPERATOR)) out.push(entry('operator', 'operator', box.minY - 56));
-    if (ends.has(OFFCANVAS)) out.push(entry('offcanvas', 'off map', box.maxY + 24));
-    return out;
-  }, [on, box, measured, railView, posts, select, anchor, ends]);
-
-  const arcs = useMemo(
-    () =>
-      messageArcs([...shown, ...claims], router, {
-        kinds: ALL_KINDS,
-        participant: null,
-        focus,
-        hover,
-        selected,
-        anchors,
-      }),
-    [shown, claims, router, focus, hover, selected, anchors],
-  );
-  const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
-  const edges = useMemo<Edge[]>(
-    () =>
-      arcs.map(
-        (a) =>
-          ({
-            id: a.id,
-            source: a.source,
-            target: a.target,
-            targetHandle: a.targetHandle,
-            type: 'message',
-            zIndex: a.highlighted ? 20 : 10,
-            data: {
-              message: a.message,
-              highlighted: a.highlighted,
-              arriving: arrivals.has(a.message.id),
-              onSelect: claimIds.has(a.message.id) ? undefined : select,
-            },
-          }) satisfies MessageFlowEdge,
-      ),
-    [arcs, arrivals, claimIds, select],
-  );
-
-  return useMemo(() => (on ? { nodes, edges, onEnter, onLeave } : null), [on, nodes, edges, onEnter, onLeave]);
 }

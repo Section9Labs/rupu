@@ -1,18 +1,35 @@
 // The workflow run page's message and board layer, as the page holds it:
 // the run's board (`GET /api/runs/:id/board`, through the host transports),
 // the layer built from the run's graph, events and message space
-// (`buildRunLayer`), the shared timeline (Replay, scrubber, live) and what
-// it has revealed, and the selected message. `null` while the run has no
+// (`runLayer`'s parts, each memoized on what it reads), the shared timeline
+// (Replay, scrubber, live) and what it has revealed, and the selected
+// message. `null` while the run has no
 // message space: the page then shows today's graph.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, apiErrorMessage, type RunEvent, type RunGraphResponse } from '../api';
+import { api, apiErrorMessage, type RunEvent, type SpaceParticipant } from '../api';
 import type { RunGraphModel } from '../runGraphModel';
 import type { MessageSpace } from '../useMessageSpace';
 import { countAtOrBefore, timeBounds } from '../timeline/timeline';
 import { useTimeline, type TimelineState } from '../timeline/useTimeline';
 import type { BoardSource, FlowMessage } from './flowModel';
-import { buildRunLayer, RUN_SPACE, type RunLayer } from './runLayer';
+import {
+  composeRunLayer,
+  LAYER_EVENT_TYPES,
+  runBoard,
+  runMessages,
+  runResolver,
+  RUN_SPACE,
+  stepTimeline,
+  type LayerStep,
+  type RunLayer,
+  type RunRecordInput,
+} from './runLayer';
+import { useStableList } from './useStableList';
+
+const sameStep = (a: LayerStep, b: LayerStep) => a.id === b.id && a.state === b.state;
+const sameParticipant = (a: SpaceParticipant, b: SpaceParticipant) =>
+  a.address === b.address && a.run_id === b.run_id && a.step_id === b.step_id && a.codename === b.codename;
 
 /** How often a local running run's board is re-read. */
 export const BOARD_POLL_MS = 10_000;
@@ -44,7 +61,7 @@ export function useRunLayer({
   host?: string;
   model: RunGraphModel | null;
   events: RunEvent[];
-  record: Pick<RunGraphResponse, 'run' | 'step_results' | 'units'> | null;
+  record: RunRecordInput | null;
   space: MessageSpace;
   running: boolean;
 }): RunLayerView | null {
@@ -79,13 +96,24 @@ export function useRunLayer({
   }, [on, id, remote, running]);
 
   // --- the layer -----------------------------------------------------------
-  const { participants, log } = space;
+  // Each part is keyed on what it reads, so a live event that changes none of
+  // it (a tool call, a warning, a status tick) rebuilds nothing here.
+  const { log } = space;
+  const participants = useStableList(space.participants, sameParticipant);
+  const layerEvents = useStableList(useMemo(() => events.filter((e) => LAYER_EVENT_TYPES.has(e.type)), [events]));
+  const steps = useStableList(
+    useMemo<LayerStep[]>(() => (model ? model.nodes.map((n) => ({ id: n.id, state: n.state })) : []), [model]),
+    sameStep,
+  );
+  const stepIds = useMemo(() => new Set(steps.map((s) => s.id)), [steps]);
+  const rec = record ?? undefined;
+  const resolve = useMemo(() => runResolver(stepIds, participants, layerEvents, rec), [stepIds, participants, layerEvents, rec]);
+  const stepTimes = useMemo(() => stepTimeline(steps, layerEvents, rec), [steps, layerEvents, rec]);
+  const messages = useMemo(() => runMessages(log.messages, resolve), [log, resolve]);
+  const boardSpace = useMemo(() => runBoard(board, messages, resolve), [board, messages, resolve]);
   const layer = useMemo(
-    () =>
-      on && model
-        ? buildRunLayer(model, events, { participants, messages: log.messages }, board, { record: record ?? undefined })
-        : null,
-    [on, model, events, participants, log, board, record],
+    () => (on ? composeRunLayer(stepTimes, messages, boardSpace) : null),
+    [on, stepTimes, messages, boardSpace],
   );
 
   // --- the timeline --------------------------------------------------------
