@@ -40,6 +40,7 @@ import {
   type BoardSource,
   type FlowBoardSpace,
   type FlowNodeRef,
+  type FlowSpace,
 } from '../../lib/flow/flowModel';
 import {
   RAIL,
@@ -139,13 +140,13 @@ function FrameSpace({
 }: {
   runId: string;
   live: boolean;
-  onSpace: (runId: string, space: { id: string; participants: MessageSpace['participants']; messages: MessageSpace['log']['messages'] } | null) => void;
+  onSpace: (runId: string, space: FlowSpace | null) => void;
 }) {
   const s = useMessageSpace({ route: 'runs', id: runId }, { live, load: true, reading: false });
   const present = s.space === 'present';
   useEffect(() => {
-    onSpace(runId, present ? { id: runId, participants: s.participants, messages: s.log.messages } : null);
-  }, [onSpace, runId, present, s.participants, s.log]);
+    onSpace(runId, present ? { id: runId, participants: s.participants, messages: s.log.messages, caughtUp: s.caughtUp } : null);
+  }, [onSpace, runId, present, s.participants, s.log, s.caughtUp]);
   return null;
 }
 
@@ -263,23 +264,27 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   );
   const counts = useMemo(() => messageCounts(shownMessages, router), [shownMessages, router]);
 
-  // The packets: a message that lands after the map has its spaces read (a
-  // live one, or one a replay reveals) travels once. What the first read of
-  // a space brings is the map's starting state, not news.
-  const spaceRead =
-    flowSpace.loaded || flowSpace.status === 'unavailable' || flowSpace.status === 'error' || flowSpace.space === 'absent';
-  const seen = useRef<Set<string> | null>(null);
-  const seenSpaces = useRef(new Set<string>());
+  // The packets: a message that lands after its space's log was read whole
+  // (a live one, or one a replay reveals) travels once. What a space's
+  // opening read brings, page by page or as a stream's replay, is the map's
+  // starting state, not news.
+  const flowCaughtUp =
+    flowSpace.caughtUp || flowSpace.status === 'unavailable' || flowSpace.status === 'error' || flowSpace.space === 'absent';
+  const caughtUpKey = useMemo(
+    () => [...(flowCaughtUp ? [FLOW_SPACE] : []), ...spaces.filter((s) => s.id !== FLOW_SPACE && s.caughtUp).map((s) => s.id)].join(','),
+    [flowCaughtUp, spaces],
+  );
+  const seen = useRef(new Set<string>());
+  /** The spaces that had caught up when the last messages were taken in. */
+  const caughtUpBefore = useRef(new Set<string>());
   const [arrivals, setArrivals] = useState<ReadonlyMap<string, number>>(() => new Map());
   useEffect(() => {
-    if (!spaceRead) return;
-    const prev = seen.current;
     const fresh: string[] = [];
     for (const m of shownMessages) {
-      if (prev && !prev.has(m.id) && seenSpaces.current.has(m.space)) fresh.push(m.id);
+      if (!seen.current.has(m.id) && caughtUpBefore.current.has(m.space)) fresh.push(m.id);
     }
-    for (const m of shownMessages) seenSpaces.current.add(m.space);
     seen.current = new Set(shownMessages.map((m) => m.id));
+    caughtUpBefore.current = new Set(caughtUpKey ? caughtUpKey.split(',') : []);
     if (fresh.length === 0) return;
     const until = Date.now() + ARRIVE_MS;
     setArrivals((a) => {
@@ -287,7 +292,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       for (const id of fresh) next.set(id, until);
       return next;
     });
-  }, [shownMessages, spaceRead]);
+  }, [shownMessages, caughtUpKey]);
   useEffect(() => {
     if (arrivals.size === 0) return;
     let first = Infinity;

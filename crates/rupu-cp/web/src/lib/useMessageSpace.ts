@@ -16,6 +16,9 @@ export const PAGE_SIZE = 200;
 /** How often a local live root's participants are re-read. */
 export const PARTICIPANTS_POLL_MS = 10_000;
 const FLUSH_MS = 60;
+/** A live stream has caught up with the log once it has been quiet this long
+ *  after opening (the stream replays the whole log first). */
+export const CAUGHT_UP_QUIET_MS = 400;
 
 export interface MessageSource {
   route: MessageRoute;
@@ -34,6 +37,11 @@ export interface MessageSpace {
   log: SpaceLog;
   /** The whole log has been read (a live stream may still add to it). */
   loaded: boolean;
+  /** Everything the log held when it was opened has arrived: after the last
+   *  page of a paged read, or once a live stream's replay has gone quiet. A
+   *  message arriving after this is new. (`loaded` turns true on a stream's
+   *  first batch, which can be part of its replay.) */
+  caughtUp: boolean;
   /** The live stream is connected. */
   streaming: boolean;
   /** Re-read on demand (no live stream). */
@@ -76,6 +84,7 @@ export function useMessageSpace(
   const [participants, setParticipants] = useState<SpaceParticipant[]>([]);
   const [log, setLog] = useState<SpaceLog>(EMPTY_LOG);
   const [loaded, setLoaded] = useState(false);
+  const [caughtUp, setCaughtUp] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [generation, setGeneration] = useState(0);
   const [pending, setPending] = useState<PendingSend[]>([]);
@@ -91,6 +100,7 @@ export function useMessageSpace(
     setParticipants([]);
     setLog(EMPTY_LOG);
     setLoaded(false);
+    setCaughtUp(false);
     setPending([]);
     setSendError(null);
     setBlocked(null);
@@ -138,27 +148,37 @@ export function useMessageSpace(
     if (!follow) return;
     const buffer: MessageStreamFrame[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let quiet: ReturnType<typeof setTimeout> | null = null;
     const flush = () => {
       timer = null;
       const frames = buffer.splice(0);
       setLog((l) => withFrames(l, frames));
       setLoaded(true);
     };
+    // Each frame (and the open) restarts the quiet timer; when it runs out,
+    // the replay is over.
+    const settle = () => {
+      if (quiet) clearTimeout(quiet);
+      quiet = setTimeout(() => setCaughtUp(true), CAUGHT_UP_QUIET_MS);
+    };
     const close = api.subscribeMessages(route, id, {
       onFrame: (f) => {
         buffer.push(f);
         if (!timer) timer = setTimeout(flush, FLUSH_MS);
+        settle();
       },
       onOpen: () => {
         setStreaming(true);
         // An empty log sends no frame: the open is what says it was read.
         if (!timer) timer = setTimeout(flush, FLUSH_MS);
+        settle();
       },
       onError: () => setStreaming(false),
     });
     return () => {
       close();
       if (timer) clearTimeout(timer);
+      if (quiet) clearTimeout(quiet);
       setStreaming(false);
     };
   }, [follow, route, id]);
@@ -183,6 +203,7 @@ export function useMessageSpace(
         after = r.view.next;
       }
       setLoaded(true);
+      setCaughtUp(true);
     })().catch((e: unknown) => {
       if (ctl.signal.aborted) return;
       setStatus('error');
@@ -251,6 +272,7 @@ export function useMessageSpace(
     participants,
     log,
     loaded,
+    caughtUp,
     streaming,
     refreshable: !follow,
     refresh,

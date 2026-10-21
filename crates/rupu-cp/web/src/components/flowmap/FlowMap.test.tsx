@@ -363,6 +363,31 @@ describe('FlowMap', () => {
     );
   });
 
+  it('a_frame_log_read_in_two_pages_sends_no_packets_on_open', async () => {
+    vi.mocked(api.getMessages).mockImplementation(async (route, _id, opts) => {
+      if (route === 'agentiflows') {
+        return { kind: 'ok', view: { participants: FLOW_PARTICIPANTS, messages: FLOW_MESSAGES, legacy: false, space: 'present' } };
+      }
+      // gannet#1's log, in two pages; the second comes a little later.
+      const second = opts?.after === 'page-2';
+      if (second) await new Promise((r) => setTimeout(r, 30));
+      return {
+        kind: 'ok',
+        view: {
+          participants: GANNET_PARTICIPANTS,
+          messages: second ? GANNET_MESSAGES.slice(2) : GANNET_MESSAGES.slice(0, 2),
+          legacy: false,
+          space: 'present',
+          next: second || opts?.limit === 1 ? null : 'page-2',
+        },
+      };
+    });
+    mount();
+    await waitFor(() => expect(screen.getByTestId('msg-arc-msg_009')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByTestId('msg-arc-msg_011')).toBeInTheDocument());
+    expect(document.querySelector('.afx-msg-packet')).toBeNull();
+  });
+
   it('packets_travel_for_new_messages_not_on_open', async () => {
     mount();
     await waitFor(() => expect(screen.getByTestId('msg-arc-msg_015')).toBeInTheDocument());
