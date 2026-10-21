@@ -48,12 +48,19 @@ describe('useStateCue', () => {
 
 describe('edgeTone', () => {
   it('reads the edge by the state of the step it leads into', () => {
-    expect(edgeTone('running')).toBe('live');
-    expect(edgeTone('awaiting_approval')).toBe('await');
-    expect(edgeTone('done')).toBe('done');
-    expect(edgeTone('failed')).toBe('done');
-    expect(edgeTone('pending')).toBe('idle');
-    expect(edgeTone('skipped')).toBe('idle');
-    expect(edgeTone(undefined)).toBe('idle');
+    expect(edgeTone('done', 'running')).toBe('live');
+    expect(edgeTone('done', 'awaiting_approval')).toBe('await');
+    expect(edgeTone('done', 'done')).toBe('lit');
+    expect(edgeTone('done', 'failed')).toBe('lit');
+    expect(edgeTone('done', 'pending')).toBe('idle');
+    expect(edgeTone('done', 'skipped')).toBe('idle');
+    expect(edgeTone(undefined, undefined)).toBe('idle');
+  });
+
+  it('an edge out of a failed step is a dead end, unless the run went on anyway', () => {
+    expect(edgeTone('failed', 'pending')).toBe('dead');
+    expect(edgeTone('failed', 'awaiting_approval')).toBe('dead');
+    expect(edgeTone('failed', 'running')).toBe('live');
+    expect(edgeTone('failed', 'done')).toBe('lit');
   });
 });

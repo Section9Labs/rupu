@@ -74,10 +74,12 @@ export function useStateCue(state: StepState): { cue: StateCue | null; key: numb
 }
 
 /** How an edge reads: `live` flows into a running step, `await` into a step
- *  that waits on the operator, `done` has been traversed, `idle` not yet. */
-export type EdgeTone = 'idle' | 'done' | 'live' | 'await';
+ *  that waits on the operator, `lit` has been traversed, `dead` leaves a
+ *  failed step (the run will not come this way), `idle` not reached yet. */
+export type EdgeTone = 'idle' | 'lit' | 'live' | 'await' | 'dead';
 
-export function edgeTone(target: StepState | undefined): EdgeTone {
+export function edgeTone(source: StepState | undefined, target: StepState | undefined): EdgeTone {
+  if (source === 'failed' && target !== 'running' && target !== 'done') return 'dead';
   switch (target) {
     case 'running':
       return 'live';
@@ -86,7 +88,7 @@ export function edgeTone(target: StepState | undefined): EdgeTone {
     case 'done':
     case 'failed':
     case 'paused':
-      return 'done';
+      return 'lit';
     default:
       return 'idle';
   }

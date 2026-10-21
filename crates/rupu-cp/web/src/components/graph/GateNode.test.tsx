@@ -44,7 +44,7 @@ describe('GateNode', () => {
     const node: GraphNode = { id: 'approve', kind: 'gate', state: 'awaiting_approval' };
     renderGate(makeProps(node));
     expect(screen.getByText('approve')).toBeInTheDocument();
-    expect(screen.getByText('awaiting')).toBeInTheDocument();
+    expect(screen.getByText('needs you')).toBeInTheDocument();
   });
 
   it('renders an "auto" tag when approval_gate.auto_approve is true', () => {
@@ -95,6 +95,23 @@ describe('GateNode', () => {
     const node: GraphNode = { id: 'approve', kind: 'gate', state: 'awaiting_approval' };
     renderGate(makeProps(node));
     expect(screen.getByTestId('rg-kindpill')).toBeInTheDocument();
-    expect(screen.getByText('awaiting')).toBeInTheDocument();
+    expect(screen.getByText('needs you')).toBeInTheDocument();
+  });
+
+  it('carries Approve / Reject only while it waits and the page gave it a control', () => {
+    const gate = { state: () => ({ pending: false, decision: null, error: null }), approve: () => {}, reject: () => {} };
+    const waiting: GraphNode = { id: 'ship', kind: 'gate', state: 'awaiting_approval' };
+    const props = makeProps(waiting);
+    renderGate({ ...props, data: { ...props.data, gate } });
+    expect(screen.getByRole('button', { name: 'Approve ship' })).toBeInTheDocument();
+    cleanup();
+
+    // a read-only graph (no control) and a gate that has moved on show none
+    renderGate(makeProps(waiting));
+    expect(screen.queryByRole('button', { name: 'Approve ship' })).toBeNull();
+    cleanup();
+    const done = makeProps({ ...waiting, state: 'done' });
+    renderGate({ ...done, data: { ...done.data, gate } });
+    expect(screen.queryByRole('button', { name: 'Approve ship' })).toBeNull();
   });
 });

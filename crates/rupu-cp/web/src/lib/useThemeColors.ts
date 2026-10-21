@@ -62,6 +62,12 @@ const VARS = {
 
 export type ColorKey = keyof typeof VARS;
 
+/** A token's RGB channels as a CSS expression (`var(--c-…)`), for stylesheets
+ *  that compose their own alpha: `rgb(var(--k) / .14)` with `--k` set to this. */
+export function colorChannels(key: ColorKey): string {
+  return `var(${VARS[key]})`;
+}
+
 export interface ThemeColors {
   bg: string;
   panel: string;

@@ -1,161 +1,106 @@
-// PanelLoopNode — a `panel` step with a gate fix-loop. Renders the panel
-// container, a `round {current}/{max}` counter when known, the gate condition
-// (`until_severity` / `max_iterations`), and an animated "↻ looping" loop cue
-// while running — matching the fanout-loop mockup's panel + gate block.
-//
-// The model's GraphNode does not carry panelist names, so we surface the gate
-// + round rather than fabricating reviewers.
+// PanelLoopNode — a `panel` step with a gate fix-loop: the round counter
+// (`round 2/5`, turning ↻ while it loops), the gate's condition, and one row
+// per panelist / fixer run (each selects its transcript). The model carries no
+// panelist names before they run, so the rows are the runs, not a roster.
 
 import { memo } from 'react';
-import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
-import type { GraphNode } from '../../lib/runGraphModel';
-import { stateStyle, glyphBg } from './stepStyle';
-import { NodeFrame, StateBadge } from './NodeFrame';
+import type { NodeProps, Node } from '@xyflow/react';
+import type { GraphNode, UnitView } from '../../lib/runGraphModel';
+import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
-import { runKindAccent } from './kindBridge';
 import { memberLabel } from '../../lib/codename';
+import { useStateCue } from '../../lib/graph/runMotion';
 import { AgentIdentity } from '../codename/AgentIdentity';
+import { NodeFoot, NodeFrame, NodeHead, StatusGlyph } from './NodeFrame';
 import WarnMark, { unitWarningSuffix } from './WarnMark';
 
 export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Select a panelist/fixer unit's transcript — same callback FanoutNode uses. */
   onOpenUnit?: (stepId: string, index: number) => void;
-  /** Entrance slot (see `entranceSlots`). */
+  /** Entrance slot (see `useEntranceSlots`). */
   slot?: number;
 }
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
 
+function PanelRow({ unit, onOpen }: { unit: UnitView; onOpen?: () => void }) {
+  const colors = useThemeColors();
+  const { cue } = useStateCue(unit.state);
+  const who = unit.codename ? memberLabel(unit.codename, unit.agent, unit.provider, unit.model) : unit.key;
+  return (
+    <button
+      type="button"
+      data-state={unit.state}
+      data-cue={cue ?? undefined}
+      title={`${who} · ${stateStyle(colors, unit.state).label}${unitWarningSuffix(unit.warnings)}`}
+      onClick={onOpen}
+      className="gx-prow gx-s nodrag"
+    >
+      <StatusGlyph state={unit.state} />
+      {unit.codename || unit.agent ? (
+        <AgentIdentity
+          className="gx-ident gx-ident-sm min-w-0 flex-1"
+          codename={unit.codename}
+          derived={unit.codenameDerived}
+          agent={unit.agent}
+          provider={unit.provider}
+          model={unit.model}
+        />
+      ) : (
+        <span className="gx-subname min-w-0 flex-1 truncate">{unit.key}</span>
+      )}
+      <WarnMark warnings={unit.warnings?.map((message) => ({ index: unit.index, message }))} />
+    </button>
+  );
+}
+
 function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   const { node, onOpenUnit } = data;
-  const colors = useThemeColors();
-  // Container identity: the SAME accent the editor paints 'panel' with
-  // (status.awaiting).
-  const accentKey = runKindAccent(node.kind);
-  const handleStyle = {
-    background: colors.alpha(accentKey, 0.5),
-    width: 6,
-    height: 6,
-    border: 'none',
-  } as const;
-  const s = stateStyle(colors, node.state);
-  const running = node.state === 'running';
   const gate = node.gate;
   const round = node.round;
-  // Panelist/fixer runs surface as fanout units (folded by step_id). Each is a
-  // clickable chip that selects its transcript.
   const units = node.fanout?.units ?? [];
   const box = nodeSize(node);
-
   return (
     <NodeFrame
       state={node.state}
+      kind={node.kind}
       slot={data.slot}
+      width={box.width}
+      minHeight={box.height}
       testId="rg-container"
-      className="rounded-[12px] border px-2.5 py-2"
-      style={{
-        borderColor: colors.alpha(accentKey, 0.4),
-        background: colors.alpha(accentKey, 0.08),
-        width: box.width,
-        minHeight: box.height,
-      }}
     >
-      <Handle type="target" position={Position.Left} style={handleStyle} />
-
-      <div
-        className="flex items-center justify-between gap-2 text-meta font-bold uppercase tracking-wide"
-        style={{ color: colors.get(accentKey) }}
-      >
-        <span className="truncate">
-          panel · {node.id}
-          {round && <span className="ml-1 tabular-nums">· round {round.current}/{round.max}</span>}
-        </span>
-        <WarnMark warnings={node.warnings} className="ml-auto" />
-        {running && (
-          <span
-            className="rg-loop-spin text-ui leading-none"
-            style={{ color: colors.status.awaiting }}
-            aria-label="looping"
-          >
-            ↻
+      <NodeHead kind={node.kind} name={node.id} state={node.state}>
+        <WarnMark warnings={node.warnings} />
+        {round && (
+          <span className="gx-count">
+            {node.state === 'running' && (
+              <span className="gx-loop" aria-label="looping">
+                ↻
+              </span>
+            )}
+            {round.current}/{round.max}
           </span>
         )}
+      </NodeHead>
+      <div className="gx-body gx-chip">
+        {gate ? (
+          <>
+            gate ≥ {gate.until_severity} · max {gate.max_iterations}
+          </>
+        ) : (
+          'gate'
+        )}
       </div>
-
-      {/* gate condition block */}
-      <div
-        className="mt-1.5 flex items-center gap-1.5 rounded-[8px] border px-1.5 py-1"
-        style={{
-          borderColor: colors.alpha('status.awaiting', 0.45),
-          background: colors.alpha('status.awaiting', 0.12),
-        }}
-      >
-        <StateBadge state={node.state} color={s.color} glyph={s.glyph} small />
-        <span className="text-meta font-medium" style={{ color: colors.status.awaiting }}>
-          {gate ? (
-            <>
-              gate ≥ {gate.until_severity} · max {gate.max_iterations}
-            </>
-          ) : (
-            'gate'
-          )}
-        </span>
-      </div>
-
-      {/* panelist / fixer rows — each selects its transcript on click. One
-          row per unit (PANEL_UNIT_ROW_H) so the identity's provider/model
-          line isn't clipped the way an 88px chip clipped it. */}
       {units.length > 0 && (
-        <div className="mt-1.5 flex flex-col gap-1">
+        <div className="gx-prows">
           {units.map((u) => (
-            <button
-              key={u.index}
-              type="button"
-              title={`${u.codename ? memberLabel(u.codename, u.agent, u.provider, u.model) : u.key} · ${stateStyle(colors, u.state).label}${unitWarningSuffix(u.warnings)}`}
-              onClick={() => onOpenUnit?.(node.id, u.index)}
-              className="flex w-full min-w-0 items-start gap-1 rounded bg-panel/80 px-1.5 py-0.5 text-left text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
-            >
-              <span
-                data-state={u.state}
-                className="rgx-unit mt-[3px] inline-block h-2 w-2 shrink-0 rounded-[2px]"
-                style={{ background: glyphBg(colors, u.state), ['--u' as string]: u.index }}
-                aria-hidden
-              />
-              {u.codename || u.agent ? (
-                <AgentIdentity
-                  className="flex-1"
-                  codename={u.codename}
-                  derived={u.codenameDerived}
-                  agent={u.agent}
-                  provider={u.provider}
-                  model={u.model}
-                />
-              ) : (
-                <span className="min-w-0 truncate">{u.key}</span>
-              )}
-              <WarnMark
-                warnings={u.warnings?.map((message) => ({ index: u.index, message }))}
-                className="ml-auto"
-              />
-            </button>
+            <PanelRow key={u.index} unit={u} onOpen={() => onOpenUnit?.(node.id, u.index)} />
           ))}
         </div>
       )}
-
-      <div className="mt-1.5 flex items-center gap-1.5">
-        <span key={node.state} className="rgx-swap rounded bg-panel/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
-          {s.label}
-        </span>
-        {node.agent && (
-          <span className="truncate rounded bg-panel/70 px-1.5 py-px text-meta text-ink-dim">
-            {node.agent}
-          </span>
-        )}
-      </div>
-
-      <Handle type="source" position={Position.Right} style={handleStyle} />
+      <NodeFoot kind={node.kind}>{node.agent && <span className="gx-sub truncate">{node.agent}</span>}</NodeFoot>
     </NodeFrame>
   );
 }

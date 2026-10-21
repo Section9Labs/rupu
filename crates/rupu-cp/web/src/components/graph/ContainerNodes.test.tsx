@@ -1,13 +1,9 @@
 // @vitest-environment jsdom
 // Container run nodes take their KIND accent (parallel/panel/for_each each
-// have a distinct token — see kindVisuals.KIND_ACCENT); the per-sub-step /
-// per-unit chips stay state-colored. The border-color assertions pin the
-// exact color jsdom's CSSOM normalizes the seeded CSS_VARS below to
-// (`rgb(<channels> / <alpha>)` inline style reads back as
-// `rgba(<r>, <g>, <b>, <alpha>)`), since `useThemeColors` reads the raw
-// channels directly off `document.documentElement`'s inline style (no
-// var()-resolution involved).
-import { nodeSize, PARALLEL_HEADER_H, PARALLEL_SUBROW_ID_H, PARALLEL_PAD_V } from '../../lib/nodeSize';
+// have a distinct token — see kindVisuals.KIND_ACCENT), set on the card frame
+// as `--k` (the stylesheet tints the kind tile and label with it); the
+// per-sub-step / per-unit chips stay state-colored (`data-state`).
+import { nodeSize, PARALLEL_HEADER_H, PARALLEL_SUBROW_ID_H, PARALLEL_ROW_GAP } from '../../lib/nodeSize';
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
@@ -83,8 +79,9 @@ function renderFanout(node: GraphNode) {
   return renderContainer(FanoutNode, 'fanout', node);
 }
 
-function containerBorderColor(container: HTMLElement): string {
-  return (container.querySelector('[data-testid="rg-container"]') as HTMLElement).style.borderColor;
+/** The kind channels the card frame paints with (`--k`). */
+function kindVar(container: HTMLElement): string {
+  return (container.querySelector('.gx-node') as HTMLElement).style.getPropertyValue('--k');
 }
 
 const PARALLEL: GraphNode = {
@@ -102,12 +99,13 @@ describe('ParallelNode', () => {
     renderParallel(PARALLEL);
     expect(screen.getByText('lint')).toBeInTheDocument();
     expect(screen.getByText('test')).toBeInTheDocument();
-    expect(screen.getByText(/parallel · fanwork/)).toBeInTheDocument();
+    expect(screen.getByText('fanwork')).toBeInTheDocument();
+    expect(screen.getByText('parallel')).toBeInTheDocument();
   });
 
   it('the container tint uses the parallel kind accent (sev.critical)', () => {
     const { container } = renderParallel(PARALLEL);
-    expect(containerBorderColor(container)).toBe('rgba(147, 51, 234, 0.4)');
+    expect(kindVar(container)).toBe('var(--c-sev-critical)');
   });
 });
 
@@ -137,7 +135,7 @@ describe('PanelLoopNode', () => {
 
   it('the container tint uses the panel kind accent (status.awaiting)', () => {
     const { container } = renderPanel(PANEL);
-    expect(containerBorderColor(container)).toBe('rgba(245, 158, 11, 0.4)');
+    expect(kindVar(container)).toBe('var(--c-status-awaiting)');
   });
 });
 
@@ -159,13 +157,16 @@ const FANOUT: GraphNode = {
 describe('FanoutNode', () => {
   it('keeps the status channel — every unit square still renders', () => {
     renderFanout(FANOUT);
-    expect(screen.getByText(/for_each · shard · 3/)).toBeInTheDocument();
-    expect(screen.getByText('2', { exact: false })).toBeInTheDocument();
+    expect(screen.getByText('shard')).toBeInTheDocument();
+    expect(screen.getByLabelText('2 of 3 done')).toHaveTextContent('2/3');
+    // one cell per unit, each carrying its own state
+    const cells = Array.from(document.querySelectorAll('button.gx-cell'));
+    expect(cells.map((c) => c.getAttribute('data-state'))).toEqual(['done', 'done', 'running']);
   });
 
   it('the container tint uses the for_each kind accent (brand.500)', () => {
     const { container } = renderFanout(FANOUT);
-    expect(containerBorderColor(container)).toBe('rgba(124, 58, 237, 0.4)');
+    expect(kindVar(container)).toBe('var(--c-brand-500)');
   });
 });
 
@@ -187,17 +188,14 @@ const FANOUT_LARGE: GraphNode = {
 } as unknown as GraphNode;
 
 describe('FanoutNode (large card, total > 12)', () => {
-  it('the header label, the %, and the expand-all button all take the same for_each kind accent', () => {
-    renderFanout(FANOUT_LARGE);
-    const header = screen.getByText(/for_each · bigshard/);
-    const headerColor = getComputedStyle(header).color;
-    const pct = screen.getByText('67%');
-    const pctColor = getComputedStyle(pct).color;
-    const button = screen.getByRole('button', { name: /expand all/ });
-    const buttonColor = getComputedStyle(button).color;
-
-    expect(headerColor).toBe(pctColor);
-    expect(pctColor).toBe(buttonColor);
+  it('summarises done / total, the percentage, and expands into the unit browser', () => {
+    const { container } = renderFanout(FANOUT_LARGE);
+    expect(screen.getByText('bigshard')).toBeInTheDocument();
+    expect(screen.getByText('67%')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /expand all 15 · running \(3\)/ })).toBeInTheDocument();
+    // the density preview carries one cell per unit, by state
+    expect(container.querySelectorAll('.gx-mini-cell[data-state="done"]')).toHaveLength(10);
+    expect(kindVar(container)).toBe('var(--c-brand-500)');
   });
 });
 
@@ -262,9 +260,7 @@ describe('codenames on container nodes', () => {
     // no codename → sub id row still renders, no identity
     expect(screen.getByText('test')).toBeInTheDocument();
     // layout reserves the identity rows for every sub-step that runs an agent
-    expect(nodeSize(node).height).toBe(
-      PARALLEL_HEADER_H + 2 * PARALLEL_SUBROW_ID_H + PARALLEL_PAD_V,
-    );
+    expect(nodeSize(node).height).toBe(PARALLEL_HEADER_H + 2 * PARALLEL_SUBROW_ID_H + PARALLEL_ROW_GAP);
   });
 
   it('PanelLoopNode unit title uses the unit agent, never the unit key', () => {
@@ -320,16 +316,16 @@ describe('step warnings on container nodes', () => {
     const { container } = renderFanout(node);
     const mark = screen.getByTestId('rg-warn');
     expect(mark.getAttribute('title')).toBe('unit 1: host gpu-9 sent no coverage stream');
-    // only unit 1's square carries the warning ring + message
-    const squares = Array.from(container.querySelectorAll('button'));
+    // only unit 1's cell carries the warning ring + message
+    const squares = Array.from(container.querySelectorAll('button.gx-cell'));
     expect(squares).toHaveLength(3);
     expect(squares[1].className).toContain('ring-warn');
     expect(squares[1].getAttribute('title')).toMatch(/done · ⚠ host gpu-9 sent no coverage stream$/);
     expect(squares[0].className).not.toContain('ring-warn');
     expect(squares[0].getAttribute('title')).not.toMatch(/⚠/);
     // the header counts are still the lifecycle's: 2 done, none failed
-    expect(screen.getByText(/2 ✓/)).toBeInTheDocument();
-    expect(screen.queryByText(/✕/)).toBeNull();
+    expect(screen.getByLabelText('2 of 3 done')).toBeInTheDocument();
+    expect(container.querySelector('.gx-failcount')).toBeNull();
   });
 
   it('FanoutNode (large) marks the header', () => {

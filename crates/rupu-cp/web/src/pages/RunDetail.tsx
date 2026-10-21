@@ -35,6 +35,7 @@ import { asPermissionMode, isAgentRunRecord, isRetryable, RETRY_STALL_MS, runsAp
 import { TabBar, TabButton } from '../components/TabBar';
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
 import RunGraph, { type NodeSelection } from '../components/RunGraph';
+import type { GateControl } from '../components/graph/GateActions';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import RunWarningsBanner from '../components/RunWarningsBanner';
 import TranscriptPanel from '../components/TranscriptPanel';
@@ -843,6 +844,34 @@ export default function RunDetail() {
     }
   }
 
+  // Approve / Reject on the gate node itself: the same handlers the banners
+  // use, so the node and its banner always agree. One parked gate goes through
+  // the single-gate handlers (the banner it shares state with); several go
+  // through the per-gate ones, keyed by step id. The handlers are read through
+  // a ref so the control (and the graph's nodes) only change with the state.
+  const gateHandlers = useRef({ onApprove, onReject, onApproveGate, onRejectGate });
+  gateHandlers.current = { onApprove, onReject, onApproveGate, onRejectGate };
+  const multiGate = awaitingGates.length > 1;
+  const gateControl = useMemo<GateControl | undefined>(() => {
+    if (!run || cancelled) return undefined;
+    if (multiGate) {
+      return {
+        state: (stepId) => {
+          const gs = multiGateState[stepId] ?? DEFAULT_GATE_UI_STATE;
+          return { pending: gs.pending, decision: gs.decision, error: gs.error };
+        },
+        approve: (stepId) => void gateHandlers.current.onApproveGate(stepId),
+        reject: (stepId) => void gateHandlers.current.onRejectGate(stepId),
+      };
+    }
+    const decision = rejected ? 'rejected' : resumeRequested ? 'approved' : null;
+    return {
+      state: () => ({ pending: gatePending, decision, error: gateError }),
+      approve: () => void gateHandlers.current.onApprove(),
+      reject: () => void gateHandlers.current.onReject(),
+    };
+  }, [run, cancelled, multiGate, multiGateState, rejected, resumeRequested, gatePending, gateError]);
+
   // ---- Selection-driven derivations (safe when model is null) --------------
 
   // The selected node, its fan-out (if any), and its resolved transcript path.
@@ -1401,6 +1430,7 @@ export default function RunDetail() {
           <RunGraph
             model={model!}
             positions={positions}
+            gate={gateControl}
             onSelectNode={selectFromNode}
             onExpandFanout={selectStep}
             onOpenUnit={selectUnit}
