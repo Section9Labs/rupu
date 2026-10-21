@@ -21,8 +21,10 @@ import { buildRunGraphModel, type RunGraphModel } from '../runGraphModel';
 import type { MessageSpace } from '../useMessageSpace';
 import { FLOW_SPACE, type BoardSource, type FlowInput, type FlowSpace } from './flowModel';
 
-/** How long a followed frame batches its run-log events before a rebuild. */
-const FRAME_FLUSH_MS = 120;
+/** How long a followed frame batches its run-log events before a rebuild:
+ *  each rebuild that changes a state re-lays the whole map, so a busy child
+ *  is redrawn at most this often. */
+const FRAME_FLUSH_MS = 1000;
 /** A followed frame keeps at most this many events (as RunDetail does). */
 const FRAME_MAX_EVENTS = 5000;
 
@@ -56,7 +58,7 @@ export function useFlowData(
   const [childrenLoaded, setChildrenLoaded] = useState(false);
   const [flowBoard, setFlowBoard] = useState<BoardSource | null>(null);
   const [loadedFrames, setLoadedFrames] = useState<string[]>([]);
-  const [graphs, setGraphs] = useState<ReadonlyMap<string, RunGraphModel>>(new Map());
+  const [graphs, setGraphs] = useState<Map<string, RunGraphModel>>(new Map());
   const [frameBoards, setFrameBoards] = useState<ReadonlyMap<string, BoardSource>>(new Map());
   const [frameSpaces, setFrameSpaces] = useState<ReadonlyMap<string, FlowSpace>>(new Map());
   const [frameErrors, setFrameErrors] = useState<ReadonlyMap<string, string>>(new Map());
@@ -160,10 +162,16 @@ export function useFlowData(
     let graph: RunGraphResponse | null = null;
     const events: RunEvent[] = [];
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let signature = '';
     const rebuild = () => {
       timer = null;
       if (!graph || ctl.signal.aborted) return;
       const model = buildRunGraphModel(graph, events);
+      const sig = graphSignature(model);
+      // Most events change no state the map shows: keep the model the map
+      // already has, so it isn't rebuilt.
+      if (sig === signature) return;
+      signature = sig;
       setGraphs((m) => new Map(m).set(f, model));
     };
     api.getRunGraph(f).then(
@@ -221,6 +229,8 @@ export function useFlowData(
         (r) => {
           if (!ctl.signal.aborted) setFrameBoards((m) => new Map(m).set(f, boardSource(r)));
         },
+        // A failed re-read keeps the board the frame already shows (it was
+        // read once when the frame loaded); the next poll tries again.
         () => {},
       );
     }
@@ -244,14 +254,13 @@ export function useFlowData(
     for (const [f, b] of frameBoards) m.set(f, b);
     return m;
   }, [flowBoard, frameBoards]);
-  const childGraphs = useMemo(() => new Map(graphs), [graphs]);
 
   return {
     detail,
     children,
     spaces,
     boards,
-    childGraphs,
+    childGraphs: graphs,
     loadFrame,
     loadedFrames,
     setFrameSpace,
@@ -259,4 +268,18 @@ export function useFlowData(
     childrenError,
     frameErrors,
   };
+}
+
+/** What the map draws of a run graph: each step's state, identity, loop
+ *  round and warnings, its units' and members' states and codenames. Two
+ *  models with the same signature draw the same. */
+export function graphSignature(m: RunGraphModel): string {
+  return m.nodes
+    .map((n) => {
+      const units = n.fanout?.units.map((u) => `${u.state},${u.codename ?? ''},${u.warnings?.length ?? 0}`).join(';') ?? '';
+      const subs = n.parallel?.map((p) => `${p.state},${p.codename ?? ''},${p.model ?? ''}`).join(';') ?? '';
+      const who = `${n.codename ?? ''},${n.agent ?? ''},${n.provider ?? ''},${n.model ?? ''}`;
+      return `${n.id}:${n.state}:${n.round?.current ?? ''}:${who}:${n.warnings?.length ?? 0}:${units}:${subs}`;
+    })
+    .join('|');
 }

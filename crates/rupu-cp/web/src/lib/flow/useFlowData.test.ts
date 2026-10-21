@@ -79,9 +79,17 @@ describe('useFlowData', () => {
     expect(result.current.boards.get(RUN.gannet1)).toEqual(GANNET_BOARD);
     expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('pending');
 
-    // A live event rebuilds the frame's graph.
+    // A live event rebuilds the frame's graph (batched, about once a second).
     act(() => m.emit({ type: 'step_started', run_id: RUN.gannet1, step_id: 'collect' } as RunEvent));
-    await waitFor(() => expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('running'));
+    await waitFor(() => expect(result.current.childGraphs.get(RUN.gannet1)!.nodeById('collect')!.state).toBe('running'), {
+      timeout: 2500,
+    });
+    // An event that changes nothing the map draws keeps the same model, so
+    // the map isn't rebuilt.
+    const before = result.current.childGraphs;
+    act(() => m.emit({ type: 'step_working', run_id: RUN.gannet1, step_id: 'collect' } as RunEvent));
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(result.current.childGraphs).toBe(before);
 
     // A poll while the child runs re-reads its board, not its graph.
     rerender({ detail: { ...DETAIL } });
