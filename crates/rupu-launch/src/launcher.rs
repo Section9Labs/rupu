@@ -300,6 +300,8 @@ enum Vetted {
         name: String,
         target: WorkflowRef,
         inputs: BTreeMap<String, String>,
+        /// Dispatched from a file the caller generated.
+        generated: bool,
     },
 }
 
@@ -572,8 +574,14 @@ impl RunLauncher {
                 prompt: Some(prompt.clone()),
                 workflow: None,
                 inputs: BTreeMap::new(),
+                generated: false,
             },
-            Vetted::Workflow { target, inputs, .. } => Request {
+            Vetted::Workflow {
+                target,
+                inputs,
+                generated,
+                ..
+            } => Request {
                 mode,
                 link,
                 prompt: None,
@@ -582,6 +590,7 @@ impl RunLauncher {
                     WorkflowRef::Name(_) => None,
                 },
                 inputs: inputs.clone(),
+                generated: *generated,
             },
         };
         let launch = LaunchRecord {
@@ -892,6 +901,7 @@ impl RunLauncher {
     /// approval gate and no remote placement, every agent it runs is one the
     /// caller may dispatch, and its inputs resolve.
     fn vet_workflow(&self, req: &ChildRequest, id: &RunIdentity) -> Result<Vetted, LaunchError> {
+        let is_file = matches!(req.target, ChildTarget::File(_));
         let (label, wf, target) = match &req.target {
             ChildTarget::Name(name) => {
                 if !id.launch.workflows.contains(name) {
@@ -929,16 +939,11 @@ impl RunLauncher {
             }
             ChildTarget::File(file) => {
                 // Only a workflow this run generated (`workflows.generate`).
-                let generated = id
+                let inside = id
                     .launch
                     .children_dir
-                    .as_ref()
-                    .map(|d| d.join("generated"))
-                    .and_then(|d| d.canonicalize().ok());
-                let inside = match (generated, file.canonicalize().ok()) {
-                    (Some(dir), Some(f)) => f.starts_with(dir),
-                    _ => false,
-                };
+                    .as_deref()
+                    .is_some_and(|d| is_generated_file(d, file));
                 if !inside {
                     return Err(LaunchError::new(
                         "workflow_not_dispatchable",
@@ -994,6 +999,7 @@ impl RunLauncher {
             name: label,
             target,
             inputs,
+            generated: is_file,
         })
     }
 
@@ -2005,6 +2011,18 @@ impl RunLauncher {
                 })
             })
             .await
+    }
+}
+
+/// Whether `file` lies inside `<children_dir>/generated/`, where
+/// `workflows.generate` writes.
+fn is_generated_file(children_dir: &Path, file: &Path) -> bool {
+    match (
+        children_dir.join("generated").canonicalize().ok(),
+        file.canonicalize().ok(),
+    ) {
+        (Some(dir), Some(f)) => f.starts_with(dir),
+        _ => false,
     }
 }
 

@@ -186,6 +186,10 @@ pub struct Request {
     pub workflow: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, String>,
+    /// A workflow child dispatched from a file the caller wrote with
+    /// `workflows.generate` (inside its `<children dir>/generated/`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
 }
 
 /// An earlier run of a child.
