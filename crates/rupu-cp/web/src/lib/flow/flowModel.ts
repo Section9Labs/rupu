@@ -272,7 +272,7 @@ function placer(spans: RoundSpan[], byId: Map<string, RunChild>): (c: RunChild) 
   return (c) => place(c, new Set());
 }
 
-type Resolve = (address: string) => string;
+export type Resolve = (address: string) => string;
 
 /** A space's addresses to node ids: participants to their run (a workflow
  *  child's step agents to `<child>/<step>`), `lead`, `operator`, else
@@ -311,7 +311,9 @@ function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel 
 
 const BOARD_KINDS: ReadonlySet<RowKind> = new Set(['post', 'mention', 'directive', 'retract']);
 
-function flowMessage(m: SpaceMessage, space: string, resolve: Resolve, at: number | null): FlowMessage {
+/** `m` as the map draws it: its endpoints through `resolve`, a board write
+ *  also landing on the board, every undelivered recipient its own end. */
+export function flowMessage(m: SpaceMessage, space: string, resolve: Resolve, at: number | null): FlowMessage {
   const kind = rowKind(m);
   const undelivered = (m.delivery?.undelivered ?? []).map((u) => ({
     to: resolve(u.to),
@@ -340,7 +342,7 @@ function flowMessage(m: SpaceMessage, space: string, resolve: Resolve, at: numbe
 
 /** Each message's time, in log order; an unparseable `ts` borrows the latest
  *  time before it (else the first after it), `null` when the log has none. */
-function borrowedTimes(messages: SpaceMessage[]): (number | null)[] {
+export function borrowedTimes(messages: SpaceMessage[]): (number | null)[] {
   const out: (number | null)[] = [];
   let latest: number | null = null;
   for (const m of messages) {

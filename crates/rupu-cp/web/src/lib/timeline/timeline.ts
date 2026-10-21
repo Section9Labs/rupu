@@ -51,6 +51,19 @@ export function revealed(items: TimelineItem[], t: number | null): Set<string> {
   return out;
 }
 
+/** How many of `sorted` (by `at`) are at or before `t`. A reveal keyed on
+ *  this count changes only when a replay frame reveals something. */
+export function countAtOrBefore(sorted: readonly TimelineItem[], t: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid].at <= t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 /** 40 ms of replay per second of run, clamped to 6-16 s. */
 export function replayDuration(start: number, end: number): number {
   return Math.min(16000, Math.max(6000, ((end - start) / 1000) * 40));

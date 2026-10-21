@@ -53,9 +53,10 @@ import {
 } from '../../lib/flow/flowEdges';
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
+import { useArrivals } from '../../lib/flow/useArrivals';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
-import { timeBounds, type TimelineItem } from '../../lib/timeline/timeline';
+import { countAtOrBefore, timeBounds } from '../../lib/timeline/timeline';
 import { KIND_FILTERS, OPERATOR, type KindFilter } from '../../lib/messages';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
@@ -85,8 +86,6 @@ import '@xyflow/react/dist/style.css';
 const MINIMAP_MIN_NODES = 6;
 /** The spine sits this far left of the round cards. */
 const SPINE_X = -28;
-/** How long a newly revealed message's packet travels (and a bit). */
-const ARRIVE_MS = 1500;
 /** The rail's top: clear of the summary chip at the canvas's top right. */
 const RAIL_TOP = 56;
 const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
@@ -171,18 +170,6 @@ function shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>): b
   return ka.every((k) => Object.is(a[k], b[k]));
 }
 
-/** How many of `sorted` (by `at`) are at or before `t`. */
-function countAtOrBefore(sorted: readonly TimelineItem[], t: number): number {
-  let lo = 0;
-  let hi = sorted.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (sorted[mid].at <= t) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
 function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace: MessageSpace }) {
   const colors = useThemeColors();
   const mode = useThemeMode();
@@ -264,50 +251,15 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   );
   const counts = useMemo(() => messageCounts(shownMessages, router), [shownMessages, router]);
 
-  // The packets: a message that lands after its space's log was read whole
-  // (a live one, or one a replay reveals) travels once. What a space's
-  // opening read brings, page by page or as a stream's replay, is the map's
-  // starting state, not news.
+  // The packets (useArrivals): a message landing after its space caught up
+  // travels once.
   const flowCaughtUp =
     flowSpace.caughtUp || flowSpace.status === 'unavailable' || flowSpace.status === 'error' || flowSpace.space === 'absent';
   const caughtUpKey = useMemo(
     () => [...(flowCaughtUp ? [FLOW_SPACE] : []), ...spaces.filter((s) => s.id !== FLOW_SPACE && s.caughtUp).map((s) => s.id)].join(','),
     [flowCaughtUp, spaces],
   );
-  const seen = useRef(new Set<string>());
-  /** The spaces that had caught up when the last messages were taken in. */
-  const caughtUpBefore = useRef(new Set<string>());
-  const [arrivals, setArrivals] = useState<ReadonlyMap<string, number>>(() => new Map());
-  useEffect(() => {
-    const fresh: string[] = [];
-    for (const m of shownMessages) {
-      if (!seen.current.has(m.id) && caughtUpBefore.current.has(m.space)) fresh.push(m.id);
-    }
-    seen.current = new Set(shownMessages.map((m) => m.id));
-    caughtUpBefore.current = new Set(caughtUpKey ? caughtUpKey.split(',') : []);
-    if (fresh.length === 0) return;
-    const until = Date.now() + ARRIVE_MS;
-    setArrivals((a) => {
-      const next = new Map(a);
-      for (const id of fresh) next.set(id, until);
-      return next;
-    });
-  }, [shownMessages, caughtUpKey]);
-  useEffect(() => {
-    if (arrivals.size === 0) return;
-    let first = Infinity;
-    for (const until of arrivals.values()) first = Math.min(first, until);
-    const timer = setTimeout(
-      () =>
-        setArrivals((a) => {
-          const now = Date.now();
-          const next = new Map([...a].filter(([, until]) => until > now));
-          return next.size === a.size ? a : next;
-        }),
-      Math.max(0, first - Date.now()),
-    );
-    return () => clearTimeout(timer);
-  }, [arrivals]);
+  const arrivals = useArrivals(shownMessages, caughtUpKey);
 
   // --- the board rail and frame strips, as of `t` -------------------------
   const boardAsOf = useCallback(

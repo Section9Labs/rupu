@@ -34,7 +34,7 @@ import { RetryControl, type RetryChoice } from '../components/runops/RetryContro
 import { asPermissionMode, isAgentRunRecord, isRetryable, RETRY_STALL_MS, runsApi } from '../lib/api3b/runs';
 import { TabBar, TabButton } from '../components/TabBar';
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
-import RunGraph, { type NodeSelection } from '../components/RunGraph';
+import RunGraph, { type NodeSelection, type RunGraphOverlay } from '../components/RunGraph';
 import type { GateControl } from '../components/graph/GateActions';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import RunWarningsBanner from '../components/RunWarningsBanner';
@@ -44,6 +44,11 @@ import { MessageLinksContext, type MessageLinks } from '../components/transcript
 import { msgHash, parseMsgHash } from '../lib/messages';
 import { useTabParam, withTab } from '../lib/tabParam';
 import { useMessageSpace } from '../lib/useMessageSpace';
+import { useRunLayer, type RunLayerView } from '../lib/flow/useRunLayer';
+import { boardAt } from '../lib/flow/runLayer';
+import { TimeAxis } from '../components/timeline/TimeAxis';
+import MessageListPanel from '../components/flowmap/MessageListPanel';
+import BoardRail from '../components/flowmap/BoardRail';
 import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
@@ -81,6 +86,27 @@ type Tab = (typeof RUN_TABS)[number];
  * selection, so this is informational); `null` means "whole run".
  */
 type Selection = { stepId: string; unitIndex?: number } | null;
+
+/** The Messages list and the board under the run graph (its message layer):
+ *  what the replay has revealed; a row picked lights its arc. */
+function RunLayerPanels({ view }: { view: RunLayerView }) {
+  const { layer, shown, revealed, selected, select, spaces } = view;
+  const posts = revealed ? layer.board.posts.filter((p) => revealed.has(p.id)) : layer.board.posts;
+  return (
+    <div className="grid gap-3 lg:grid-cols-2">
+      <section className="afx-panel" aria-label="Run messages" data-testid="run-layer-messages">
+        <h3 className="afx-panel-h">
+          Messages <span>{shown.length}</span>
+        </h3>
+        <MessageListPanel messages={shown} spaces={spaces} selected={selected} onSelect={select} />
+      </section>
+      <section className="afx-panel" aria-label="Run board" data-testid="run-layer-board">
+        <h3 className="afx-panel-h">Board</h3>
+        <BoardRail board={boardAt(layer.board.view, revealed)} posts={posts} onSelect={select} />
+      </section>
+    </div>
+  );
+}
 
 /** The step (and fan-out unit) a message-space participant ran as. */
 function selectionOf(model: RunGraphModel, p: SpaceParticipant): Selection {
@@ -200,11 +226,6 @@ export default function RunDetail() {
   // Transcript, without rewriting the URL, so `?tab=cycles` flips to Cycles
   // once the autoflow context arrives.
   const tab: Tab = (tabParam === 'cycles' && !autoflowCtx) || (tabParam === 'children' && remote) ? 'transcript' : tabParam;
-
-  const [messagesOpened, setMessagesOpened] = useState(false);
-  useEffect(() => {
-    if (tab === 'messages') setMessagesOpened(true);
-  }, [tab]);
 
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
@@ -590,12 +611,43 @@ export default function RunDetail() {
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
 
-  // The run's message space: probed always (the tab shows only when there is
-  // one), read in full once the tab is opened, followed while the run is live
-  // so the tab can count what arrives.
+  // The run's message space: probed always (the tab and the graph's layer
+  // show only when there is one), read in full when there is (the graph's
+  // layer draws every message), followed while the run is live.
   const messages = useMessageSpace(
     { route: 'runs', id, host },
-    { live: isRunning && !!run, load: (isRunning && !!run) || messagesOpened, reading: tab === 'messages' },
+    { live: isRunning && !!run, load: true, reading: tab === 'messages' },
+  );
+  // The graph's message and board layer, its time axis and its panels.
+  const runLayer = useRunLayer({
+    id,
+    host,
+    model,
+    events: rawEvents,
+    record: graph,
+    space: messages,
+    running: isRunning,
+  });
+  // Rebuilt only when what the graph draws changes, not on every page render.
+  const caughtUp = messages.caughtUp;
+  const layerData = runLayer?.layer;
+  const layerRevealed = runLayer?.revealed ?? null;
+  const layerSelected = runLayer?.selected ?? null;
+  const layerSelect = runLayer?.select;
+  const graphOverlay = useMemo<RunGraphOverlay | undefined>(
+    () =>
+      layerData
+        ? {
+            messages: layerData.messages,
+            board: layerData.board.view,
+            writers: layerData.board.writers,
+            revealed: layerRevealed,
+            selected: layerSelected,
+            onSelect: layerSelect,
+            caughtUp,
+          }
+        : undefined,
+    [layerData, layerRevealed, layerSelected, layerSelect, caughtUp],
   );
   const messageLinks = useMemo<MessageLinks>(() => {
     const openAt = (address: string, msgId: string) => {
@@ -1426,7 +1478,19 @@ export default function RunDetail() {
         )}
 
         {/* Persistent chrome: the run graph + per-turn usage chart. */}
-        <section className="mt-3" data-testid="run-graph-chrome">
+        <section className="mt-3 space-y-3" data-testid="run-graph-chrome">
+          {runLayer && (
+            <TimeAxis
+              bands={runLayer.layer.timeline.bands}
+              items={runLayer.layer.timeline.items}
+              bounds={runLayer.bounds}
+              t={runLayer.timeline.t}
+              live={isRunning}
+              onScrub={runLayer.timeline.scrub}
+              onReplay={runLayer.timeline.replay}
+              onRelease={runLayer.timeline.release}
+            />
+          )}
           <RunGraph
             model={model!}
             positions={positions}
@@ -1434,7 +1498,9 @@ export default function RunDetail() {
             onSelectNode={selectFromNode}
             onExpandFanout={selectStep}
             onOpenUnit={selectUnit}
+            overlay={graphOverlay}
           />
+          {runLayer && <RunLayerPanels view={runLayer} />}
         </section>
 
         {/* Persistent chrome: per-turn usage chart. */}

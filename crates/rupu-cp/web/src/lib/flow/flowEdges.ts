@@ -35,7 +35,7 @@ export interface Router {
  *  (a retraction lands on the directive it retracts). */
 export const claimKey = (c: Pick<ClaimView, 'key' | 'acquired_at'>) => `claim:${c.key}:${c.acquired_at}`;
 
-const boardKey = (m: FlowMessage) => (m.kind === 'retract' ? (m.message.refs?.retracts ?? m.id) : m.id);
+export const boardKey = (m: FlowMessage) => (m.kind === 'retract' ? (m.message.refs?.retracts ?? m.id) : m.id);
 
 export function makeRouter(model: FlowModel, visible: ReadonlySet<string>): Router {
   const roundOf = new Map<string, number>();
