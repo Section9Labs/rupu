@@ -2039,3 +2039,45 @@ async fn a_joined_child_a_stop_ended_is_continued() {
         (ChildState::Done, Some("continued answer"))
     );
 }
+
+/// A child launched in a lead round records that round on its `started` line;
+/// one launched outside a round records none (and writes no key).
+#[tokio::test]
+#[serial]
+async fn started_line_carries_its_round() {
+    let home = kinds_home();
+    let backend = Arc::new(ScriptedProcesses::done("x"));
+    let l = home.launcher_with(home.assembler(config()), backend, None);
+    let ctx = parent_ctx(&home, PermissionMode::Bypass);
+    let h = l
+        .launch_in_round(
+            request(ChildKind::Agent, "probe", Some("go")),
+            &ctx,
+            Some(3),
+        )
+        .await
+        .expect("launches");
+    l.join(
+        &ctx.identity,
+        JoinSet::Handles(vec![h.handle]),
+        Duration::from_secs(60),
+        Until::All,
+    )
+    .await;
+    let entries = ledger::read(&home.runs().join("parent_run_1"));
+    assert_eq!(entries[0].started.round, Some(3));
+}
+
+#[tokio::test]
+#[serial]
+async fn launch_without_round_writes_none() {
+    let home = kinds_home();
+    let backend = Arc::new(ScriptedProcesses::done("x"));
+    let l = home.launcher_with(home.assembler(config()), backend, None);
+    let ctx = parent_ctx(&home, PermissionMode::Bypass);
+    run(&l, &ctx, request(ChildKind::Agent, "probe", Some("go"))).await;
+    let dir = home.runs().join("parent_run_1");
+    assert_eq!(ledger::read(&dir)[0].started.round, None);
+    let raw = std::fs::read_to_string(dir.join("children.jsonl")).unwrap();
+    assert!(!raw.contains("\"round\""), "{raw}");
+}

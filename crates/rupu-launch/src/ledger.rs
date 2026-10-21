@@ -129,6 +129,10 @@ pub struct Started {
     /// anything can still continue the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<PathBuf>,
+    /// The agentiflow lead round that launched it (`None`: not launched by
+    /// a lead, or a ledger written before rounds were recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 impl Started {
@@ -160,6 +164,7 @@ impl Started {
             continues: None,
             prior_tokens: None,
             tree: None,
+            round: None,
         }
     }
 }

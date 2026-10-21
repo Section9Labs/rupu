@@ -332,7 +332,11 @@ fn pool_workflow_ids(spec: &WorkflowsSpec, catalog: &dyn rupu_tools::CatalogPort
 /// ending, so its `finish` does nothing — units dispatched in one round are
 /// joined in a later one. The flow stops the unjoined ones when it winds
 /// down ([`run_agentiflow`]).
-struct AcrossRounds(Arc<rupu_launch::RunLauncher>);
+struct AcrossRounds {
+    launcher: Arc<rupu_launch::RunLauncher>,
+    /// The lead's current round; each child's `started` line records it.
+    round: Arc<AtomicU32>,
+}
 
 #[async_trait::async_trait]
 impl rupu_tools::Launcher for AcrossRounds {
@@ -341,7 +345,7 @@ impl rupu_tools::Launcher for AcrossRounds {
         req: &rupu_tools::ChildRequest,
         from: &rupu_tools::ToolContext,
     ) -> Result<(), rupu_tools::LaunchError> {
-        self.0.check(req, from).await
+        self.launcher.check(req, from).await
     }
 
     async fn launch(
@@ -349,7 +353,9 @@ impl rupu_tools::Launcher for AcrossRounds {
         req: rupu_tools::ChildRequest,
         from: &rupu_tools::ToolContext,
     ) -> Result<rupu_tools::ChildHandle, rupu_tools::LaunchError> {
-        self.0.launch(req, from).await
+        self.launcher
+            .launch_in_round(req, from, Some(self.round.load(Ordering::Relaxed)))
+            .await
     }
 
     async fn join(
@@ -359,13 +365,13 @@ impl rupu_tools::Launcher for AcrossRounds {
         timeout: std::time::Duration,
         until: rupu_tools::Until,
     ) -> Vec<rupu_tools::ChildStatus> {
-        self.0.join(from, which, timeout, until).await
+        self.launcher.join(from, which, timeout, until).await
     }
 
     async fn finish(&self, _from: &rupu_tools::RunIdentity, _how: rupu_tools::ParentEnd) {}
 
     fn children(&self, from: &rupu_tools::RunIdentity) -> Vec<rupu_tools::ChildStatus> {
-        self.0.children(from)
+        self.launcher.children(from)
     }
 }
 
@@ -900,7 +906,10 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 project: project.clone(),
             });
             let lead_launcher: Arc<dyn rupu_tools::Launcher> =
-                Arc::new(AcrossRounds(Arc::clone(&launcher)));
+                Arc::new(AcrossRounds {
+                    launcher: Arc::clone(&launcher),
+                    round: Arc::clone(&round),
+                });
             let workflow_generator = generation
                 .is_some()
                 .then(|| Arc::clone(&launcher) as Arc<dyn rupu_tools::WorkflowGenerator>);
@@ -1673,7 +1682,7 @@ mod tests {
         struct Buf(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Buf {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
+                self.launcher.lock().unwrap().extend_from_slice(b);
                 Ok(b.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {

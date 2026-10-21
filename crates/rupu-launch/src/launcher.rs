@@ -145,6 +145,7 @@ struct LaunchRecord {
     continues: Option<Box<PriorRun>>,
     prior_tokens: Option<ChildTokens>,
     tree: Option<PathBuf>,
+    round: Option<u32>,
 }
 
 /// `child` as its `started` line records it.
@@ -158,6 +159,7 @@ fn started_of(child: &Child) -> Started {
         continues: child.launch.continues.clone(),
         prior_tokens: child.launch.prior_tokens,
         tree: child.launch.tree.clone(),
+        round: child.launch.round,
         ..Started::new(
             &child.handle,
             child.kind,
@@ -488,6 +490,135 @@ pub struct RunLauncher {
 }
 
 impl RunLauncher {
+    /// [`Launcher::launch`] for a child an agentiflow lead launches in
+    /// `round`: the round is recorded on the child's `started` line.
+    pub async fn launch_in_round(
+        &self,
+        req: ChildRequest,
+        ctx: &ToolContext,
+        round: Option<u32>,
+    ) -> Result<ChildHandle, LaunchError> {
+        let stopping = crate::reaper::stop_token();
+        if stopping.is_cancelled() {
+            return Err(Refused::Stopping.into_launch_error());
+        }
+        let vetted = self.vet(&req, ctx).await?;
+        let from = Caller::of(ctx);
+        let id = &from.identity;
+        let name = vetted.name().to_string();
+        let codename = self.mint_codename(id.codename.as_deref(), &name);
+        // A child sharing its parent's message space is addressed by its
+        // codename below the parent's (spec F1a §3.1); a workflow child of a
+        // flow keeps the address its flow records it under.
+        let address = match req.kind {
+            ChildKind::Workflow => id
+                .launch
+                .flow
+                .is_some()
+                .then(|| self.address(codename.as_deref(), &name)),
+            _ => match &from.bus {
+                Some(bus) => Some(
+                    codename
+                        .as_deref()
+                        .and_then(|c| bus.address_below(c))
+                        .unwrap_or_else(|| self.address(None, &name)),
+                ),
+                None => (req.kind != ChildKind::Subagent && id.launch.flow.is_some())
+                    .then(|| self.address(codename.as_deref(), &name)),
+            },
+        };
+        let (run_id, transcript) = match req.kind {
+            ChildKind::Subagent => {
+                let (sub, transcript) = self
+                    .env
+                    .store
+                    .create_sub_run(&id.run_id, &name)
+                    .map_err(|e| LaunchError::new("run_store", e.to_string()))?;
+                (sub, Some(transcript))
+            }
+            ChildKind::Agent => {
+                let run_id = format!("run_{}", ulid::Ulid::new());
+                let dir = transcripts_dir(self.global(), Some(&from.workspace.path));
+                let transcript = dir.join(format!("{run_id}.jsonl"));
+                (run_id, Some(transcript))
+            }
+            ChildKind::Workflow => (format!("run_{}", ulid::Ulid::new()), None),
+        };
+        // A child sharing the parent's space (a workflow child is its own):
+        // its broadcast cursor starts at the space's current tip before it
+        // exists, so nothing broadcast before its first turn is swallowed as
+        // backlog.
+        if let (Some(bus), Some(address), false) =
+            (&from.bus, &address, req.kind == ChildKind::Workflow)
+        {
+            if let Err(e) = bus.mailbox.register_broadcast_cursor(address) {
+                tracing::warn!(participant = %address, error = %e, "could not register the child's broadcast cursor");
+            }
+        }
+        let handle = ChildHandle {
+            handle: format!("ch_{}", ulid::Ulid::new()),
+            kind: req.kind,
+            name,
+            run_id,
+            codename,
+            address,
+            transcript,
+        };
+        let (mode, link) = from.bounds(req.kind, None);
+        let request = match &vetted {
+            Vetted::Agent { prompt, .. } => Request {
+                mode,
+                link,
+                prompt: Some(prompt.clone()),
+                workflow: None,
+                inputs: BTreeMap::new(),
+            },
+            Vetted::Workflow { target, inputs, .. } => Request {
+                mode,
+                link,
+                prompt: None,
+                workflow: match target {
+                    WorkflowRef::File(f) => Some(f.clone()),
+                    WorkflowRef::Name(_) => None,
+                },
+                inputs: inputs.clone(),
+            },
+        };
+        let launch = LaunchRecord {
+            request: Some(Box::new(request)),
+            tree: from.tree.clone(),
+            round,
+            ..LaunchRecord::default()
+        };
+        let child = self.new_child(handle.clone(), &from, launch);
+        let work = match (req.kind, vetted) {
+            (
+                ChildKind::Subagent,
+                Vetted::Agent {
+                    spec: Some(spec),
+                    prompt,
+                    ..
+                },
+            ) => Work::Subagent {
+                spec,
+                prompt: Box::new(UserTurn::new(prompt)),
+                ceiling: mode,
+                continues: None,
+            },
+            (ChildKind::Subagent, _) => {
+                unreachable!("a sub-agent's spec is loaded when it is vetted")
+            }
+            (_, vetted) => Work::Process(Box::new(ProcessLaunch {
+                run_id: child.run_id.clone(),
+                kind: child.kind,
+                argv: self.process_argv(&vetted, &child, &from),
+                cwd: Some(from.workspace.path.clone()),
+            })),
+        };
+        self.start(Arc::new(child), work, from)?;
+        Ok(handle)
+    }
+
     pub fn new(env: LaunchEnv) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             env,
@@ -1367,6 +1498,7 @@ impl RunLauncher {
             continues: prior.continues.clone(),
             prior_tokens: prior.prior_tokens,
             tree: from.tree.clone(),
+            round: prior.round,
         };
         let mut child = self.new_child(handle_of(prior), from, launch);
         child.st = Mutex::new(Inner {
@@ -1446,6 +1578,7 @@ impl RunLauncher {
                         // the earlier ones.
                         prior_tokens: prior.prior_tokens,
                         tree: from.tree.clone(),
+                        round: prior.round,
                     };
                     let child = self.continued(prior, prior.run_id.clone(), None, launch, from);
                     let work = Work::Process(Box::new(ProcessLaunch {
@@ -1536,6 +1669,7 @@ impl RunLauncher {
                 ),
             ),
             tree: from.tree.clone(),
+            round: prior.round,
         };
         match prior.kind {
             ChildKind::Subagent => {
@@ -1628,6 +1762,7 @@ impl RunLauncher {
             continues: None,
             prior_tokens: prior.prior_tokens,
             tree: from.tree.clone(),
+            round: prior.round,
         };
         let missing = |what: &str| format!("it never started, and its {what} was not recorded");
         match prior.kind {
@@ -1956,124 +2091,7 @@ impl Launcher for RunLauncher {
         req: ChildRequest,
         ctx: &ToolContext,
     ) -> Result<ChildHandle, LaunchError> {
-        let stopping = crate::reaper::stop_token();
-        if stopping.is_cancelled() {
-            return Err(Refused::Stopping.into_launch_error());
-        }
-        let vetted = self.vet(&req, ctx).await?;
-        let from = Caller::of(ctx);
-        let id = &from.identity;
-        let name = vetted.name().to_string();
-        let codename = self.mint_codename(id.codename.as_deref(), &name);
-        // A child sharing its parent's message space is addressed by its
-        // codename below the parent's (spec F1a §3.1); a workflow child of a
-        // flow keeps the address its flow records it under.
-        let address = match req.kind {
-            ChildKind::Workflow => id
-                .launch
-                .flow
-                .is_some()
-                .then(|| self.address(codename.as_deref(), &name)),
-            _ => match &from.bus {
-                Some(bus) => Some(
-                    codename
-                        .as_deref()
-                        .and_then(|c| bus.address_below(c))
-                        .unwrap_or_else(|| self.address(None, &name)),
-                ),
-                None => (req.kind != ChildKind::Subagent && id.launch.flow.is_some())
-                    .then(|| self.address(codename.as_deref(), &name)),
-            },
-        };
-        let (run_id, transcript) = match req.kind {
-            ChildKind::Subagent => {
-                let (sub, transcript) = self
-                    .env
-                    .store
-                    .create_sub_run(&id.run_id, &name)
-                    .map_err(|e| LaunchError::new("run_store", e.to_string()))?;
-                (sub, Some(transcript))
-            }
-            ChildKind::Agent => {
-                let run_id = format!("run_{}", ulid::Ulid::new());
-                let dir = transcripts_dir(self.global(), Some(&from.workspace.path));
-                let transcript = dir.join(format!("{run_id}.jsonl"));
-                (run_id, Some(transcript))
-            }
-            ChildKind::Workflow => (format!("run_{}", ulid::Ulid::new()), None),
-        };
-        // A child sharing the parent's space (a workflow child is its own):
-        // its broadcast cursor starts at the space's current tip before it
-        // exists, so nothing broadcast before its first turn is swallowed as
-        // backlog.
-        if let (Some(bus), Some(address), false) =
-            (&from.bus, &address, req.kind == ChildKind::Workflow)
-        {
-            if let Err(e) = bus.mailbox.register_broadcast_cursor(address) {
-                tracing::warn!(participant = %address, error = %e, "could not register the child's broadcast cursor");
-            }
-        }
-        let handle = ChildHandle {
-            handle: format!("ch_{}", ulid::Ulid::new()),
-            kind: req.kind,
-            name,
-            run_id,
-            codename,
-            address,
-            transcript,
-        };
-        let (mode, link) = from.bounds(req.kind, None);
-        let request = match &vetted {
-            Vetted::Agent { prompt, .. } => Request {
-                mode,
-                link,
-                prompt: Some(prompt.clone()),
-                workflow: None,
-                inputs: BTreeMap::new(),
-            },
-            Vetted::Workflow { target, inputs, .. } => Request {
-                mode,
-                link,
-                prompt: None,
-                workflow: match target {
-                    WorkflowRef::File(f) => Some(f.clone()),
-                    WorkflowRef::Name(_) => None,
-                },
-                inputs: inputs.clone(),
-            },
-        };
-        let launch = LaunchRecord {
-            request: Some(Box::new(request)),
-            tree: from.tree.clone(),
-            ..LaunchRecord::default()
-        };
-        let child = self.new_child(handle.clone(), &from, launch);
-        let work = match (req.kind, vetted) {
-            (
-                ChildKind::Subagent,
-                Vetted::Agent {
-                    spec: Some(spec),
-                    prompt,
-                    ..
-                },
-            ) => Work::Subagent {
-                spec,
-                prompt: Box::new(UserTurn::new(prompt)),
-                ceiling: mode,
-                continues: None,
-            },
-            (ChildKind::Subagent, _) => {
-                unreachable!("a sub-agent's spec is loaded when it is vetted")
-            }
-            (_, vetted) => Work::Process(Box::new(ProcessLaunch {
-                run_id: child.run_id.clone(),
-                kind: child.kind,
-                argv: self.process_argv(&vetted, &child, &from),
-                cwd: Some(from.workspace.path.clone()),
-            })),
-        };
-        self.start(Arc::new(child), work, from)?;
-        Ok(handle)
+        self.launch_in_round(req, ctx, None).await
     }
 
     async fn join(
