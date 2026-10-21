@@ -328,3 +328,68 @@ export function CountUp({ value, format }: { value: number; format: (v: number) 
   }, [value]);
   return <>{format(shown)}</>;
 }
+
+/** A live sparkline: a thin line with a fading area over the last few
+ *  samples, its latest point breathing. Each new sample slides the trace one
+ *  step left (WAAPI, ~600ms), so it reads as a stream, not a redraw.
+ *  Reduced motion: it redraws in place. */
+export function Sparkline({
+  values,
+  color,
+  width = 72,
+  height = 26,
+  panel,
+}: {
+  values: number[];
+  color: string;
+  width?: number;
+  height?: number;
+  /** The background the end dot is ringed against. */
+  panel: string;
+}) {
+  const gRef = useRef<SVGGElement>(null);
+  const uid = useRef(`spark-${Math.random().toString(36).slice(2, 8)}`).current;
+  const n = values.length;
+  const step = n > 1 ? (width - 6) / (n - 1) : 0;
+  const max = Math.max(1, ...values);
+  const ys = values.map((v) => height - 3 - (v / max) * (height - 7));
+  const xs = values.map((_, i) => i * step);
+  const line = xs.map((x, i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${ys[i].toFixed(1)}`).join('');
+  const signature = values.join(',');
+  const first = useRef(true);
+
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    const g = gRef.current;
+    if (!g || prefersReducedMotion() || typeof g.animate !== 'function') return;
+    g.animate([{ transform: `translateX(${step}px)` }, { transform: 'translateX(0)' }], {
+      duration: 600,
+      easing: 'cubic-bezier(0.77, 0, 0.175, 1)',
+    });
+  }, [signature, step]);
+
+  if (n < 2) return null;
+  const lastX = xs[n - 1];
+  const lastY = ys[n - 1];
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} className="block overflow-visible" aria-hidden>
+      <defs>
+        <FadeGradient id={`${uid}-g`} color={color} top={0.35} bottom={0} />
+        <clipPath id={`${uid}-c`}>
+          <rect x={0} y={-4} width={width} height={height + 8} />
+        </clipPath>
+      </defs>
+      <g clipPath={`url(#${uid}-c)`}>
+        <g ref={gRef}>
+          <path d={`${line}L${lastX},${height}L0,${height}Z`} fill={`url(#${uid}-g)`} />
+          <path d={line} fill="none" strokeWidth={1.5} strokeLinejoin="round" strokeLinecap="round" style={{ stroke: color }} />
+        </g>
+      </g>
+      <circle className="cp-chart-ring" cx={lastX} cy={lastY} r={3} fill="none" strokeWidth={1.25} style={{ stroke: color, opacity: 1 }} />
+      <circle cx={lastX} cy={lastY} r={2.4} strokeWidth={1.25} style={{ fill: color, stroke: panel }} />
+    </svg>
+  );
+}

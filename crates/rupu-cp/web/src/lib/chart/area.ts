@@ -88,34 +88,6 @@ export function seriesMax(series: number[][]): number {
   return m;
 }
 
-/** Column centres: `n` equal slots across the plot, each bar centred in its
- *  slot so the first and last bars sit fully inside the plot (unlike line/area
- *  points, which sit on the plot edges). */
-export function bandCenters(n: number, p: Plot): number[] {
-  if (n <= 0) return [];
-  const slot = (p.x1 - p.x0) / n;
-  return Array.from({ length: n }, (_, i) => p.x0 + slot * (i + 0.5));
-}
-
-/** A column's width: a fraction of its slot (never below 2px). */
-export function bandWidth(n: number, p: Plot, frac = 0.62): number {
-  if (n <= 0) return 0;
-  return Math.max(2, ((p.x1 - p.x0) / n) * frac);
-}
-
-/** A rounded-top, square-bottom rect as an SVG path (`d`) — the column cap
- *  (app-screens §Charts: "4px top radius with a square bottom on the
- *  baseline"). Radius is clamped to half the width and the height. */
-export function roundedTopRect(x: number, y: number, w: number, h: number, r: number): string {
-  const rr = Math.max(0, Math.min(r, w / 2, h));
-  return (
-    `M ${round(x)} ${round(y + h)} L ${round(x)} ${round(y + rr)} ` +
-    `Q ${round(x)} ${round(y)} ${round(x + rr)} ${round(y)} ` +
-    `L ${round(x + w - rr)} ${round(y)} Q ${round(x + w)} ${round(y)} ${round(x + w)} ${round(y + rr)} ` +
-    `L ${round(x + w)} ${round(y + h)} Z`
-  );
-}
-
 /** Totals per index (top of the stack) — for the peak label and the y scale. */
 export function totals(series: number[][]): number[] {
   const n = series[0]?.length ?? 0;
@@ -135,42 +107,6 @@ export function peakIndex(totalsArr: number[]): number {
     }
   }
   return best;
-}
-
-/** `"x,y x,y …"` polyline points along a series' values. */
-export function linePoints(vals: number[], xa: number[], max: number, p: Plot): string {
-  return vals.map((v, i) => `${round(xa[i])},${round(yOf(v, max, p))}`).join(' ');
-}
-
-/**
- * A filled stacked band: forward along `topVals`, back along `bottomVals`
- * (or the baseline when omitted), closed. Empty string for no points.
- */
-export function areaPath(
-  topVals: number[],
-  bottomVals: number[] | null,
-  xa: number[],
-  max: number,
-  p: Plot,
-): string {
-  const n = topVals.length;
-  if (n === 0) return '';
-  let d = '';
-  for (let i = 0; i < n; i++) {
-    d += `${i === 0 ? 'M' : 'L'} ${round(xa[i])} ${round(yOf(topVals[i], max, p))} `;
-  }
-  if (bottomVals) {
-    for (let i = n - 1; i >= 0; i--) {
-      d += `L ${round(xa[i])} ${round(yOf(bottomVals[i], max, p))} `;
-    }
-  } else {
-    d += `L ${round(xa[n - 1])} ${round(p.y0)} L ${round(xa[0])} ${round(p.y0)} `;
-  }
-  return `${d}Z`;
-}
-
-function round(v: number): number {
-  return Math.round(v * 100) / 100;
 }
 
 /**

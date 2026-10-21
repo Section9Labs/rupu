@@ -63,7 +63,7 @@ const GAP = 16;
 const DN_H = 72;
 const BOTTOM = 24;
 /** Smallest bucket, in px: thinner than this and the line turns to hair. */
-const BIN_PX = 3;
+const BIN_PX = 5;
 const DEFAULT_W = 720;
 
 type SeriesKey = 'in' | 'cache' | 'out';
@@ -512,7 +512,7 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
                       strokeWidth={1.25}
                       strokeDasharray="1 3"
                       strokeLinecap="round"
-                      style={{ stroke: colors.alpha('chart.1', 0.75) }}
+                      style={{ stroke: colors.alpha('chart.1', 0.55) }}
                     />
                   )}
                   <path

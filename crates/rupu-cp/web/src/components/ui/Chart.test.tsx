@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render, screen } from '@testing-library/react';
-import { Chart, placeRefLabels, plotFor, spacedTicks, tooltipModel, type ChartSeries } from './Chart';
+import { Chart, liveSegments, placeRefLabels, plotFor, spacedTicks, tooltipModel, type ChartSeries } from './Chart';
 import { ThemeProvider } from '../theme/ThemeProvider';
 
 afterEach(cleanup);
@@ -16,12 +16,16 @@ const series: ChartSeries[] = [
 const wrap = (ui: React.ReactNode) => render(<ThemeProvider>{ui}</ThemeProvider>);
 
 describe('Chart', () => {
-  it('renders a stacked area + line per series', () => {
+  it('renders a fading stacked band and a line per series, traced by the sweep', () => {
     const { container } = wrap(<Chart dates={dates} series={series} title="Outcomes over time" />);
-    // one polyline per series (the stacked line tops)
-    expect(container.querySelectorAll('polyline').length).toBe(2);
-    // one filled area path per series, inside the reveal-clipped group
-    expect(container.querySelectorAll('[clip-path] path').length).toBe(2);
+    const swept = container.querySelector('[clip-path]') as SVGGElement;
+    // one gradient-filled band per series
+    expect(swept.querySelectorAll('path[fill^="url("]').length).toBe(2);
+    // one gradient per series in the defs
+    expect(container.querySelectorAll('linearGradient').length).toBeGreaterThanOrEqual(2);
+    // the sweep clip and the rise group carry the draw-in classes
+    expect(container.querySelector('.cp-chart-sweep')).not.toBeNull();
+    expect(swept.querySelector('.cp-chart-rise')).not.toBeNull();
   });
 
   it('labels the title, legend and peak total', () => {
@@ -41,9 +45,14 @@ describe('Chart', () => {
     expect(screen.getByText('214 runs')).toBeInTheDocument();
   });
 
-  it('draws the now-pulse ring (reduced-motion hides it via CSS, not the DOM)', () => {
+  it('breathes a ring on the latest point only while live', () => {
     const { container } = wrap(<Chart dates={dates} series={series} />);
-    expect(container.querySelector('.cp-chart-now')).not.toBeNull();
+    expect(container.querySelector('.cp-chart-ring')).not.toBeNull();
+    cleanup();
+    const still = wrap(<Chart dates={dates} series={series} live={false} />);
+    expect(still.container.querySelector('.cp-chart-ring')).toBeNull();
+    // the end dot stays either way
+    expect(still.container.querySelector('.cp-chart-pop')).not.toBeNull();
   });
 
   it('shows y-tick labels and an exposed role=img plot', () => {
@@ -56,7 +65,7 @@ describe('Chart', () => {
   it('renders an empty (no-data) chart without crashing', () => {
     const { container } = wrap(<Chart dates={[]} series={[]} title="Empty" />);
     expect(screen.getByText('Empty')).toBeInTheDocument();
-    expect(container.querySelectorAll('polyline').length).toBe(0);
+    expect(container.querySelector('[clip-path]')).toBeNull();
   });
 
   it('tooltipModel stacks per-series values and the total for a bucket', () => {
@@ -66,27 +75,16 @@ describe('Chart', () => {
     expect(m.total).toBe(214);
   });
 
-  it('kind="line" draws one overlaid line per series and no area fills', () => {
+  it('kind="line" draws overlaid lines with no bands', () => {
     const { container } = wrap(<Chart dates={dates} series={series} kind="line" />);
-    expect(container.querySelectorAll('polyline').length).toBe(2);
-    // overlaid lines aren't clipped area paths
-    expect(container.querySelectorAll('[clip-path] path').length).toBe(0);
-    // the now-pulse still marks the latest point
-    expect(container.querySelector('.cp-chart-now')).not.toBeNull();
-  });
-
-  it('kind="column" draws stacked columns — no lines, no now-pulse', () => {
-    const { container } = wrap(<Chart dates={dates} series={series} kind="column" />);
-    expect(container.querySelectorAll('polyline').length).toBe(0);
-    // each column's cap is a rounded-top path inside the reveal clip
-    expect(container.querySelectorAll('[clip-path] path').length).toBeGreaterThan(0);
-    // columns don't carry the breathing now-dot (the rightmost bar is "now")
-    expect(container.querySelector('.cp-chart-now')).toBeNull();
+    const swept = container.querySelector('[clip-path]') as SVGGElement;
+    expect(swept.querySelectorAll('path[fill^="url("]').length).toBe(0);
+    // each line is drawn (the hero line also has its glow under it)
+    expect(swept.querySelectorAll('path[fill="none"]').length).toBe(3);
   });
 
   it('yFormat formats the y-tick labels', () => {
     wrap(<Chart dates={dates} series={series} yFormat={(v) => `$${v}`} />);
-    // the baseline 0 tick is always present, now dollar-formatted
     expect(screen.getByText('$0')).toBeInTheDocument();
   });
 
@@ -96,46 +94,24 @@ describe('Chart', () => {
       { key: 'beta', label: 'beta', values: [2, 3, 4, 5], rawColor: 'rgb(40, 50, 60)' },
     ];
     const { container } = wrap(<Chart dates={dates} series={dyn} />);
-    const swatches = Array.from(container.querySelectorAll('.cp-chart-legend-swatch, [aria-hidden]')).filter(
-      (el) => (el as HTMLElement).style.background,
-    );
-    const backgrounds = swatches.map((el) => (el as HTMLElement).style.background);
+    const backgrounds = Array.from(container.querySelectorAll('[aria-hidden]'))
+      .map((el) => (el as HTMLElement).style?.background)
+      .filter(Boolean);
     expect(backgrounds).toContain('rgb(10, 20, 30)');
     expect(backgrounds).toContain('rgb(40, 50, 60)');
-    // still a stacked area (one filled path per series inside the reveal clip)
-    expect(container.querySelectorAll('[clip-path] path').length).toBe(2);
   });
 
   it('showLegend={false} / showCard={false} drop the chrome but keep the plot', () => {
     const { container } = wrap(
       <Chart dates={dates} series={series} showLegend={false} showCard={false} ariaLabel="bare" />,
     );
-    // no legend swatches in the header area; the plot is still there
     expect(screen.getByRole('img', { name: 'bare' })).toBeInTheDocument();
     expect(container.querySelector('.rounded-xl.border')).toBeNull();
-  });
-
-  it('kind="composed" overlays an area + two lines on two axes, unstacked (no Total, no peak)', () => {
-    const composed: ChartSeries[] = [
-      { key: 'in', label: 'In', values: [800, 600, 400, 900], color: 'status.running', mark: 'area', axis: 'left' },
-      { key: 'out', label: 'Out', values: [120, 90, 200, 110], color: 'status.done', mark: 'line', axis: 'right' },
-      { key: 'cached', label: 'Cached', values: [40, 50, 30, 20], color: 'status.awaiting', mark: 'line', axis: 'right' },
-    ];
-    const { container } = wrap(
-      <Chart dates={dates} series={composed} kind="composed" yFormat={(v) => `${v}`} yFormatRight={(v) => `${v}`} />,
-    );
-    // in → area (1 clipped path) + its top line; out/cached → 2 lines ⇒ 3 polylines
-    expect(container.querySelectorAll('[clip-path] path').length).toBe(1);
-    expect(container.querySelectorAll('polyline').length).toBe(3);
-    // overlaid, not stacked: the now-pulse still marks the latest point
-    expect(container.querySelector('.cp-chart-now')).not.toBeNull();
+    expect(screen.queryByText('Completed')).toBeNull();
   });
 
   it('refLines draw a dashed vertical with its label', () => {
-    const composed: ChartSeries[] = [
-      { key: 'in', label: 'In', values: [800, 600, 400, 900], color: 'status.running', mark: 'area', axis: 'left' },
-    ];
-    wrap(<Chart dates={dates} series={composed} kind="composed" refLines={[{ index: 2, label: 'step-b' }]} />);
+    wrap(<Chart dates={dates} series={series} refLines={[{ index: 2, label: 'step-b' }]} />);
     expect(screen.getByText('step-b')).toBeInTheDocument();
   });
 
@@ -147,8 +123,19 @@ describe('Chart', () => {
   });
 });
 
+describe('liveSegments', () => {
+  it('keeps a band\'s line only where it (or a neighbour) has a value', () => {
+    expect(liveSegments([0, 0, 3, 0, 0, 0, 2, 2])).toEqual([
+      [1, 3],
+      [5, 7],
+    ]);
+    expect(liveSegments([0, 0, 0])).toEqual([]);
+    expect(liveSegments([1, 1])).toEqual([[0, 1]]);
+  });
+});
+
 describe('chart layout at true pixel size', () => {
-  const plot = plotFor(1000, 220, false);
+  const plot = plotFor(1000, 220);
   const xs = (n: number) => Array.from({ length: n }, (_, i) => plot.x0 + ((plot.x1 - plot.x0) * i) / (n - 1));
 
   it('draws the svg 1:1 with its box, so labels keep their designed size', () => {

@@ -136,7 +136,9 @@ export function useMorphedSeries(target: number[][]): number[][] {
     // on every render, so identity would morph forever.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signature]);
-  return shown;
+  // A new shape is drawn as is on the render it arrives, never through a
+  // frame of the old one (callers index the result by the new shape).
+  return lerpSeries(shown, target, 1) !== null ? shown : target;
 }
 
 /** Where the stylus sits at time fraction `t` of the sweep: x on the plot and

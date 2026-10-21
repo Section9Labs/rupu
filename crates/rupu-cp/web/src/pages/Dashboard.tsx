@@ -70,16 +70,17 @@ function num(v: number | null | undefined): string {
 
 function outcomeSeries(buckets: TerminalBucket[]): ChartSeries[] {
   return [
-    { key: 'completed', label: 'Completed', values: buckets.map((b) => b.completed), color: 'status.completed', fillOpacity: 0.18 },
-    { key: 'failed', label: 'Failed', values: buckets.map((b) => b.failed), color: 'status.failed', fillOpacity: 0.28 },
+    { key: 'completed', label: 'Completed', values: buckets.map((b) => b.completed), color: 'status.completed', fillOpacity: 0.28 },
+    { key: 'failed', label: 'Failed', values: buckets.map((b) => b.failed), color: 'status.failed', fillOpacity: 0.42 },
   ];
 }
 
 function throughputSeries(buckets: ThroughputBucket[]): ChartSeries[] {
   return [
-    { key: 'manual', label: 'Manual', values: buckets.map((b) => b.manual), color: 'info', fillOpacity: 0.16 },
-    { key: 'cron', label: 'Cron', values: buckets.map((b) => b.cron), color: 'status.awaiting', fillOpacity: 0.16 },
-    { key: 'event', label: 'Event', values: buckets.map((b) => b.event), color: 'brand.500', fillOpacity: 0.18 },
+    // categorical: the chart palette in its fixed order
+    { key: 'manual', label: 'Manual', values: buckets.map((b) => b.manual), color: 'chart.1' },
+    { key: 'cron', label: 'Cron', values: buckets.map((b) => b.cron), color: 'chart.4' },
+    { key: 'event', label: 'Event', values: buckets.map((b) => b.event), color: 'chart.3' },
   ];
 }
 
@@ -223,11 +224,10 @@ export default function Dashboard() {
               subtitle="Runs per day · completed vs failed"
               dates={dayLabels(data.terminal_buckets)}
               series={outcomeSeries(data.terminal_buckets)}
-              headline={{ value: kpis[1].value, label: `ok · ${data.cycles.total.toLocaleString()} cycles` }}
+              headline={{ value: kpis[2].value, label: `succeeded · ${data.cycles.total.toLocaleString()} cycles` }}
               peakSubLabel={(i) => `${data.terminal_buckets[i]?.failed ?? 0} failed`}
             />
             <Chart
-              kind="column"
               title="Throughput by trigger"
               subtitle="Runs per day · by what started them"
               dates={dayLabels(data.throughput_buckets)}

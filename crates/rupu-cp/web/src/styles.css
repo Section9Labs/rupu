@@ -334,8 +334,7 @@
 .sr-sev-medium   { color: rgb(var(--c-sev-medium));   background: rgb(var(--c-sev-medium-bg)); }
 .sr-sev-low      { color: rgb(var(--c-sev-low));      background: rgb(var(--c-sev-low-bg)); }
 .sr-sev-info     { color: rgb(var(--c-sev-info));     background: rgb(var(--c-sev-info-bg)); }
-.sr-spark { display: flex; align-items: flex-end; gap: 2px; height: 26px; }
-.sr-spark i { width: 3px; background: rgb(var(--c-brand-500) / .55); border-radius: 1px; display: block; transition: height .5s ease; }
+.sr-spark { display: flex; align-items: flex-end; height: 26px; --chart-sweep: 0ms; }
 
 /* ── the editorial event card ── */
 .sr-ev {
@@ -416,7 +415,7 @@
 .sr-pfoot .fp span { padding: 0 5px; border-radius: 4px; font-weight: 600; }
 
 @media (prefers-reduced-motion: reduce) {
-  .sr-ev.is-fresh, .sr-beacon, .sr-kpi.flash .sr-kpi-val, .sr-spark i { animation: none !important; transition: none !important; }
+  .sr-ev.is-fresh, .sr-beacon, .sr-kpi.flash .sr-kpi-val { animation: none !important; transition: none !important; }
 }
 
 /* ================================================================== */
@@ -1520,6 +1519,27 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
   transform: scale(0.97);
 }
 
+/* Heatmap cells (netflow timeline): they sweep in left to right, column by
+   column, and a hot cell lifts under the pointer. */
+.cp-heat-cell {
+  transform-origin: bottom;
+  animation: cp-heat-in 420ms var(--ease-out) both;
+  animation-delay: calc(min(var(--i, 0), 120) * 6ms);
+  transition:
+    transform 140ms var(--ease-out),
+    box-shadow 140ms ease;
+}
+@keyframes cp-heat-in {
+  from { opacity: 0; transform: scaleY(0.5); }
+  to { opacity: 1; transform: none; }
+}
+@media (hover: hover) and (pointer: fine) {
+  .cp-heat-hot:hover {
+    transform: scaleY(1.2);
+    box-shadow: 0 0 0 1px rgb(var(--c-ink) / 0.55);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   /* No sweep, rise, blur or glide: the finished chart fades in whole. */
   .cp-chart-sweep,
@@ -1559,6 +1579,10 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
   }
   .cp-chart-tip-card {
     transform: none !important;
+  }
+  .cp-heat-cell {
+    animation: cp-chart-fade-in 200ms ease both !important;
+    transition: none !important;
   }
   .cp-chart-appear,
   .cp-chart-brush,

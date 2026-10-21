@@ -1,14 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  areaPath,
-  bandCenters,
-  bandWidth,
   cumulativeTops,
-  linePoints,
   niceScale,
   peakIndex,
-  roundedTopRect,
   seriesMax,
+  tightScale,
   totals,
   xsFor,
   yOf,
@@ -17,25 +13,10 @@ import {
 
 const P: Plot = { x0: 0, x1: 100, y0: 100, yTop: 0 };
 
-describe('unstacked + column geometry', () => {
+describe('unstacked geometry', () => {
   it('seriesMax is the largest single value across series (never summed)', () => {
     expect(seriesMax([[1, 5, 2], [3, 2, 4]])).toBe(5);
     expect(seriesMax([])).toBe(0);
-  });
-  it('bandCenters centres n bars in n equal slots, inside the plot edges', () => {
-    // slot = 100/2 = 50 → centres at 25, 75 (not on the 0/100 edges)
-    expect(bandCenters(2, P)).toEqual([25, 75]);
-    expect(bandCenters(0, P)).toEqual([]);
-  });
-  it('bandWidth is a fraction of the slot, never below 2px', () => {
-    expect(bandWidth(2, P, 0.62)).toBeCloseTo(31);
-    expect(bandWidth(200, P)).toBe(2); // clamped
-  });
-  it('roundedTopRect is a rounded-top, square-bottom path', () => {
-    const d = roundedTopRect(0, 0, 10, 20, 3);
-    expect(d.startsWith('M')).toBe(true);
-    expect(d.trim().endsWith('Z')).toBe(true);
-    expect(d).toContain('Q'); // the two top corners
   });
 });
 
@@ -99,24 +80,19 @@ describe('cumulativeTops / totals / peakIndex', () => {
   });
 });
 
-describe('paths', () => {
-  it('linePoints lists x,y pairs', () => {
-    expect(linePoints([0, 200], [0, 100], 200, P)).toBe('0,100 100,0');
+describe('tightScale', () => {
+  it('picks the round top closest above the data', () => {
+    // a 402k peak gets a 500k top in 100k steps, not 600k
+    expect(tightScale(414_000, 3, 5)).toMatchObject({ max: 500_000, step: 100_000 });
+    expect(tightScale(414_000, 3, 5).ticks).toEqual([0, 100_000, 200_000, 300_000, 400_000, 500_000]);
   });
-  it('areaPath to the baseline opens with M and closes with Z', () => {
-    const d = areaPath([200, 200], null, [0, 100], 200, P);
-    expect(d.startsWith('M')).toBe(true);
-    expect(d.trim().endsWith('Z')).toBe(true);
-    // returns to baseline (y0 = 100)
-    expect(d).toContain('100');
+  it('keeps the interval count within bounds', () => {
+    const s = tightScale(19, 2, 3);
+    expect(s.ticks.length - 1).toBeGreaterThanOrEqual(2);
+    expect(s.ticks.length - 1).toBeLessThanOrEqual(3);
+    expect(s.max).toBeGreaterThanOrEqual(19);
   });
-  it('areaPath with a bottom band walks back along it', () => {
-    const d = areaPath([200, 200], [100, 100], [0, 100], 200, P);
-    // top at y=0, bottom at y=50 (value 100 of max 200)
-    expect(d).toContain('0 0');
-    expect(d).toContain('50');
-  });
-  it('empty input yields empty path', () => {
-    expect(areaPath([], null, [], 10, P)).toBe('');
+  it('falls back for a zero/empty max', () => {
+    expect(tightScale(0)).toEqual({ max: 1, step: 1, ticks: [0, 1] });
   });
 });

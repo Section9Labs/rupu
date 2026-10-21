@@ -9,6 +9,8 @@ import { Radio } from 'lucide-react';
 import { cn } from '../../lib/cn';
 import { ConnectionBadge, type ConnectionState } from '../RunEventFeed';
 import type { Vitals } from '../../lib/situationRoom/roster';
+import { useThemeColors } from '../../lib/useThemeColors';
+import { Sparkline } from '../charts/parts';
 
 /** Adds a transient `flash` class whenever `value` increases. */
 function useFlash(value: number): boolean {
@@ -62,7 +64,7 @@ export default function PulseStrip({
   spark: number[];
 }) {
   const f = vitals.findings;
-  const max = Math.max(1, ...spark);
+  const colors = useThemeColors();
   return (
     <header className="flex items-stretch border-b border-border bg-panel/70 shrink-0">
       <div className="sr-brandcell flex items-center gap-2.5 px-5 border-r border-border">
@@ -98,10 +100,8 @@ export default function PulseStrip({
         <Kpi label="Events / min" minWidth={150}>
           <div className="flex items-end gap-2">
             <div className="sr-kpi-val text-[18px]">{vitals.eventsPerMin}</div>
-            <div className="sr-spark" aria-hidden>
-              {spark.map((v, i) => (
-                <i key={i} style={{ height: `${Math.max(4, Math.round((v / max) * 24))}px` }} />
-              ))}
+            <div className="sr-spark cp-in" aria-hidden>
+              <Sparkline values={spark} color={colors.get('chart.1')} panel={colors.panel} />
             </div>
           </div>
         </Kpi>
