@@ -105,8 +105,9 @@ export const DETAIL: AgentiflowDetail = {
     stop_reason: null,
     // Stamped when the flow stops; 0 while it runs.
     rounds: 0,
-    goals_met: 1,
-    goals_total: 2,
+    // Goals are stamped when the flow completes; empty while it runs.
+    goals_met: 0,
+    goals_total: 0,
     spent_usd: 41.37,
     spent_tokens: 6_060_000,
     started_at: at(0),
@@ -115,10 +116,7 @@ export const DETAIL: AgentiflowDetail = {
     runner_alive: true,
     trigger: 'manual',
     runner_pid: 48211,
-    goals: [
-      { id: 'verified', met: true, current: 2, target: 2 },
-      { id: 'report', met: false, current: 0, target: 1 },
-    ],
+    goals: [],
   },
   def: {
     name: 'acme-shop-auth',

@@ -8,6 +8,7 @@ import {
   type FlowInput,
   type FlowModel,
 } from './flowModel';
+import { timeBounds } from '../timeline/timeline';
 import { CHILDREN, DETAIL, FLOW_ID, GANNET_GRAPH, RUN, at, fixtureInput, ms } from './fixtures';
 
 /** Every round of the fixture expanded, so its whole tree is in `nodes`. */
@@ -61,12 +62,14 @@ describe('flow model', () => {
     expect(frame.graph).toBe(GANNET_GRAPH);
     expect(node(m, RUN.lynx1)?.child?.name).toBe('surface-mapper');
 
-    // Round 0 and 1 are finished and not among the latest two: by default
-    // they collapse, and their children leave the canvas.
+    // Round 0 is finished and not among the latest two finished rounds (1,
+    // 2; the running round 3 is expanded besides): by default it collapses,
+    // and its children leave the canvas.
     const dflt = buildFlowModel(fixtureInput());
-    expect(dflt.rounds.map((r) => r.collapsed)).toEqual([true, true, false, false]);
+    expect(dflt.rounds.map((r) => r.collapsed)).toEqual([true, false, false, false]);
     expect(dflt.nodes.map((n) => n.id)).toEqual([
-      'lead', 'round:0', 'round:1', 'round:2', RUN.kite1, RUN.kite2, RUN.kite3, RUN.wren3, 'round:3', RUN.owl1,
+      'lead', 'round:0', 'round:1', RUN.gannet1, 'round:2', RUN.kite1, RUN.kite2, RUN.kite3, RUN.wren3,
+      'round:3', RUN.owl1,
     ]);
     // A collapsed round still names its children (for its summary card).
     expect(dflt.rounds[0].childIds).toHaveLength(5);
@@ -82,19 +85,50 @@ describe('flow model', () => {
       null,
     ]);
     expect(m.rounds.map((r) => r.spentUsd)).toEqual([8.4, 29.75, 39.05, null]);
+    const none = [{ id: 'verified', met: false, current: 0 }, { id: 'report', met: false, current: 0 }];
     expect(m.rounds.map((r) => r.goalsAfter)).toEqual([
       // Round 1's event: the assessment it started from.
-      [{ id: 'verified', met: false, current: 0 }, { id: 'report', met: false, current: 0 }],
+      none,
       // Round 2's event.
-      [{ id: 'verified', met: false, current: 0 }, { id: 'report', met: false, current: 0 }],
-      // The last finished round: the record's latest evaluation.
-      [{ id: 'verified', met: true, current: 2 }, { id: 'report', met: false, current: 0 }],
+      none,
+      // The last finished round of a running flow: no event after it, and
+      // the record holds no goals until the flow completes.
+      null,
       // Still running.
       null,
     ]);
 
-    // An old run: rounds carry no decision, goals or start; the last round
-    // still gets the record's goals, the others nothing.
+    // A completed flow: its last finished round reads the record's goals; a
+    // failed one's record has none, so that round's are unknown.
+    const goals = [
+      { id: 'verified', met: true, current: 2, target: 2 },
+      { id: 'report', met: true, current: 1, target: 1 },
+    ];
+    const ended = (status: 'completed' | 'failed') => {
+      const input = fixtureInput();
+      input.detail = {
+        ...DETAIL,
+        record: {
+          ...DETAIL.record,
+          status,
+          ended_at: at(130),
+          goals: status === 'completed' ? goals : [],
+          goals_met: status === 'completed' ? 2 : 0,
+          goals_total: status === 'completed' ? 2 : 0,
+        },
+      };
+      return buildFlowModel(input).rounds.map((r) => r.goalsAfter);
+    };
+    // Round 3 (owl#1's) ended without its event.
+    expect(ended('completed')).toEqual([
+      none,
+      none,
+      [{ id: 'verified', met: true, current: 2 }, { id: 'report', met: true, current: 1 }],
+      null,
+    ]);
+    expect(ended('failed')).toEqual([none, none, null, null]);
+
+    // An old run: rounds carry no decision, goals or start.
     const old = fixtureInput();
     old.detail = {
       ...DETAIL,
@@ -108,7 +142,7 @@ describe('flow model', () => {
     expect(om.rounds.map((r) => [r.decision, r.startedAt, r.goalsAfter === null])).toEqual([
       [null, null, true],
       [null, null, true],
-      [null, null, false],
+      [null, null, true],
       [null, null, true],
     ]);
     // Its bands still span the rounds: from the previous end (round 0 from
@@ -184,6 +218,26 @@ describe('flow model', () => {
       [3, null, ms(120), false],
     ]);
     expect(node(tm, RUN.owl1)).toMatchObject({ parentId: 'round:3', round: 3, inferred: true });
+
+    // No round at all (an unreadable event log, children without a start):
+    // one synthetic round 0 holds everything, inferred.
+    const bare = fixtureInput();
+    bare.detail = { ...DETAIL, events: [], record: { ...DETAIL.record, status: 'failed', ended_at: at(130) } };
+    bare.children = CHILDREN.map((c) => ({ ...strip(c), started_at: null }));
+    const bm = buildFlowModel(bare);
+    expect(bm.rounds).toHaveLength(1);
+    expect(bm.rounds[0]).toMatchObject({
+      round: 0, startedAt: null, endedAt: ms(110), decision: null, goalsAfter: null, collapsed: false, hidden: 0,
+    });
+    expect(bm.rounds[0].childIds).toHaveLength(CHILDREN.length);
+    const placed = bm.nodes.filter((n) => n.child);
+    expect(placed.every((n) => n.round === 0 && n.inferred)).toBe(true);
+    // With start times, the round spans them.
+    bare.children = CHILDREN.map(strip);
+    bare.detail = { ...bare.detail, record: { ...bare.detail.record, ended_at: null } };
+    const bs = buildFlowModel(bare);
+    expect(bs.rounds.map((r) => [r.round, r.startedAt, r.endedAt])).toEqual([[0, ms(2), ms(110)]]);
+    expect(bs.timeline.bands).toEqual([{ key: 'round:0', label: 'Round 0', from: ms(2), to: ms(110), row: 'round' }]);
   });
 
   it('unmapped_addresses_still_produce_an_edge', () => {
@@ -254,6 +308,40 @@ describe('flow model', () => {
       [RUN.gannet1, { ...GANNET_GRAPH, nodeById: (id: string) => (id === 'review' ? undefined : GANNET_GRAPH.nodeById(id)) }],
     ]);
     expect(msg(buildFlowModel(noStep), 'msg_012')?.to).toEqual([RUN.gannet1]);
+    // Until the frame's graph is loaded, its steps are the frame.
+    const unloaded = fixtureInput();
+    unloaded.childGraphs = new Map();
+    expect(msg(buildFlowModel(unloaded), 'msg_009')).toMatchObject({ from: RUN.gannet1, to: [RUN.gannet1] });
+
+    // A step agent's sub-agent resolves through its parent hop to the step.
+    const subs = fixtureInput();
+    const [flowSpace, gannet] = subs.spaces;
+    const sub = (id: string, from: string, to: string): SpaceMessage => ({
+      id, ts: at(50), kind: 'direct', from, to, body: id, delivery: { resolved: [to] }, seen: [],
+    });
+    subs.spaces = [
+      flowSpace,
+      {
+        ...gannet,
+        participants: [
+          ...gannet.participants,
+          { address: 'probe#5>wren#1', agent: 'route-crawler', run_id: 'sub_01M5GWREN1', kind: 'subagent', live: false },
+          { address: 'nest#1', agent: 'helper', run_id: 'run_01M5GNEST1', kind: 'workflow_step', live: false },
+        ],
+        messages: [
+          ...gannet.messages,
+          sub('msg_950', 'probe#5>wren#1', 'review#3'),
+          sub('msg_951', 'probe#7>wren#2', 'probe#7'),
+          sub('msg_952', 'nest#1>wren#4', 'ghost#1>wren#9'),
+        ],
+      },
+    ];
+    const sm = buildFlowModel(subs);
+    expect(msg(sm, 'msg_950')).toMatchObject({ from: `${RUN.gannet1}/probe`, to: [`${RUN.gannet1}/review`] });
+    // Not listed itself: still its parent hop's step.
+    expect(msg(sm, 'msg_951')?.from).toBe(`${RUN.gannet1}/probe`);
+    // A parent hop with no step is the frame; no listed hop is off canvas.
+    expect(msg(sm, 'msg_952')).toMatchObject({ from: RUN.gannet1, to: ['offcanvas'] });
   });
 
   it('density_rules_apply_at_scale', () => {
@@ -262,8 +350,9 @@ describe('flow model', () => {
     const m = buildFlowModel(input);
 
     expect(m.rounds).toHaveLength(200);
-    // The latest two rounds, plus round 120, which still has a running child.
-    expect(m.rounds.filter((r) => !r.collapsed).map((r) => r.round)).toEqual([120, 198, 199]);
+    // The latest two finished rounds, the running round 199, and round 120,
+    // which still has a running child.
+    expect(m.rounds.filter((r) => !r.collapsed).map((r) => r.round)).toEqual([120, 197, 198, 199]);
 
     const busy = m.rounds[120];
     expect(busy.childIds).toHaveLength(23);
@@ -296,6 +385,36 @@ describe('flow model', () => {
     const few = bigFlow(ARC_REST_LIMIT);
     expect(buildFlowModel(few).messages.every((x) => x.atRest)).toBe(true);
     expect(buildFlowModel(bigFlow(ARC_REST_LIMIT + 1)).messages.filter((x) => x.atRest)).toHaveLength(1);
+
+    // The limit counts per space: a frame's few arcs stay at rest beside a
+    // busy flow.
+    const mixed = bigFlow(ARC_REST_LIMIT + 1);
+    mixed.spaces.push({
+      id: 'run_frame',
+      participants: [],
+      messages: Array.from({ length: 5 }, (_, i) => ({
+        id: `msg_f${i}`, ts: at(i), kind: 'direct' as const, from: 'a#1', to: 'b#1', body: '',
+        delivery: { resolved: ['b#1'] }, seen: [],
+      })),
+    });
+    const mm = buildFlowModel(mixed);
+    expect(mm.messages.filter((x) => x.space === 'run_frame').every((x) => x.atRest)).toBe(true);
+    expect(mm.messages.filter((x) => x.space === 'flow' && x.atRest)).toHaveLength(1);
+
+    // A failed sub-agent below a child past the limit keeps that child a card.
+    const deep = bigFlow();
+    deep.children.push({
+      ...deep.children.find((c) => c.run_id === 'run_u120_20')!,
+      handle: 'wren#1', kind: 'subagent', run_id: 'sub_u120_20', parent_run_id: 'run_u120_20', depth: 2,
+      status: 'failed',
+    });
+    const dm = buildFlowModel(deep);
+    expect(dm.rounds[120].hidden).toBe(12);
+    expect(dm.nodes.filter((n) => n.round === 120 && n.kind === 'child').map((n) => n.id)).toEqual([
+      ...[0, 1, 2, 3, 4, 5, 6, 7, 9, 15].map((i) => `run_u120_${i}`),
+      'run_u120_20',
+      'sub_u120_20',
+    ]);
   });
 
   it('timeline_items_cover_rounds_children_messages_board', () => {
@@ -339,6 +458,23 @@ describe('flow model', () => {
       [`claim:${RUN.gannet1}:/api/tokens:` + at(34), ms(34), undefined],
     ]);
     expect(m.timeline.items).toHaveLength(4 + 11 + 18 + 6);
+
+    // An unparseable `ts`: listed, ordered at its space's latest time before
+    // it, never on the axis.
+    const bad = fixtureInput();
+    const flowMsgs = [...bad.spaces[0].messages];
+    flowMsgs.splice(6, 0, {
+      id: 'msg_bad', ts: 'not a time', kind: 'direct', from: 'lynx#3', to: 'lead', body: 'clock skew',
+      delivery: { resolved: ['lead'] }, seen: [],
+    });
+    bad.spaces = [{ ...bad.spaces[0], messages: flowMsgs }, bad.spaces[1]];
+    const bm = buildFlowModel(bad);
+    expect(msg(bm, 'msg_bad')).toMatchObject({ at: ms(20), atKnown: false });
+    expect(msg(bm, 'msg_006')?.atKnown).toBe(true);
+    const order = bm.messages.map((x) => x.id);
+    expect(order.indexOf('msg_bad')).toBe(order.indexOf('msg_006') + 1);
+    expect(bm.timeline.items.some((i) => i.key === 'msg_bad')).toBe(false);
+    expect(timeBounds(bm.timeline.items, bm.timeline.bands, null).start).toBe(ms(1));
 
     expect(m.timeline.bands).toEqual([
       { key: 'round:0', label: 'Round 0', from: ms(1), to: ms(23), row: 'round' },

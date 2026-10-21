@@ -20,11 +20,12 @@ import { LEAD, OPERATOR, rowKind, type RowKind } from '../messages';
 import type { RunGraphModel } from '../runGraphModel';
 import type { TimelineBand, TimelineItem } from '../timeline/timeline';
 
-/** The latest rounds kept expanded (the running one always is). */
+/** The latest finished rounds kept expanded; the running one is too. */
 export const KEEP_EXPANDED_ROUNDS = 2;
 /** Cards a round shows before the rest fold into "+N more". */
 export const MAX_CARDS_PER_ROUND = 8;
-/** Above this many messages, only operator arcs are drawn at rest. */
+/** Above this many messages in one space (the flow's, or a frame's), only
+ *  that space's operator arcs are drawn at rest. */
 export const ARC_REST_LIMIT = 40;
 
 /** The flow's own space (and board) id. */
@@ -67,7 +68,8 @@ export interface FlowRound {
   endedAt: number | null;
   decision: string | null;
   /** The assessment that followed the round: the next round's `goals`, the
-   *  record's for the last finished round; `null` when unknown or running. */
+   *  record's for the last round of a completed flow (the record holds goals
+   *  only once the flow completes); `null` when unknown or running. */
   goalsAfter: GoalAfter[] | null;
   /** The run's cumulative spend as the round ended. */
   spentUsd: number | null;
@@ -117,7 +119,11 @@ export interface FlowMessage {
   /** Drawn without hover or selection. */
   atRest: boolean;
   space: string;
+  /** Its `ts`; for an unparseable one, the space's latest time before it
+   *  (else its first), so it keeps its place in the list. */
   at: number;
+  /** False when `at` was borrowed: the message has no timeline item. */
+  atKnown: boolean;
   body: string;
   message: SpaceMessage;
 }
@@ -193,9 +199,19 @@ function roundSpans(detail: AgentiflowDetail, children: RunChild[]): RoundSpan[]
       ? c.round === next
       : !listed.has(c.parent_run_id) && (time(c.started_at) ?? -Infinity) > lastEnd,
   );
-  if (detail.record.status === 'running' || beyond) {
-    const endedAt = detail.record.status === 'running' ? null : time(detail.record.ended_at);
+  const running = detail.record.status === 'running';
+  if (running || (beyond && spans.length > 0)) {
+    const endedAt = running ? null : time(detail.record.ended_at);
     spans.push({ round: next, event: null, startedAt: null, endedAt, from: prevEnd });
+  }
+  // A stopped flow with no round to hang work on (an unreadable event log):
+  // one round 0 spanning its children, everything in it inferred.
+  if (spans.length === 0 && children.length > 0) {
+    const starts = children.map((c) => time(c.started_at)).filter((t): t is number => t !== null);
+    const ends = children.map((c) => time(c.finished_at)).filter((t): t is number => t !== null);
+    const startedAt = starts.length ? Math.min(...starts) : null;
+    const endedAt = ends.length ? Math.max(...ends) : time(detail.record.ended_at);
+    spans.push({ round: 0, event: null, startedAt, endedAt, from: startedAt ?? runStart });
   }
   return spans;
 }
@@ -237,15 +253,29 @@ type Resolve = (address: string) => string;
 function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel | undefined): Resolve {
   const byAddress = new Map(space.participants.map((p) => [p.address, p]));
   const frame = space.id !== FLOW_SPACE;
-  const inner = (step: string) => (graph && !graph.nodeById(step) ? space.id : `${space.id}/${step}`);
+  // The frame itself until its graph is loaded, or when the graph has no
+  // such step.
+  const inner = (step: string) => (graph?.nodeById(step) ? `${space.id}/${step}` : space.id);
+  // A step agent's sub-agent (`probe#5>wren#1`) through its nearest listed
+  // ancestor hop: that hop's step, else the frame.
+  const viaHop = (address: string): string | null => {
+    for (let a = address; a.includes('>'); ) {
+      a = a.slice(0, a.lastIndexOf('>'));
+      const q = byAddress.get(a);
+      if (q) return q.step_id ? inner(q.step_id) : space.id;
+    }
+    return null;
+  };
   return (address) => {
     if (address === OPERATOR) return OPERATOR;
     if (address === LEAD) return LEAD;
     const p = byAddress.get(address);
-    if (p) {
-      if (frame && p.step_id) return inner(p.step_id);
-      if (childIds.has(p.run_id)) return p.run_id;
+    if (frame && p?.step_id) return inner(p.step_id);
+    if (frame) {
+      const hop = viaHop(address);
+      if (hop) return hop;
     }
+    if (p && childIds.has(p.run_id)) return p.run_id;
     if (frame && address.startsWith('step:')) return inner(address.slice('step:'.length));
     return OFFCANVAS;
   };
@@ -253,7 +283,7 @@ function resolver(space: FlowSpace, childIds: Set<string>, graph: RunGraphModel 
 
 const BOARD_KINDS: ReadonlySet<RowKind> = new Set(['post', 'mention', 'directive', 'retract']);
 
-function flowMessage(m: SpaceMessage, space: string, resolve: Resolve): FlowMessage {
+function flowMessage(m: SpaceMessage, space: string, resolve: Resolve, at: number | null): FlowMessage {
   const kind = rowKind(m);
   const undelivered = (m.delivery?.undelivered ?? []).map((u) => ({
     to: resolve(u.to),
@@ -273,10 +303,25 @@ function flowMessage(m: SpaceMessage, space: string, resolve: Resolve): FlowMess
     undelivered,
     atRest: true,
     space,
-    at: time(m.ts) ?? 0,
+    at: at ?? 0,
+    atKnown: time(m.ts) !== null,
     body: m.body,
     message: m,
   };
+}
+
+/** Each message's time, in log order; an unparseable `ts` borrows the latest
+ *  time before it (else the first after it), `null` when the log has none. */
+function borrowedTimes(messages: SpaceMessage[]): (number | null)[] {
+  const out: (number | null)[] = [];
+  let latest: number | null = null;
+  for (const m of messages) {
+    const t = time(m.ts);
+    if (t !== null) latest = latest === null ? t : Math.max(latest, t);
+    out.push(t ?? latest);
+  }
+  const first = out.find((t) => t !== null) ?? null;
+  return out.map((t) => t ?? first);
 }
 
 function boardSpace(view: BoardSource | null, posts: FlowMessage[], resolve: Resolve): FlowBoardSpace {
@@ -333,8 +378,14 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
   const withEvents = spans.filter((s) => s.event);
   const lastEvents = withEvents[withEvents.length - 1];
   const transcripts = new Map(detail.lead_transcripts.map((t) => [t.round, t.path]));
-  const latest = new Set(spans.slice(-KEEP_EXPANDED_ROUNDS).map((s) => s.round));
   const running = detail.record.status === 'running';
+  const isLive = (s: RoundSpan) => running && s.event === null;
+  const latest = new Set(
+    spans
+      .filter((s) => !isLive(s))
+      .slice(-KEEP_EXPANDED_ROUNDS)
+      .map((s) => s.round),
+  );
   const seen = new Set<string>();
 
   const rounds: FlowRound[] = [];
@@ -344,15 +395,22 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     const top = tops.get(s.round) ?? [];
     const tree: FlowNodeRef[] = [];
     for (const c of top) subtree(c, 1, id, tree, seen);
-    const isRunning = running && s.event === null;
     const busy = tree.some((n) => n.child && unfinished(n.child));
     const open = expanded.has(id);
-    const collapsed = !isRunning && !latest.has(s.round) && !open && !busy;
+    const collapsed = !isLive(s) && !latest.has(s.round) && !open && !busy;
 
     let hidden = 0;
     nodes.push({ id, kind: 'round', parentId: LEAD, depth: 0, round: s.round, inferred: false });
     if (!collapsed) {
-      const shown = open ? top : top.filter((c, k) => k < MAX_CARDS_PER_ROUND || alwaysShown(c));
+      // A top-level child stays a card when it, or anything below it,
+      // failed or is running.
+      const keep = new Set<string>();
+      let head = '';
+      for (const n of tree) {
+        if (n.parentId === id) head = n.id;
+        if (n.child && alwaysShown(n.child)) keep.add(head);
+      }
+      const shown = open ? top : top.filter((c, k) => k < MAX_CARDS_PER_ROUND || keep.has(c.run_id));
       const visible = new Set(shown.map((c) => c.run_id));
       hidden = top.length - shown.length;
       // Each shown top-level child brings its whole subtree.
@@ -370,7 +428,9 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     let goalsAfter: GoalAfter[] | null = null;
     if (s.event) {
       if (next) goalsAfter = next.goals ?? null;
-      else if (s === lastEvents) goalsAfter = detail.record.goals.map(({ id: g, met, current }) => ({ id: g, met, current }));
+      else if (s === lastEvents && detail.record.status === 'completed') {
+        goalsAfter = detail.record.goals.map(({ id: g, met, current }) => ({ id: g, met, current }));
+      }
     }
     rounds.push({
       round: s.round,
@@ -399,9 +459,13 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     return r;
   };
   const messages = input.spaces
-    .flatMap((s) => s.messages.map((m) => flowMessage(m, s.id, resolverOf(s.id))))
+    .flatMap((s) => {
+      const times = borrowedTimes(s.messages);
+      const list = s.messages.map((m, i) => flowMessage(m, s.id, resolverOf(s.id), times[i]));
+      if (list.length > ARC_REST_LIMIT) for (const m of list) m.atRest = m.kind === 'operator';
+      return list;
+    })
     .sort((a, b) => a.at - b.at);
-  if (messages.length > ARC_REST_LIMIT) for (const m of messages) m.atRest = m.kind === 'operator';
 
   const postsOf = (spaceId: string) =>
     messages.filter((m) => m.space === spaceId && (m.kind === 'post' || m.kind === 'mention'));
@@ -430,7 +494,7 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
       if (at !== null) items.push({ key: id, at, kind: 'child' });
     }
   }
-  for (const m of messages) items.push({ key: m.id, at: m.at, kind: 'message', sub: m.kind });
+  for (const m of messages) if (m.atKnown) items.push({ key: m.id, at: m.at, kind: 'message', sub: m.kind });
   for (const [spaceId, view] of input.boards) {
     if ('kind' in view) continue;
     for (const c of view.claims) {
