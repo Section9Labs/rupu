@@ -57,10 +57,11 @@ export default function RunUsageTimeline({
     { key: 'out', label: 'Out', values: points.map((p) => p.out), color: 'status.done', mark: 'line', axis: 'right' },
     { key: 'cached', label: 'Cached', values: points.map((p) => p.cached), color: 'status.awaiting', mark: 'line', axis: 'right' },
   ];
-  // First turn of each new label group (skip index 0) — the step boundaries.
+  // First turn of each label group — the step boundaries. Index 0 names the
+  // first segment; the engine skips its dashed line at the plot edge.
   const refLines: ChartRefLine[] = separators
     ? points.reduce<ChartRefLine[]>((acc, p, i) => {
-        if (i > 0 && p.label !== points[i - 1].label) acc.push({ index: i, label: p.label });
+        if (i === 0 ? p.label : p.label !== points[i - 1].label) acc.push({ index: i, label: p.label });
         return acc;
       }, [])
     : [];
@@ -75,6 +76,7 @@ export default function RunUsageTimeline({
       refLines={refLines}
       tooltipLabels={tooltipLabels}
       ariaLabel="Per-turn token usage"
+      height={220}
     />
   );
 }
