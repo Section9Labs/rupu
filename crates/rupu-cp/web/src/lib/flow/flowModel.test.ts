@@ -579,3 +579,18 @@ describe('flow structure and messages', () => {
     expect(JSON.stringify(model)).toBe(JSON.stringify(buildFlowModel(input)));
   });
 });
+
+describe('a failed lead round', () => {
+  it('is_failed_with_its_reason_never_done', () => {
+    const events = DETAIL.events.map((e) =>
+      e.kind === 'round' && e.round === 2
+        ? { ...e, outcome: 'error', error: 'provider overloaded (529); recovery exhausted', decision: undefined }
+        : e,
+    );
+    const model = buildFlowModel({ ...fixtureInput(), detail: { ...DETAIL, events } });
+    const r2 = model.rounds.find((r) => r.round === 2)!;
+    expect(r2).toMatchObject({ failed: true, error: 'provider overloaded (529); recovery exhausted', decision: null });
+    const r1 = model.rounds.find((r) => r.round === 1)!;
+    expect(r1).toMatchObject({ failed: false, error: null, turnBudgetHit: false });
+  });
+});

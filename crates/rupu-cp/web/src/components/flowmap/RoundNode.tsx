@@ -2,7 +2,8 @@
 // with what the lead decided that round, the goals met after it, the run's
 // spend as it ended, how many children it launched and the round's lead
 // transcript. A run that predates the decision record shows the round
-// number, counts and transcript link only.
+// number, counts and transcript link only. A round whose lead call failed is
+// drawn failed, with the reason its event recorded.
 
 import { memo } from 'react';
 import { Link } from 'react-router-dom';
@@ -28,9 +29,16 @@ export interface RoundNodeData extends Record<string, unknown> {
 
 type RoundFlowNode = Node<RoundNodeData, 'round'>;
 
+/** A round's state: the open one runs, one whose lead call failed failed,
+ *  any other ended one is done. */
+export function roundCardState(r: Pick<FlowRound, 'failed'>, live: boolean): StepState {
+  if (live) return 'running';
+  return r.failed ? 'failed' : 'done';
+}
+
 function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
   const { round: r, live, launched, messages, slot } = data;
-  const state: StepState = live ? 'running' : 'done';
+  const state: StepState = roundCardState(r, live);
   const met = r.goalsAfter?.filter((g) => g.met).length;
   return (
     <NodeFrame state={state} kind="step" slot={slot} width={CARD_W} minHeight={CARD_H} testId="flow-round">
@@ -43,10 +51,16 @@ function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
         <StatusCapsule state={state} />
       </div>
       <div className="gx-body">
-        {r.decision && (
-          <div className="afx-decision" title={r.decision}>
-            {r.decision}
+        {r.failed ? (
+          <div className="gx-error afx-result" title={r.error ?? undefined} data-testid="flow-round-error">
+            {r.error ?? 'the lead\'s call failed this round'}
           </div>
+        ) : (
+          r.decision && (
+            <div className="afx-decision" title={r.decision}>
+              {r.decision}
+            </div>
+          )
         )}
         <div className="gx-sub afx-result">
           {r.spentUsd != null && <span>{formatSpendShort(r.spentUsd)} spent · </span>}
@@ -70,6 +84,7 @@ function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
               goals {met}/{r.goalsAfter.length} ·
             </span>
           )}
+          {r.turnBudgetHit && <span title="the round stopped at its turn budget">turn budget ·</span>}
           <span>{launched} launched</span>
         </span>
       </div>

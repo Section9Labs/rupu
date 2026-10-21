@@ -83,6 +83,12 @@ export interface FlowRound {
   goalsAfter: GoalAfter[] | null;
   /** The run's cumulative spend as the round ended. */
   spentUsd: number | null;
+  /** The lead's call failed this round (its event's `outcome: error`). */
+  failed: boolean;
+  /** Why, when it failed (the event's `error`). */
+  error: string | null;
+  /** The round stopped at its turn budget (`outcome: turn_budget_hit`). */
+  turnBudgetHit: boolean;
   transcriptPath: string | null;
   collapsed: boolean;
   /** Every child the round launched, any depth, in tree order. */
@@ -511,6 +517,9 @@ export function buildFlowStructure(
       decision: s.event?.decision ?? null,
       goalsAfter,
       spentUsd: s.event ? s.event.spent_usd : null,
+      failed: s.event?.outcome === 'error',
+      error: s.event?.outcome === 'error' ? (s.event.error ?? null) : null,
+      turnBudgetHit: s.event?.outcome === 'turn_budget_hit',
       transcriptPath: transcripts.get(s.round) ?? null,
       collapsed,
       childIds: tree.map((n) => n.id),

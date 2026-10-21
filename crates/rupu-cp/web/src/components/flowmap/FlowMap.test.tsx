@@ -257,6 +257,20 @@ describe('FlowMap', () => {
     expect(api.getRunGraph).toHaveBeenCalledTimes(1);
   });
 
+  it('a_failed_lead_round_is_drawn_failed_with_its_reason', async () => {
+    const events = FLOW.events.map((e) =>
+      e.kind === 'round' && e.round === 2
+        ? { ...e, outcome: 'error', error: 'provider overloaded (529); recovery exhausted', decision: undefined }
+        : e,
+    );
+    mount({ ...FLOW, events });
+    await waitFor(() => expect(node('round:2')).not.toBeNull());
+    const card = node('round:2')!;
+    expect(within(card).getByTestId('flow-round-error')).toHaveTextContent('provider overloaded (529); recovery exhausted');
+    expect(card.querySelector('.gx-node')).toHaveAttribute('data-state', 'failed');
+    expect(node('round:1')!.querySelector('.gx-node')).toHaveAttribute('data-state', 'done');
+  });
+
   it('generated_frame_opens_its_definition', async () => {
     mount();
     await waitFor(() => expect(node(RUN.gannet1)).not.toBeNull());

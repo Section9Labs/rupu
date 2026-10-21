@@ -86,7 +86,7 @@ import MessageEdge, { type MessageFlowEdge } from './MessageEdge';
 import MessageListPanel from './MessageListPanel';
 import CollapsiblePanel from './CollapsiblePanel';
 import FlowToolbar from './FlowToolbar';
-import RoundNode from './RoundNode';
+import RoundNode, { roundCardState } from './RoundNode';
 import ChildNode, { CHILD_KIND, childState } from './ChildNode';
 import WorkflowFrameNode from './WorkflowFrameNode';
 import { LeadNode, RailNode, SpineNode } from './MapNodes';
@@ -184,10 +184,14 @@ function FrameSpace({
 
 const isUnfinished = (c: RunChild | undefined) => c?.status === 'running' || c?.status === 'pending';
 
-function stateOfRef(n: FlowNodeRef | undefined, liveRound: number | null): StepState {
+function stateOfRef(
+  n: FlowNodeRef | undefined,
+  liveRound: number | null,
+  failedRounds: ReadonlySet<number>,
+): StepState {
   if (!n) return 'pending';
   if (n.child) return childState(n.child);
-  if (n.kind === 'round') return n.round === liveRound ? 'running' : 'done';
+  if (n.kind === 'round') return n.round === liveRound ? 'running' : failedRounds.has(n.round) ? 'failed' : 'done';
   return 'pending';
 }
 
@@ -198,9 +202,10 @@ function runKindOfRef(n: FlowNodeRef | undefined): RunKind {
 }
 
 /** A round's state on the navigator: the live one runs; a finished one is
- *  failed when a child it launched failed. */
+ *  failed when its lead call failed or a child it launched failed. */
 function roundState(r: FlowRound, liveRound: number | null, childById: ReadonlyMap<string, RunChild>): StepState {
   if (r.round === liveRound) return 'running';
+  if (r.failed) return 'failed';
   if (r.endedAt === null && liveRound === null && r.childIds.length === 0) return 'pending';
   return r.childIds.some((id) => childById.get(id)?.status === 'failed') ? 'failed' : 'done';
 }
@@ -277,6 +282,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const refById = useMemo(() => new Map(structure.nodes.map((n) => [n.id, n])), [structure]);
   const childById = useMemo(() => new Map(children.map((c) => [c.run_id, c])), [children]);
   const liveRound = running ? (structure.rounds.find((r) => r.endedAt === null)?.round ?? null) : null;
+  const failedRounds = useMemo(
+    () => new Set(structure.rounds.filter((r) => r.failed).map((r) => r.round)),
+    [structure],
+  );
   const visible = useMemo(() => {
     const v = new Set<string>(['lead', 'spine', RAIL]);
     for (const n of structure.nodes) {
@@ -629,7 +638,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     // The tree: a round into what it launched, a child into its children.
     const tree = (source: string, target: string, sRef: FlowNodeRef | undefined, tRef: FlowNodeRef | undefined) => {
       if (!visible.has(source) || !visible.has(target)) return;
-      const tone = edgeTone(stateOfRef(sRef, liveRound), tRef ? stateOfRef(tRef, liveRound) : 'pending');
+      const tone = edgeTone(
+        stateOfRef(sRef, liveRound, failedRounds),
+        tRef ? stateOfRef(tRef, liveRound, failedRounds) : 'pending',
+      );
       out.push({
         id: `t:${source}->${target}`,
         source,
@@ -666,7 +678,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       if (n.kind === 'frame' && n.graph && visible.has(n.id)) out.push(...runEdges(n.graph, colors, slots, `${n.id}/`));
     }
     return out;
-  }, [structure, visible, liveRound, colors, slots, refById, layout]);
+  }, [structure, visible, liveRound, failedRounds, colors, slots, refById, layout]);
 
   const arcs = useMemo(
     () =>
@@ -1038,15 +1050,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
 }
 
 function miniColor(colors: ThemeColors, n: Node): string {
-  const d = n.data as { child?: RunChild; node?: { state: StepState }; live?: boolean };
+  const d = n.data as { child?: RunChild; node?: { state: StepState }; live?: boolean; round?: FlowRound };
   const state: StepState | null = d.child
     ? childState(d.child)
     : d.node
       ? d.node.state
-      : n.type === 'round'
-        ? d.live
-          ? 'running'
-          : 'done'
+      : n.type === 'round' && d.round
+        ? roundCardState(d.round, !!d.live)
         : null;
   if (!state || state === 'pending' || state === 'skipped') return colors.alpha('inkMute', 0.45);
   return stateStyle(colors, state).color;
