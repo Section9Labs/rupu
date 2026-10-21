@@ -1582,7 +1582,7 @@
  * chevron turns. */
 .afx-panel[data-collapsed='true'] .afx-panel-h { padding-bottom: 10px; }
 .afx-panel-toggle {
-  display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; padding: 0; border: 0; background: none;
+  display: inline-flex; flex: none; align-items: baseline; gap: 6px; padding: 0; border: 0; background: none;
   font: inherit; color: inherit; cursor: pointer; border-radius: 4px;
 }
 .afx-panel-toggle:focus-visible { outline: 2px solid rgb(var(--c-brand-500) / 0.6); outline-offset: 2px; }
