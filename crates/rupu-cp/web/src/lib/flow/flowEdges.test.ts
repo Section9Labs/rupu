@@ -10,7 +10,7 @@ import {
   messageCounts,
   type ArcOptions,
 } from './flowEdges';
-import { FLOW_BOARD, RUN, fixtureInput } from './fixtures';
+import { CHILDREN, DETAIL, FLOW_BOARD, FLOW_MESSAGES, RUN, at, fixtureInput } from './fixtures';
 
 const ALL: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
 
@@ -123,5 +123,24 @@ describe('flowEdges', () => {
     const counts = messageCounts(model.messages, makeRouter(model, drawn(model)));
     expect(counts.get(RUN.owl1)).toBe(2);
     expect(counts.has(RAIL)).toBe(false);
+  });
+
+  it('the_lead_lands_where_the_model_places_work_when_a_round_end_is_unreadable', () => {
+    // Round 1's end can't be parsed: it never ends, so anything after round
+    // 0 belongs to it, for the model and the router alike.
+    const events = DETAIL.events.map((e) => (e.kind === 'round' && e.round === 1 ? { ...e, ts: 'not a time' } : e));
+    const late = { ...CHILDREN[4], run_id: 'run_01M5LATE', handle: 'kite#9', address: 'kite#9', round: undefined, started_at: at(150) };
+    const lead = { id: 'msg_900', ts: at(150), kind: 'direct' as const, from: 'lead', to: 'kite#9', body: 'late', delivery: { resolved: [] }, seen: [] };
+    const input = fixtureInput();
+    const m = buildFlowModel({
+      ...input,
+      detail: { ...DETAIL, events },
+      children: [...CHILDREN, late],
+      spaces: [{ ...input.spaces[0], messages: [...FLOW_MESSAGES, lead] }, input.spaces[1]],
+    });
+    const placed = m.rounds.find((r) => r.childIds.includes(late.run_id))!.round;
+    expect(placed).toBe(1);
+    const router = makeRouter(m, drawn(m));
+    expect(router.anchorOf('lead', m.messages.find((x) => x.id === 'msg_900')!)).toEqual({ node: `round:${placed}` });
   });
 });

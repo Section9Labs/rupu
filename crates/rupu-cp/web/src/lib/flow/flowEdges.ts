@@ -9,7 +9,7 @@
 
 import type { ClaimView } from '../api';
 import { KIND_FILTERS, LEAD, OPERATOR, type KindFilter } from '../messages';
-import { BOARD, FLOW_SPACE, OFFCANVAS, type BoardSource, type FlowMessage, type FlowModel } from './flowModel';
+import { BOARD, FLOW_SPACE, OFFCANVAS, makeRoundAt, type BoardSource, type FlowMessage, type FlowModel } from './flowModel';
 
 /** The flow's board on the canvas (the rail node). */
 export const RAIL = 'rail';
@@ -42,19 +42,8 @@ export function makeRouter(model: FlowModel, visible: ReadonlySet<string>): Rout
   for (const n of model.nodes) if (n.kind !== 'lead') roundOf.set(n.id, n.round);
   for (const r of model.rounds) for (const id of r.childIds) roundOf.set(id, r.round);
   const byRound = new Map(model.rounds.map((r) => [r.round, r]));
-  // The lead's round at a time: the first round not over by then (rounds
-  // end in order; an open round never ends), else the last.
-  const ends = model.rounds.map((r) => r.endedAt ?? Infinity);
-  const leadRound = (at: number): number | undefined => {
-    let lo = 0;
-    let hi = ends.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (ends[mid] >= at) hi = mid;
-      else lo = mid + 1;
-    }
-    return model.rounds[Math.min(lo, model.rounds.length - 1)]?.round;
-  };
+  // The lead's round at a time: the same lookup the model places children by.
+  const leadRound = makeRoundAt(model.rounds);
   const drawn = (node: string): Anchor | null => (visible.has(node) ? { node } : null);
 
   const anchorOf = (endpoint: string, m: FlowMessage): Anchor | null => {

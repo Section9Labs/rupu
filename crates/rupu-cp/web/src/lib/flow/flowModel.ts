@@ -42,6 +42,9 @@ export interface FlowSpace {
   id: string;
   participants: SpaceParticipant[];
   messages: SpaceMessage[];
+  /** Everything its log held when opened has been read (`useMessageSpace`'s
+   *  `caughtUp`): messages arriving after this are new. */
+  caughtUp?: boolean;
 }
 
 export interface FlowInput {
@@ -221,15 +224,39 @@ interface Placement {
   inferred: boolean;
 }
 
+/** The round in progress at `t`: the first round (in order) not over by
+ *  then, a round with no end counting as never over; the last round when all
+ *  were. The one lookup the model and the map's router share. A prefix
+ *  maximum of the ends keeps the search right when an unparseable end sits
+ *  between parseable ones. */
+export function makeRoundAt(rounds: readonly { round: number; endedAt: number | null }[]): (t: number) => number | undefined {
+  const reach: number[] = [];
+  let max = -Infinity;
+  for (const r of rounds) {
+    max = Math.max(max, r.endedAt ?? Infinity);
+    reach.push(max);
+  }
+  return (t) => {
+    let lo = 0;
+    let hi = reach.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (reach[mid] >= t) hi = mid;
+      else lo = mid + 1;
+    }
+    return rounds[Math.min(lo, rounds.length - 1)]?.round;
+  };
+}
+
 /** `child.round`; else a launched child's root ancestor's; else the first
  *  round not over when it started (the last round if none), inferred. */
 function placer(spans: RoundSpan[], byId: Map<string, RunChild>): (c: RunChild) => Placement {
   const known = new Set(spans.map((s) => s.round));
   const memo = new Map<string, Placement>();
+  const roundAt = makeRoundAt(spans);
   const byTime = (c: RunChild): Placement => {
     const t = time(c.started_at);
-    const hit = t === null ? undefined : spans.find((s) => (s.endedAt ?? Infinity) >= t);
-    return { round: (hit ?? spans[spans.length - 1]).round, inferred: true };
+    return { round: (t === null ? undefined : roundAt(t)) ?? spans[spans.length - 1].round, inferred: true };
   };
   const place = (c: RunChild, seen: Set<string>): Placement => {
     const cached = memo.get(c.run_id);
