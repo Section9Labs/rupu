@@ -48,7 +48,8 @@ import { useRunLayer, type RunLayerView } from '../lib/flow/useRunLayer';
 import { boardAt } from '../lib/flow/runLayer';
 import { TimeAxis } from '../components/timeline/TimeAxis';
 import MessageListPanel from '../components/flowmap/MessageListPanel';
-import BoardRail from '../components/flowmap/BoardRail';
+import BoardRail, { boardCounts } from '../components/flowmap/BoardRail';
+import CollapsiblePanel from '../components/flowmap/CollapsiblePanel';
 import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
@@ -92,18 +93,16 @@ type Selection = { stepId: string; unitIndex?: number } | null;
 function RunLayerPanels({ view }: { view: RunLayerView }) {
   const { layer, shown, revealed, selected, select, spaces } = view;
   const posts = revealed ? layer.board.posts.filter((p) => revealed.has(p.id)) : layer.board.posts;
+  const board = boardAt(layer.board.view, revealed);
   return (
-    <div className="grid gap-3 lg:grid-cols-2">
-      <section className="afx-panel" aria-label="Run messages" data-testid="run-layer-messages">
-        <h3 className="afx-panel-h">
-          Messages <span>{shown.length}</span>
-        </h3>
+    // `items-start`: a folded panel keeps its width, and only its header's height.
+    <div className="grid items-start gap-3 lg:grid-cols-2">
+      <CollapsiblePanel name="run-messages" title="Messages" count={shown.length} label="Run messages" testId="run-layer-messages">
         <MessageListPanel messages={shown} spaces={spaces} selected={selected} onSelect={select} />
-      </section>
-      <section className="afx-panel" aria-label="Run board" data-testid="run-layer-board">
-        <h3 className="afx-panel-h">Board</h3>
-        <BoardRail board={boardAt(layer.board.view, revealed)} posts={posts} onSelect={select} />
-      </section>
+      </CollapsiblePanel>
+      <CollapsiblePanel name="run-board" title="Board" count={boardCounts(board, posts)} label="Run board" testId="run-layer-board">
+        <BoardRail board={board} posts={posts} onSelect={select} />
+      </CollapsiblePanel>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import type { StepState } from '../../lib/runGraphModel';
 import { formatSpendTokens, formatSpendUsd, goalViews } from '../../lib/agentiflow';
 import { formatDuration } from '../../lib/duration';
 import { childState } from './ChildNode';
+import CollapsiblePanel from './CollapsiblePanel';
 
 /** Over the canvas's top-right corner: the children at a glance. */
 export function MapSummary({ list, messages }: { list: RunChild[]; messages: number }) {
@@ -110,11 +111,14 @@ export function GoalsPanel({
   const views = goalViews(detail.record, detail.def);
   const count = (s: StepState) => list.filter((c) => childState(c) === s).length;
   const participants = spaces.flatMap((s) => s.participants);
+  const metNow = views.filter((g) => after.get(g.id)?.met ?? g.met).length;
   return (
-    <section className="afx-panel" aria-label="Goals">
-      <h3 className="afx-panel-h">
-        Goals {detail.def?.description && <span className="afx-panel-sub">{detail.def.description}</span>}
-      </h3>
+    <CollapsiblePanel
+      name="flow-goals"
+      title="Goals"
+      count={views.length > 0 ? `${metNow}/${views.length}` : undefined}
+      sub={detail.def?.description && <span className="afx-panel-sub">{detail.def.description}</span>}
+    >
       <ul className="afx-goals">
         {views.map((g) => {
           const now = after.get(g.id);
@@ -146,6 +150,6 @@ export function GoalsPanel({
           {participants.filter((p) => p.live).length} live of {participants.length}
         </dd>
       </dl>
-    </section>
+    </CollapsiblePanel>
   );
 }

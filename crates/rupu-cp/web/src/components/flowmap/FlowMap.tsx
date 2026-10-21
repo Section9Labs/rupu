@@ -65,6 +65,7 @@ import { KIND_FILTERS, type KindFilter } from '../../lib/messages';
 import { useThemeColors, type ThemeColors } from '../../lib/useThemeColors';
 import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
+import { MINIMAP_MIN_PANE, usePaneWidth } from '../../lib/graph/usePaneWidth';
 import type { StepState } from '../../lib/runGraphModel';
 import { crewTint, parseCodename } from '../../lib/codename';
 import { stateStyle } from '../graph/stepStyle';
@@ -76,6 +77,7 @@ import { DialogFrame } from '../customers/DialogFrame';
 import { TimeAxis } from '../timeline/TimeAxis';
 import MessageEdge, { type MessageFlowEdge } from './MessageEdge';
 import MessageListPanel from './MessageListPanel';
+import CollapsiblePanel from './CollapsiblePanel';
 import FlowToolbar from './FlowToolbar';
 import RoundNode from './RoundNode';
 import ChildNode, { CHILD_KIND, childState } from './ChildNode';
@@ -88,9 +90,9 @@ import '@xyflow/react/dist/style.css';
 
 /** The run graph's minimap rule: only past this many cards. */
 const MINIMAP_MIN_NODES = 6;
-/** The minimap's size; while it shows, the placed and fitted map keeps its
- *  width clear of it (the run graph does the same), so the rail's foot is
- *  never under it. */
+/** The minimap's size; while it shows (a pane at least MINIMAP_MIN_PANE
+ *  wide), the placed and fitted map keeps its width clear of it (the run
+ *  graph does the same), so the rail's foot is never under it. */
 const MINIMAP = { width: 150, height: 96 };
 const MINIMAP_CLEAR = MINIMAP.width + 30;
 /** The map's top sits below the canvas's summary chip. */
@@ -638,8 +640,9 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         hover: hoverNode,
         selected: selectedMsg,
         anchors,
+        arriving: arrivals,
       }),
-    [shownMessages, claims, router, kinds, participant, focus?.id, hoverNode, selectedMsg, anchors],
+    [shownMessages, claims, router, kinds, participant, focus?.id, hoverNode, selectedMsg, anchors, arrivals],
   );
   const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
   // The cards an arc keeps clear of: every drawn card, not the frames (a
@@ -690,13 +693,14 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const onNodeEnter = useCallback<NodeMouseHandler>((_e, n) => setHoverNode(n.id), []);
   const onNodeLeave = useCallback<NodeMouseHandler>(() => setHoverNode(null), []);
 
+  const pane = useRef<HTMLDivElement>(null);
   const cardCount = model.nodes.filter((n) => n.kind === 'child' || n.kind === 'frame' || n.kind === 'round').length;
-  const showMinimap = cardCount > MINIMAP_MIN_NODES;
+  const paneWidth = usePaneWidth(pane);
+  const showMinimap = cardCount > MINIMAP_MIN_NODES && paneWidth >= MINIMAP_MIN_PANE;
 
   // The viewport: fit the map's width at first, from its top (a running flow
   // from its newest round); follow the newest round while running unless
   // the operator has panned away. A poll never moves it otherwise.
-  const pane = useRef<HTMLDivElement>(null);
   const panned = useRef(false);
   const placed = useRef(false);
   const placedWidth = useRef(0);
@@ -841,13 +845,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       {data.loadedFrames.map((f) => (
         <FrameSpace key={f} runId={f} live={isUnfinished(childById.get(f))} onSpace={data.setFrameSpace} />
       ))}
-      <div className="grid gap-3 lg:grid-cols-[3fr_2fr]">
-        <section className="afx-panel" aria-label="Messages">
-          <h3 className="afx-panel-h">
-            Messages <span>{listed.length}</span>
-          </h3>
+      {/* `items-start`: a folded panel keeps its width, and only its header's height. */}
+      <div className="grid items-start gap-3 lg:grid-cols-[3fr_2fr]">
+        <CollapsiblePanel name="flow-messages" title="Messages" count={listed.length}>
           <MessageListPanel messages={listed} spaces={spaceLabels} selected={selectedMsg} onSelect={selectFromList} />
-        </section>
+        </CollapsiblePanel>
         <GoalsPanel detail={detail} model={model} list={children} spaces={spaces} />
       </div>
       {definition && (

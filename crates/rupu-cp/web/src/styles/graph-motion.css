@@ -1544,6 +1544,20 @@
   font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
 }
 .afx-panel-h > span { font-weight: 400; color: rgb(var(--c-ink-mute)); }
+/* The title row folds its panel (CollapsiblePanel): instant, only the
+ * chevron turns. */
+.afx-panel[data-collapsed='true'] .afx-panel-h { padding-bottom: 10px; }
+.afx-panel-toggle {
+  display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; cursor: pointer; border-radius: 4px;
+}
+.afx-panel-toggle:focus-visible { outline: 2px solid rgb(var(--c-brand-500) / 0.6); outline-offset: 2px; }
+.afx-panel-count { font-weight: 400; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums; }
+.afx-panel-chev {
+  flex: none; align-self: center; color: rgb(var(--c-ink-mute));
+  transition: rotate 150ms var(--ease-out);
+}
+.afx-panel[data-collapsed='true'] .afx-panel-chev { rotate: -90deg; }
 .afx-panel-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .afx-goals { margin: 0; padding: 0 12px; list-style: none; font-size: 12px; }
 .afx-goals li { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
@@ -1563,4 +1577,5 @@
   .afx-frame { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
   .afx-frame > .gx-glow { animation: none; }
   .afx-meter > i { transition: none; }
+  .afx-panel-chev { transition: none; }
 }

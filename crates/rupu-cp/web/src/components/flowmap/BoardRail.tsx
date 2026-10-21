@@ -33,6 +33,20 @@ function claimTimes(c: ClaimView): string {
   }
 }
 
+const n = (k: number, one: string) => `${k} ${one}${k === 1 ? '' : 's'}`;
+
+/** A board at a glance, for a folded panel's header: `1 claim · 7 posts`
+ *  (the sections it has; `none` for an empty board). */
+export function boardCounts(board: BoardSource | null, posts: FlowMessage[]): string {
+  const view = board && !('kind' in board) ? board : null;
+  const parts = [
+    view && view.claims.length > 0 ? n(view.claims.length, 'claim') : null,
+    view && view.directives.length > 0 ? n(view.directives.length, 'directive') : null,
+    posts.length > 0 ? n(posts.length, 'post') : null,
+  ].filter((x): x is string => !!x);
+  return parts.length > 0 ? parts.join(' · ') : 'none';
+}
+
 export default function BoardRail({
   board,
   posts,
