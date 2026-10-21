@@ -1,7 +1,9 @@
 //! The runs operator tools: workflow run lists, details and run control.
 
 use super::{op, OpSpec};
-use crate::api::{autoflow_runs, events, run_streams, runs, source, transcript, transcripts};
+use crate::api::{
+    autoflow_runs, board, events, run_streams, runs, source, transcript, transcripts,
+};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -109,6 +111,13 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "/api/runs/:id/children",
             "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns `{children}`, each with its handle, kind, status and tokens.",
         ),
+        op(
+            "runs.board",
+            Method::GET,
+            "/api/runs/:id/board",
+            "Read a run's board: the claims and directives in its message space.\n\n`id` is the run id; `host` picks a remote host. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, owner, acquired, lease expiry, ended, state held|released|expired), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
+        )
+        .query::<board::BoardQuery>(),
         op(
             "runs.usage",
             Method::GET,

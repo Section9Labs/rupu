@@ -1550,6 +1550,12 @@ mod tests {
         {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -1682,6 +1688,12 @@ mod tests {
             _msg: rupu_cp::host::connector::OperatorMessageRequest,
         ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
         {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
         async fn pull_finding_artifact(
@@ -2238,6 +2250,12 @@ steps:
         {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -2772,6 +2790,12 @@ steps:
         {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -2956,6 +2980,12 @@ steps:
             _msg: rupu_cp::host::connector::OperatorMessageRequest,
         ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
         {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
         async fn pull_finding_artifact(

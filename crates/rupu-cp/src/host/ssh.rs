@@ -226,6 +226,31 @@ fn message_command(argv: &[String]) -> String {
     )
 }
 
+/// Printed, instead of running `rupu __board`, by [`board_command`]'s gate
+/// when the remote `rupu __features` doesn't list
+/// [`crate::node::protocol::CAP_RUN_BOARD`].
+const BOARD_UNSUPPORTED: &str = "rupu-board: unsupported";
+
+/// The one remote command an SSH board read sends: `rupu __board <id>`
+/// ([`board_argv`]) behind [`feature_gate`] on `run.board`, as
+/// [`message_command`] gates `__message`.
+fn board_command(id: &str) -> String {
+    let cmd: Vec<String> = std::iter::once("rupu".to_string())
+        .chain(board_argv(id))
+        .collect();
+    feature_gate(
+        &[(crate::node::protocol::CAP_RUN_BOARD, BOARD_UNSUPPORTED)],
+        &build_remote_command(&cmd),
+    )
+}
+
+/// The argv (after `rupu`) of the `rupu __board` that reads run `id`'s
+/// board. Public so `rupu-cli` can check its own clap accepts it.
+#[doc(hidden)]
+pub fn board_argv(id: &str) -> Vec<String> {
+    vec!["__board".to_string(), id.to_string()]
+}
+
 /// The argv (after `rupu`) of the `rupu __message list` that reads `q` of
 /// `id`'s messages. Public so `rupu-cli` can check its own clap accepts it.
 #[doc(hidden)]
@@ -2309,17 +2334,37 @@ impl SshHostConnector {
         &self,
         argv: Vec<String>,
     ) -> Result<T, HostConnectorError> {
+        self.helper_call(
+            &message_command(&argv),
+            "__message",
+            CAP_RUN_MESSAGES,
+            MESSAGES_UNSUPPORTED,
+        )
+        .await
+    }
+
+    /// Run `command` — a hidden `rupu <helper>` behind [`feature_gate`] on
+    /// `feature`, which prints `marker` instead on a remote without it —
+    /// and read what it printed: `T`, or its `{"error": …}` reply
+    /// (`MessageErrorReply`), which keeps its code's status.
+    async fn helper_call<T: serde::de::DeserializeOwned>(
+        &self,
+        command: &str,
+        helper: &str,
+        feature: &str,
+        marker: &str,
+    ) -> Result<T, HostConnectorError> {
         let out = self
             .exec
-            .run(&message_command(&argv))
+            .run(command)
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if printed(&out.stdout, LAUNCH_RUPU_NOT_FOUND) {
             return Err(self.rupu_not_found());
         }
-        if printed(&out.stdout, MESSAGES_UNSUPPORTED) {
+        if printed(&out.stdout, marker) {
             return Err(HostConnectorError::Unsupported(format!(
-                "host {}: the remote rupu predates `{CAP_RUN_MESSAGES}`; upgrade rupu there",
+                "host {}: the remote rupu predates `{feature}`; upgrade rupu there",
                 self.host_id
             )));
         }
@@ -2331,7 +2376,7 @@ impl SshHostConnector {
         }
         if out.success {
             return serde_json::from_str(stdout).map_err(|e| {
-                HostConnectorError::Remote(0, format!("parse `rupu __message` output: {e}"))
+                HostConnectorError::Remote(0, format!("parse `rupu {helper}` output: {e}"))
             });
         }
         let stderr = out.stderr.trim();
@@ -2340,7 +2385,7 @@ impl SshHostConnector {
         }
         Err(HostConnectorError::Remote(
             0,
-            format!("`rupu __message` failed on host {}: {stderr}", self.host_id),
+            format!("`rupu {helper}` failed on host {}: {stderr}", self.host_id),
         ))
     }
 
@@ -3593,6 +3638,26 @@ impl HostConnector for SshHostConnector {
         msg: OperatorMessageRequest,
     ) -> Result<OperatorSendReply, HostConnectorError> {
         self.message_call(message_send_argv(id, &msg)).await
+    }
+
+    /// Shells `rupu __board <id>` (no listing cache: a board is read when
+    /// asked for).
+    async fn run_board(
+        &self,
+        id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        if crate::host::messages::MessageRoute::of_id(id)
+            != Some(crate::host::messages::MessageRoute::Runs)
+        {
+            return Err(HostConnectorError::NotFound(format!("no run `{id}`")));
+        }
+        self.helper_call(
+            &board_command(id),
+            "__board",
+            crate::node::protocol::CAP_RUN_BOARD,
+            BOARD_UNSUPPORTED,
+        )
+        .await
     }
 
     async fn pull_finding_artifact(
@@ -11860,6 +11925,43 @@ mod tests {
         assert!(matches!(
             conn.send_operator_message("run_01MSG", send).await,
             Err(HostConnectorError::Unreachable(_))
+        ));
+    }
+
+    /// A board read runs `rupu __board <id>` only on a remote whose `rupu
+    /// __features` lists `run.board`, and reads its view or its refusal.
+    #[tokio::test]
+    async fn the_board_runs_only_on_a_remote_advertising_it() {
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let view = r#"{"claims":[],"directives":[],"journal":true}"#;
+        let bin = fake_message_rupu(&format!("echo '{report}'"), &format!("echo '{view}'"));
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let got = conn.run_board("run_01BOARD").await.unwrap();
+        assert!(got.journal && got.claims.is_empty());
+        assert_eq!(recorded_argv(&bin).unwrap(), ["__board", "run_01BOARD"]);
+
+        let bin = fake_message_rupu(
+            &format!("echo '{report}'"),
+            r#"echo '{"error":{"code":"not_found","message":"no run"}}'; exit 3"#,
+        );
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        assert!(matches!(
+            conn.run_board("run_01BOARD").await,
+            Err(HostConnectorError::NotFound(m)) if m == "no run"
+        ));
+
+        let bin = fake_message_rupu(r#"echo '{"features":["run.messages"]}'"#, "echo '{}'");
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let err = conn.run_board("run_01BOARD").await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("predates `run.board`")),
+            "{err:?}"
+        );
+        assert_eq!(recorded_argv(&bin), None, "`__board` never ran");
+        assert!(matches!(
+            conn.run_board("af_01BOARD").await,
+            Err(HostConnectorError::NotFound(_))
         ));
     }
 }

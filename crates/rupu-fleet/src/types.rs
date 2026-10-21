@@ -79,6 +79,7 @@ pub struct ClaimView {
     pub state: ClaimState,
     /// False when only the claim file's stem is known (a claim written before
     /// the journal): `key` then holds that stem, kept so it stays unique.
+    #[serde(default)]
     pub key_known: bool,
 }
 

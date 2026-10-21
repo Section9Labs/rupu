@@ -6,6 +6,7 @@ pub mod auth_status;
 pub mod autoflow_claims;
 pub mod autoflow_runs;
 pub mod autoflows;
+pub mod board;
 pub mod children;
 pub mod code;
 pub mod config;

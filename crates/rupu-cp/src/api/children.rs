@@ -54,6 +54,34 @@ pub struct ChildDto {
     pub transcript_path: Option<String>,
     /// Read from a `sub/` directory, not the ledger.
     pub legacy: bool,
+    /// The agentiflow lead round that launched it: a direct child's own,
+    /// a deeper child's its root ancestor's. Absent when nothing recorded
+    /// one (not launched by a lead, or a ledger from before rounds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    /// A workflow child dispatched from a file its parent wrote with
+    /// `workflows.generate`.
+    pub generated: bool,
+    /// The start of its answer ([`excerpt`]), when it recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_excerpt: Option<String>,
+}
+
+/// The most of an answer [`excerpt`] keeps, in chars.
+const EXCERPT_CHARS: usize = 240;
+
+/// `output` without its surrounding whitespace, cut to [`EXCERPT_CHARS`]
+/// chars (so always on a char boundary) and marked `…` when cut. `None` when
+/// nothing is left.
+pub(crate) fn excerpt(output: &str) -> Option<String> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+    match output.char_indices().nth(EXCERPT_CHARS) {
+        Some((cut, _)) => Some(format!("{}…", &output[..cut])),
+        None => Some(output.to_string()),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +132,9 @@ fn from_entry(e: ChildEntry, parent: &str) -> ChildDto {
             .as_ref()
             .map(|p| p.display().to_string()),
         legacy: false,
+        round: e.started.round,
+        generated: e.started.request.as_ref().is_some_and(|r| r.generated),
+        output_excerpt: f.and_then(|f| f.output.as_deref()).and_then(excerpt),
     }
 }
 
@@ -136,6 +167,9 @@ fn legacy_subagent(transcript: &Path, sub_run_id: &str, parent: &str, depth: u32
         finished_at: None,
         transcript_path: Some(transcript.display().to_string()),
         legacy: true,
+        round: None,
+        generated: false,
+        output_excerpt: None,
     }
 }
 
@@ -143,11 +177,11 @@ fn legacy_subagent(transcript: &Path, sub_run_id: &str, parent: &str, depth: u32
 /// launch order per parent (parents breadth-first). A child an attempt took
 /// on from an earlier one is listed once, as its latest record says.
 pub fn children_of(store: &RunStore, run_id: &str) -> Vec<ChildDto> {
-    let mut parents: VecDeque<(String, u32)> = VecDeque::from([(run_id.to_string(), 0)]);
+    let mut parents: VecDeque<Parent> = VecDeque::from([Parent::root(run_id)]);
     for rec in store.read_step_results(run_id).unwrap_or_default() {
-        parents.push_back((rec.run_id.clone(), 0));
+        parents.push_back(Parent::root(&rec.run_id));
         for item in &rec.items {
-            parents.push_back((item.run_id.clone(), 0));
+            parents.push_back(Parent::root(&item.run_id));
         }
     }
     walk_children(store, parents)
@@ -170,27 +204,61 @@ pub fn ledger_units(af_dir: &Path, af_id: &str) -> Vec<ChildDto> {
 /// breadth-first walk as [`children_of`]. A `units` entry is kept as given; the
 /// caller dedups the direct level, the walk dedups the descendants.
 pub fn with_descendants(store: &RunStore, units: Vec<ChildDto>) -> Vec<ChildDto> {
-    let mut parents: VecDeque<(String, u32)> = VecDeque::new();
+    let mut parents: VecDeque<Parent> = VecDeque::new();
     for u in &units {
-        parents.push_back((u.run_id.clone(), u.depth));
+        parents.push_back(Parent::below(u));
     }
     let mut out = units;
     out.extend(walk_children(store, parents));
     out
 }
 
-/// Breadth-first over `parents` — each a run id whose `children.jsonl` to read,
-/// paired with the depth to stamp its legacy sub-agents at — collecting every
-/// child of every kind, in launch order per parent (parents breadth-first). A
-/// child a later attempt took on under the same handle is listed once, as its
-/// latest record says.
-fn walk_children(store: &RunStore, mut parents: VecDeque<(String, u32)>) -> Vec<ChildDto> {
+/// A run whose children [`walk_children`] reads.
+struct Parent {
+    run_id: String,
+    /// The depth its legacy sub-agents are stamped one below.
+    depth: u32,
+    /// `None`: its children are the walk's direct children, each with its
+    /// own round. `Some(round)`: they sit under a direct child, so they
+    /// take its round.
+    round: Option<Option<u32>>,
+}
+
+impl Parent {
+    /// A run at the top of the walk.
+    fn root(run_id: &str) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            depth: 0,
+            round: None,
+        }
+    }
+
+    /// `child`, as the parent of what it launched.
+    fn below(child: &ChildDto) -> Self {
+        Self {
+            run_id: child.run_id.clone(),
+            depth: child.depth,
+            round: Some(child.round),
+        }
+    }
+}
+
+/// Breadth-first over `parents`, collecting every child of every kind, in
+/// launch order per parent (parents breadth-first). A child a later attempt
+/// took on under the same handle is listed once, as its latest record says.
+fn walk_children(store: &RunStore, mut parents: VecDeque<Parent>) -> Vec<ChildDto> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     // Each handle's latest record: where it is in `out`, and when it started.
     let mut latest: std::collections::HashMap<String, (usize, chrono::DateTime<chrono::Utc>)> =
         std::collections::HashMap::new();
-    while let Some((parent, depth)) = parents.pop_front() {
+    while let Some(Parent {
+        run_id: parent,
+        depth,
+        round,
+    }) = parents.pop_front()
+    {
         if parent.is_empty() || !seen.insert(parent.clone()) || seen.len() > MAX_RUNS_WALKED {
             continue;
         }
@@ -198,8 +266,11 @@ fn walk_children(store: &RunStore, mut parents: VecDeque<(String, u32)>) -> Vec<
         let known: BTreeSet<String> = ledgered.iter().map(|e| e.started.run_id.clone()).collect();
         for e in ledgered {
             let at = e.started.at;
-            let child = from_entry(e, &parent);
-            parents.push_back((child.run_id.clone(), child.depth));
+            let mut child = from_entry(e, &parent);
+            if let Some(round) = round {
+                child.round = round;
+            }
+            parents.push_back(Parent::below(&child));
             if let Some(handle) = child.handle.clone() {
                 match latest.get(&handle) {
                     Some(&(_, seen)) if seen >= at => continue,
@@ -215,8 +286,10 @@ fn walk_children(store: &RunStore, mut parents: VecDeque<(String, u32)>) -> Vec<
                 continue;
             }
             let transcript = store.sub_run_transcript_path(&parent, &sub);
-            out.push(legacy_subagent(&transcript, &sub, &parent, depth + 1));
-            parents.push_back((sub, depth + 1));
+            let mut child = legacy_subagent(&transcript, &sub, &parent, depth + 1);
+            child.round = round.flatten();
+            parents.push_back(Parent::below(&child));
+            out.push(child);
         }
     }
     let keep: BTreeSet<usize> = latest.values().map(|&(i, _)| i).collect();

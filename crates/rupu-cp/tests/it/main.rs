@@ -10,6 +10,7 @@ mod agentiflows;
 mod ast;
 mod auth;
 mod autoflows;
+mod board;
 mod bucket_e2e;
 mod common;
 mod config_api;

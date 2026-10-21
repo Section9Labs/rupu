@@ -7,6 +7,7 @@ pub mod auth;
 pub mod autoflow;
 pub mod autoflow_runtime;
 pub mod autoflow_wake;
+pub mod board_helper;
 pub mod cleanup;
 pub mod completers;
 pub mod completions;

@@ -287,6 +287,12 @@ impl HostConnector for MirroringConnector {
     ) -> Result<OperatorSendReply, HostConnectorError> {
         Err(HostConnectorError::Unsupported("test double".into()))
     }
+    async fn run_board(
+        &self,
+        _id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("test double".into()))
+    }
     async fn proxy_get_json(
         &self,
         _path_and_query: &str,

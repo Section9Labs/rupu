@@ -73,6 +73,11 @@ pub fn routes() -> Router<AppState> {
             "/api/agentiflows/:id/units/:unit_id/output",
             get(get_agentiflow_unit_output),
         )
+        .route("/api/agentiflows/:id/board", get(get_agentiflow_board))
+        .route(
+            "/api/agentiflows/:id/generated/:handle",
+            get(get_agentiflow_generated),
+        )
         .route("/api/agentiflows/:id/steer", post(steer_agentiflow))
         .route("/api/agentiflows/:id/stop", post(stop_agentiflow))
 }
@@ -241,6 +246,13 @@ struct UnitDto {
     /// Absolute path of the unit's transcript when it is on disk — read it
     /// through `/api/transcript?path=`.
     transcript_path: Option<String>,
+    /// The lead round that launched it; absent when its record predates
+    /// rounds (or it is a legacy unit).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u32>,
+    /// A workflow the lead wrote with `workflows.generate`
+    /// (`GET …/generated/:handle` serves it).
+    generated: bool,
 }
 
 #[derive(Serialize)]
@@ -636,6 +648,8 @@ fn ledger_unit(s: &AppState, e: rupu_launch::ledger::ChildEntry) -> UnitDto {
         pgid: e.started.pgid,
         started_at: Some(e.started.at.to_rfc3339()),
         transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
+        round: e.started.round,
+        generated: e.started.request.as_ref().is_some_and(|r| r.generated),
         unit_id: e.started.run_id,
     }
 }
@@ -710,6 +724,8 @@ fn read_legacy_units(s: &AppState, run_dir: &std::path::Path) -> Vec<UnitDto> {
                 pgid: u.pgid,
                 started_at: meta.started_at,
                 transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
+                round: None,
+                generated: false,
                 unit_id: u.unit_id,
             }
         })
@@ -1014,6 +1030,9 @@ fn legacy_unit_children(
                 finished_at: None,
                 transcript_path: transcript.map(|p| p.to_string_lossy().into_owned()),
                 legacy: true,
+                round: None,
+                generated: false,
+                output_excerpt: st.output.as_deref().and_then(crate::api::children::excerpt),
             }
         })
         .collect()
@@ -1079,6 +1098,140 @@ async fn get_agentiflow_unit_output(
     .map_err(|e| ApiError::internal(format!("reading agentiflow {id} unit output panicked: {e}")))?
     .map_err(|()| ApiError::not_found(format!("agentiflow `{id}` has no unit `{unit_id}`")))?;
     Ok(Json(serde_json::json!({ "output": output })))
+}
+
+/// The run directory of agentiflow `id`, or a 404.
+fn existing_run_dir(s: &AppState, id: &str) -> ApiResult<PathBuf> {
+    let not_found = || ApiError::not_found(format!("no agentiflow run `{id}`"));
+    if !valid_run_id(id) {
+        return Err(not_found());
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(id);
+    if !run_dir.is_dir() {
+        return Err(not_found());
+    }
+    Ok(run_dir)
+}
+
+/// `GET /api/agentiflows/:id/board` — the flow's board
+/// (`rupu_runtime::services::board::BoardView`): every claim its journal
+/// recorded (or, on a board older than the journal, the live ones) and its
+/// directives with their retractions. Local only — a `?host=` is a 501.
+async fn get_agentiflow_board(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<LocalHostQuery>,
+) -> ApiResult<Json<rupu_runtime::services::board::BoardView>> {
+    q.require_local("an agentiflow's board")?;
+    let run_dir = existing_run_dir(&s, &id)?;
+    tokio::task::spawn_blocking(move || {
+        rupu_runtime::services::board::board_view(&run_dir, Utc::now())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading agentiflow {id} board panicked: {e}")))?
+    .map(Json)
+    .map_err(|e| ApiError::internal(format!("agentiflow {id}: the board is unreadable: {e}")))
+}
+
+/// `GET /api/agentiflows/:id/generated/:handle` body: the definition a lead
+/// wrote with `workflows.generate` and dispatched as `handle`.
+#[derive(Serialize)]
+struct GeneratedDefinition {
+    handle: String,
+    /// The workflow child's name.
+    name: String,
+    file_name: String,
+    yaml: String,
+}
+
+/// Why [`generated_definition`] serves nothing.
+enum GeneratedRefusal {
+    /// No such direct child, not a generated workflow, or its file is gone.
+    NotFound(String),
+    /// Its recorded file isn't under the flow's `generated/`.
+    Outside(String),
+    Unreadable(String),
+}
+
+/// The definition the flow in `run_dir` dispatched as `handle`: a direct
+/// child whose request is `generated`, read from its recorded file once that
+/// file's canonical path is under the canonical `<run_dir>/generated/`.
+fn generated_definition(
+    run_dir: &std::path::Path,
+    handle: &str,
+) -> Result<GeneratedDefinition, GeneratedRefusal> {
+    let entry = rupu_launch::ledger::read(run_dir)
+        .into_iter()
+        .rev()
+        .find(|e| e.started.handle == handle)
+        .ok_or_else(|| GeneratedRefusal::NotFound(format!("no child `{handle}`")))?;
+    let file = entry
+        .started
+        .request
+        .as_deref()
+        .filter(|r| r.generated)
+        .and_then(|r| r.workflow.clone())
+        .ok_or_else(|| {
+            GeneratedRefusal::NotFound(format!(
+                "child `{handle}` is not a workflow the lead generated"
+            ))
+        })?;
+    let canonical = file.canonicalize().map_err(|_| {
+        GeneratedRefusal::NotFound(format!("the definition child `{handle}` ran is gone"))
+    })?;
+    let outside = || {
+        GeneratedRefusal::Outside(format!(
+            "child `{handle}`'s definition is not under the flow's generated/ directory"
+        ))
+    };
+    let dir = run_dir
+        .join("generated")
+        .canonicalize()
+        .map_err(|_| outside())?;
+    if !canonical.starts_with(&dir) {
+        return Err(outside());
+    }
+    let yaml = std::fs::read_to_string(&canonical).map_err(|e| {
+        GeneratedRefusal::Unreadable(format!("child `{handle}`'s definition is unreadable: {e}"))
+    })?;
+    Ok(GeneratedDefinition {
+        handle: handle.to_string(),
+        name: entry.started.name,
+        file_name: file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        yaml,
+    })
+}
+
+/// `GET /api/agentiflows/:id/generated/:handle` — the workflow definition
+/// the lead wrote with `workflows.generate` and dispatched as the direct
+/// child `handle`, read only: `{handle, name, file_name, yaml}`. 404 unless
+/// that child is a generated workflow whose file still exists; 403 when its
+/// recorded file resolves outside the flow's `generated/` directory. Local
+/// only — a `?host=` is a 501.
+async fn get_agentiflow_generated(
+    State(s): State<AppState>,
+    Path((id, handle)): Path<(String, String)>,
+    Query(q): Query<LocalHostQuery>,
+) -> ApiResult<Json<GeneratedDefinition>> {
+    q.require_local("an agentiflow's generated definitions")?;
+    let run_dir = existing_run_dir(&s, &id)?;
+    tokio::task::spawn_blocking(move || generated_definition(&run_dir, &handle))
+        .await
+        .map_err(|e| ApiError::internal(format!("reading a generated definition panicked: {e}")))?
+        .map(Json)
+        .map_err(|r| match r {
+            GeneratedRefusal::NotFound(m) => ApiError::not_found(format!("agentiflow `{id}`: {m}")),
+            GeneratedRefusal::Outside(m) => ApiError(
+                axum::http::StatusCode::FORBIDDEN,
+                format!("agentiflow `{id}`: {m}"),
+            ),
+            GeneratedRefusal::Unreadable(m) => {
+                ApiError::internal(format!("agentiflow `{id}`: {m}"))
+            }
+        })
 }
 
 /// `POST /api/agentiflows/:id/steer` — the older spelling of a message to

@@ -326,6 +326,10 @@ pub enum Cmd {
         #[command(subcommand)]
         action: cmd::message::HelperAction,
     },
+    /// Internal: print a run's board as one JSON object (SSH transport);
+    /// the protocol is `cmd::board_helper`'s.
+    #[command(name = "__board", hide = true)]
+    BoardHelper { id: String },
     /// Internal: stream a finding artifact from this host's store (SSH artifact pull).
     #[command(name = "__findings", hide = true)]
     FindingsHelper {
@@ -573,6 +577,7 @@ pub async fn run(args: Vec<String>) -> ExitCode {
         Cmd::Features => cmd::features_helper::handle(),
         Cmd::FindingsHelper { action } => cmd::findings_helper::handle(action).await,
         Cmd::MessageHelper { action } => cmd::message::handle_helper(action),
+        Cmd::BoardHelper { id } => cmd::board_helper::handle(&id),
     }
 }
 
@@ -704,6 +709,11 @@ fn ensure_output_format_supported(
         ),
         Cmd::MessageHelper { .. } => output::formats::ensure_supported(
             "__message",
+            format,
+            &[output::formats::OutputFormat::Table],
+        ),
+        Cmd::BoardHelper { .. } => output::formats::ensure_supported(
+            "__board",
             format,
             &[output::formats::OutputFormat::Table],
         ),
@@ -1035,6 +1045,20 @@ mod arg_parse_tests {
                 assert_eq!(kind.as_deref(), Some("operator"));
             }
             other => panic!("expected MessageHelper(List), got {other:?}"),
+        }
+    }
+
+    /// The `rupu __board` argv an SSH coordinator sends to a remote whose
+    /// `rupu __features` lists `run.board`, this build's clap reads as sent.
+    #[test]
+    fn the_ssh_board_argv_parses_as_sent() {
+        assert!(rupu_cp::node::protocol::FeaturesReport::current()
+            .supports(rupu_cp::node::protocol::CAP_RUN_BOARD));
+        let argv = rupu_cp::host::ssh::board_argv("run_01ABC");
+        let cli = Cli::try_parse_from(std::iter::once("rupu".to_string()).chain(argv)).unwrap();
+        match cli.command {
+            Cmd::BoardHelper { id } => assert_eq!(id, "run_01ABC"),
+            other => panic!("expected BoardHelper, got {other:?}"),
         }
     }
 

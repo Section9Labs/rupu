@@ -431,6 +431,11 @@ pub const CAP_RUN_LIST: &str = "run.list";
 /// read or send messages through a peer that does not list it.
 pub const CAP_RUN_MESSAGES: &str = "run.messages";
 
+/// Host feature: this build serves a run's board — `GET
+/// /api/runs/:id/board` over HTTP, `rupu __board <id>` over SSH. A connector
+/// refuses to read a board through a peer that does not list it.
+pub const CAP_RUN_BOARD: &str = "run.board";
+
 /// Every feature this build honours as a host — what `/api/host/info`
 /// serves as `features` and what `rupu __features` prints for an SSH
 /// coordinator. Same vocabulary as the tunnel `Hello.capabilities` and the
@@ -453,6 +458,7 @@ pub fn host_features() -> Vec<String> {
         CAP_RUN_CODENAME_FLAG.to_string(),
         CAP_RUN_SUPPLIED_RUN_ID.to_string(),
         CAP_RUN_MESSAGES.to_string(),
+        CAP_RUN_BOARD.to_string(),
     ]
 }
 
@@ -681,6 +687,7 @@ mod tests {
             features.iter().any(|f| f == CAP_RUN_MESSAGES),
             "{features:?}"
         );
+        assert!(features.iter().any(|f| f == CAP_RUN_BOARD), "{features:?}");
     }
 
     #[test]
