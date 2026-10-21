@@ -1,0 +1,460 @@
+/* ──────────────────────────────────────────────────────────────────────────
+ * Workflow-graph motion (components/RunGraph.tsx, components/graph/*,
+ * components/workflow-editor/*). The graphs move the way the charts do (the
+ * "Chart motion" block in styles.css: --ease-out arrivals, --ease-in-out
+ * movement), and every move says something about the run:
+ *
+ *  - the graph arrives column by column, left to right, the order it runs:
+ *    each node settles up from a slight blur, then the edges out of it draw;
+ *  - a traversed edge fills with its kinds' gradient; the edge into a running
+ *    step carries a travelling light, the edge into a waiting gate a slower
+ *    amber one;
+ *  - a running node breathes a soft glow in the running color and its kind bar
+ *    shimmers; a waiting gate breathes amber; a failed node holds a red ring;
+ *  - a step that lands plays one cue: done settles with a green ring, failed
+ *    flashes red once;
+ *  - state changes cross-fade (colors, rings), never swap.
+ *
+ * Colors are theme tokens (channels from styles.css), so light and dark both
+ * work. Under prefers-reduced-motion nothing travels, breathes or shimmers:
+ * nodes and edges fade in, states hold their glow still, cues fade.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --rgx-stagger: 70ms;  /* between entrance columns */
+  --rgx-enter: 520ms;   /* a node's settle */
+  --rgx-draw: 640ms;    /* an edge's draw */
+}
+
+/* ── canvas ── */
+.rgx-canvas {
+  background:
+    radial-gradient(90% 70% at 50% 0%, rgb(var(--c-brand-500) / 0.06), transparent 65%),
+    rgb(var(--c-bg));
+}
+:is(.rgx-canvas, .wfx-canvas) .react-flow__controls,
+:is(.rgx-canvas, .wfx-canvas) .react-flow__minimap {
+  border-radius: 8px;
+  overflow: hidden;
+}
+:is(.rgx-canvas, .wfx-canvas) .react-flow__minimap {
+  border: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-panel) / 0.85);
+}
+:is(.rgx-canvas, .wfx-canvas) .react-flow__controls-button {
+  transition: background-color 150ms ease;
+}
+
+/* ── node frame ── */
+.rgx-node {
+  --rgx-tone: var(--c-border);
+  isolation: isolate;
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+  transition:
+    opacity 320ms var(--ease-out),
+    translate 180ms var(--ease-out),
+    border-color 320ms ease;
+}
+@keyframes rgx-enter {
+  from {
+    opacity: 0;
+    translate: 0 6px;
+    scale: 0.97;
+    filter: blur(3px);
+  }
+}
+.rgx-node[data-state='running'] { --rgx-tone: var(--c-status-running); }
+.rgx-node[data-state='awaiting_approval'] { --rgx-tone: var(--c-status-awaiting); }
+.rgx-node[data-state='failed'] { --rgx-tone: var(--c-status-failed); }
+.rgx-node[data-state='done'] { --rgx-tone: var(--c-status-done); }
+.rgx-node[data-state='paused'] { --rgx-tone: var(--c-status-paused); }
+.rgx-node[data-state='pending'] { opacity: 0.66; }
+.rgx-node[data-state='skipped'] { opacity: 0.55; }
+
+/* The glow: a ring + soft halo in the state's color, faded in and out (and,
+   while live, breathed) through opacity only. */
+.rgx-glow,
+.rgx-lift,
+.rgx-sel,
+.rgx-cue {
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.rgx-glow {
+  z-index: -1;
+  opacity: 0;
+  box-shadow:
+    0 0 0 1.5px rgb(var(--rgx-tone) / 0.85),
+    0 0 30px 5px rgb(var(--rgx-tone) / 0.36);
+  transition: opacity 420ms var(--ease-out);
+}
+.rgx-node[data-state='running'] > .rgx-glow {
+  opacity: 1;
+  animation: rgx-breathe 2.6s ease-in-out infinite;
+}
+.rgx-node[data-state='awaiting_approval'] > .rgx-glow {
+  opacity: 1;
+  animation: rgx-breathe 3.2s ease-in-out infinite;
+}
+.rgx-node[data-state='failed'] > .rgx-glow {
+  opacity: 0.85;
+}
+@keyframes rgx-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* Hover lifts the card a pixel and deepens its shadow; selection rings it in
+   the brand color. */
+.rgx-lift {
+  z-index: -1;
+  opacity: 0;
+  box-shadow: 0 10px 28px -10px rgb(var(--c-ink) / 0.28);
+  transition: opacity 180ms var(--ease-out);
+}
+.rgx-sel {
+  opacity: 0;
+  box-shadow: 0 0 0 2px rgb(var(--c-brand-500) / 0.85);
+  transition: opacity 180ms var(--ease-out);
+}
+.react-flow__node.selected .rgx-sel { opacity: 1; }
+@media (hover: hover) and (pointer: fine) {
+  .react-flow__node:hover .rgx-node { translate: 0 -1px; }
+  .react-flow__node:hover .rgx-lift { opacity: 1; }
+}
+
+/* The kind bar along the top; it shimmers while the step works. */
+.rgx-bar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  overflow: hidden;
+  border-radius: inherit;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.rgx-sheen {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.85), transparent);
+  translate: -100% 0;
+  transition: opacity 300ms ease;
+}
+.rgx-node[data-state='running'] .rgx-sheen {
+  opacity: 1;
+  animation: rgx-sheen 1.8s linear infinite;
+}
+@keyframes rgx-sheen {
+  to { translate: 100% 0; }
+}
+
+/* The status badge cross-fades its color; a running one turns its glyph. */
+.rgx-badge {
+  transition: background-color 320ms ease, color 320ms ease;
+}
+.rgx-badge[data-state='running'] > span {
+  display: inline-block;
+  animation: rgx-spin 1.6s linear infinite;
+}
+@keyframes rgx-spin {
+  to { rotate: 360deg; }
+}
+/* A status word that changes fades in rather than swapping. */
+.rgx-swap {
+  animation: rgx-fade 260ms ease-out;
+}
+
+/* One-shot cues, remounted (keyed) per state change. */
+.rgx-cue { opacity: 0; }
+.rgx-cue-done {
+  box-shadow: 0 0 0 2px rgb(var(--c-status-done) / 0.9), 0 0 18px 2px rgb(var(--c-status-done) / 0.45);
+  animation: rgx-cue 760ms var(--ease-out);
+}
+.rgx-cue-failed {
+  box-shadow: 0 0 0 2px rgb(var(--c-status-failed) / 0.95), 0 0 24px 4px rgb(var(--c-status-failed) / 0.5);
+  animation: rgx-cue 560ms var(--ease-out);
+}
+@keyframes rgx-cue {
+  0% { opacity: 1; scale: 1; }
+  100% { opacity: 0; scale: 1.05; }
+}
+.rgx-node[data-cue='done'] .rgx-badge.rgx-main {
+  animation: rgx-pop 380ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes rgx-pop {
+  from { scale: 0.7; }
+}
+
+/* ── fan-out units ── */
+.rgx-unit {
+  transition: background-color 360ms ease, scale 140ms var(--ease-out);
+}
+.rgx-unit[data-state='running'] {
+  animation: rgx-unit-work 1.8s ease-in-out infinite;
+  animation-delay: calc(var(--u, 0) * -0.23s);
+}
+@keyframes rgx-unit-work {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (hover: hover) and (pointer: fine) {
+  button.rgx-unit:hover { scale: 1.15; }
+}
+.rgx-progress {
+  transform-origin: left;
+  transition: scale 600ms var(--ease-out);
+}
+
+/* ── edges ── */
+.rgx-edge-track,
+.rgx-edge-fill {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 1 1;
+}
+.rgx-edge-track {
+  stroke-width: 1.75;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+}
+.rgx-edge-fill {
+  stroke-width: 2.5;
+  stroke-dashoffset: 1;
+  /* First paint draws it with the graph (a no-op while it is off); after that
+     it fills by transition when its step is reached. */
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+  transition: stroke-dashoffset 900ms var(--ease-out), opacity 300ms ease;
+}
+.rgx-edge-fill.is-on { stroke-dashoffset: 0; }
+@keyframes rgx-draw {
+  from { stroke-dashoffset: 1; }
+}
+.rgx-edge-head {
+  fill: none;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: stroke 400ms ease;
+  animation: rgx-fade 240ms ease-out backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms + var(--rgx-draw) * 0.7);
+}
+@keyframes rgx-fade {
+  from { opacity: 0; }
+}
+
+/* The travelling light: a short dash that rides the path, with a soft halo. */
+.rgx-edge-comet,
+.rgx-edge-halo {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 0.07 0.93;
+  /* Starts once its edge has drawn, fading in so it never sits still first. */
+  --rgx-light-at: calc(var(--i, 0) * var(--rgx-stagger) + 160ms + var(--rgx-draw));
+  animation:
+    rgx-travel 1.7s linear var(--rgx-light-at) infinite,
+    rgx-fade 300ms ease-out var(--rgx-light-at) backwards;
+}
+.rgx-edge-comet { stroke-width: 2.5; }
+.rgx-edge-halo { stroke-width: 8; opacity: 0.22; }
+.rgx-edge[data-tone='await'] .rgx-edge-comet,
+.rgx-edge[data-tone='await'] .rgx-edge-halo {
+  stroke-dasharray: 0.12 0.88;
+  animation-duration: 2.8s, 300ms;
+}
+@keyframes rgx-travel {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+
+/* ── workflow editor: cards ── */
+/* Cards arrive like the run graph's (a node dropped from the palette arrives
+   the same way, at once). Hover lifts a card's shadow; grabbing it lifts the
+   card itself; selecting fades its accent glow in. */
+.wfx-node {
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+  transition: scale 180ms var(--ease-out);
+}
+.wfx-sil-shape { transition: stroke 220ms ease; }
+.wfx-sil-glow {
+  opacity: 0;
+  transition: opacity 200ms var(--ease-out);
+}
+.wfx-sil-glow[data-on] { opacity: 0.28; }
+.wfx-sil-lift {
+  fill: rgb(var(--c-ink) / 0.3);
+  filter: blur(8px);
+  translate: 0 4px;
+  opacity: 0;
+  transition: opacity 200ms var(--ease-out), translate 200ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .react-flow__node:hover .wfx-sil-lift { opacity: 0.45; }
+}
+.react-flow__node.dragging .wfx-node { scale: 1.025; cursor: grabbing; }
+.react-flow__node.dragging .wfx-sil-lift { opacity: 0.9; translate: 0 10px; }
+
+/* Handles grow when their card is hovered, and the one a connection would
+   land on rings green. */
+.wfx-canvas .react-flow__handle {
+  transition: scale 160ms var(--ease-out), box-shadow 160ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-canvas .react-flow__node:hover .react-flow__handle {
+    scale: 1.45;
+    box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.18);
+  }
+}
+.wfx-canvas .react-flow__handle.connectingto.valid {
+  scale: 1.7;
+  box-shadow: 0 0 0 4px rgb(var(--c-status-done) / 0.3);
+}
+.wfx-canvas .react-flow__handle.connectingto:not(.valid) {
+  box-shadow: 0 0 0 4px rgb(var(--c-status-failed) / 0.25);
+}
+
+/* ── workflow editor: edges ── */
+/* An edge draws from its source to its target when it appears (so a new
+   connection reads as made), and a soft light travels toward the step it
+   feeds — brighter and quicker on the selected edge. These replace xyflow's
+   dashes on its `animated` edges. */
+.react-flow__edge.react-flow__edge-flow path.wfx-e-base {
+  fill: none;
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 0;
+  animation: rgx-draw 520ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+  transition: stroke-width 160ms var(--ease-out);
+}
+.react-flow__edge.react-flow__edge-flow path.wfx-e-light {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 0.05 0.95;
+  pointer-events: none;
+  opacity: 0.5;
+  animation: rgx-travel 2.8s linear infinite;
+  /* staggered phases, so the edges don't pulse in lockstep */
+  animation-delay: calc(var(--i, 0) * -0.41s);
+  transition: opacity 200ms ease;
+}
+.react-flow__edge.react-flow__edge-flow.selected path.wfx-e-light {
+  opacity: 1;
+  animation-duration: 1.5s;
+}
+
+/* The line a connection draws while dragged. */
+.wfx-cline-path {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  transition: stroke 150ms ease;
+}
+.wfx-cline-dot,
+.wfx-cline-halo { transition: fill 150ms ease; }
+.wfx-cline-halo {
+  opacity: 0.22;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: wfx-halo 1.2s ease-in-out infinite;
+}
+@keyframes wfx-halo {
+  0%, 100% { scale: 0.8; opacity: 0.3; }
+  50% { scale: 1.15; opacity: 0.12; }
+}
+
+/* ── workflow editor: palette ── */
+.wfx-pcard {
+  transition:
+    border-color 0.15s ease,
+    translate 160ms var(--ease-out),
+    scale 120ms var(--ease-out),
+    box-shadow 160ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-pcard:not(:disabled):hover {
+    translate: 0 -1px;
+    box-shadow: 0 6px 16px -8px rgb(var(--c-ink) / 0.35);
+  }
+}
+.wfx-pcard:not(:disabled):active { scale: 0.97; translate: none; }
+
+/* ── reduced motion: fades, no travel, no breathing ── */
+@media (prefers-reduced-motion: reduce) {
+  .rgx-node { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .rgx-node[data-state] > .rgx-glow { animation: none; }
+  .rgx-node[data-state='running'] .rgx-sheen { animation: none; opacity: 0; }
+  .rgx-badge[data-state='running'] > span { animation: none; }
+  .rgx-cue { animation-name: rgx-cue-fade; }
+  .rgx-node[data-cue] .rgx-badge { animation: none; }
+  .rgx-unit[data-state='running'] { animation: none; }
+  .rgx-edge-track,
+  .rgx-edge-fill,
+  .rgx-edge-head { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .rgx-edge-fill { transition: none; }
+  .rgx-edge-comet, .rgx-edge-halo { display: none; }
+  .react-flow__node:hover .rgx-node { translate: none; }
+  button.rgx-unit:hover { scale: none; }
+  .wfx-node { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .react-flow__node.dragging .wfx-node { scale: none; }
+  .wfx-sil-lift { translate: none; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-base { animation: rgx-fade 240ms ease-out backwards; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-light { display: none; }
+  .wfx-cline-halo { animation: none; }
+  .wfx-canvas .react-flow__handle { transition: none; }
+  .wfx-pcard:not(:disabled):hover, .wfx-pcard:not(:disabled):active { translate: none; scale: none; }
+}
+@keyframes rgx-cue-fade {
+  0% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* ── container sub-steps (parallel rows): their border takes their state ── */
+.rgx-sub {
+  transition: border-color 320ms ease;
+}
+.rgx-sub[data-state='running'] { border-color: rgb(var(--c-status-running) / 0.55); }
+.rgx-sub[data-state='failed'] { border-color: rgb(var(--c-status-failed) / 0.6); }
+
+/* ── agentiflow flow (components/agentiflow/AgentiflowGraph.tsx) ── */
+/* The spine draws down from the engagement's start, the rows settle in after
+   it, a round's branch fades in with its units, and the live tail breathes,
+   with a light running down the spine into it. */
+.afx-draw {
+  stroke-dasharray: 1 1;
+  animation: rgx-draw 700ms var(--ease-out) backwards;
+}
+.afx-branch {
+  animation: rgx-fade 360ms ease-out 200ms backwards;
+}
+.afx-row {
+  animation: afx-row var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 45ms + 80ms);
+}
+@keyframes afx-row {
+  from { opacity: 0; translate: 0 4px; }
+}
+.afx-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: afx-ring 2.2s var(--ease-out) infinite;
+}
+@keyframes afx-ring {
+  0% { scale: 1; opacity: 0.8; }
+  70%, 100% { scale: 2.6; opacity: 0; }
+}
+.afx-light {
+  stroke-linecap: round;
+  stroke-dasharray: 0.18 0.82;
+  animation: rgx-travel 1.6s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .afx-draw { animation: rgx-fade 240ms ease-out backwards; }
+  .afx-row { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-ring { animation: none; opacity: 0.35; }
+  .afx-light { display: none; }
+}

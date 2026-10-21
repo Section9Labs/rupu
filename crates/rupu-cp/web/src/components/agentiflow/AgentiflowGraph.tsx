@@ -251,6 +251,8 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
           {/* The lead spine — one continuous line through every spine node. */}
           {nodes.length > 1 && (
             <line
+              className="afx-draw"
+              pathLength={1}
               x1={SPINE_X}
               y1={firstY}
               x2={SPINE_X}
@@ -269,7 +271,7 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
             const firstU = n.units[0];
             const lastU = n.units[n.units.length - 1];
             return (
-              <g key={`branch-${n.key}`}>
+              <g key={`branch-${n.key}`} className="afx-branch">
                 {/* fan-out from the round node to the lane top */}
                 <path d={spur(SPINE_X, n.nodeY, BRANCH_X, firstU.cy)} fill="none" stroke={pal.lane} strokeWidth={1.5} />
                 {/* the lane itself */}
@@ -284,6 +286,8 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
                 {n.units.map((u) => (
                   <g key={u.unit.unit_id}>
                     <line x1={BRANCH_X} y1={u.cy} x2={CARD_X - 6} y2={u.cy} stroke={u.tint} strokeOpacity={0.6} strokeWidth={1.5} />
+                    {/* a running unit breathes a ring out of its dot */}
+                    {u.pulse && <circle className="afx-ring" cx={BRANCH_X} cy={u.cy} r={4} fill="none" stroke={u.tint} strokeWidth={1.5} />}
                     <circle
                       cx={BRANCH_X}
                       cy={u.cy}
@@ -291,7 +295,6 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
                       fill={u.dotFill ?? (mode === 'dark' ? '#141416' : '#ffffff')}
                       stroke={u.dotRing ?? u.tint}
                       strokeWidth={1.6}
-                      className={u.pulse ? 'animate-pulse' : undefined}
                     />
                   </g>
                 ))}
@@ -302,7 +305,27 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
           {/* Spine node glyphs */}
           {nodes.map((n) => {
             if (n.kind === 'pulse') {
-              return <circle key={n.key} cx={SPINE_X} cy={n.nodeY} r={5} fill={leadTint} className="animate-pulse" />;
+              // The live tail: a light runs down the last stretch of the spine
+              // into it, and a ring breathes out of it.
+              const prevY = nodes.length > 1 ? nodes[nodes.length - 2].nodeY : n.nodeY;
+              return (
+                <g key={n.key}>
+                  {prevY < n.nodeY && (
+                    <line
+                      className="afx-light"
+                      pathLength={1}
+                      x1={SPINE_X}
+                      y1={prevY}
+                      x2={SPINE_X}
+                      y2={n.nodeY}
+                      stroke={leadTint}
+                      strokeWidth={3}
+                    />
+                  )}
+                  <circle className="afx-ring" cx={SPINE_X} cy={n.nodeY} r={5} fill="none" stroke={leadTint} strokeWidth={1.5} />
+                  <circle cx={SPINE_X} cy={n.nodeY} r={5} fill={leadTint} />
+                </g>
+              );
             }
             const fill =
               n.kind === 'stop'
@@ -322,17 +345,21 @@ export default function AgentiflowGraph({ detail }: { detail: AgentiflowDetail }
         </svg>
 
         {/* Row content — aligned to the SVG node y's. */}
-        {nodes.map((n) => (
-          <div key={`row-${n.key}`} className="absolute" style={{ top: n.top, left: CARD_X, right: 0, height: n.kind === 'round' ? HEADER_H : n.height }}>
+        {nodes.map((n, i) => (
+          <div
+            key={`row-${n.key}`}
+            className="afx-row absolute"
+            style={{ top: n.top, left: CARD_X, right: 0, height: n.kind === 'round' ? HEADER_H : n.height, ['--i' as string]: Math.min(i, 8) }}
+          >
             <RowHead node={n} detail={detail} leadCrew={leadCrew} onToggle={toggleRound} />
           </div>
         ))}
         {nodes.flatMap((n) =>
-          n.units.map((u) => (
+          n.units.map((u, k) => (
             <div
               key={`unit-${u.unit.unit_id}`}
-              className="absolute"
-              style={{ top: u.blockTop, left: CARD_X, right: 0, height: u.blockHeight }}
+              className="afx-row absolute"
+              style={{ top: u.blockTop, left: CARD_X, right: 0, height: u.blockHeight, ['--i' as string]: Math.min(k + 1, 10) }}
             >
               <div className="flex items-center" style={{ height: ROW_H }}>
                 <UnitCard

@@ -7,6 +7,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
+import { NodeFrame, StateBadge } from './NodeFrame';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
@@ -15,6 +16,8 @@ import WarnMark from './WarnMark';
 
 export interface ParallelNodeData extends Record<string, unknown> {
   node: GraphNode;
+  /** Entrance slot (see `entranceSlots`). */
+  slot?: number;
 }
 
 type ParallelFlowNode = Node<ParallelNodeData, 'parallel'>;
@@ -34,13 +37,14 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
   const subs = node.parallel ?? [];
   const total = subs.length;
   const done = subs.filter((s) => s.state === 'done').length;
-  const running = node.state === 'running';
   const box = nodeSize(node);
 
   return (
-    <div
-      data-testid="rg-container"
-      className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
+    <NodeFrame
+      state={node.state}
+      slot={data.slot}
+      testId="rg-container"
+      className="rounded-[12px] border px-2 py-1.5"
       style={{
         borderColor: colors.alpha(accentKey, 0.4),
         background: colors.alpha(accentKey, 0.08),
@@ -67,15 +71,13 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
         {subs.map((sub) => {
           const ss = stateStyle(colors, sub.state);
           return (
-            <div key={sub.id} className="rounded-[6px] border border-border bg-panel px-1.5 py-1">
+            <div
+              key={sub.id}
+              data-state={sub.state}
+              className="rgx-sub rounded-[6px] border border-border bg-panel px-1.5 py-1"
+            >
               <div className="flex items-center gap-1.5">
-                <span
-                  className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-                  style={{ background: ss.color }}
-                  aria-hidden
-                >
-                  {ss.glyph}
-                </span>
+                <StateBadge state={sub.state} color={ss.color} glyph={ss.glyph} small />
                 <span className="min-w-0 truncate text-note text-ink">{sub.id}</span>
               </div>
               {/* identity on its own lines (PARALLEL_SUBROW_ID_H) */}
@@ -94,7 +96,7 @@ function ParallelNodeView({ data }: NodeProps<ParallelFlowNode>) {
       </div>
 
       <Handle type="source" position={Position.Right} style={handleStyle} />
-    </div>
+    </NodeFrame>
   );
 }
 

@@ -123,4 +123,20 @@ describe('RunGraph edges', () => {
     render(<RunGraph model={pending} positions={POS} />);
     expect(captured[0].style?.stroke).not.toBe(traversed);
   });
+
+  it('hands the RunEdge its tone and the gradient of its two kinds', () => {
+    const model = modelWith(
+      [node('a', 'action', 'done'), node('b', 'step', 'running'), node('c', 'gate', 'pending')],
+      [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }],
+    );
+    render(<RunGraph model={model} positions={POS} />);
+    const [live, idle] = captured;
+    expect(live.type).toBe('run');
+    expect(live.data).toMatchObject({
+      tone: 'live',
+      from: 'rgb(100 116 139)', // action: sev.info
+      light: 'rgb(59 130 246)', // the running color
+    });
+    expect(idle.data).toMatchObject({ tone: 'idle' });
+  });
 });

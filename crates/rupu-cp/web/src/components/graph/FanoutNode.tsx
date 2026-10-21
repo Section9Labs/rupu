@@ -15,6 +15,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, UnitView } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
+import { NodeFrame } from './NodeFrame';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize, FANOUT_INLINE_THRESHOLD, FANOUT_INLINE_COLS } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
@@ -28,6 +29,8 @@ export interface FanoutNodeData extends Record<string, unknown> {
   node: GraphNode;
   onOpenUnit?: (stepId: string, index: number) => void;
   onExpandFanout?: (stepId: string) => void;
+  /** Entrance slot (see `entranceSlots`). */
+  slot?: number;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
@@ -89,7 +92,6 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     border: 'none',
   } as const;
   const fo = node.fanout;
-  const running = node.state === 'running';
   const box = nodeSize(node);
 
   // No units to show. This is NOT always "awaiting" — a for_each over an empty
@@ -126,8 +128,10 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
               ? 'skipped'
               : 'awaiting units…';
     return (
-      <div
-        className={['relative rounded-[12px] border px-3 py-2', running ? 'rg-pulse-run' : ''].join(' ')}
+      <NodeFrame
+        state={node.state}
+        slot={data.slot}
+        className="rounded-[12px] border px-3 py-2"
         style={{ borderColor: border, background: bg, width: box.width, minHeight: box.height }}
       >
         <Handle type="target" position={Position.Left} style={handleStyle} />
@@ -138,9 +142,9 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
           <span className="truncate">for_each · {node.id}</span>
           <WarnMark warnings={node.warnings} />
         </div>
-        <div className="mt-1 text-note text-ink-mute">{message}</div>
+        <div key={message} className="rgx-swap mt-1 text-note text-ink-mute">{message}</div>
         <Handle type="source" position={Position.Right} style={handleStyle} />
-      </div>
+      </NodeFrame>
     );
   }
 
@@ -155,9 +159,11 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
   if (total <= INLINE_THRESHOLD) {
     const cols = Math.min(total, FANOUT_INLINE_COLS);
     return (
-      <div
-        data-testid="rg-container"
-        className={['relative rounded-[12px] border px-2 py-1.5', running ? 'rg-pulse-run' : ''].join(' ')}
+      <NodeFrame
+        state={node.state}
+        slot={data.slot}
+        testId="rg-container"
+        className="rounded-[12px] border px-2 py-1.5"
         style={{
           borderColor: colors.alpha(accentKey, 0.4),
           background: colors.alpha(accentKey, 0.12),
@@ -192,25 +198,28 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
               type="button"
               title={unitTitle(node, u, stateStyle(colors, u.state).label)}
               onClick={() => onOpenUnit?.(node.id, u.index)}
+              data-state={u.state}
               className={cn(
-                'h-[15px] w-[15px] rounded-[3px] transition-transform hover:scale-110',
+                'rgx-unit h-[15px] w-[15px] rounded-[3px]',
                 u.warnings?.length && 'ring-2 ring-warn ring-offset-1 ring-offset-panel',
               )}
-              style={{ background: glyphBg(colors, u.state) }}
+              style={{ background: glyphBg(colors, u.state), ['--u' as string]: u.index }}
             />
           ))}
         </div>
         <Handle type="source" position={Position.Right} style={handleStyle} />
-      </div>
+      </NodeFrame>
     );
   }
 
   // ---- Large fan-out: collapsed X/N card ----------------------------------
   const preview = fo.units.slice(0, PREVIEW_CELLS);
   return (
-    <div
-      data-testid="rg-container"
-      className={['relative rounded-[12px] border bg-panel px-3 py-2.5 shadow-card', running ? 'rg-pulse-run' : ''].join(' ')}
+    <NodeFrame
+      state={node.state}
+      slot={data.slot}
+      testId="rg-container"
+      className="rounded-[12px] border bg-panel px-3 py-2.5 shadow-card"
       style={{ borderColor: colors.alpha(accentKey, 0.4), width: box.width, minHeight: box.height }}
     >
       <Handle type="target" position={Position.Left} style={handleStyle} />
@@ -242,9 +251,9 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         style={{ background: colors.surface }}
       >
         <div
-          className="h-full"
+          className="rgx-progress h-full"
           style={{
-            width: `${pct}%`,
+            scale: `${pct / 100} 1`,
             background: `linear-gradient(90deg, ${colors.status.running}, ${colors.status.done})`,
           }}
         />
@@ -269,8 +278,9 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
         {preview.map((u) => (
           <span
             key={u.index}
-            className="block h-[9px] w-[9px] rounded-[2px]"
-            style={{ background: glyphBg(colors, u.state) }}
+            data-state={u.state}
+            className="rgx-unit block h-[9px] w-[9px] rounded-[2px]"
+            style={{ background: glyphBg(colors, u.state), ['--u' as string]: u.index }}
           />
         ))}
       </div>
@@ -287,7 +297,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
       </button>
 
       <Handle type="source" position={Position.Right} style={handleStyle} />
-    </div>
+    </NodeFrame>
   );
 }
 

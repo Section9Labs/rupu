@@ -10,6 +10,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode } from '../../lib/runGraphModel';
 import { stateStyle, glyphBg } from './stepStyle';
+import { NodeFrame, StateBadge } from './NodeFrame';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { nodeSize } from '../../lib/nodeSize';
 import { runKindAccent } from './kindBridge';
@@ -21,6 +22,8 @@ export interface PanelLoopNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Select a panelist/fixer unit's transcript — same callback FanoutNode uses. */
   onOpenUnit?: (stepId: string, index: number) => void;
+  /** Entrance slot (see `entranceSlots`). */
+  slot?: number;
 }
 
 type PanelFlowNode = Node<PanelLoopNodeData, 'panel'>;
@@ -47,9 +50,11 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
   const box = nodeSize(node);
 
   return (
-    <div
-      data-testid="rg-container"
-      className={['relative rounded-[12px] border px-2.5 py-2', running ? 'rg-pulse-await' : ''].join(' ')}
+    <NodeFrame
+      state={node.state}
+      slot={data.slot}
+      testId="rg-container"
+      className="rounded-[12px] border px-2.5 py-2"
       style={{
         borderColor: colors.alpha(accentKey, 0.4),
         background: colors.alpha(accentKey, 0.08),
@@ -87,13 +92,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
           background: colors.alpha('status.awaiting', 0.12),
         }}
       >
-        <span
-          className="inline-flex h-3 w-3 shrink-0 items-center justify-center rounded-[3px] text-[8px] font-bold leading-none text-white"
-          style={{ background: s.color }}
-          aria-hidden
-        >
-          {s.glyph}
-        </span>
+        <StateBadge state={node.state} color={s.color} glyph={s.glyph} small />
         <span className="text-meta font-medium" style={{ color: colors.status.awaiting }}>
           {gate ? (
             <>
@@ -119,8 +118,9 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
               className="flex w-full min-w-0 items-start gap-1 rounded bg-panel/80 px-1.5 py-0.5 text-left text-meta text-ink-dim ring-1 ring-brand-100 transition-colors hover:bg-panel hover:text-brand-700"
             >
               <span
-                className="mt-[3px] inline-block h-2 w-2 shrink-0 rounded-[2px]"
-                style={{ background: glyphBg(colors, u.state) }}
+                data-state={u.state}
+                className="rgx-unit mt-[3px] inline-block h-2 w-2 shrink-0 rounded-[2px]"
+                style={{ background: glyphBg(colors, u.state), ['--u' as string]: u.index }}
                 aria-hidden
               />
               {u.codename || u.agent ? (
@@ -145,7 +145,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       )}
 
       <div className="mt-1.5 flex items-center gap-1.5">
-        <span className="rounded bg-panel/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
+        <span key={node.state} className="rgx-swap rounded bg-panel/70 px-1.5 py-px text-meta text-brand-700 ring-1 ring-brand-100">
           {s.label}
         </span>
         {node.agent && (
@@ -156,7 +156,7 @@ function PanelLoopNodeView({ data }: NodeProps<PanelFlowNode>) {
       </div>
 
       <Handle type="source" position={Position.Right} style={handleStyle} />
-    </div>
+    </NodeFrame>
   );
 }
 
