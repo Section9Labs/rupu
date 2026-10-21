@@ -57,6 +57,14 @@
   --c-ok: 22 163 74;    --c-ok-bg: 240 253 244;
   --c-warn: 217 119 6;  --c-warn-bg: 255 251 235;
   --c-info: 37 99 235;  --c-info-bg: 239 246 255;
+  /* Chart categorical palette, fixed order (never cycled). Validated with the
+     dataviz checker against the light panel: lightness band, chroma floor,
+     colorblind + normal-vision separation of adjacent slots, 3:1 contrast. */
+  --c-chart-1: 47 111 214;  /* blue   */
+  --c-chart-2: 31 138 70;   /* green  */
+  --c-chart-3: 122 82 209;  /* violet */
+  --c-chart-4: 176 109 0;   /* amber  */
+  --c-chart-5: 15 138 163;  /* cyan   */
 }
 
 [data-theme="dark"] {
@@ -100,6 +108,12 @@
   --c-ok: 74 222 128;   --c-ok-bg: 18 40 27;
   --c-warn: 251 191 36; --c-warn-bg: 48 36 12;
   --c-info: 96 165 250; --c-info-bg: 20 32 54;
+  /* The same five slots, stepped for the dark panel (validated against it). */
+  --c-chart-1: 76 142 239;
+  --c-chart-2: 51 172 90;
+  --c-chart-3: 140 109 226;
+  --c-chart-4: 201 130 18;
+  --c-chart-5: 33 163 188;
 }
 
 @layer base {
@@ -1301,67 +1315,254 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
    cmTooltips.ts's header comment for the full specificity accounting. */
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Living stacked-area chart (components/ui/Chart.tsx). The plot draws in with a
- * left-to-right reveal (the series trace across time), the latest point pops
- * in and then breathes a now-pulse, and the hover crosshair glides. All
- * token-based (colors come from the component via inline `rgb(var(--c-*))`);
- * this file owns only the motion. Every rule is disabled under
- * prefers-reduced-motion, where the chart simply appears, static and complete.
+ * Chart motion (components/ui/Chart.tsx and components/charts/*). One small
+ * vocabulary shared by every chart, so they all move the same way:
+ *
+ *  - the plot is traced left to right by a sweep (a clip that opens over
+ *    1.4s) while its areas rise from the baseline; a glowing stylus rides the
+ *    leading edge (JS, Chart's `useStylus`);
+ *  - the frame (grid, ticks, axis names) settles in first, staggered, from a
+ *    slight blur;
+ *  - annotations (the peak stem and its label, end dots) land after the sweep;
+ *  - "now" breathes, only on a live series;
+ *  - hover is a crosshair that glides between buckets and a tooltip that
+ *    follows instantly once open.
+ *
+ * Arrivals use --ease-out, on-screen movement (zoom, morph) uses
+ * --ease-in-out. Colors come from the components (theme tokens); this file
+ * owns only motion. Under prefers-reduced-motion nothing moves or blurs:
+ * the finished chart fades in, and hover still works without gliding.
  * ────────────────────────────────────────────────────────────────────────── */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --chart-sweep: 1400ms;
+  --chart-land: 1000ms; /* when annotations start landing */
+}
 
-/* Reveal wipe: the clip rect scales from the left, uncovering the areas and
-   lines in sync so the chart reads as drawing across its time axis. */
-.cp-chart-wipe {
+/* The sweep: a clip rect that opens from the left, tracing the marks. */
+.cp-chart-sweep {
   transform: scaleX(0);
   transform-origin: left;
   transform-box: fill-box;
 }
-.cp-chart-wipe.cp-in {
+.cp-in .cp-chart-sweep {
   transform: scaleX(1);
-  transition: transform 1000ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform var(--chart-sweep) var(--ease-out);
 }
 
-/* The latest point: a solid dot that pops in once the reveal reaches it, then
-   its ring breathes continuously so "now" stays alive. */
-.cp-chart-now-dot {
+/* Areas rise from their baseline as the sweep passes (`.cp-down` for a panel
+   that hangs below its baseline, like the token flow's output). */
+.cp-chart-rise {
+  transform: scaleY(0.04);
+  transform-origin: bottom;
   transform-box: fill-box;
-  transform-origin: center;
-  animation: cp-now-pop 480ms 840ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
-}
-@keyframes cp-now-pop {
-  from { transform: scale(0); }
-  to { transform: scale(1); }
-}
-.cp-chart-now {
-  transform-box: fill-box;
-  transform-origin: center;
-  /* hidden until the reveal + pop are done, then it starts breathing */
   opacity: 0;
-  animation: cp-chart-ring 2.4s cubic-bezier(0.23, 1, 0.32, 1) 1200ms infinite;
+}
+.cp-chart-rise.cp-down {
+  transform-origin: top;
+}
+.cp-in .cp-chart-rise {
+  transform: scaleY(1);
+  opacity: 1;
+  transition:
+    transform 1050ms var(--ease-out),
+    opacity 280ms ease-out;
+}
+
+/* The frame: gridlines draw out from the axis, tick labels settle from a
+   slight blur, staggered by --i (set per element). */
+.cp-chart-grid {
+  transform: scaleX(0);
+  transform-origin: left;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-grid {
+  transform: scaleX(1);
+  transition: transform 700ms var(--ease-out) calc(var(--i, 0) * 45ms);
+}
+.cp-chart-tick {
+  opacity: 0;
+  transform: translateY(3px);
+  filter: blur(2px);
+}
+.cp-in .cp-chart-tick {
+  opacity: 1;
+  transform: none;
+  filter: none;
+  transition:
+    opacity 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms),
+    transform 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms),
+    filter 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms);
+}
+
+/* Annotations land once the sweep has passed: the peak stem drops from its
+   label, the label and end dots fade up. */
+.cp-chart-late {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.cp-in .cp-chart-late {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 380ms var(--ease-out) calc(var(--chart-land) + var(--i, 0) * 60ms),
+    transform 380ms var(--ease-out) calc(var(--chart-land) + var(--i, 0) * 60ms);
+}
+.cp-chart-stem {
+  transform: scaleY(0);
+  transform-origin: top;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-stem {
+  transform: scaleY(1);
+  transition: transform 460ms var(--ease-out) var(--chart-land);
+}
+.cp-chart-pop {
+  opacity: 0;
+  transform: scale(0.4);
+  transform-origin: center;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-pop {
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 240ms ease-out var(--chart-sweep),
+    transform 420ms cubic-bezier(0.34, 1.56, 0.64, 1) var(--chart-sweep);
+}
+
+/* "Now" on a live series: a ring that breathes out of the latest point. */
+.cp-chart-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation: cp-chart-ring 2.4s var(--ease-out) calc(var(--chart-sweep) + 200ms) infinite;
 }
 @keyframes cp-chart-ring {
   0% { transform: scale(0.55); opacity: 0.9; }
-  70%, 100% { transform: scale(2.6); opacity: 0; }
+  70%, 100% { transform: scale(2.8); opacity: 0; }
 }
-.cp-chart-cross {
-  transition: transform 90ms cubic-bezier(0.23, 1, 0.32, 1);
+.cp-chart-hovering .cp-chart-ring {
+  animation-play-state: paused;
 }
+
+/* The stylus riding the sweep's leading edge (positioned per frame in JS). */
+.cp-chart-stylus {
+  pointer-events: none;
+}
+
+/* Hover: the crosshair glides between buckets; its dots glide on y. */
+.cp-chart-cross,
+.cp-chart-veil {
+  pointer-events: none;
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-cross-dot {
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-cross.cp-appear,
+.cp-chart-cross.cp-appear .cp-chart-cross-dot,
+.cp-chart-veil.cp-appear {
+  transition: none;
+}
+
+/* The tooltip: the outer box follows the crosshair (instant on the first
+   show, gliding after), the inner card scales in from the point it names. */
+.cp-chart-tip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 10;
+  pointer-events: none;
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-tip.cp-appear {
+  transition: none;
+}
+.cp-chart-tip-card {
+  opacity: 0;
+  transform: scale(0.96);
+  transform-origin: 50% 100%;
+  transition:
+    opacity 130ms ease-out,
+    transform 160ms var(--ease-out);
+}
+.cp-chart-tip.cp-on .cp-chart-tip-card {
+  opacity: 1;
+  transform: none;
+}
+
+/* Focus: hovering a legend entry or a stage dims everything else. */
+.cp-chart-fade {
+  transition: opacity 180ms ease;
+}
+
+/* A brush selection, and a tick that joins the axis on a rescale, fade in. */
+.cp-chart-appear,
+.cp-chart-brush {
+  animation: cp-chart-fade-in 120ms ease-out both;
+}
+@keyframes cp-chart-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* A zoom chip / reset control slides in from the top-right corner. */
+.cp-chart-chip {
+  animation: cp-chart-chip-in 220ms var(--ease-out) both;
+}
+@keyframes cp-chart-chip-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+.cp-chart-chip:active {
+  transform: scale(0.97);
+}
+
 @media (prefers-reduced-motion: reduce) {
-  /* No reveal, no pop, no breathing: the finished chart, at rest. */
-  .cp-chart-wipe,
-  .cp-chart-wipe.cp-in {
+  /* No sweep, rise, blur or glide: the finished chart fades in whole. */
+  .cp-chart-sweep,
+  .cp-in .cp-chart-sweep,
+  .cp-chart-grid,
+  .cp-in .cp-chart-grid,
+  .cp-chart-stem,
+  .cp-in .cp-chart-stem {
     transform: none !important;
     transition: none !important;
   }
-  .cp-chart-now-dot {
-    animation: none !important;
+  .cp-chart-rise,
+  .cp-chart-tick,
+  .cp-chart-late,
+  .cp-chart-pop {
     transform: none !important;
+    filter: none !important;
   }
-  .cp-chart-now {
+  .cp-in .cp-chart-rise,
+  .cp-in .cp-chart-tick,
+  .cp-in .cp-chart-late,
+  .cp-in .cp-chart-pop {
+    transform: none !important;
+    filter: none !important;
+    transition: opacity 200ms ease !important;
+  }
+  .cp-chart-ring {
     animation: none !important;
     opacity: 0 !important;
   }
-  .cp-chart-cross {
+  .cp-chart-cross,
+  .cp-chart-cross-dot,
+  .cp-chart-veil,
+  .cp-chart-tip,
+  .cp-chart-tip-card {
     transition: none !important;
+  }
+  .cp-chart-tip-card {
+    transform: none !important;
+  }
+  .cp-chart-appear,
+  .cp-chart-brush,
+  .cp-chart-chip {
+    animation: none !important;
   }
 }

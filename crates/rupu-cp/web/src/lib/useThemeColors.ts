@@ -52,6 +52,12 @@ const VARS = {
   // paint with. There is no dedicated "sky" token to match TriggerChip's
   // `sky` tone exactly; `info` is the closest existing blue in the palette.
   info: '--c-info',
+  // Chart categorical palette, fixed order: blue, green, violet, amber, cyan.
+  'chart.1': '--c-chart-1',
+  'chart.2': '--c-chart-2',
+  'chart.3': '--c-chart-3',
+  'chart.4': '--c-chart-4',
+  'chart.5': '--c-chart-5',
 } as const;
 
 export type ColorKey = keyof typeof VARS;

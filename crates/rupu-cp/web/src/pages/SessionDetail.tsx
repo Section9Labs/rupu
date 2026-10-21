@@ -448,11 +448,8 @@ export default function SessionDetailPage() {
             <span className="hidden group-open:inline">▾ Session details</span>
           </summary>
           <div className="mt-3 space-y-4">
-            <section className="rounded-xl border border-border bg-panel px-4 py-3 shadow-card">
-              <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-dim">
-                Token usage by turn
-              </h2>
-              <RunUsageTimeline series={series} />
+            <section className="rounded-xl border border-border bg-panel px-5 pb-3 pt-4 shadow-card">
+              <RunUsageTimeline series={series} live={sessionLive} />
             </section>
 
             <dl className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-panel shadow-card">

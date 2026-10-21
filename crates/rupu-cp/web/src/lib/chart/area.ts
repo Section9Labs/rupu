@@ -172,3 +172,30 @@ export function areaPath(
 function round(v: number): number {
   return Math.round(v * 100) / 100;
 }
+
+/**
+ * The tightest "nice" scale above `maxValue` with between `minTicks` and
+ * `maxTicks` intervals: every round step (1, 2, 2.5, 5 × 10ⁿ) is tried and the
+ * one whose top sits closest above the data wins, so a 402k peak gets a 500k
+ * top (100k steps), not 600k. Ties go to fewer gridlines.
+ */
+export function tightScale(maxValue: number, minTicks = 3, maxTicks = 5): Scale {
+  if (!Number.isFinite(maxValue) || maxValue <= 0) {
+    return { max: 1, step: 1, ticks: [0, 1] };
+  }
+  const mag = Math.pow(10, Math.floor(Math.log10(maxValue)));
+  let best: { max: number; step: number; count: number } | null = null;
+  for (const m of [0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10]) {
+    const step = m * mag;
+    const count = Math.ceil(maxValue / step - 1e-9);
+    if (count < minTicks || count > maxTicks) continue;
+    const max = count * step;
+    if (!best || max < best.max - 1e-9 || (Math.abs(max - best.max) < 1e-9 && count < best.count)) {
+      best = { max, step, count };
+    }
+  }
+  if (!best) return niceScale(maxValue, minTicks);
+  const ticks: number[] = [];
+  for (let k = 0; k <= best.count; k++) ticks.push(Math.round(k * best.step * 1e6) / 1e6);
+  return { max: best.max, step: best.step, ticks };
+}
