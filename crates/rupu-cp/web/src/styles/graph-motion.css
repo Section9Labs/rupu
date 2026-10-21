@@ -1233,3 +1233,131 @@
   .tl-scrubber { transition: none; }
   .tl-btn:active { scale: none; }
 }
+
+/* ── agentiflow flow: message arcs, board rail, message list (afx-*) ──
+   An arc is the run graph's edge family: round caps, the same draw-in, a
+   packet that travels once as the message lands. Undelivered stops short in a
+   dashed red dead end. Reduced motion: the arc fades, no packet. */
+.afx-msg path { fill: none; stroke-linecap: round; }
+.afx-msg-base {
+  stroke-width: 1.5;
+  stroke-dasharray: 1 1;
+  opacity: 0.5;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  transition: opacity 200ms ease, stroke-width 200ms ease;
+}
+.afx-msg-halo { stroke-width: 6; filter: blur(3px); opacity: 0; transition: opacity 240ms ease; }
+.afx-msg[data-highlighted='true'] .afx-msg-base { opacity: 1; stroke-width: 2; }
+.afx-msg[data-highlighted='true'] .afx-msg-halo { opacity: 0.28; }
+.afx-msg[data-dead='true'] .afx-msg-base { stroke-dasharray: 3 5; }
+.afx-msg-packet {
+  stroke-width: 3.5;
+  stroke-dasharray: 0.07 1.2;
+  animation: afx-packet 900ms var(--ease-in-out) both;
+}
+@keyframes afx-packet {
+  from { stroke-dashoffset: 0.07; opacity: 1; }
+  85% { opacity: 1; }
+  to { stroke-dashoffset: -1; opacity: 0; }
+}
+.afx-msg-dead { animation: rgx-fade 300ms ease-out 200ms backwards; }
+.afx-msg-dead path { stroke-width: 1.5; }
+.afx-msg-hit { stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: default; }
+.afx-msg-tip {
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 10px;
+  background: rgb(var(--c-surface) / 0.96);
+  color: rgb(var(--c-ink));
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: var(--gx-shadow-lift);
+  animation: rgx-fade 140ms ease-out backwards;
+}
+.afx-msg-tip-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; font-weight: 600; }
+.afx-msg-tip-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.afx-msg-tip-body { color: rgb(var(--c-ink-dim)); white-space: pre-wrap; overflow-wrap: anywhere; }
+.afx-msg-tip-reason { margin-top: 4px; color: rgb(var(--c-status-failed)); }
+
+/* The board rail. */
+.afx-rail { display: flex; flex-direction: column; gap: 14px; padding: 10px 12px; font-size: 12px; overflow-y: auto; }
+.afx-rail-h { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--c-ink-mute)); }
+.afx-rail-item {
+  display: block;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 8px;
+  background: rgb(var(--c-panel));
+  text-align: left;
+  color: rgb(var(--c-ink));
+  animation: rgx-enter 300ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 40ms);
+}
+.afx-rail-btn { cursor: pointer; transition: background-color 120ms var(--ease-out); }
+.afx-rail-btn:hover { background: rgb(var(--c-surface-hover)); }
+.afx-rail-item[data-state='held'] { border-color: rgb(var(--c-status-running) / 0.6); }
+.afx-rail-item[data-state='expired'] { border-style: dashed; }
+.afx-rail-item[data-retracted='true'] { opacity: 0.55; }
+.afx-rail-item[data-retracted='true'] .afx-rail-body { text-decoration: line-through; }
+.afx-rail-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.afx-rail-key { font-weight: 600; }
+.afx-rail-state { color: rgb(var(--c-ink-mute)); }
+.afx-rail-who { font-weight: 600; }
+.afx-rail-sub { color: rgb(var(--c-ink-mute)); }
+.afx-rail-body { margin-top: 2px; color: rgb(var(--c-ink-dim)); overflow-wrap: anywhere; }
+.afx-rail-note { color: rgb(var(--c-ink-mute)); font-style: italic; }
+.afx-rail-empty { color: rgb(var(--c-ink-mute)); }
+
+/* The message list and toolbar. */
+.afx-list { display: flex; flex-direction: column; overflow-y: auto; font-size: 12px; }
+.afx-list-empty { padding: 12px; color: rgb(var(--c-ink-mute)); font-size: 12px; }
+.afx-list-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px;
+  border-bottom: 1px solid rgb(var(--c-border));
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease-out);
+}
+.afx-list-row:hover { background: rgb(var(--c-surface-hover)); }
+.afx-list-row[data-selected='true'] { background: rgb(var(--c-surface-hover)); box-shadow: inset 2px 0 0 rgb(var(--c-brand-500)); }
+.afx-list-meta { display: flex; align-items: center; gap: 6px; color: rgb(var(--c-ink-mute)); }
+.afx-list-time { font-variant-numeric: tabular-nums; }
+.afx-list-tag { padding: 0 6px; border: 1px solid rgb(var(--c-border)); border-radius: 999px; font-size: 11px; }
+.afx-list-tag-dead { color: rgb(var(--c-status-failed)); border-color: rgb(var(--c-status-failed) / 0.5); }
+.afx-list-who { font-weight: 600; }
+.afx-list-body { color: rgb(var(--c-ink-dim)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.afx-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.afx-toolbar-kinds { display: flex; gap: 4px; }
+.afx-pill {
+  padding: 2px 9px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 999px;
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink-dim));
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease-out), scale 120ms var(--ease-out);
+}
+.afx-pill[aria-pressed='true'] { background: rgb(var(--c-surface-hover)); color: rgb(var(--c-ink)); }
+.afx-pill:active { scale: 0.97; }
+.afx-select {
+  padding: 2px 6px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 6px;
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink));
+  font-size: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .afx-msg-base { animation: rgx-fade 240ms ease-out backwards; }
+  .afx-msg-packet { display: none; }
+  .afx-rail-item { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-pill:active { scale: none; }
+}

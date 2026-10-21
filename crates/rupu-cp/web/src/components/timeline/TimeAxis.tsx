@@ -5,18 +5,8 @@
 import { useRef } from 'react';
 import { useThemeColors } from '../../lib/useThemeColors';
 import type { TimelineBand, TimelineItem } from '../../lib/timeline/timeline';
-
-// Message row kind -> theme token (Task 11 swaps this for messagePaint).
-type Token = Parameters<ReturnType<typeof useThemeColors>['get']>[0];
-const TICK_TOKEN: Record<string, Token> = {
-  post: 'chart.5',
-  mention: 'chart.5',
-  direct: 'chart.4',
-  broadcast: 'chart.3',
-  directive: 'chart.1',
-  retract: 'chart.1',
-  operator: 'status.awaiting',
-};
+import type { RowKind } from '../../lib/messages';
+import { messagePaint } from '../../lib/flow/messagePaint';
 
 export function TimeAxis({
   bands,
@@ -116,7 +106,7 @@ export function TimeAxis({
             <span
               key={i.key}
               className="tl-tick"
-              style={{ left: pct(i.at), background: colors.get(TICK_TOKEN[i.sub ?? 'post'] ?? 'chart.5') }}
+              style={{ left: pct(i.at), background: messagePaint((i.sub ?? 'post') as RowKind, colors).stroke }}
             />
           ))}
         {t !== null && (
