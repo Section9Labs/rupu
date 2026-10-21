@@ -144,8 +144,9 @@ export function TimelineView({
               <div
                 key={i}
                 title={`${n} active runs · ${boundaries.runLabel[i]}`}
-                className="flex-1 rounded-[1px]"
+                className="cp-heat-cell flex-1 rounded-[1px]"
                 style={{
+                  ['--i' as string]: i,
                   background: colors.alpha('inkMute', Math.min(0.75, (n / maxRuns) * 0.75)),
                 }}
               />
@@ -200,13 +201,14 @@ export function TimelineView({
                           if (b.calls > 0) onZoomBucket(from, to);
                         }}
                         className={cn(
-                          'flex flex-1 flex-col justify-end rounded-[1px] border-0 p-0',
-                          b.calls > 0 && 'cursor-pointer',
+                          'cp-heat-cell flex flex-1 flex-col justify-end rounded-[1px] border-0 p-0',
+                          b.calls > 0 && 'cp-heat-hot cursor-pointer',
                         )}
                         style={{
+                          ['--i' as string]: i,
                           background:
                             b.calls > 0
-                              ? colors.alpha('brand.500', 0.12 + 0.78 * (b.calls / globalMax))
+                              ? colors.alpha('chart.1', 0.12 + 0.78 * (b.calls / globalMax))
                               : 'transparent',
                         }}
                       >

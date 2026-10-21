@@ -1409,13 +1409,15 @@ export default function RunDetail() {
 
         {/* Persistent chrome: per-turn usage chart. */}
         <section
-          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3"
+          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-5 pb-3 pt-4"
           data-testid="usage-timeline-chrome"
         >
-          <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
-            Token usage by turn
-          </h2>
-          <RunUsageTimeline series={(usageFromGraph ? null : liveUsage?.points) ?? series} separators />
+          <RunUsageTimeline
+            key={id}
+            series={(usageFromGraph ? null : liveUsage?.points) ?? series}
+            separators
+            live={isRunning}
+          />
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}

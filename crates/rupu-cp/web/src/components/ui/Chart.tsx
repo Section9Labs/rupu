@@ -1,49 +1,47 @@
-// Chart — the living chart tile (spec §"Charts"; ports charts-v2.html). One
-// engine, one visual language: thin stacked areas / overlaid lines / stacked
-// columns / a composed dual-axis mix, all sharing a real baseline with a
-// recessive grid, round y-ticks above the max, rounded data-ends, an optional
-// direct-labelled peak, a breathing now-pulse on the latest point, and an
-// interruptible hover crosshair + tooltip — with a prefers-reduced-motion
-// fallback (no draw-in, no pulse, static).
+// Chart — the living chart (spec §"Charts", visual language charts-v2.html).
+// One engine for every time series in the CP that isn't the token flow:
+// thin stacked areas (`area`, the default) or overlaid lines (`line`) on a
+// real baseline, a recessive grid with round ticks just above the data, a
+// direct-labelled peak, and a quiet end dot that breathes while the series
+// is live.
 //
-// Pure-SVG (no recharts). Geometry is the tested `lib/chart/area.ts`; token
-// colors come from theme tokens via `useThemeColors` (right in light + dark,
-// never a raw hex) — except where a caller supplies a dynamic palette through
-// `ChartSeries.rawColor` (the usage timelines, which color per model/pivot).
-// Motion is CSS classes in `styles.css`, all guarded by
-// `@media (prefers-reduced-motion: reduce)`. Series are given bottom-first
-// (stacking order); the last series is the top of the stack (the attention
-// band) and owns the now-pulse.
+// Motion (styles.css "Chart motion"): the frame settles in from a slight
+// blur, the marks are traced left to right by a sweep while their areas rise,
+// a stylus glows on the leading edge, the peak stem and end dot land after
+// the sweep. New data of the same shape morphs into place. Hover is a fading
+// crosshair with a dot riding each series, a tooltip that follows it, and the
+// future dimmed behind the pointer; hovering a legend entry isolates its
+// series. Reduced motion: the finished chart fades in, nothing moves.
+//
+// Pure SVG drawn 1:1 with its box (never a stretched viewBox), so type and
+// strokes keep their size at any width. Geometry is lib/chart/area.ts; colors
+// are theme tokens (`color`) or a caller's dynamic palette (`rawColor`).
 
-import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useThemeColors, type ColorKey } from '../../lib/useThemeColors';
 import { cn } from '../../lib/cn';
 import { useDragSelection } from '../dashboard/useDragSelection';
+import { cumulativeTops, peakIndex, seriesMax, tightScale, totals, xsFor, yOf, type Plot } from '../../lib/chart/area';
+import { prefersReducedMotion, useDrawIn, useMeasuredWidth, useMorphedSeries } from '../../lib/chart/motion';
 import {
-  areaPath,
-  bandCenters,
-  bandWidth,
-  cumulativeTops,
-  linePoints,
-  niceScale,
-  peakIndex,
-  roundedTopRect,
-  seriesMax,
-  totals,
-  xsFor,
-  yOf,
-  type Plot,
-} from '../../lib/chart/area';
+  ChartLegend,
+  ChartTooltip,
+  CrossGradient,
+  Crosshair,
+  FadeGradient,
+  GlowFilter,
+  Stylus,
+  useHoverIndex,
+  type TipRow,
+} from '../charts/parts';
 
 /** Width the chart is laid out at before (or without) a measured container —
  *  the dashboard tile's width, and what jsdom tests render at. */
 const DEFAULT_W = 480;
 /** Default plot height in CSS pixels. */
 const DEFAULT_H = 176;
-/** Margins around the plot box, in CSS pixels. The SVG is drawn 1:1 with its
- *  container (never a fixed viewBox stretched to fit), so type, strokes and
- *  dots keep their designed size on any width. */
-const PAD = { left: 48, right: 14, composedRight: 48, top: 26, bottom: 28 };
+/** Margins around the plot box, in CSS pixels. */
+const PAD = { left: 48, right: 14, top: 26, bottom: 28 };
 /** Smallest gap between two x-tick labels, and between two reference-line
  *  labels, in CSS pixels. */
 const MIN_TICK_GAP = 56;
@@ -52,10 +50,10 @@ const MIN_REF_LABEL_GAP = 8;
 const MONO_CHAR_W = 6;
 
 /** The plot box for a `w`×`h` chart. */
-export function plotFor(w: number, h: number, composed: boolean): Plot {
+export function plotFor(w: number, h: number): Plot {
   return {
     x0: PAD.left,
-    x1: Math.max(PAD.left + 1, w - (composed ? PAD.composedRight : PAD.right)),
+    x1: Math.max(PAD.left + 1, w - PAD.right),
     y0: h - PAD.bottom,
     yTop: PAD.top,
   };
@@ -81,7 +79,7 @@ export function spacedTicks(xs: number[], peak: number, minGap = MIN_TICK_GAP): 
 }
 
 /** A reference-line label laid out on the plot: where its text sits and which
- *  way it anchors, or `null` when it would collide with the previous one. */
+ *  way it anchors. */
 export interface PlacedRefLabel {
   index: number;
   text: string;
@@ -130,58 +128,44 @@ export function placeRefLabels(
   return kept.map((k) => k.label);
 }
 
-/** The width of the element `ref` points at, tracked as it resizes. Falls back
- *  to `fallback` until measured (and where there is no ResizeObserver). */
-function useMeasuredWidth(ref: React.RefObject<HTMLElement | null>, fallback: number): number {
-  const [w, setW] = useState(fallback);
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const measure = () => {
-      const next = Math.round(el.getBoundingClientRect().width);
-      if (next > 0) setW(next);
-    };
-    measure();
-    if (typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [ref]);
-  return w;
+/** Index ranges where a series has something to draw: a bucket counts when it
+ *  or a neighbour is non-zero, so a band that is empty for a stretch draws no
+ *  line over the band beneath it. Pure, for testing. */
+export function liveSegments(values: number[]): [number, number][] {
+  const out: [number, number][] = [];
+  let start = -1;
+  for (let i = 0; i < values.length; i++) {
+    const live = values[i] > 0 || (values[i - 1] ?? 0) > 0 || (values[i + 1] ?? 0) > 0;
+    if (live && start < 0) start = i;
+    if (!live && start >= 0) {
+      out.push([start, i - 1]);
+      start = -1;
+    }
+  }
+  if (start >= 0) out.push([start, values.length - 1]);
+  return out;
 }
-/** 1px seam between stacked column segments (app-screens §Charts). */
-const SEAM = 1;
 
 export interface ChartSeries {
   key: string;
   label: string;
   /** One value per bucket; same length/order as `dates`. */
   values: number[];
-  /** Token color key — stroke + a tint fill. Optional when `rawColor` is given. */
+  /** Token color key. Optional when `rawColor` is given. */
   color?: ColorKey;
-  /** A raw CSS color (e.g. a dynamic palette entry) that overrides `color`. For
-   *  dynamic per-series palettes — area fills then paint via `fill`+`fillOpacity`
-   *  attrs rather than a pre-alpha'd token. */
+  /** A raw CSS color (a dynamic palette entry) that overrides `color`. */
   rawColor?: string;
-  /** Fill opacity for the band (default 0.16). */
+  /** Strength of the band's fade at its top (default 0.3). */
   fillOpacity?: number;
-  /** `composed` kind only: the mark this series draws (default `line`). */
-  mark?: 'area' | 'line';
-  /** `composed` kind only: which axis this series is scaled against (default `left`). */
-  axis?: 'left' | 'right';
+  /** A value shown next to the series in the legend (e.g. its total). */
+  legendValue?: React.ReactNode;
 }
 
-/** Which mark the same chart engine draws. All share one frame (grid, ticks,
- *  baseline), one reveal, one crosshair/tooltip, one now-pulse and one count-up
- *  headline — the "living" language, applied to:
- *   - `area`     stacked tinted areas + top lines (the default, unchanged);
- *   - `line`     overlaid, unstacked series lines (no fills), each its own hue;
- *   - `column`   stacked columns rising to the baseline, rounded tops, seams;
- *   - `composed` an overlaid mix where each series picks its own `mark` and is
- *                scaled against its own `axis` (left/right) — a dual-axis chart. */
-export type ChartKind = 'area' | 'line' | 'column' | 'composed';
+/** `area`: stacked fading bands with their top lines (the default).
+ *  `line`: overlaid, unstacked lines, each its own hue. */
+export type ChartKind = 'area' | 'line';
 
-/** A dashed vertical reference line (e.g. a step/turn boundary). */
+/** A dashed vertical reference line (e.g. a boundary). */
 export interface ChartRefLine {
   /** The bucket index the line sits on. */
   index: number;
@@ -192,9 +176,8 @@ export interface ChartRefLine {
 export interface ChartProps {
   /** x labels, one per bucket. */
   dates: string[];
-  /** Bottom-first stacking order (stacked for `area`/`column`; overlaid for `line`/`composed`). */
+  /** Bottom-first stacking order (stacked for `area`, overlaid for `line`). */
   series: ChartSeries[];
-  /** The mark this chart draws (default `area`). */
   kind?: ChartKind;
   title?: string;
   /** Sub-line under the title. */
@@ -203,41 +186,39 @@ export interface ChartProps {
   headline?: { value: React.ReactNode; label?: React.ReactNode };
   /** A quiet explanatory line under the plot. */
   note?: React.ReactNode;
-  /** Peak sub-label, e.g. (i,total) => "16 failed". Falls back to "peak". */
+  /** Peak sub-label, e.g. (i,total) => "16 failed". Falls back to the bucket's date. */
   peakSubLabel?: (index: number, total: number) => string;
-  /** Format the (left-axis) y-tick labels. Default `String(v)`. */
+  /** Format values (tooltip, peak) and, unless `yTickFormat` is given, the
+   *  y-tick labels. Default `String(v)`. */
   yFormat?: (v: number) => string;
-  /** `composed` kind: format the right-axis y-tick labels. Defaults to `yFormat`. */
-  yFormatRight?: (v: number) => string;
+  /** Format the y-tick labels (round numbers, so usually coarser than values). */
+  yTickFormat?: (v: number) => string;
   /** Render the built-in legend (default `true`). */
   showLegend?: boolean;
-  /** Wrap the chart in the panel card chrome (default `true`). A caller embedding
-   *  the plot inside its own section passes `false` for a bare plot. */
+  /** Wrap the chart in the panel card chrome (default `true`). */
   showCard?: boolean;
   /** Dashed vertical reference lines over the plot. */
   refLines?: ChartRefLine[];
+  /** The latest bucket is "now": its end dot breathes (default `true`). */
+  live?: boolean;
   /**
    * Marquee drag-select. Called with the ordered `(startKey, endKey)` bucket
-   * keys once a real drag (not a plain click) finishes — see `useDragSelection`
-   * for the state machine (and its contract: always ordered). INERT when
-   * omitted. The keys come from `selectKeys` (default: `dates`).
+   * keys once a real drag (not a plain click) finishes — see `useDragSelection`.
+   * INERT when omitted. The keys come from `selectKeys` (default: `dates`).
    */
   onSelectRange?: (startKey: string, endKey: string) => void;
-  /** Per-bucket keys handed to `onSelectRange` — e.g. full `2026-06-21` day
-   *  buckets while `dates` shows the short `06-21` tick. Defaults to `dates`. */
+  /** Per-bucket keys handed to `onSelectRange`. Defaults to `dates`. */
   selectKeys?: string[];
-  /** Per-bucket tooltip titles — richer than the compact x-tick (e.g.
-   *  `turn 3 · review` while `dates` shows just `3`). Defaults to `dates`. */
+  /** Per-bucket tooltip titles, richer than the compact x-tick. Defaults to `dates`. */
   tooltipLabels?: string[];
   /** Accessible name for the plot. */
   ariaLabel?: string;
-  /** Plot height in CSS pixels (default 176). The width always follows the container. */
+  /** Plot height in CSS pixels (default 176). The width follows the container. */
   height?: number;
   className?: string;
 }
 
-/** One tooltip row — pure, exported for testing. `value` stays numeric; the
- *  component formats it at render with the series' axis formatter. */
+/** One tooltip row — pure, exported for testing. */
 export interface TooltipRow {
   key: string;
   label: string;
@@ -259,7 +240,7 @@ export function tooltipModel(series: ChartSeries[], dates: string[], i: number) 
   return { date: dates[i] ?? '', rows, total };
 }
 
-/** Nearest bucket index to a viewBox-space x. */
+/** Nearest bucket index to a plot-space x. */
 function nearestIndex(xa: number[], px: number): number {
   let best = 0;
   let bestD = Infinity;
@@ -277,59 +258,11 @@ function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
 }
 
-/** True when the viewer asked for reduced motion (guarded for SSR/jsdom). */
-function prefersReducedMotion(): boolean {
-  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
-  try {
-    return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  } catch {
-    return false;
-  }
-}
-
-const COUNT_MS = 750;
-function easeOutCubic(t: number): number {
-  return 1 - (1 - t) ** 3;
-}
-
-/** The headline figure, counting up from 0 on mount. It parses a LEADING number
- *  from a string value ("92%", "518+", "1,284") and animates just that part,
- *  keeping the suffix; anything without one (an em-dash, a node) renders
- *  unchanged. Reduced motion → the final value immediately. */
-function AnimatedFigure({ value }: { value: React.ReactNode }) {
-  const parsed = typeof value === 'string' ? value.match(/^([\d,]+(?:\.\d+)?)(.*)$/s) : null;
-  const target = parsed ? Number(parsed[1].replace(/,/g, '')) : null;
-  const suffix = parsed ? parsed[2] : '';
-  const decimals = parsed && parsed[1].includes('.') ? parsed[1].split('.')[1].length : 0;
-  const [n, setN] = useState<number | null>(() =>
-    target != null && !prefersReducedMotion() ? 0 : target,
-  );
-
-  useEffect(() => {
-    if (target == null || prefersReducedMotion()) {
-      setN(target);
-      return;
-    }
-    let raf = 0;
-    const start = performance.now();
-    const tick = (now: number) => {
-      const t = Math.min(1, (now - start) / COUNT_MS);
-      setN(target * easeOutCubic(t));
-      if (t < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [target]);
-
-  if (target == null || n == null) return <>{value}</>;
-  const shown = decimals > 0 ? n.toFixed(decimals) : Math.round(n).toLocaleString();
-  return (
-    <>
-      {shown}
-      {suffix}
-    </>
-  );
-}
+const pts = (xs: number[], ys: number[], a = 0, b = xs.length - 1) => {
+  let d = '';
+  for (let i = a; i <= b; i++) d += `${i === a ? 'M' : 'L'}${xs[i].toFixed(1)},${ys[i].toFixed(1)}`;
+  return d;
+};
 
 export function Chart({
   dates,
@@ -341,10 +274,11 @@ export function Chart({
   note,
   peakSubLabel,
   yFormat,
-  yFormatRight,
+  yTickFormat,
   showLegend = true,
   showCard = true,
   refLines,
+  live = true,
   onSelectRange,
   selectKeys,
   tooltipLabels,
@@ -354,93 +288,70 @@ export function Chart({
 }: ChartProps) {
   const colors = useThemeColors();
   const svgRef = useRef<SVGSVGElement>(null);
-  const boxRef = useRef<HTMLDivElement>(null);
-  const width = useMeasuredWidth(boxRef, DEFAULT_W);
-  const [hover, setHover] = useState<number | null>(null);
-  const [drawn, setDrawn] = useState(false);
+  const [width, boxRef] = useMeasuredWidth(DEFAULT_W);
+  // the draw-in plays when there is data, not on an empty first frame
+  const drawn = useDrawIn(dates.length > 0 && series.length > 0);
+  const hover = useHoverIndex();
+  const [focus, setFocus] = useState<string | null>(null);
   const uid = useId().replace(/:/g, '');
-  const clipId = `cp-reveal-${uid}`;
   const drag = useDragSelection(onSelectRange);
-
-  // Trigger the draw-in on the next frame after mount (CSS handles the
-  // reduced-motion fallback — the riser just appears).
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setDrawn(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
 
   const n = dates.length;
   const keys = selectKeys ?? dates;
-  const valueSeries = series.map((s) => s.values);
-  const composed = kind === 'composed';
-  const plot = plotFor(width, height, composed);
-  const xTickY = height - 12;
-  // Area + column stack (scale on the per-bucket total); line/composed overlay
-  // (scale on the largest single value, series never summed).
-  const stacked = kind === 'area' || kind === 'column';
+  const stacked = kind === 'area';
+  const plot = plotFor(width, height);
+  const xTickY = height - 10;
 
-  /** Resolve a series' paint color: a raw palette entry wins over a token. */
-  const seriesColor = (s: ChartSeries): string => s.rawColor ?? colors.get(s.color ?? 'status.running');
-  /** Fill props for an area band — `fillOpacity` attr for a raw color, a
-   *  pre-alpha'd token otherwise (so the Dashboard's token areas are unchanged). */
-  const fillAttrs = (s: ChartSeries): { fill: string; fillOpacity?: number } =>
-    s.rawColor
-      ? { fill: s.rawColor, fillOpacity: s.fillOpacity ?? 0.16 }
-      : { fill: colors.alpha(s.color ?? 'status.running', s.fillOpacity ?? 0.16) };
-
-  const tot = totals(valueSeries);
-  // Primary (left) scale.
-  const leftVals = composed
-    ? series.filter((s) => (s.axis ?? 'left') !== 'right').map((s) => s.values)
-    : valueSeries;
-  const dataMax = stacked ? (tot.length ? Math.max(...tot) : 0) : seriesMax(leftVals);
-  const scale = niceScale(dataMax);
-  // Composed charts get a second, independent scale for their right-axis series.
-  const rightVals = composed ? series.filter((s) => s.axis === 'right').map((s) => s.values) : [];
-  const rightScale = composed ? niceScale(seriesMax(rightVals)) : scale;
-  const scaleOf = (s: ChartSeries) => (composed && s.axis === 'right' ? rightScale : scale);
-
-  const xa = xsFor(n, plot);
-  // Columns sit centred in n equal slots; area/line/composed points sit on the plot edges.
-  const xc = kind === 'column' ? bandCenters(n, plot) : xa;
-  const barW = bandWidth(n, plot);
-  const tops = cumulativeTops(valueSeries); // per series cumulative top (stacked)
-  const peak = peakIndex(tot);
-
+  const raw = series.map((s) => s.values);
+  const tot = totals(raw);
+  const dataMax = stacked ? (tot.length ? Math.max(...tot) : 0) : seriesMax(raw);
+  const scale = tightScale(dataMax * 1.02, 3, 5);
+  // Same-shaped new data morphs into place, and the scale's top morphs with
+  // it, so marks never overshoot the plot mid-morph.
+  const morphed = useMorphedSeries([...raw, [scale.max]]);
+  const values = morphed.slice(0, -1);
+  const shownMax = morphed[morphed.length - 1]?.[0] ?? scale.max;
+  const xs = xsFor(n, plot);
+  const tops = cumulativeTops(values);
+  const peak = peakIndex(stacked ? tot : raw.length ? raw[0].map((_, i) => Math.max(...raw.map((s) => s[i] ?? 0))) : []);
   const hasData = n > 0 && series.length > 0;
+  const yv = (v: number) => yOf(v, shownMax, plot);
 
-  /** y of series `si`'s mark at bucket `i`: the cumulative top when stacked,
-   *  the series' own value (on its axis' scale) when overlaid. */
-  const markY = (si: number, i: number) =>
-    yOf(stacked ? tops[si][i] : valueSeries[si][i], scaleOf(series[si]).max, plot);
+  /** y of series `si`'s mark at bucket `i`. */
+  const markY = (si: number, i: number) => yv(stacked ? tops[si]?.[i] ?? 0 : values[si]?.[i] ?? 0);
 
-  // x-ticks: first, last, the peak and evenly spaced ones between, never closer
-  // than MIN_TICK_GAP px.
-  const tickIdx = spacedTicks(xc, peak);
-  const refLabels = hasData && refLines ? placeRefLabels(refLines, xc, plot) : [];
+  const tickIdx = spacedTicks(xs, peak);
+  const refLabels = hasData && refLines ? placeRefLabels(refLines, xs, plot) : [];
 
-  // The now-pulse series: the top of the stack, or (composed) the hero area.
-  const topSeries = series.length - 1;
-  const composedAreaIdx = series.findIndex((s) => (s.mark ?? 'line') === 'area');
-  const pulseIdx = composed && composedAreaIdx >= 0 ? composedAreaIdx : topSeries;
-  const lastX = xc[n - 1];
-  const lastTopY = hasData ? markY(pulseIdx, n - 1) : plot.y0;
-  const pulseStroke = series[pulseIdx] ? seriesColor(series[pulseIdx]) : colors.get('status.running');
-
+  const seriesColor = (s: ChartSeries): string => s.rawColor ?? colors.get(s.color ?? 'chart.1');
   const fmtY = yFormat ?? ((v: number) => String(v));
-  const fmtYRight = yFormatRight ?? fmtY;
-  const formatForSeries = (s: ChartSeries) => (composed && s.axis === 'right' ? fmtYRight : fmtY);
+  const fmtTick = yTickFormat ?? fmtY;
 
-  // Left-axis ticks carry the hero series' hue in a composed chart (so the
-  // axis reads as "this scale belongs to the area"); otherwise they're quiet.
-  const leftAxisSeries = composed ? series.find((s) => (s.axis ?? 'left') !== 'right') : undefined;
-  const leftTickFill = leftAxisSeries ? seriesColor(leftAxisSeries) : colors.inkDim;
+  // The series whose line tops the chart at the end: the top of the stack
+  // that has a value there (an empty top band would put the dot on another
+  // band's line), else the largest line.
+  let endIdx = series.length - 1;
+  if (hasData) {
+    if (stacked) {
+      for (let si = series.length - 1; si >= 0; si--) {
+        if ((raw[si][n - 1] ?? 0) > 0) {
+          endIdx = si;
+          break;
+        }
+      }
+    } else {
+      endIdx = raw.reduce((best, s, si) => ((s[n - 1] ?? 0) > (raw[best][n - 1] ?? 0) ? si : best), 0);
+    }
+  }
+  const endColor = series[endIdx] ? seriesColor(series[endIdx]) : colors.get('chart.1');
+  const lastX = xs[n - 1];
+  const endY = hasData ? markY(endIdx, n - 1) : plot.y0;
 
+  // ── drag-select band ─────────────────────────────────────────────────────
   const bucketX = (key: string): number | null => {
     const i = keys.indexOf(key);
-    return i >= 0 ? xc[i] : null;
+    return i >= 0 ? xs[i] : null;
   };
-  // The in-progress selection band (brand-tinted), under the marks.
   const slot = n > 1 ? (plot.x1 - plot.x0) / (n - 1) : plot.x1 - plot.x0;
   let band: { x: number; w: number } | null = null;
   if (drag.band) {
@@ -458,14 +369,12 @@ export function Chart({
     if (!svg || !hasData) return null;
     const r = svg.getBoundingClientRect();
     if (r.width === 0) return null; // jsdom / not laid out
-    const px = ((e.clientX - r.left) / r.width) * width;
-    return nearestIndex(xc, px);
+    return nearestIndex(xs, ((e.clientX - r.left) / r.width) * width);
   };
-
   const onMove = (e: React.MouseEvent) => {
     const i = indexFromEvent(e);
     if (i == null) return;
-    setHover(i);
+    hover.set(i);
     if (onSelectRange) drag.onMouseMove({ activeLabel: keys[i] });
   };
   const onDown = (e: React.MouseEvent) => {
@@ -476,19 +385,48 @@ export function Chart({
   };
   const onUp = () => drag.finalizeDrag();
   const onLeave = () => {
-    setHover(null);
+    hover.set(null);
     drag.finalizeDrag();
   };
 
-  const tip = hover != null && hasData ? tooltipModel(series, dates, hover) : null;
-  const hoverX = hover != null ? xc[hover] : 0;
-  const hoverTopY = hover != null ? markY(pulseIdx, hover) : 0;
+  // ── tooltip ──────────────────────────────────────────────────────────────
+  const hi = hover.index;
+  const tip = hi != null && hasData ? tooltipModel(series, dates, hi) : null;
+  const hoverX = hi != null ? xs[hi] : 0;
+  let tipRows: TipRow[] = [];
+  if (tip) {
+    // top of the stack first, the way the bands read
+    const ordered = stacked ? [...tip.rows].reverse() : tip.rows;
+    const many = ordered.length > 4;
+    tipRows = ordered
+      .filter((r) => !many || r.value > 0)
+      .map((r) => {
+        const s = series.find((x) => x.key === r.key) as ChartSeries;
+        return {
+          key: r.key,
+          label: r.label,
+          value: fmtY(r.value),
+          color: seriesColor(s),
+          muted: r.value === 0,
+        };
+      });
+    if (stacked && series.length > 1) tipRows.push({ key: '__total', label: 'Total', value: fmtY(tip.total), total: true });
+  }
+  const tipY = hi != null && hasData ? Math.min(...series.map((_, si) => markY(si, hi))) : 0;
 
-  const swatch = (color: ColorKey | undefined, rawColor: string | undefined): string =>
-    rawColor ?? (color ? colors.get(color) : colors.get('status.running'));
+  const opacityOf = (s: ChartSeries) => (focus && focus !== s.key ? 0.14 : 1);
+  const sweepId = `${uid}-sweep`;
+  const showPeak = hasData && peak >= 0 && (stacked ? tot[peak] : seriesMax(raw)) > 0;
 
   return (
-    <div className={cn(showCard && 'rounded-xl border border-border bg-panel p-4', className)}>
+    <div
+      className={cn(
+        showCard && 'rounded-xl border border-border bg-panel p-4',
+        drawn && 'cp-in',
+        tip && 'cp-chart-hovering',
+        className,
+      )}
+    >
       {(title || headline) && (
         <div className="mb-1 flex items-start justify-between gap-4">
           <div className="min-w-0">
@@ -506,20 +444,13 @@ export function Chart({
         </div>
       )}
 
-      {/* legend */}
-      {showLegend && series.length > 0 && (
-        <div className="mb-1 flex flex-wrap gap-x-4 gap-y-1">
-          {series.map((s) => (
-            <span key={s.key} className="inline-flex items-center gap-1.5 text-note text-ink-dim">
-              <span
-                className="h-2 w-2 shrink-0 rounded-sm"
-                style={{ background: seriesColor(s) }}
-                aria-hidden
-              />
-              {s.label}
-            </span>
-          ))}
-        </div>
+      {showLegend && (series.length > 1 || series[0]?.legendValue != null) && (
+        <ChartLegend
+          className="mb-1"
+          focus={focus}
+          onFocus={setFocus}
+          items={series.map((s) => ({ key: s.key, label: s.label, color: seriesColor(s), value: s.legendValue }))}
+        />
       )}
 
       <div ref={boxRef} className="relative">
@@ -528,7 +459,7 @@ export function Chart({
           viewBox={`0 0 ${width} ${height}`}
           width="100%"
           height={height}
-          className="block overflow-visible"
+          className="block select-none overflow-visible"
           style={onSelectRange ? { cursor: 'crosshair' } : undefined}
           role="img"
           aria-label={ariaLabel ?? title ?? 'chart'}
@@ -537,24 +468,28 @@ export function Chart({
           onMouseUp={onUp}
           onMouseLeave={onLeave}
         >
-          {/* left-to-right reveal: the plot area wipes open as the chart draws
-              in, so the series trace across time rather than stretching up. */}
           <defs>
-            <clipPath id={clipId}>
-              <rect
-                className={cn('cp-chart-wipe', drawn && 'cp-in')}
-                x={plot.x0}
-                y={plot.yTop - 6}
-                width={plot.x1 - plot.x0}
-                height={plot.y0 - plot.yTop + 10}
-              />
+            <clipPath id={sweepId}>
+              <rect className="cp-chart-sweep" x={plot.x0 - 6} y={0} width={plot.x1 - plot.x0 + 12} height={height} />
             </clipPath>
+            {series.map((s, si) => (
+              <FadeGradient
+                key={s.key}
+                id={`${uid}-g${si}`}
+                color={seriesColor(s)}
+                top={Math.min(0.5, s.fillOpacity ?? 0.3)}
+                bottom={stacked && si > 0 ? 0.08 : 0.02}
+              />
+            ))}
+            <GlowFilter id={`${uid}-glow`} />
+            <CrossGradient id={`${uid}-cross`} color={colors.ink} y0={plot.yTop - 6} y1={plot.y0} />
           </defs>
 
-          {/* gridlines + y ticks (left / primary axis) */}
-          {scale.ticks.map((t) => {
-            const y = yOf(t, scale.max, plot);
+          {/* frame: gridlines draw out from the axis, ticks settle in */}
+          {scale.ticks.map((t, k) => {
+            const y = yv(t);
             const isBase = t === 0;
+            if (y < plot.yTop - 6) return null;
             return (
               <g key={t}>
                 <line
@@ -562,343 +497,311 @@ export function Chart({
                   y1={y}
                   x2={plot.x1}
                   y2={y}
-                  style={{ stroke: isBase ? colors.border : colors.alpha('border', 0.6) }}
+                  className={isBase ? undefined : 'cp-chart-grid'}
+                  style={{
+                    ['--i' as string]: k,
+                    stroke: isBase ? colors.alpha('inkMute', 0.5) : colors.alpha('border', 0.7),
+                  }}
                   strokeWidth={1}
                 />
                 <text
-                  x={plot.x0 - 6}
-                  y={y + 3}
+                  x={plot.x0 - 8}
+                  y={y + 3.5}
                   textAnchor="end"
-                  className="font-mono"
-                  style={{ fill: leftTickFill, fontSize: 10 }}
+                  className="cp-chart-tick font-mono"
+                  style={{ ['--i' as string]: k, fill: colors.inkMute, fontSize: 10 }}
                 >
-                  {fmtY(t)}
+                  {fmtTick(t)}
                 </text>
               </g>
             );
           })}
 
-          {/* right-axis ticks (composed only) — labels only, no second grid */}
-          {composed &&
-            rightScale.ticks.map((t) => (
-              <text
-                key={`ry-${t}`}
-                x={plot.x1 + 6}
-                y={yOf(t, rightScale.max, plot) + 3}
-                textAnchor="start"
-                className="font-mono"
-                style={{ fill: colors.inkMute, fontSize: 10 }}
-              >
-                {fmtYRight(t)}
-              </text>
-            ))}
-
-          {/* selection band (marquee drag-select), beneath the marks */}
           {band && band.w > 0 && (
             <rect
               data-chart-band
+              className="cp-chart-brush"
               x={band.x}
-              y={plot.yTop}
+              y={plot.yTop - 4}
               width={band.w}
-              height={plot.y0 - plot.yTop}
-              style={{ fill: colors.alpha('brand.500', 0.15), pointerEvents: 'none' }}
+              height={plot.y0 - plot.yTop + 4}
+              rx={4}
+              strokeWidth={1}
+              style={{
+                fill: colors.alpha('brand.500', 0.1),
+                stroke: colors.alpha('brand.500', 0.5),
+                pointerEvents: 'none',
+              }}
             />
           )}
 
-          {/* marks (area / line / column / composed), revealed left-to-right by the wipe clip */}
+          {/* marks: traced by the sweep, risen from the baseline */}
           {hasData && (
-            <g clipPath={`url(#${clipId})`}>
-              {/* area: stacked tinted bands + their top lines */}
-              {kind === 'area' &&
-                series.map((s, si) => {
-                  const top = tops[si];
-                  const bottom = si === 0 ? null : tops[si - 1];
-                  return (
-                    <path
-                      key={`a-${s.key}`}
-                      d={areaPath(top, bottom, xa, scale.max, plot)}
-                      {...fillAttrs(s)}
-                    />
-                  );
-                })}
-              {kind === 'area' &&
-                series.map((s, si) => (
-                  <polyline
-                    key={`l-${s.key}`}
-                    points={linePoints(tops[si], xa, scale.max, plot)}
-                    fill="none"
-                    strokeWidth={2}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    style={{ stroke: seriesColor(s) }}
-                  />
-                ))}
-
-              {/* line: one overlaid line per series, on its own values, no fill */}
-              {kind === 'line' &&
-                series.map((s) => (
-                  <polyline
-                    key={`l-${s.key}`}
-                    points={linePoints(s.values, xa, scale.max, plot)}
-                    fill="none"
-                    strokeWidth={2}
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    style={{ stroke: seriesColor(s) }}
-                  />
-                ))}
-
-              {/* composed: each series draws its own mark on its own axis' scale,
-                  overlaid (never stacked) — the dual-axis treatment. */}
-              {composed &&
-                series.map((s) => {
-                  const max = scaleOf(s).max;
-                  if ((s.mark ?? 'line') === 'area') {
+            <g clipPath={`url(#${sweepId})`}>
+              <g className="cp-chart-rise">
+                {stacked &&
+                  series.map((s, si) => {
+                    const top = tops[si].map(yv);
+                    const bottom = si === 0 ? xs.map(() => plot.y0) : tops[si - 1].map(yv);
+                    let d = pts(xs, top);
+                    for (let i = n - 1; i >= 0; i--) d += `L${xs[i].toFixed(1)},${bottom[i].toFixed(1)}`;
                     return (
-                      <g key={`cm-${s.key}`}>
-                        <path d={areaPath(s.values, null, xa, max, plot)} {...fillAttrs(s)} />
-                        <polyline
-                          points={linePoints(s.values, xa, max, plot)}
-                          fill="none"
-                          strokeWidth={2}
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          style={{ stroke: seriesColor(s) }}
-                        />
-                      </g>
+                      <path
+                        key={`a-${s.key}`}
+                        d={`${d}Z`}
+                        fill={`url(#${uid}-g${si})`}
+                        className="cp-chart-fade"
+                        style={{ opacity: opacityOf(s) }}
+                      />
                     );
-                  }
+                  })}
+                {/* stacked lines are drawn top band first, so where a thin band
+                    sits on a thick one the thick band's line stays on top */}
+                {(stacked ? [...series].reverse() : series).map((s) => {
+                  const si = series.indexOf(s);
+                  const ys = (stacked ? tops[si] : values[si]).map(yv);
+                  const segs = stacked ? liveSegments(values[si]) : [[0, n - 1] as [number, number]];
+                  const d = segs.map(([a, b]) => pts(xs, ys, a, b)).join('');
+                  if (!d) return null;
+                  const hero = si === endIdx;
                   return (
-                    <polyline
-                      key={`cm-${s.key}`}
-                      points={linePoints(s.values, xa, max, plot)}
-                      fill="none"
-                      strokeWidth={2}
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      style={{ stroke: seriesColor(s) }}
-                    />
-                  );
-                })}
-
-              {/* column: stacked columns, 1px seams, a rounded top on the cap */}
-              {kind === 'column' &&
-                xc.map((cx, i) => {
-                  // The topmost non-zero segment owns the rounded cap.
-                  let cap = -1;
-                  for (let si = series.length - 1; si >= 0; si--) {
-                    if ((valueSeries[si][i] ?? 0) > 0) {
-                      cap = si;
-                      break;
-                    }
-                  }
-                  const x = cx - barW / 2;
-                  return (
-                    <g key={`c-${i}`}>
-                      {series.map((s, si) => {
-                        if ((valueSeries[si][i] ?? 0) <= 0) return null;
-                        const segTop = yOf(tops[si][i], scale.max, plot);
-                        const segBot = yOf(si === 0 ? 0 : tops[si - 1][i], scale.max, plot);
-                        const h = segBot - segTop - SEAM;
-                        if (h <= 0) return null;
-                        const fill = seriesColor(s);
-                        return si === cap ? (
-                          <path
-                            key={`seg-${s.key}`}
-                            d={roundedTopRect(x, segTop + SEAM, barW, h, 3)}
-                            style={{ fill }}
-                          />
-                        ) : (
-                          <rect
-                            key={`seg-${s.key}`}
-                            x={x}
-                            y={segTop + SEAM}
-                            width={barW}
-                            height={h}
-                            style={{ fill }}
-                          />
-                        );
-                      })}
+                    <g key={`l-${s.key}`} className="cp-chart-fade" style={{ opacity: opacityOf(s) }}>
+                      {hero && (
+                        <path
+                          d={d}
+                          fill="none"
+                          strokeWidth={5}
+                          strokeLinejoin="round"
+                          filter={`url(#${uid}-glow)`}
+                          style={{ stroke: seriesColor(s), opacity: 0.32 }}
+                        />
+                      )}
+                      <path
+                        d={d}
+                        fill="none"
+                        strokeWidth={2}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        style={{ stroke: seriesColor(s) }}
+                      />
                     </g>
                   );
                 })}
+              </g>
             </g>
           )}
 
-          {/* dashed vertical reference lines (step/turn boundaries) */}
+          {/* dashed vertical reference lines */}
           {hasData &&
             refLines?.map((r) =>
               r.index > 0 && r.index < n ? (
                 <line
                   key={`ref-${r.index}`}
-                  x1={xc[r.index]}
+                  x1={xs[r.index]}
                   y1={plot.yTop}
-                  x2={xc[r.index]}
+                  x2={xs[r.index]}
                   y2={plot.y0}
-                  style={{ stroke: colors.border, strokeDasharray: '3 3' }}
+                  strokeDasharray="2 4"
+                  style={{ stroke: colors.border }}
                   strokeWidth={1}
                 />
               ) : null,
             )}
-
-          {refLabels.map((l) => (
+          {refLabels.map((l, k) => (
             <text
               key={`refl-${l.index}`}
               x={l.x}
               y={plot.yTop + 8}
               textAnchor={l.anchor}
-              className="font-mono"
-              style={{ fill: colors.inkMute, fontSize: 9 }}
+              className="cp-chart-tick font-mono"
+              style={{ ['--i' as string]: k, fill: colors.inkMute, fontSize: 9 }}
             >
               {l.text}
             </text>
           ))}
 
-          {/* peak marker (stacked kinds only — an overlaid chart has no single
-              "total" to label) */}
-          {hasData && stacked && peak >= 0 && tot[peak] > 0 && (
-            <g>
-              <line
-                x1={xc[peak]}
-                y1={yOf(tot[peak], scale.max, plot)}
-                x2={xc[peak]}
-                y2={plot.yTop - 2}
-                style={{ stroke: colors.border, strokeDasharray: '2 2' }}
-                strokeWidth={1}
-              />
-              <text
-                x={xc[peak]}
-                y={plot.yTop - 6}
-                textAnchor="middle"
-                style={{ fill: colors.ink, fontSize: 11, fontWeight: 600 }}
-              >
-                {fmtY(tot[peak])}
-              </text>
-              <text
-                x={xc[peak]}
-                y={plot.yTop + 5}
-                textAnchor="middle"
-                className="font-mono"
-                style={{ fill: colors.inkDim, fontSize: 9 }}
-              >
-                {peakSubLabel ? peakSubLabel(peak, tot[peak]) : 'peak'}
-              </text>
-            </g>
-          )}
+          {/* the peak: a stem drops from its label to the highest point */}
+          {showPeak &&
+            (() => {
+              const px = xs[peak];
+              const value = stacked ? tot[peak] : Math.max(...raw.map((s) => s[peak] ?? 0));
+              const sub = peakSubLabel ? peakSubLabel(peak, value) : dates[peak];
+              const anchor = px - plot.x0 < 60 ? 'start' : plot.x1 - px < 90 ? 'end' : 'middle';
+              return (
+                <g pointerEvents="none">
+                  <line
+                    x1={px}
+                    x2={px}
+                    y1={plot.yTop - 8}
+                    y2={yv(value) - 5}
+                    strokeDasharray="2 2"
+                    className="cp-chart-stem"
+                    style={{ stroke: colors.alpha('inkMute', 0.8) }}
+                  />
+                  <text
+                    x={px}
+                    y={plot.yTop - 12}
+                    textAnchor={anchor}
+                    className="cp-chart-late"
+                    style={{ fill: colors.ink, fontSize: 11.5, fontWeight: 620 }}
+                  >
+                    {fmtY(value)}
+                    {sub && (
+                      <tspan dx={5} style={{ fill: colors.inkMute, fontSize: 10.5, fontWeight: 450 }}>
+                        {sub}
+                      </tspan>
+                    )}
+                  </text>
+                </g>
+              );
+            })()}
 
-          {/* now pulse on the latest point (area/line/composed) + plain end-dots
-              on the other overlaid series so every line terminates cleanly.
-              Columns don't need it — the rightmost bar already reads as "now". */}
-          {hasData && kind !== 'column' && (
-            <>
-              {(kind === 'line' || composed) &&
+          {/* end dots: the latest point of each overlaid line, and the top of
+              the stack; it breathes while the chart is live */}
+          {hasData && (
+            <g pointerEvents="none">
+              {kind === 'line' &&
                 series.map((s, si) =>
-                  si === pulseIdx ? null : (
+                  si === endIdx ? null : (
                     <circle
                       key={`end-${s.key}`}
+                      className="cp-chart-pop"
                       cx={lastX}
                       cy={markY(si, n - 1)}
-                      r={2.6}
+                      r={2.8}
                       style={{ fill: seriesColor(s) }}
                     />
                   ),
                 )}
+              {live && (
+                <circle
+                  className="cp-chart-ring cp-chart-now"
+                  cx={lastX}
+                  cy={endY}
+                  r={4.5}
+                  fill="none"
+                  strokeWidth={1.5}
+                  style={{ stroke: endColor }}
+                />
+              )}
               <circle
-                className="cp-chart-now"
+                className="cp-chart-pop"
                 cx={lastX}
-                cy={lastTopY}
-                r={4}
-                fill="none"
+                cy={endY}
+                r={3.4}
                 strokeWidth={1.5}
-                style={{ stroke: pulseStroke }}
+                style={{ fill: endColor, stroke: colors.panel }}
               />
-              <circle
-                className="cp-chart-now-dot"
-                cx={lastX}
-                cy={lastTopY}
-                r={3}
-                style={{ fill: pulseStroke }}
-              />
-            </>
+            </g>
+          )}
+
+          {hasData && (
+            <Stylus
+              start={drawn}
+              xs={xs}
+              ys={xs.map((_, i) => markY(endIdx, i))}
+              x0={plot.x0 - 6}
+              x1={plot.x1 + 6}
+              color={endColor}
+            />
           )}
 
           {/* x ticks */}
-          {tickIdx.map((i) => (
+          {tickIdx.map((i, k) => (
             <text
               key={`x-${i}`}
-              x={xc[i]}
+              x={xs[i]}
               y={xTickY}
               textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}
-              className="font-mono"
-              style={{ fill: colors.inkDim, fontSize: 10 }}
+              className="cp-chart-tick font-mono"
+              style={{ ['--i' as string]: k, fill: colors.inkMute, fontSize: 10 }}
             >
               {dates[i]}
             </text>
           ))}
 
-          {/* crosshair */}
+          {/* hover: the future steps back behind the pointer */}
           {tip && (
-            <g className="cp-chart-cross" style={{ transform: `translateX(${hoverX}px)` }}>
-              <line
-                x1={0}
-                y1={plot.yTop}
-                x2={0}
-                y2={plot.y0}
-                style={{ stroke: colors.get('status.pending') }}
-                strokeWidth={1}
-              />
-              {kind !== 'column' &&
-                series.map((s, si) => (
-                  <circle
-                    key={`d-${s.key}`}
-                    cx={0}
-                    cy={markY(si, hover as number)}
-                    r={3.2}
-                    style={{ fill: seriesColor(s), stroke: colors.panel }}
-                    strokeWidth={1.5}
-                  />
-                ))}
-            </g>
+            <rect
+              x={hoverX}
+              y={plot.yTop - 6}
+              width={Math.max(0, plot.x1 - hoverX + 2)}
+              height={plot.y0 - plot.yTop + 6}
+              pointerEvents="none"
+              style={{ fill: colors.panel, opacity: 0.42 }}
+            />
+          )}
+          {tip && (
+            <Crosshair
+              x={hoverX}
+              y0={plot.yTop - 6}
+              y1={plot.y0}
+              strokeId={`${uid}-cross`}
+              ring={colors.panel}
+              appear={hover.appear}
+              dots={series.map((s, si) => ({ key: s.key, y: markY(si, hi as number), color: seriesColor(s) }))}
+            />
           )}
         </svg>
 
-        {/* tooltip */}
-        {tip && (
-          <div
-            className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-[112%] whitespace-nowrap rounded-lg border border-border-strong bg-surface px-2.5 py-2 text-note shadow-lg"
-            style={{ left: `${(hoverX / width) * 100}%`, top: `${(hoverTopY / height) * 100}%` }}
-            role="status"
-          >
-            <div className="mb-1 font-semibold text-ink">
-              {tooltipLabels?.[hover as number] ?? tip.date}
-            </div>
-            {tip.rows.map((r) => {
-              const s = series.find((x) => x.key === r.key);
-              const shown = s ? formatForSeries(s)(r.value) : String(r.value);
-              return (
-                <div key={r.key} className="flex items-center gap-2 leading-relaxed">
-                  <span
-                    className="h-2 w-2 shrink-0 rounded-sm"
-                    style={{ background: swatch(r.color, r.rawColor) }}
-                    aria-hidden
-                  />
-                  <span className="flex-1 pr-3 text-ink-dim">{r.label}</span>
-                  <span className="font-mono font-semibold tabular-nums text-ink">{shown}</span>
-                </div>
-              );
-            })}
-            {stacked && (
-              <div className="mt-1 flex justify-between gap-4 border-t border-border pt-1">
-                <span className="text-ink-dim">Total</span>
-                <span className="font-mono font-bold tabular-nums text-ink">{fmtY(tip.total)}</span>
-              </div>
-            )}
-          </div>
-        )}
+        <ChartTooltip
+          open={!!tip}
+          appear={hover.appear}
+          x={hoverX}
+          y={tipY}
+          width={width}
+          title={hi != null ? tooltipLabels?.[hi] ?? tip?.date : ''}
+          rows={tipRows}
+        />
       </div>
 
       {note && <p className="mt-2 text-note text-ink-dim">{note}</p>}
     </div>
+  );
+}
+
+const COUNT_MS = 750;
+function easeOutCubic(t: number): number {
+  return 1 - (1 - t) ** 3;
+}
+
+/** The headline figure, counting up from 0 on mount. It parses a LEADING number
+ *  from a string value ("92%", "518+", "1,284") and animates just that part,
+ *  keeping the suffix; anything without one renders unchanged. */
+function AnimatedFigure({ value }: { value: React.ReactNode }) {
+  const parsed = typeof value === 'string' ? value.match(/^([\d,]+(?:\.\d+)?)(.*)$/s) : null;
+  const target = parsed ? Number(parsed[1].replace(/,/g, '')) : null;
+  const suffix = parsed ? parsed[2] : '';
+  const decimals = parsed && parsed[1].includes('.') ? parsed[1].split('.')[1].length : 0;
+  const [n, setN] = useState<number | null>(() => (target != null && !prefersReducedMotion() ? 0 : target));
+
+  // a new value glides from the one on screen, never back from 0
+  const shownRef = useRef(n);
+  shownRef.current = n;
+  useEffect(() => {
+    if (target == null || prefersReducedMotion()) {
+      setN(target);
+      return;
+    }
+    let raf = 0;
+    const from = shownRef.current ?? 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / COUNT_MS);
+      setN(from + (target - from) * easeOutCubic(t));
+      if (t < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target]);
+
+  if (target == null || n == null) return <>{value}</>;
+  const shown = decimals > 0 ? n.toFixed(decimals) : Math.round(n).toLocaleString();
+  return (
+    <>
+      {shown}
+      {suffix}
+    </>
   );
 }
 

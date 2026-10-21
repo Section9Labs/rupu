@@ -163,37 +163,38 @@ export default function UsageTimelineStacked({
   // order. `rawColor` carries the dynamic per-pivot palette into the engine
   // (the one place the shared Chart paints outside the theme tokens). The full
   // `bucket` is the drag-select key; the short `bucketTick` is only the x-label.
-  const chartSeries: ChartSeries[] = models.map((m) => ({
-    key: m,
-    label: displayLabel(m),
-    values: data.map((d) => (d[m] as number) ?? 0),
-    rawColor: colors.get(m),
-  }));
+  const chartSeries: ChartSeries[] = models.map((m) => {
+    const values = data.map((d) => (d[m] as number) ?? 0);
+    return {
+      key: m,
+      label: displayLabel(m),
+      values,
+      rawColor: colors.get(m),
+      legendValue: fmt(values.reduce((sum, v) => sum + v, 0)),
+    };
+  });
   const dates = data.map((d) => bucketTick(d.bucket));
   const selectKeys = data.map((d) => d.bucket);
 
   return (
-    <div>
-      <Chart
-        kind="area"
-        showCard={false}
-        showLegend={false}
-        dates={dates}
-        selectKeys={selectKeys}
-        series={chartSeries}
-        yFormat={fmt}
-        onSelectRange={onSelectRange}
-        ariaLabel={`Usage over time (${metric === 'cost' ? 'spend' : 'tokens'})`}
-      />
-      {/* Legend — pivot keys → colors (stable). */}
-      <ul className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5">
-        {models.map((m) => (
-          <li key={m} className="flex items-center gap-1.5 text-note">
-            <span className="w-2.5 h-2.5 rounded-sm shrink-0" style={{ background: colors.get(m) }} />
-            <span className="text-ink-dim truncate max-w-[160px]">{displayLabel(m)}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
+    <Chart
+      kind="area"
+      showCard={false}
+      dates={dates}
+      selectKeys={selectKeys}
+      series={chartSeries}
+      yFormat={fmt}
+      yTickFormat={metric === 'cost' ? costTick : fmt}
+      onSelectRange={onSelectRange}
+      height={220}
+      ariaLabel={`Usage over time (${metric === 'cost' ? 'spend' : 'tokens'})`}
+    />
   );
+}
+
+/** A cost tick: whole dollars on a round axis, cents only for sub-$10 steps. */
+function costTick(v: number): string {
+  if (v >= 1000) return `$${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)}k`;
+  if (v % 1 !== 0) return `$${v.toFixed(2)}`;
+  return `$${Math.round(v)}`;
 }

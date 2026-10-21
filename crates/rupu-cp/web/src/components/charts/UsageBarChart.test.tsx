@@ -24,6 +24,8 @@ describe('UsageBarChart (usage footprint strip)', () => {
     }
     // In = 100 + 300 = 400.
     expect(screen.getByText('400')).toBeInTheDocument();
+    // Tokens = in + out (cache reads are part of input, not added on top).
+    expect(screen.getByText('Tokens').nextElementSibling).toHaveTextContent('500');
   });
 
   it('shows a dash for spend only when nothing in the list priced', () => {
