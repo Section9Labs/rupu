@@ -42,31 +42,35 @@ function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
         <MessageCount n={messages} />
         <StatusCapsule state={state} />
       </div>
-      {r.decision && (
-        <div className="gx-body">
+      <div className="gx-body">
+        {r.decision && (
           <div className="afx-decision" title={r.decision}>
             {r.decision}
           </div>
+        )}
+        <div className="gx-sub afx-result">
+          {r.spentUsd != null && <span>{formatSpendUsd(r.spentUsd)} spent · </span>}
+          {r.transcriptPath ? (
+            <Link
+              className="afx-link nodrag"
+              to={`/transcript?path=${encodeURIComponent(r.transcriptPath)}&live=${live ? 1 : 0}`}
+            >
+              lead transcript
+            </Link>
+          ) : (
+            <span>no lead transcript</span>
+          )}
         </div>
-      )}
+      </div>
       <div className="gx-foot">
         <span className="gx-kind">lead</span>
         <span className="afx-foot-r">
           {r.goalsAfter && (
             <span>
-              goals {met}/{r.goalsAfter.length}
+              goals {met}/{r.goalsAfter.length} ·
             </span>
           )}
-          {r.spentUsd != null && <span>{formatSpendUsd(r.spentUsd)}</span>}
           <span>{launched} launched</span>
-          {r.transcriptPath && (
-            <Link
-              className="afx-link nodrag"
-              to={`/transcript?path=${encodeURIComponent(r.transcriptPath)}&live=${live ? 1 : 0}`}
-            >
-              transcript
-            </Link>
-          )}
         </span>
       </div>
     </NodeFrame>

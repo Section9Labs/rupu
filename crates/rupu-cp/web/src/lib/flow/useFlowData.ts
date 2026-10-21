@@ -33,6 +33,8 @@ export interface FlowData extends FlowInput {
   loadedFrames: string[];
   /** A loaded frame's message space (`null` while it has none). */
   setFrameSpace(childRunId: string, space: FlowSpace | null): void;
+  /** The children have been read (or failed to be) at least once. */
+  childrenLoaded: boolean;
   /** Why the children could not be read; `null` when they were. */
   childrenError: string | null;
   /** Why a frame's graph could not be read, by its run id. */
@@ -51,6 +53,7 @@ export function useFlowData(
 
   const [children, setChildren] = useState<RunChild[]>([]);
   const [childrenError, setChildrenError] = useState<string | null>(null);
+  const [childrenLoaded, setChildrenLoaded] = useState(false);
   const [flowBoard, setFlowBoard] = useState<BoardSource | null>(null);
   const [loadedFrames, setLoadedFrames] = useState<string[]>([]);
   const [graphs, setGraphs] = useState<ReadonlyMap<string, RunGraphModel>>(new Map());
@@ -62,6 +65,7 @@ export function useFlowData(
   useEffect(() => {
     setChildren([]);
     setChildrenError(null);
+    setChildrenLoaded(false);
     setFlowBoard(null);
     setLoadedFrames([]);
     setGraphs(new Map());
@@ -79,9 +83,12 @@ export function useFlowData(
         if (ctl.signal.aborted) return;
         setChildren(c);
         setChildrenError(null);
+        setChildrenLoaded(true);
       })
       .catch((e: unknown) => {
-        if (!ctl.signal.aborted) setChildrenError(apiErrorMessage(e));
+        if (ctl.signal.aborted) return;
+        setChildrenError(apiErrorMessage(e));
+        setChildrenLoaded(true);
       });
     return () => ctl.abort();
   }, [id, detail]);
@@ -95,9 +102,10 @@ export function useFlowData(
       .then((r) => {
         if (!ctl.signal.aborted) setFlowBoard(boardSource(r));
       })
-      .catch(() => {
-        // A failed read keeps the last board; the rail says "not loaded"
-        // until one arrives.
+      .catch((e: unknown) => {
+        // A failed read keeps the last board; with none yet, the rail says
+        // why it has none.
+        if (!ctl.signal.aborted) setFlowBoard((b) => b ?? { kind: 'unavailable', reason: apiErrorMessage(e) });
       });
     return () => ctl.abort();
   }, [id, boardTick]);
@@ -178,7 +186,10 @@ export function useFlowData(
       (r) => {
         if (!ctl.signal.aborted) setFrameBoards((m) => new Map(m).set(f, boardSource(r)));
       },
-      () => {},
+      (e: unknown) => {
+        if (ctl.signal.aborted) return;
+        setFrameBoards((m) => (m.has(f) ? m : new Map(m).set(f, { kind: 'unavailable', reason: apiErrorMessage(e) })));
+      },
     );
     const unsubscribe = live
       ? api.subscribeRunLog(f, (ev) => {
@@ -244,6 +255,7 @@ export function useFlowData(
     loadFrame,
     loadedFrames,
     setFrameSpace,
+    childrenLoaded,
     childrenError,
     frameErrors,
   };

@@ -1311,7 +1311,7 @@
 .afx-rail-who { font-weight: 600; }
 .afx-rail-sub { color: rgb(var(--c-ink-mute)); }
 .afx-rail-body { margin-top: 2px; color: rgb(var(--c-ink-dim)); overflow-wrap: anywhere; }
-.afx-rail-note { color: rgb(var(--c-ink-mute)); font-style: italic; }
+.afx-rail-note { color: rgb(var(--c-ink-mute)); font-style: italic; overflow-wrap: anywhere; }
 .afx-rail-empty { color: rgb(var(--c-ink-mute)); }
 
 /* The message list and toolbar. */
@@ -1401,10 +1401,8 @@
 }
 .afx-link { color: rgb(var(--c-brand-500)); font-weight: 600; }
 .afx-link:hover { text-decoration: underline; }
-.afx-inferred {
-  padding: 0 4px; border: 1px dashed rgb(var(--c-ink-mute) / 0.6); border-radius: 4px;
-  color: rgb(var(--c-ink-mute)); font-style: italic;
-}
+.afx-inferred { display: inline-flex; flex: none; color: rgb(var(--c-ink-mute)); cursor: help; }
+.afx-icon-link { display: inline-flex; flex: none; }
 .afx-more {
   display: flex; align-items: center; gap: 7px; width: 100%; height: 20px;
   font-size: 13px; font-weight: 600; color: rgb(var(--c-ink)); text-align: left; cursor: pointer;
@@ -1489,6 +1487,11 @@
   padding: 10px 12px 0; font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
 }
 .afx-rail-node .afx-rail { overflow: visible; }
+.afx-rail-node .afx-rail-body,
+.afx-rail-compact .afx-rail-body {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.afx-rail-compact .afx-rail-body { -webkit-line-clamp: 2; }
 .react-flow__handle.afx-anchor {
   width: 6px; height: 6px; min-width: 0; min-height: 0; left: -4px;
   border: 1.5px solid rgb(var(--c-ink-mute) / 0.6); background: rgb(var(--gx-card));

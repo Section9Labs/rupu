@@ -8,7 +8,7 @@
 import { memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { Node, NodeProps } from '@xyflow/react';
-import { Bot, CornerDownRight, Mail, Workflow, type LucideIcon } from 'lucide-react';
+import { Bot, CircleDashed, CornerDownRight, Mail, ScrollText, Workflow, type LucideIcon } from 'lucide-react';
 import type { ChildKind, RunChild } from '../../lib/api';
 import type { StepState } from '../../lib/runGraphModel';
 import { formatDuration } from '../../lib/duration';
@@ -72,9 +72,28 @@ export function MessageCount({ n }: { n: number }) {
 
 export function InferredMark() {
   return (
-    <span className="afx-inferred" title="Placed by its start time: this run did not record the round that launched it.">
-      inferred
+    <span
+      className="afx-inferred"
+      data-testid="flow-inferred"
+      title="inferred: placed by its start time, as this run did not record the round that launched it"
+      aria-label="inferred placement"
+    >
+      <CircleDashed size={12} aria-hidden />
     </span>
+  );
+}
+
+/** A transcript link as an icon (a card's foot has little room). */
+export function TranscriptLink({ path, live, label = 'transcript' }: { path: string; live: boolean; label?: string }) {
+  return (
+    <Link
+      className="afx-link afx-icon-link nodrag"
+      to={`/transcript?path=${encodeURIComponent(path)}&live=${live ? 1 : 0}`}
+      title={label}
+      aria-label={label}
+    >
+      <ScrollText size={12} aria-hidden />
+    </Link>
   );
 }
 
@@ -114,6 +133,7 @@ function ChildNodeView({ data }: NodeProps<ChildFlowNode>) {
         <span className="gx-name" title={c.codename ?? c.name}>
           {c.address ?? c.handle ?? c.name}
         </span>
+        {inferred && <InferredMark />}
         <MessageCount n={messages} />
         <StatusCapsule state={state} />
       </div>
@@ -124,16 +144,8 @@ function ChildNodeView({ data }: NodeProps<ChildFlowNode>) {
       <div className="gx-foot">
         <span className="gx-kind">{kind.label}</span>
         <span className="afx-foot-r">
-          {inferred && <InferredMark />}
           {spend && <span>{spend}</span>}
-          {c.transcript_path && (
-            <Link
-              className="afx-link nodrag"
-              to={`/transcript?path=${encodeURIComponent(c.transcript_path)}&live=${state === 'running' ? 1 : 0}`}
-            >
-              transcript
-            </Link>
-          )}
+          {c.transcript_path && <TranscriptLink path={c.transcript_path} live={state === 'running'} />}
         </span>
       </div>
     </NodeFrame>

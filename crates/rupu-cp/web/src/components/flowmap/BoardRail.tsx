@@ -48,26 +48,26 @@ export default function BoardRail({
     </span>
   );
 
-  if (board && 'kind' in board) {
-    return (
-      <aside className={cls} aria-label="Board">
-        <div className="afx-rail-note">
-          this host can't show the board.
-          {board.reason && <span className="afx-rail-sub"> {board.reason}</span>}
-        </div>
-      </aside>
-    );
-  }
+  // A host that can't serve the board still has the posts (they are
+  // messages): the note says why claims and directives are missing.
+  const unavailable = board && 'kind' in board ? board : null;
+  const view = board && !('kind' in board) ? board : null;
 
   return (
     <aside className={cls} aria-label="Board">
+      {unavailable && (
+        <div className="afx-rail-note">
+          this host can't show the board.
+          {unavailable.reason && <span className="afx-rail-sub"> {unavailable.reason}</span>}
+        </div>
+      )}
       {board === null && <div className="afx-rail-note">board not loaded.</div>}
-      {board && (
+      {view && (
         <>
           <section>
             <h3 className="afx-rail-h">Claims</h3>
-            {board.claims.length === 0 && <div className="afx-rail-empty">none</div>}
-            {board.claims.map((c, i) => (
+            {view.claims.length === 0 && <div className="afx-rail-empty">none</div>}
+            {view.claims.map((c, i) => (
               <div key={`${c.key}/${c.owner}/${i}`} className="afx-rail-item" data-state={c.state} style={{ ['--i' as string]: i }}>
                 {anchor?.(`claim:${c.key}:${c.acquired_at}`)}
                 <div className="afx-rail-line">
@@ -79,14 +79,14 @@ export default function BoardRail({
                 </div>
               </div>
             ))}
-            {!board.journal && (
+            {!view.journal && (
               <div className="afx-rail-note">claims before this version show only while held</div>
             )}
           </section>
           <section>
             <h3 className="afx-rail-h">Directives</h3>
-            {board.directives.length === 0 && <div className="afx-rail-empty">none</div>}
-            {board.directives.map((d: DirectiveView, i) => (
+            {view.directives.length === 0 && <div className="afx-rail-empty">none</div>}
+            {view.directives.map((d: DirectiveView, i) => (
               <button
                 key={d.id}
                 type="button"

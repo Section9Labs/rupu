@@ -20,6 +20,13 @@ describe('BoardRail', () => {
     expect(screen.queryByText('Claims')).toBeNull();
   });
 
+  it('an_unavailable_board_still_lists_its_posts', () => {
+    wrap(<BoardRail board={{ kind: 'unavailable', reason: 'host too old' }} posts={model.board.posts} onSelect={() => {}} />);
+    expect(screen.getByText(/this host can't show the board/)).toBeInTheDocument();
+    expect(screen.getByText(/token-fixation advisory/)).toBeInTheDocument();
+    expect(screen.queryByText('Claims')).toBeNull();
+  });
+
   it('pre_journal_board_says_so', () => {
     const board = {
       claims: [{ ...FLOW_BOARD.claims[2], key: 'file-stem', key_known: false }],

@@ -28,13 +28,11 @@ import {
   type Node,
   type NodeChange,
   type NodeMouseHandler,
-  type NodeProps,
   type NodeTypes,
 } from '@xyflow/react';
-import { CheckCircle2, Circle } from 'lucide-react';
 import { api, apiErrorMessage, type AgentiflowDetail, type RunChild } from '../../lib/api';
 import { buildFlowModel, BOARD, FLOW_SPACE, OFFCANVAS, type FlowMessage, type FlowNodeRef } from '../../lib/flow/flowModel';
-import { FRAME_HEAD, FRAME_PAD, RAIL_W, layoutFlow } from '../../lib/flow/flowLayout';
+import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
@@ -45,8 +43,6 @@ import { edgeTone, useEntranceSlots } from '../../lib/graph/runMotion';
 import { mergeMeasured, type Size } from '../../lib/graph/measured';
 import type { StepState } from '../../lib/runGraphModel';
 import { crewTint, parseCodename } from '../../lib/codename';
-import { formatSpendUsd, formatSpendTokens, goalViews } from '../../lib/agentiflow';
-import { formatDuration } from '../../lib/duration';
 import { stateStyle } from '../graph/stepStyle';
 import { runKindAccent, type RunKind } from '../graph/kindBridge';
 import RunEdge, { type RunFlowEdge } from '../graph/RunEdge';
@@ -55,12 +51,13 @@ import { useThemeMode } from '../codename/useThemeMode';
 import { DialogFrame } from '../customers/DialogFrame';
 import { TimeAxis } from '../timeline/TimeAxis';
 import MessageEdge, { type MessageFlowEdge } from './MessageEdge';
-import BoardRail from './BoardRail';
 import MessageListPanel from './MessageListPanel';
 import FlowToolbar from './FlowToolbar';
 import RoundNode from './RoundNode';
 import ChildNode, { CHILD_KIND, childState } from './ChildNode';
 import WorkflowFrameNode from './WorkflowFrameNode';
+import { EntryNode, LeadNode, RailNode, SpineNode } from './MapNodes';
+import { GoalsPanel, HeaderStrip, MapSummary } from './FlowPanels';
 import MoreNode from './MoreNode';
 
 import '@xyflow/react/dist/style.css';
@@ -71,91 +68,10 @@ const MINIMAP_MIN_NODES = 6;
 const SPINE_X = -28;
 /** How long a newly revealed message's packet travels (and a bit). */
 const ARRIVE_MS = 1500;
+/** The rail's top: clear of the summary chip at the canvas's top right. */
+const RAIL_TOP = 56;
 const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
 const FIT = { padding: 0.12, maxZoom: 1.0, minZoom: 0.15 };
-
-// ---------------------------------------------------------------------------
-// The map's own small nodes: the spine, the lead's start, the rail, the
-// operator's (and an unknown address's) entry.
-// ---------------------------------------------------------------------------
-
-interface SpineData extends Record<string, unknown> {
-  height: number;
-  dots: number[];
-  live: boolean;
-  tint: string;
-}
-
-function SpineNode({ data }: NodeProps<Node<SpineData, 'spine'>>) {
-  const top = data.dots[0] ?? 0;
-  const end = data.dots[data.dots.length - 1] ?? top;
-  return (
-    <svg className="afx-spine-svg" width={24} height={Math.max(end + 24, 1)} aria-hidden style={{ color: data.tint }}>
-      <line className="afx-spine-line" x1={12} y1={0} x2={12} y2={end} pathLength={1} />
-      {data.dots.map((y, i) => (
-        <circle key={i} className="afx-spine-dot" cx={12} cy={y} r={4} style={{ ['--i' as string]: Math.min(i, 10) }} />
-      ))}
-      {data.live && (
-        <>
-          <circle className="afx-spine-ring" cx={12} cy={end} r={5} />
-          <circle className="afx-spine-dot" cx={12} cy={end} r={5} />
-        </>
-      )}
-    </svg>
-  );
-}
-
-interface LeadData extends Record<string, unknown> {
-  codename: string;
-  agent: string | null;
-  startedAt: string;
-}
-
-function LeadNode({ data }: NodeProps<Node<LeadData, 'lead'>>) {
-  const t = Date.parse(data.startedAt);
-  return (
-    <div className="afx-lead" data-testid="flow-lead">
-      <b>Engagement started</b>
-      <span>
-        lead {data.codename}
-        {data.agent ? ` · ${data.agent}` : ''}
-        {Number.isFinite(t) ? ` · ${new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}
-      </span>
-    </div>
-  );
-}
-
-interface RailData extends Record<string, unknown> {
-  view: Parameters<typeof BoardRail>[0]['board'];
-  posts: FlowMessage[];
-  minHeight: number;
-  onSelect: (id: string) => void;
-  anchor: (key: string) => React.ReactNode;
-}
-
-function RailNode({ data }: NodeProps<Node<RailData, 'rail'>>) {
-  return (
-    <div className="afx-rail-node nodrag nowheel" style={{ width: RAIL_W, minHeight: data.minHeight }}>
-      <Handle type="target" position={Position.Left} className="gx-port" />
-      <div className="afx-rail-title">Board</div>
-      <BoardRail board={data.view} posts={data.posts} onSelect={data.onSelect} anchor={data.anchor} />
-    </div>
-  );
-}
-
-interface EntryData extends Record<string, unknown> {
-  label: string;
-}
-
-function EntryNode({ data }: NodeProps<Node<EntryData, 'entry'>>) {
-  return (
-    <div className="afx-entry" data-testid={`flow-entry-${data.label}`}>
-      {data.label}
-      <Handle type="source" position={Position.Right} className="gx-port" />
-      <Handle type="target" position={Position.Right} className="gx-port" />
-    </div>
-  );
-}
 
 const MAP_NODE_TYPES: NodeTypes = {
   ...NODE_TYPES,
@@ -579,11 +495,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     out.push({
       id: 'rail',
       type: 'rail',
-      position: { x: layout.railX, y: 0 },
+      // Below the canvas's summary chip, which sits over the top-right.
+      position: { x: layout.railX, y: RAIL_TOP },
       draggable: false,
       selectable: false,
       measured: measured.get('rail'),
-      data: { view: railView, posts: railPosts, minHeight: layout.height, onSelect: selectMessage, anchor },
+      data: { view: railView, posts: railPosts, minHeight: Math.max(0, layout.height - RAIL_TOP), onSelect: selectMessage, anchor },
     });
     const ends = new Set(model.messages.flatMap((m) => [m.from, ...m.to]));
     if (ends.has(OPERATOR)) {
@@ -773,34 +690,40 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const pane = useRef<HTMLDivElement>(null);
   const panned = useRef(false);
   const placed = useRef(false);
+  const placedWidth = useRef(0);
   const lastRound = model.rounds[model.rounds.length - 1];
   const lastRoundPos = lastRound ? layout.positions.get(`round:${lastRound.round}`) : undefined;
   const followKey = running && lastRound ? `round:${lastRound.round}` : null;
   useEffect(() => {
     const el = pane.current;
-    if (!el || !lastRoundPos) return;
+    if (!el || !lastRoundPos || !rf.viewportInitialized || !data.childrenLoaded) return;
     const w = el.clientWidth;
     const h = el.clientHeight;
     if (w === 0 || h === 0) return;
     const left = layout.operator.x - 24;
-    const zoom = Math.min(1, Math.max(FIT.minZoom, w / (layout.width - left + 48)));
-    const x = -left * zoom + 24;
+    const fitZoom = Math.min(1, Math.max(FIT.minZoom, w / (layout.width - left + 48)));
     if (!placed.current) {
       placed.current = true;
-      if (layout.height * zoom < h) {
-        void rf.fitView(FIT);
+      placedWidth.current = layout.width;
+      const y = running ? -(lastRoundPos.y * fitZoom) + h * 0.35 : 24;
+      void rf.setViewport({ x: -left * fitZoom + 24, y: Math.min(24, y), zoom: fitZoom });
+      return;
+    }
+    // The map grew wider (a frame's graph loaded): keep its width in view.
+    if (layout.width > placedWidth.current && !panned.current) {
+      placedWidth.current = layout.width;
+      const vp = rf.getViewport();
+      if (fitZoom < vp.zoom) {
+        void rf.setViewport({ x: -left * fitZoom + 24, y: vp.y * (fitZoom / vp.zoom), zoom: fitZoom }, { duration: 320 });
         return;
       }
-      const y = running ? -(lastRoundPos.y * zoom) + h * 0.35 : 24;
-      void rf.setViewport({ x, y: Math.min(24, y), zoom });
-      return;
     }
     if (!followKey || panned.current) return;
     const vp = rf.getViewport();
     void rf.setViewport({ x: vp.x, y: Math.min(24, -(lastRoundPos.y * vp.zoom) + h * 0.35), zoom: vp.zoom }, { duration: 320 });
     // Only a new newest round (or the first placement) moves the viewport.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [followKey, lastRoundPos !== undefined]);
+  }, [followKey, lastRoundPos !== undefined, rf.viewportInitialized, data.childrenLoaded, layout.width]);
 
   // A row picked in the Messages list finds its arc: the map centres on it.
   useEffect(() => {
@@ -955,143 +878,4 @@ function miniColor(colors: ThemeColors, n: Node): string {
         : null;
   if (!state || state === 'pending' || state === 'skipped') return colors.alpha('inkMute', 0.45);
   return stateStyle(colors, state).color;
-}
-
-/** Over the canvas's top-right corner: the children at a glance. */
-function MapSummary({ list, messages }: { list: RunChild[]; messages: number }) {
-  const count = (s: StepState) => list.filter((c) => childState(c) === s).length;
-  const items: [StepState, number, string][] = [
-    ['done', count('done'), 'done'],
-    ['running', count('running'), 'running'],
-    ['failed', count('failed'), 'failed'],
-  ];
-  return (
-    <div className="gx-summary" data-testid="flow-summary">
-      {items
-        .filter(([, n]) => n > 0)
-        .map(([s, n, w]) => (
-          <span key={s} data-state={s} className="gx-summary-item gx-s">
-            <i className="afx-dot" aria-hidden />
-            <b>{n}</b> {w}
-          </span>
-        ))}
-      <span className="gx-summary-item">
-        <b>{messages}</b> messages
-      </span>
-    </div>
-  );
-}
-
-/** Goals met after the latest assessed round (the record's once the flow
- *  completes), and the run's spend. */
-function latestGoals(detail: AgentiflowDetail, model: ReturnType<typeof buildFlowModel>) {
-  if (detail.record.status === 'completed' && detail.record.goals.length > 0) return detail.record.goals;
-  for (let i = model.rounds.length - 1; i >= 0; i--) if (model.rounds[i].goalsAfter) return model.rounds[i].goalsAfter!;
-  return detail.record.goals;
-}
-
-function Meter({ value, tone }: { value: number; tone: 'ok' | 'brand' }) {
-  return (
-    <span className="afx-meter" data-tone={tone} aria-hidden>
-      <i style={{ transform: `scaleX(${Math.min(1, Math.max(0, value))})` }} />
-    </span>
-  );
-}
-
-function HeaderStrip({
-  detail,
-  model,
-  running,
-}: {
-  detail: AgentiflowDetail;
-  model: ReturnType<typeof buildFlowModel>;
-  running: boolean;
-}) {
-  const { record, def } = detail;
-  const goals = latestGoals(detail, model);
-  const total = def?.goals.length ?? record.goals_total;
-  const met = goals.filter((g) => g.met).length;
-  const capUsd = def?.budget?.usd ?? null;
-  const capRounds = def?.budget?.rounds ?? null;
-  const started = Date.parse(record.started_at);
-  const ended = record.ended_at ? Date.parse(record.ended_at) : Date.now();
-  return (
-    <div className="afx-head" data-testid="flow-head">
-      <span>
-        <span className="k">round</span> <b>{model.rounds.length}</b>
-        {capRounds ? ` / ${capRounds}` : ''}
-      </span>
-      <span>
-        <span className="k">goals</span> {total > 0 && <Meter value={met / total} tone="ok" />}
-        <b>{met}</b> / {total} met
-      </span>
-      <span>
-        <span className="k">spend</span> {capUsd ? <Meter value={(record.spent_usd ?? 0) / capUsd} tone="brand" /> : null}
-        <b>{formatSpendUsd(record.spent_usd)}</b>
-        {capUsd ? ` / ${formatSpendUsd(capUsd)}` : ''}
-      </span>
-      <span>
-        <b>{formatSpendTokens(record.spent_tokens)}</b>
-      </span>
-      {Number.isFinite(started) && (
-        <span>
-          <span className="k">{running ? 'running' : 'ran'}</span> {formatDuration(Math.max(0, ended - started))}
-        </span>
-      )}
-    </div>
-  );
-}
-
-function GoalsPanel({
-  detail,
-  model,
-  list,
-  spaces,
-}: {
-  detail: AgentiflowDetail;
-  model: ReturnType<typeof buildFlowModel>;
-  list: RunChild[];
-  spaces: { participants: { live: boolean }[] }[];
-}) {
-  const after = new Map(latestGoals(detail, model).map((g) => [g.id, g]));
-  const views = goalViews(detail.record, detail.def);
-  const count = (s: StepState) => list.filter((c) => childState(c) === s).length;
-  const participants = spaces.flatMap((s) => s.participants);
-  return (
-    <section className="afx-panel" aria-label="Goals">
-      <h3 className="afx-panel-h">
-        Goals {detail.def?.description && <span className="afx-panel-sub">{detail.def.description}</span>}
-      </h3>
-      <ul className="afx-goals">
-        {views.map((g) => {
-          const now = after.get(g.id);
-          const met = now?.met ?? g.met;
-          return (
-            <li key={g.id}>
-              {met ? (
-                <CheckCircle2 size={14} className="text-ok" aria-label="met" />
-              ) : (
-                <Circle size={14} className="text-ink-mute" aria-label="not met" />
-              )}
-              <span className="o">{g.objective}</span>
-              <span className="c">
-                {now?.current ?? g.current}/{g.target}
-              </span>
-            </li>
-          );
-        })}
-        {views.length === 0 && <li className="text-ink-mute">No goals recorded.</li>}
-      </ul>
-      <dl className="afx-kv">
-        <dt>children</dt>
-        <dd>
-          {count('done')} done · {count('running')} running · {count('failed')} failed
-        </dd>
-        <dt>participants</dt>
-        <dd>
-          {participants.filter((p) => p.live).length} live of {participants.length}
-        </dd>
-      </dl>
-    </section>
-  );
 }
