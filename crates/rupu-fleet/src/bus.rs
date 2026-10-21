@@ -683,7 +683,7 @@ fn append<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FleetError>
 }
 
 /// An exclusive `flock` on `path`, held while the returned file lives.
-fn lock_exclusive(path: &Path) -> Result<std::fs::File, FleetError> {
+pub(crate) fn lock_exclusive(path: &Path) -> Result<std::fs::File, FleetError> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)

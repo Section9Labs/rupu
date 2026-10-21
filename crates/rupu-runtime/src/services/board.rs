@@ -65,11 +65,14 @@ pub fn board_view(space: &Path, now: DateTime<Utc>) -> Result<BoardView, FleetEr
             DirectiveEvent::Retract { retract, at } => {
                 if let Some(&slot) = slot_of.get(&retract) {
                     let v = &mut directives[slot];
-                    v.retracted = true;
-                    v.retracted_at = at
-                        .as_deref()
-                        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                        .map(|t| t.with_timezone(&Utc));
+                    // The first retraction counts; a repeat changes nothing.
+                    if !v.retracted {
+                        v.retracted = true;
+                        v.retracted_at = at
+                            .as_deref()
+                            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                            .map(|t| t.with_timezone(&Utc));
+                    }
                 }
             }
         }

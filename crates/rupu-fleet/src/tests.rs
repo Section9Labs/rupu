@@ -724,6 +724,9 @@ fn claim_release_writes_journal_lines() {
     assert_eq!(lines[0]["owner"], "lynx#1");
     assert!(lines[0]["lease_expires_at"].is_string());
     assert_eq!(lines[1]["ev"], "released");
+    assert_eq!(lines[1]["key"], "host:1");
+    assert_eq!(lines[1]["owner"], "lynx#1");
+    assert!(chrono::DateTime::parse_from_rfc3339(lines[1]["at"].as_str().unwrap()).is_ok());
     let view = board.claims_view(chrono::Utc::now()).unwrap();
     assert_eq!(view.len(), 1);
     assert_eq!(view[0].state, ClaimState::Released);
@@ -741,7 +744,6 @@ fn expired_claim_is_reported_expired() {
     else {
         panic!("granted")
     };
-    std::mem::forget(old);
     let ClaimOutcome::Granted(_new) = board
         .claim("svc", "b", std::time::Duration::from_secs(60))
         .unwrap()
@@ -759,6 +761,13 @@ fn expired_claim_is_reported_expired() {
         })
         .collect();
     assert_eq!(evs, ["claimed:a", "expired:a", "claimed:b"]);
+    // The stale guard's drop finds a successor's file and journals nothing.
+    drop(old);
+    assert_eq!(
+        journal(tmp.path()).len(),
+        3,
+        "no released for the stale guard"
+    );
     let view = board.claims_view(chrono::Utc::now()).unwrap();
     assert_eq!(view.len(), 2);
     assert_eq!(
@@ -790,6 +799,8 @@ fn pre_journal_live_claim_reads_as_held() {
     assert_eq!(view.len(), 1);
     assert_eq!(view[0].state, ClaimState::Held);
     assert_eq!(view[0].owner, "old#1");
+    assert!(!view[0].key_known);
+    assert_eq!(view[0].key, "k-0123456789abcdef");
     // The same claim later, after its lease: reported expired.
     let later = board.claims_view(now + chrono::Duration::hours(2)).unwrap();
     assert_eq!(later[0].state, ClaimState::Expired);
@@ -818,4 +829,80 @@ fn retraction_records_its_time() {
         other => panic!("expected a retraction, got {other:?}"),
     }
     assert!(board.read_directives().unwrap().is_empty());
+}
+
+#[test]
+fn a_corrupt_claim_file_does_not_fail_the_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let ClaimOutcome::Granted(_g) = board
+        .claim("ok", "a", std::time::Duration::from_secs(60))
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let dir = tmp.path().join("board").join("claims");
+    std::fs::write(dir.join("empty-0000000000000000.json"), "").unwrap();
+    std::fs::write(dir.join("junk-1111111111111111.json"), "{not json").unwrap();
+    let view = board.claims_view(chrono::Utc::now()).unwrap();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].key, "ok");
+    assert!(view[0].key_known);
+}
+
+#[test]
+fn a_half_written_last_journal_line_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let ClaimOutcome::Granted(g) = board
+        .claim("k", "a", std::time::Duration::from_secs(60))
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    std::mem::forget(g);
+    let path = tmp.path().join("board").join("claims.jsonl");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    // A release still being written: complete JSON, but no newline yet.
+    text.push_str(r#"{"ev":"released","key":"k","owner":"a","at":"2026-01-01T00:00:00+00:00"}"#);
+    std::fs::write(&path, text).unwrap();
+    let view = board.claims_view(chrono::Utc::now()).unwrap();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].state, ClaimState::Held);
+}
+
+#[test]
+fn an_end_matches_its_own_grant_not_the_owners_newer_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let ttl = std::time::Duration::from_secs(60);
+    let ClaimOutcome::Granted(first) = board.claim("k", "a", ttl).unwrap() else {
+        panic!("granted")
+    };
+    // The same owner acquires the key again (its first lease having lapsed
+    // and been reaped) while the first guard's release is still in flight:
+    // simulate by journaling the new grant before the old release lands.
+    let first_token = first.token.clone();
+    std::mem::forget(first);
+    std::fs::remove_dir_all(tmp.path().join("board").join("claims")).unwrap();
+    let ClaimOutcome::Granted(second) = board.claim("k", "a", ttl).unwrap() else {
+        panic!("granted")
+    };
+    board.journal_claim(&crate::board::JournalLine::Released {
+        key: "k".into(),
+        owner: "a".into(),
+        token: Some(first_token),
+        at: chrono::Utc::now().to_rfc3339(),
+    });
+    let view = board.claims_view(chrono::Utc::now()).unwrap();
+    assert_eq!(view.len(), 2);
+    let states: Vec<ClaimState> = view.iter().map(|v| v.state).collect();
+    assert!(states.contains(&ClaimState::Released) && states.contains(&ClaimState::Held));
+    let held = view.iter().find(|v| v.state == ClaimState::Held).unwrap();
+    let released = view
+        .iter()
+        .find(|v| v.state == ClaimState::Released)
+        .unwrap();
+    assert!(held.acquired_at >= released.acquired_at);
+    drop(second);
 }

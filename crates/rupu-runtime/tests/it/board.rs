@@ -53,3 +53,26 @@ fn board_view_of_an_empty_space_is_empty_not_an_error() {
     assert!(view.directives.is_empty());
     assert!(!view.journal);
 }
+
+#[test]
+fn a_second_retraction_keeps_the_first_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let id = board
+        .put_directive(&Directive {
+            id: String::new(),
+            author: "lead".into(),
+            ts: Utc::now().to_rfc3339(),
+            body: "b".into(),
+            addressed_to: None,
+        })
+        .unwrap();
+    board.retract_directive(&id).unwrap();
+    let first = board_view(tmp.path(), Utc::now()).unwrap().directives[0].retracted_at;
+    assert!(first.is_some());
+    std::thread::sleep(Duration::from_millis(5));
+    board.retract_directive(&id).unwrap();
+    let view = board_view(tmp.path(), Utc::now()).unwrap();
+    assert_eq!(view.directives[0].retracted_at, first);
+    assert!(view.directives[0].retracted);
+}

@@ -65,6 +65,7 @@ impl Board {
                 self.journal_claim(&JournalLine::Claimed {
                     key: key.to_string(),
                     owner: owner.to_string(),
+                    token: Some(rec.token.clone()),
                     at: rec.acquired_at,
                     lease_expires_at: rec.lease_expires_at,
                 });
@@ -179,6 +180,7 @@ impl Board {
                     Ok(()) => self.journal_claim(&JournalLine::Expired {
                         key: key.to_string(),
                         owner: rec.owner.clone(),
+                        token: Some(rec.token.clone()).filter(|t| !t.is_empty()),
                         at: Utc::now().to_rfc3339(),
                     }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -220,9 +222,17 @@ impl Board {
     /// whose lease has passed `now` is reported `Expired`.
     pub fn claims_view(&self, now: DateTime<Utc>) -> Result<Vec<ClaimView>, FleetError> {
         let mut views: Vec<ClaimView> = Vec::new();
+        // The grant token of each view, parallel to `views`.
+        let mut tokens: Vec<Option<String>> = Vec::new();
         let path = self.journal_path();
         let text = read_log_text(&path)?;
-        for (n, line) in text
+        // A concurrent append can leave a half-written last line (the journal
+        // is read without its lock): only newline-terminated lines count.
+        let complete = match text.rfind('\n') {
+            Some(i) => &text[..i],
+            None => "",
+        };
+        for (n, line) in complete
             .lines()
             .enumerate()
             .filter(|(_, l)| !l.trim().is_empty())
@@ -235,6 +245,7 @@ impl Board {
                 JournalLine::Claimed {
                     key,
                     owner,
+                    token,
                     at,
                     lease_expires_at,
                 } => {
@@ -250,14 +261,38 @@ impl Board {
                         lease_expires_at: expires,
                         ended_at: None,
                         state: ClaimState::Held,
+                        key_known: true,
                     });
+                    tokens.push(token);
                 }
-                JournalLine::Released { key, owner, at } => {
-                    end_latest(&mut views, &key, &owner, &at, ClaimState::Released)
-                }
-                JournalLine::Expired { key, owner, at } => {
-                    end_latest(&mut views, &key, &owner, &at, ClaimState::Expired)
-                }
+                JournalLine::Released {
+                    key,
+                    owner,
+                    token,
+                    at,
+                } => end_latest(
+                    &mut views,
+                    &tokens,
+                    &key,
+                    &owner,
+                    token.as_deref(),
+                    &at,
+                    ClaimState::Released,
+                ),
+                JournalLine::Expired {
+                    key,
+                    owner,
+                    token,
+                    at,
+                } => end_latest(
+                    &mut views,
+                    &tokens,
+                    &key,
+                    &owner,
+                    token.as_deref(),
+                    &at,
+                    ClaimState::Expired,
+                ),
             }
         }
         // Live claim files the journal does not account for.
@@ -271,18 +306,26 @@ impl Board {
                 let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
-                let Some(rec) = read_claim(&file)? else {
-                    continue;
+                let rec = match read_claim(&file) {
+                    Ok(Some(rec)) => rec,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(path = %file.display(), error = %e, "skipping an unreadable claim file");
+                        continue;
+                    }
                 };
                 let Some(acquired_at) = parse_time(&rec.acquired_at) else {
                     continue;
                 };
+                let key_known = rec.key.is_some();
                 let key = rec.key.clone().unwrap_or_else(|| stem.to_string());
-                let known = views.iter().any(|v| {
+                let known = views.iter().zip(&tokens).any(|(v, t)| {
                     v.state == ClaimState::Held
-                        && v.owner == rec.owner
-                        && v.acquired_at == acquired_at
                         && claim_stem(&v.key) == stem
+                        && match t {
+                            Some(t) if !rec.token.is_empty() => *t == rec.token,
+                            _ => v.owner == rec.owner && v.acquired_at == acquired_at,
+                        }
                 });
                 if !known {
                     views.push(ClaimView {
@@ -292,6 +335,7 @@ impl Board {
                         lease_expires_at: parse_time(&rec.lease_expires_at),
                         ended_at: None,
                         state: ClaimState::Held,
+                        key_known,
                     });
                 }
             }
@@ -442,17 +486,23 @@ pub(crate) enum JournalLine {
     Claimed {
         key: String,
         owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         at: String,
         lease_expires_at: String,
     },
     Released {
         key: String,
         owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         at: String,
     },
     Expired {
         key: String,
         owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
         at: String,
     },
 }
@@ -463,42 +513,41 @@ fn parse_time(s: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// End the latest still-held acquisition of `key` by `owner`.
-fn end_latest(views: &mut [ClaimView], key: &str, owner: &str, at: &str, state: ClaimState) {
-    if let Some(v) = views
-        .iter_mut()
-        .rev()
-        .find(|v| v.state == ClaimState::Held && v.key == key && v.owner == owner)
-    {
-        v.state = state;
-        v.ended_at = parse_time(at);
+/// End the latest still-held acquisition of `key`: the one with this grant
+/// `token`, or, for a journal line written without one, by `owner`.
+fn end_latest(
+    views: &mut [ClaimView],
+    tokens: &[Option<String>],
+    key: &str,
+    owner: &str,
+    token: Option<&str>,
+    at: &str,
+    state: ClaimState,
+) {
+    let found = views.iter().zip(tokens).rposition(|(v, t)| {
+        v.state == ClaimState::Held
+            && v.key == key
+            && match (token, t) {
+                (Some(want), Some(have)) => want == have,
+                _ => v.owner == owner,
+            }
+    });
+    if let Some(i) = found {
+        views[i].state = state;
+        views[i].ended_at = parse_time(at);
     }
 }
 
 /// [`append_jsonl`] serialized by a sidecar `<path>.lock` (`flock`).
 fn append_jsonl_locked<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FleetError> {
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
             action: format!("create dir {}", parent.display()),
             source: e,
         })?;
     }
-    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|e| FleetError::Io {
-            action: format!("open lock {}", lock_path.display()),
-            source: e,
-        })?;
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).map_err(|e| {
-        FleetError::Io {
-            action: format!("lock {}", lock_path.display()),
-            source: e.into(),
-        }
-    })?;
+    let _lock = crate::bus::lock_exclusive(&lock_path)?;
     append_jsonl(path, value)
 }
 

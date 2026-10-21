@@ -43,6 +43,7 @@ impl Drop for ClaimGuard {
                         &crate::board::JournalLine::Released {
                             key: self.key.clone(),
                             owner: self.owner.clone(),
+                            token: Some(self.token.clone()),
                             at: chrono::Utc::now().to_rfc3339(),
                         },
                     );
@@ -76,6 +77,9 @@ pub struct ClaimView {
     pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
     pub state: ClaimState,
+    /// False when only the claim file's stem is known (a claim written before
+    /// the journal): `key` then holds that stem, kept so it stays unique.
+    pub key_known: bool,
 }
 
 /// The record persisted inside a claim lock file.
