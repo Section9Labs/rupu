@@ -698,3 +698,124 @@ fn an_addressed_post_to_a_role_reaches_every_live_member_and_respects_inbox_caps
     assert_eq!(b_inbox[0].post_kind, None);
     assert_eq!(sender.board.read_posts().unwrap().len(), 1);
 }
+
+fn journal(root: &Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(root.join("board").join("claims.jsonl")).unwrap();
+    text.lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn claim_release_writes_journal_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let ClaimOutcome::Granted(guard) = board
+        .claim("host:1", "lynx#1", std::time::Duration::from_secs(60))
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    drop(guard);
+    let lines = journal(tmp.path());
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0]["ev"], "claimed");
+    assert_eq!(lines[0]["key"], "host:1");
+    assert_eq!(lines[0]["owner"], "lynx#1");
+    assert!(lines[0]["lease_expires_at"].is_string());
+    assert_eq!(lines[1]["ev"], "released");
+    let view = board.claims_view(chrono::Utc::now()).unwrap();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].state, ClaimState::Released);
+    assert!(view[0].ended_at.is_some());
+    assert_eq!(view[0].key, "host:1");
+}
+
+#[test]
+fn expired_claim_is_reported_expired() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let ClaimOutcome::Granted(old) = board
+        .claim("svc", "a", std::time::Duration::from_secs(0))
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    std::mem::forget(old);
+    let ClaimOutcome::Granted(_new) = board
+        .claim("svc", "b", std::time::Duration::from_secs(60))
+        .unwrap()
+    else {
+        panic!("granted")
+    };
+    let evs: Vec<String> = journal(tmp.path())
+        .iter()
+        .map(|l| {
+            format!(
+                "{}:{}",
+                l["ev"].as_str().unwrap(),
+                l["owner"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(evs, ["claimed:a", "expired:a", "claimed:b"]);
+    let view = board.claims_view(chrono::Utc::now()).unwrap();
+    assert_eq!(view.len(), 2);
+    assert_eq!(
+        (view[0].owner.as_str(), view[0].state),
+        ("a", ClaimState::Expired)
+    );
+    assert_eq!(
+        (view[1].owner.as_str(), view[1].state),
+        ("b", ClaimState::Held)
+    );
+}
+
+#[test]
+fn pre_journal_live_claim_reads_as_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("board").join("claims");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = chrono::Utc::now();
+    let rec = serde_json::json!({
+        "owner": "old#1",
+        "acquired_at": now.to_rfc3339(),
+        "lease_expires_at": (now + chrono::Duration::hours(1)).to_rfc3339(),
+        "token": "t",
+    });
+    std::fs::write(dir.join("k-0123456789abcdef.json"), rec.to_string()).unwrap();
+    let board = Board::new(tmp.path());
+    assert!(!board.has_journal());
+    let view = board.claims_view(now).unwrap();
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].state, ClaimState::Held);
+    assert_eq!(view[0].owner, "old#1");
+    // The same claim later, after its lease: reported expired.
+    let later = board.claims_view(now + chrono::Duration::hours(2)).unwrap();
+    assert_eq!(later[0].state, ClaimState::Expired);
+}
+
+#[test]
+fn retraction_records_its_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let board = Board::new(tmp.path());
+    let id = board
+        .put_directive(&Directive {
+            id: String::new(),
+            author: "lead".into(),
+            ts: "t".into(),
+            body: "b".into(),
+            addressed_to: None,
+        })
+        .unwrap();
+    board.retract_directive(&id).unwrap();
+    let events = board.directive_events().unwrap();
+    match &events[1] {
+        DirectiveEvent::Retract { retract, at } => {
+            assert_eq!(retract, &id);
+            assert!(chrono::DateTime::parse_from_rfc3339(at.as_deref().unwrap()).is_ok());
+        }
+        other => panic!("expected a retraction, got {other:?}"),
+    }
+    assert!(board.read_directives().unwrap().is_empty());
+}

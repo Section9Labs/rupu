@@ -8,6 +8,10 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub struct ClaimGuard {
     pub(crate) path: PathBuf,
+    /// The board root and the raw key/owner, for the claim journal's `released`.
+    pub(crate) board_root: PathBuf,
+    pub(crate) key: String,
+    pub(crate) owner: String,
     /// Per-key `.reaplock`; serializes this guard's delete against reaps.
     pub(crate) lock_path: PathBuf,
     /// Unique per grant; matches the `token` in the claim file we wrote.
@@ -34,8 +38,14 @@ impl Drop for ClaimGuard {
         }
         if let Ok(bytes) = std::fs::read(&self.path) {
             if let Ok(rec) = serde_json::from_slice::<ClaimRecord>(&bytes) {
-                if rec.token == self.token {
-                    let _ = std::fs::remove_file(&self.path);
+                if rec.token == self.token && std::fs::remove_file(&self.path).is_ok() {
+                    crate::board::Board::new(&self.board_root).journal_claim(
+                        &crate::board::JournalLine::Released {
+                            key: self.key.clone(),
+                            owner: self.owner.clone(),
+                            at: chrono::Utc::now().to_rfc3339(),
+                        },
+                    );
                 }
             }
         }
@@ -49,6 +59,25 @@ pub enum ClaimOutcome {
     Denied { holder: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimState {
+    Held,
+    Released,
+    Expired,
+}
+
+/// One acquisition of a claim, as the claim journal tells it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimView {
+    pub key: String,
+    pub owner: String,
+    pub acquired_at: chrono::DateTime<chrono::Utc>,
+    pub lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub state: ClaimState,
+}
+
 /// The record persisted inside a claim lock file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ClaimRecord {
@@ -58,6 +87,9 @@ pub(crate) struct ClaimRecord {
     /// Unique per grant; lets a guard delete only its OWN claim file.
     #[serde(default)]
     pub token: String,
+    /// The raw key; absent in a claim file written before the journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -132,7 +164,13 @@ pub struct Directive {
 #[serde(untagged)]
 pub enum DirectiveEvent {
     /// Lift the directive with this id from the live set.
-    Retract { retract: String },
+    Retract {
+        retract: String,
+        /// When it was retracted; absent on a retraction written before the
+        /// board view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+    },
     /// Add (or, for a live id, replace) a directive.
     Put(Directive),
 }

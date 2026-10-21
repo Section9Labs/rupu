@@ -568,7 +568,7 @@ fn legacy_messages(bus: &Bus) -> Result<Vec<MessageView>, BusError> {
                     d.body,
                 ));
             }
-            DirectiveEvent::Retract { retract } => {
+            DirectiveEvent::Retract { retract, .. } => {
                 let from = authors.get(&retract).cloned().unwrap_or_default();
                 let mut m = message(
                     format!("legacy_retract_{n}"),
