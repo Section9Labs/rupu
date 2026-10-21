@@ -125,37 +125,41 @@ fn decision_excerpt_caps_at_600_on_a_word_boundary() {
     assert_eq!(cut.chars().count(), 601);
 }
 
-#[test]
-fn round_event_records_decision_start_goals() {
+/// Run a one-goal flow on `leads` (one mock provider per round, in order) and
+/// return its `round` events. `prep` gets the run's dir before the run starts.
+fn round_events(
+    id: &str,
+    leads: Vec<MockProvider>,
+    prep: impl FnOnce(&std::path::Path),
+) -> Vec<serde_json::Value> {
     let tmp = tempfile::tempdir().unwrap();
     let global = tmp.path().join("global");
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(global.join("agents")).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
-    let rounds = Arc::new(Mutex::new(vec![MockProvider::new(vec![
-        ScriptedTurn::AssistantText {
-            text: "Map the surface first.".into(),
-            stop: ModelStop::EndTurn,
-            input_tokens: 1,
-            output_tokens: 1,
-        },
-    ])]));
+    let dir = agentiflow_dir(&global).join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    prep(&dir);
+    let n = leads.len();
+    let mut leads = leads;
+    leads.reverse();
+    let leads = Arc::new(Mutex::new(leads));
     let started = chrono::Utc::now();
     let tick = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let clock = Arc::clone(&tick);
     run_agentiflow(RunAgentiflowOpts {
-        def: AgentiflowDef::parse_str(
+        def: AgentiflowDef::parse_str(&format!(
             "name: rounds\n\
              lead: lead\n\
              engagement_profiles: [network]\n\
              goals:\n  \
                - id: any-finding\n    \
                  objective: \"Record at least one finding.\"\n    \
-                 target: { findings: {}, count_gte: 1 }\n\
-             scope: { authorized: true }\n\
-             pool: { agents: [lead] }\n\
-             round: { lead_max_turns: 4, ceiling: { rounds: 1 } }\n",
-        )
+                 target: {{ findings: {{}}, count_gte: 1 }}\n\
+             scope: {{ authorized: true }}\n\
+             pool: {{ agents: [lead] }}\n\
+             round: {{ lead_max_turns: 4, ceiling: {{ rounds: {n} }} }}\n"
+        ))
         .unwrap(),
         workspace: workspace.clone(),
         global: global.clone(),
@@ -179,12 +183,12 @@ fn round_event_records_decision_start_goals() {
                 provider: "mock".into(),
                 model: "mock-1".into(),
                 make: Box::new(move || {
-                    Box::new(rounds.lock().unwrap().pop().expect("a lead for this round"))
+                    Box::new(leads.lock().unwrap().pop().expect("a lead for this round"))
                         as Box<dyn LlmProvider>
                 }),
             },
         },
-        run_id: "af_decision".into(),
+        run_id: id.into(),
         process_backend: Some(Arc::new(rupu_launch::testing::ScriptedProcesses::done(
             "ok",
         ))),
@@ -192,14 +196,31 @@ fn round_event_records_decision_start_goals() {
         pricing: Default::default(),
     })
     .unwrap();
-
-    let dir = agentiflow_dir(&global).join("af_decision");
-    let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
-    let round: serde_json::Value = events
+    std::fs::read_to_string(dir.join("events.jsonl"))
+        .unwrap()
         .lines()
         .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-        .find(|e| e["kind"] == "round")
-        .expect("a round event");
+        .filter(|e| e["kind"] == "round")
+        .collect()
+}
+
+fn says(text: &str) -> ScriptedTurn {
+    ScriptedTurn::AssistantText {
+        text: text.into(),
+        stop: ModelStop::EndTurn,
+        input_tokens: 1,
+        output_tokens: 1,
+    }
+}
+
+#[test]
+fn round_event_records_decision_start_goals() {
+    let rounds = round_events(
+        "af_decision",
+        vec![MockProvider::new(vec![says("Map the surface first.")])],
+        |_| {},
+    );
+    let round = &rounds[0];
     assert_eq!(round["decision"], "Map the surface first.");
     let ts = chrono::DateTime::parse_from_rfc3339(round["ts"].as_str().unwrap()).unwrap();
     let began =
@@ -210,4 +231,40 @@ fn round_event_records_decision_start_goals() {
         serde_json::json!([{"id": "any-finding", "met": false, "current": 0}])
     );
     assert!(round.get("warnings").is_none(), "{round}");
+}
+
+#[test]
+fn a_round_that_says_nothing_carries_no_decision() {
+    // Round 1's model call fails before any reply: the history still ends with
+    // round 0's answer, which must not be reported as round 1's decision.
+    let rounds = round_events(
+        "af_nodecision",
+        vec![
+            MockProvider::new(vec![says("Map the surface first.")]),
+            MockProvider::new(vec![]),
+        ],
+        |_| {},
+    );
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(rounds[0]["decision"], "Map the surface first.");
+    assert_eq!(rounds[1]["outcome"], "error", "{}", rounds[1]);
+    assert!(rounds[1].get("decision").is_none(), "{}", rounds[1]);
+}
+
+#[test]
+fn round_event_carries_the_digests_warnings() {
+    // A file where the control queue's directory belongs makes the drain fail,
+    // which the digest reports as a warning.
+    let rounds = round_events(
+        "af_warn",
+        vec![MockProvider::new(vec![says("Go.")])],
+        |dir| std::fs::write(dir.join("steering"), b"not a directory").unwrap(),
+    );
+    let warnings = rounds[0]["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("operator queue unreadable")),
+        "{warnings:?}"
+    );
 }

@@ -422,6 +422,9 @@ pub struct RunAgentLeadDriver {
     provider: LeadProvider,
     rt: tokio::runtime::Runtime,
     history: Vec<Message>,
+    /// What the latest round itself said (its own assistant text, not the
+    /// carried-over history's); `None` when it said nothing.
+    last_decision: Option<String>,
     /// The skills loaded into `history` (its latest round's), carried into
     /// the next round so its compactions re-attach them.
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
@@ -475,6 +478,7 @@ impl RunAgentLeadDriver {
             provider,
             rt,
             history: Vec::new(),
+            last_decision: None,
             loaded_skills: Vec::new(),
             unseen_messages: Vec::new(),
             skills: None,
@@ -732,24 +736,28 @@ impl RunAgentLeadDriver {
     }
 }
 
+/// The text of the last assistant message among the messages a round added
+/// to the `carried` it started with. `None` when the round added none with
+/// text (the carried history's own last reply is a previous round's).
+fn round_decision(messages: &[Message], carried: usize) -> Option<String> {
+    use rupu_providers::types::{ContentBlock, Role};
+    let own = messages.get(carried..)?;
+    let last = own.iter().rev().find(|m| m.role == Role::Assistant)?;
+    let text: String = last
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 impl LeadDriver for RunAgentLeadDriver {
     fn last_decision(&self) -> Option<String> {
-        use rupu_providers::types::{ContentBlock, Role};
-        let last = self
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::Assistant)?;
-        let text: String = last
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        let text = text.trim();
-        (!text.is_empty()).then(|| text.to_string())
+        self.last_decision.clone()
     }
 
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
@@ -762,6 +770,8 @@ impl LeadDriver for RunAgentLeadDriver {
                 .block_on(assembler.resolve_skills(&self.cfg.agent, &Overrides::default()))
                 .ok();
         }
+        self.last_decision = None;
+        let carried = self.history.len();
         let (spec, pause, ceiling) = self.round_launch(ctx);
 
         let RunExit {
@@ -828,6 +838,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // The conversation carries over whatever the status: a bust or
                 // an errored-but-completed run still holds the round's work.
                 self.total_turns = self.total_turns.saturating_add(run.turns);
+                self.last_decision = round_decision(&run.final_messages, carried);
                 self.history = run.final_messages;
                 self.loaded_skills = loaded_skills;
                 self.unseen_messages = unseen_messages;
@@ -840,6 +851,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // failed before it loaded the history; adopting that would drop
                 // everything.
                 if !messages.is_empty() {
+                    self.last_decision = round_decision(&messages, carried);
                     self.history = messages;
                     self.loaded_skills = loaded_skills;
                     self.unseen_messages = unseen_messages;
