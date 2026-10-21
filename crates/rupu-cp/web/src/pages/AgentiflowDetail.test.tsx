@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // AgentiflowDetail — header + goals + budget (always shown) plus the tabbed
-// Flow (graph + fleet) / Assets / Findings / Network / Messages / Transcript / Events
+// Flow (map + fleet) / Assets / Findings / Network / Messages / Transcript / Events
 // views over one GET /api/agentiflows/:id. TranscriptPanel is mocked (heavy;
 // its own tests); the Findings/Assets/Messages tabs fetch on open and aren't
 // exercised here.
@@ -10,6 +10,13 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
+
+// The Flow tab's map has its own tests (components/flowmap); its canvas
+// can't mount under jsdom.
+vi.mock('../components/flowmap/FlowMap', () => ({
+  __esModule: true,
+  default: ({ running }: { running: boolean }) => <div data-testid="flow-map" data-running={String(running)} />,
+}));
 
 vi.mock('../components/TranscriptPanel', () => ({
   __esModule: true,
@@ -163,6 +170,8 @@ describe('AgentiflowDetail', () => {
     expect(await screen.findByRole('heading', { name: 'rupu-self-review' })).toBeInTheDocument();
     expect(screen.getByText('af_01ABC')).toBeInTheDocument();
     expect(screen.getByText('Review rupu with a fleet.')).toBeInTheDocument();
+    // The Flow tab (the default) draws the map.
+    expect(screen.getByTestId('flow-map')).toBeInTheDocument();
 
     // Goals: the objective comes from the definition, the counters from the record.
     expect(screen.getByText('Find real issues')).toBeInTheDocument();

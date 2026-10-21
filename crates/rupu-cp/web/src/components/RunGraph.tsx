@@ -44,9 +44,9 @@ import { mergeMeasured, type Size } from '../lib/graph/measured';
 import '@xyflow/react/dist/style.css';
 
 // Map the model's step kind → a registered React Flow node type.
-type FlowKind = 'step' | 'parallel' | 'fanout' | 'panel' | 'gate' | 'action';
+export type FlowKind = 'step' | 'parallel' | 'fanout' | 'panel' | 'gate' | 'action';
 
-function flowKind(kind: StepNodeDto['kind']): FlowKind {
+export function flowKind(kind: StepNodeDto['kind']): FlowKind {
   switch (kind) {
     case 'parallel':
       return 'parallel';
@@ -64,8 +64,9 @@ function flowKind(kind: StepNodeDto['kind']): FlowKind {
 }
 
 // Memoized once at module scope so React Flow doesn't see a fresh object each
-// render (which it warns about and which defeats node memoization).
-const NODE_TYPES: NodeTypes = {
+// render (which it warns about and which defeats node memoization). The
+// agentiflow map draws a workflow child's steps with these same components.
+export const NODE_TYPES: NodeTypes = {
   step: StepNode,
   parallel: ParallelNode,
   fanout: FanoutNode,
@@ -101,6 +102,50 @@ function GraphSummary({ nodes }: { nodes: readonly GraphNode[] }) {
 /** The minimap paints each node in its state's color: a live status map. */
 function miniColor(colors: ThemeColors, state: GraphNode['state']): string {
   return state === 'pending' || state === 'skipped' ? colors.alpha('inkMute', 0.45) : stateStyle(colors, state).color;
+}
+
+/** The run graph's connectors for `model`: each edge colored from its source
+ *  step's kind into its target's, toned by their states. `prefix` namespaces
+ *  the node ids (the agentiflow map keys a frame's steps `<frame>/<step>`). */
+export function runEdges(
+  model: RunGraphModel,
+  colors: ThemeColors,
+  slots: ReadonlyMap<string, number>,
+  prefix = '',
+): RunFlowEdge[] {
+  return model.edges.map((e) => {
+    const source = model.nodeById(e.from);
+    const target = model.nodeById(e.to);
+    const tone = edgeTone(source?.state, target?.state);
+
+    // The connector takes its kinds' colors (from the SOURCE step's kind
+    // into the TARGET's); the live frontier carries a glow in the running
+    // color. An awaiting gate is the one place status wins over kind: the
+    // edge arrives in amber, "needs you", whatever kind of step precedes it.
+    const fromKey = source ? runKindAccent(source.kind) : 'inkMute';
+    const toKey = target ? runKindAccent(target.kind) : fromKey;
+    const awaiting = tone === 'await';
+    const stroke = awaiting
+      ? colors.status.awaiting
+      : tone === 'idle' || tone === 'dead'
+        ? colors.alpha(fromKey, 0.35)
+        : colors.get(fromKey);
+    return {
+      id: `${prefix}${e.from}->${prefix}${e.to}`,
+      source: `${prefix}${e.from}`,
+      target: `${prefix}${e.to}`,
+      type: 'run',
+      className: tone === 'live' || awaiting ? 'rg-edge-flow' : undefined,
+      style: { stroke, strokeWidth: 2 },
+      data: {
+        tone,
+        from: colors.get(fromKey),
+        to: awaiting ? colors.status.awaiting : colors.get(toKey),
+        light: awaiting ? colors.status.awaiting : colors.status.running,
+        slot: slots.get(`${prefix}${e.from}`) ?? 0,
+      },
+    };
+  });
 }
 
 interface NodeData extends Record<string, unknown> {
@@ -212,41 +257,7 @@ function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectN
     });
   }, [model, positions, slots, measured, selectedId, handleOpenUnit, onExpandFanout, gate]);
 
-  const edges = useMemo<RunFlowEdge[]>(() => {
-    return model.edges.map((e) => {
-      const source = model.nodeById(e.from);
-      const target = model.nodeById(e.to);
-      const tone = edgeTone(source?.state, target?.state);
-
-      // The connector takes its kinds' colors (from the SOURCE step's kind
-      // into the TARGET's); the live frontier carries a glow in the running
-      // color. An awaiting gate is the one place status wins over kind: the
-      // edge arrives in amber, "needs you", whatever kind of step precedes it.
-      const fromKey = source ? runKindAccent(source.kind) : 'inkMute';
-      const toKey = target ? runKindAccent(target.kind) : fromKey;
-      const awaiting = tone === 'await';
-      const stroke = awaiting
-        ? colors.status.awaiting
-        : tone === 'idle' || tone === 'dead'
-          ? colors.alpha(fromKey, 0.35)
-          : colors.get(fromKey);
-      return {
-        id: `${e.from}->${e.to}`,
-        source: e.from,
-        target: e.to,
-        type: 'run',
-        className: tone === 'live' || awaiting ? 'rg-edge-flow' : undefined,
-        style: { stroke, strokeWidth: 2 },
-        data: {
-          tone,
-          from: colors.get(fromKey),
-          to: awaiting ? colors.status.awaiting : colors.get(toKey),
-          light: awaiting ? colors.status.awaiting : colors.status.running,
-          slot: slots.get(e.from) ?? 0,
-        },
-      };
-    });
-  }, [model, colors, slots]);
+  const edges = useMemo(() => runEdges(model, colors, slots), [model, colors, slots]);
 
   if (model.nodes.length === 0) {
     return (

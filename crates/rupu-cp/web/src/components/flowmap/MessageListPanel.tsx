@@ -1,7 +1,7 @@
 // MessageListPanel — every message of every loaded space, in time order,
 // tagged by space, kind and participants. Selecting a row selects its arc.
 
-import { useTheme } from '../theme/ThemeProvider';
+import { useThemeMode } from '../codename/useThemeMode';
 import { useThemeColors } from '../../lib/useThemeColors';
 import { messagePaint } from '../../lib/flow/messagePaint';
 import type { FlowMessage } from '../../lib/flow/flowModel';
@@ -28,7 +28,7 @@ export default function MessageListPanel({
   onSelect: (id: string | null) => void;
 }) {
   const colors = useThemeColors();
-  const { mode } = useTheme();
+  const mode = useThemeMode();
   const rows = [...messages].sort((a, b) => a.at - b.at);
   if (rows.length === 0) return <div className="afx-list-empty">No messages yet.</div>;
   return (

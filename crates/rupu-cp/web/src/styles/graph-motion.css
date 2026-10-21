@@ -1,7 +1,7 @@
 /* ──────────────────────────────────────────────────────────────────────────
  * Workflow-graph look and motion: the run graph (components/RunGraph.tsx,
- * components/graph/*, `gx-*`) and the workflow editor's canvas (`wfx-*`); the
- * agentiflow flow (`afx-*`) has its own sheet, agentiflow-flow.css, on these
+ * components/graph/*, `gx-*`), the workflow editor's canvas (`wfx-*`) and the
+ * agentiflow map (components/flowmap/*, `afx-*`, at the end), on the same
  * tokens and keyframes. "Calm depth": cards are raised panels whose
  * shadows read as light; status is a capsule whose glyph morphs between
  * states; only the live frontier moves continuously, and every move says
@@ -1286,6 +1286,7 @@
 .afx-rail { display: flex; flex-direction: column; gap: 14px; padding: 10px 12px; font-size: 12px; overflow-y: auto; }
 .afx-rail-h { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--c-ink-mute)); }
 .afx-rail-item {
+  position: relative;
   display: block;
   width: 100%;
   margin-bottom: 6px;
@@ -1361,4 +1362,173 @@
   .afx-msg-packet { display: none; }
   .afx-rail-item { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
   .afx-pill:active { scale: none; }
+}
+
+/* ── the agentiflow map (FlowMap) ──
+   Cards are the run graph's (NodeFrame); these are the map's own parts: the
+   spine, the lead's start, a workflow child's frame, the "+N more" card, the
+   rail node, the operator's entry, and the header strip and panels around
+   the canvas. The spine draws down as the map arrives and its live end
+   breathes; a frame arrives like a card. */
+.afx-canvas { height: max(520px, 72vh); }
+.afx-note { font-size: 12px; color: rgb(var(--c-warn)); }
+.afx-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px;
+  font-size: 12px; color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums;
+}
+.afx-head b { color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-head .k { color: rgb(var(--c-ink-mute)); }
+.afx-meter {
+  display: inline-block; width: 64px; height: 4px; margin: 0 6px 1px 2px; vertical-align: middle;
+  border-radius: 2px; background: rgb(var(--c-surface)); overflow: hidden;
+}
+.afx-meter > i {
+  display: block; height: 100%; transform-origin: left; background: rgb(var(--c-brand-500));
+  transition: transform 300ms var(--ease-out);
+}
+.afx-meter[data-tone='ok'] > i { background: rgb(var(--c-status-done)); }
+
+/* Card parts. */
+.afx-mcount { gap: 3px; }
+.afx-result { margin-top: 3px; }
+.afx-decision {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12px; line-height: 16px; color: rgb(var(--c-ink));
+}
+.afx-foot-r {
+  display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden;
+  white-space: nowrap; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums;
+}
+.afx-link { color: rgb(var(--c-brand-500)); font-weight: 600; }
+.afx-link:hover { text-decoration: underline; }
+.afx-inferred {
+  padding: 0 4px; border: 1px dashed rgb(var(--c-ink-mute) / 0.6); border-radius: 4px;
+  color: rgb(var(--c-ink-mute)); font-style: italic;
+}
+.afx-more {
+  display: flex; align-items: center; gap: 7px; width: 100%; height: 20px;
+  font-size: 13px; font-weight: 600; color: rgb(var(--c-ink)); text-align: left; cursor: pointer;
+}
+.afx-more:hover .afx-more-label { text-decoration: underline; }
+.afx-more + .gx-sub { margin-top: 6px; }
+
+/* The spine and the lead's start. */
+.afx-spine-svg { overflow: visible; pointer-events: none; }
+.afx-spine-line {
+  fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; opacity: 0.55;
+  stroke-dasharray: 1 1; animation: rgx-draw 900ms var(--ease-out) backwards;
+}
+.afx-spine-dot {
+  fill: currentColor; stroke: rgb(var(--c-bg)); stroke-width: 2;
+  animation: rgx-fade 300ms var(--ease-out) backwards; animation-delay: calc(var(--i, 0) * 40ms);
+}
+.afx-spine-ring {
+  fill: none; stroke: currentColor; stroke-width: 1.5;
+  transform-box: fill-box; transform-origin: center;
+  animation: afx-ring 1.8s var(--ease-out) infinite;
+}
+@keyframes afx-ring {
+  from { opacity: 0.7; scale: 1; }
+  to { opacity: 0; scale: 2.6; }
+}
+.afx-lead {
+  display: flex; align-items: baseline; gap: 8px; padding: 4px 0; white-space: nowrap;
+  font-size: 12px; color: rgb(var(--c-ink-mute));
+}
+.afx-lead b { color: rgb(var(--c-ink)); font-weight: 600; }
+
+/* A workflow child's frame. */
+.afx-frame {
+  position: relative; display: flex; flex-direction: column;
+  border: 1px dashed rgb(var(--c-brand-500) / 0.45); border-radius: 16px;
+  background: rgb(var(--c-brand-500) / 0.035);
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+}
+.afx-frame[data-state='running'] { border-color: rgb(var(--c-status-running) / 0.6); }
+.afx-frame[data-state='failed'] { border-color: rgb(var(--c-status-failed) / 0.6); }
+.afx-frame-head {
+  display: flex; align-items: center; gap: 8px; padding: 0 14px; min-width: 0;
+  font-size: 11px; color: rgb(var(--c-ink-dim)); white-space: nowrap;
+}
+.afx-frame-pen { display: inline-flex; align-items: center; gap: 5px; color: rgb(var(--c-brand-500)); font-weight: 600; }
+.afx-frame-icon { color: rgb(var(--c-brand-500)); }
+.afx-frame-name { color: rgb(var(--c-ink)); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.afx-frame-btn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px;
+  border: 1px solid rgb(var(--c-border-strong)); border-radius: 6px; background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink)); cursor: pointer; transition: background-color 120ms var(--ease-out);
+}
+.afx-frame-btn:hover { background: rgb(var(--c-surface-hover)); }
+.afx-frame-graph { position: relative; flex: none; }
+.afx-frame-note {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  font-size: 12px; color: rgb(var(--c-ink-mute));
+}
+.afx-frame-strip { padding: 0 14px; }
+.afx-frame-foot {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 6px 14px 10px;
+  font-size: 11px; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.afx-frame-who { color: rgb(var(--c-ink)); font-weight: 600; }
+
+/* A board rendered as a frame's strip: one row of compact items. */
+.afx-rail-compact { flex-direction: row; flex-wrap: wrap; gap: 6px 10px; padding: 6px 0; overflow: visible; }
+.afx-rail-compact section { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }
+.afx-rail-compact .afx-rail-h { margin: 3px 0 0; }
+.afx-rail-compact .afx-rail-item { width: auto; max-width: 220px; margin: 0; padding: 3px 7px; }
+.afx-rail-compact .afx-rail-empty { display: none; }
+.afx-rail-compact section:has(> .afx-rail-empty:only-of-type) { display: none; }
+
+/* The flow's board as a node on the canvas, and where arcs land in it. */
+.afx-rail-node {
+  border: 1px solid rgb(var(--c-border)); border-radius: 14px; background: rgb(var(--c-panel) / 0.85);
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight); cursor: default;
+}
+.afx-rail-title {
+  padding: 10px 12px 0; font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
+}
+.afx-rail-node .afx-rail { overflow: visible; }
+.react-flow__handle.afx-anchor {
+  width: 6px; height: 6px; min-width: 0; min-height: 0; left: -4px;
+  border: 1.5px solid rgb(var(--c-ink-mute) / 0.6); background: rgb(var(--gx-card));
+}
+
+/* The operator's entry, left of the spine. */
+.afx-entry {
+  padding: 2px 8px; border: 1px solid rgb(var(--c-sev-critical) / 0.5); border-radius: 999px;
+  background: rgb(var(--c-panel)); font-size: 11px; font-weight: 600; color: rgb(var(--c-sev-critical));
+  white-space: nowrap;
+}
+.afx-entry .react-flow__handle { opacity: 0; }
+
+/* The panels under the canvas. */
+.afx-panel {
+  min-width: 0; border: 1px solid rgb(var(--c-border)); border-radius: 12px; background: rgb(var(--c-panel));
+  box-shadow: var(--gx-shadow-rest);
+}
+.afx-panel .afx-list { max-height: 420px; }
+.afx-panel-h {
+  display: flex; align-items: baseline; gap: 8px; margin: 0; padding: 10px 12px 6px;
+  font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
+}
+.afx-panel-h > span { font-weight: 400; color: rgb(var(--c-ink-mute)); }
+.afx-panel-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.afx-goals { margin: 0; padding: 0 12px; list-style: none; font-size: 12px; }
+.afx-goals li { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+.afx-goals .o { flex: 1; min-width: 0; color: rgb(var(--c-ink)); }
+.afx-goals .c { color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums; }
+.afx-kv {
+  display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 8px 0 0; padding: 8px 12px 12px;
+  border-top: 1px solid rgb(var(--c-border)); font-size: 12px;
+}
+.afx-kv dt { color: rgb(var(--c-ink-mute)); }
+.afx-kv dd { margin: 0; color: rgb(var(--c-ink)); font-variant-numeric: tabular-nums; }
+.gx-summary .afx-dot { width: 6px; height: 6px; border-radius: 50%; background: rgb(var(--gx-c)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .afx-spine-line { animation: rgx-fade 240ms ease-out backwards; }
+  .afx-spine-ring { animation: none; opacity: 0; }
+  .afx-frame { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-meter > i { transition: none; }
 }

@@ -4,9 +4,9 @@
 // uses (back link + header with name / CrewChip / StatusPill, `bg-panel
 // border rounded-xl shadow-card` sections, TranscriptPanel for transcripts).
 //
-// v1 is LOCAL-only and graph-free: the data is surfaced as panels; the
-// branching graph is a later pass. A `running` run re-fetches every 5 s (the
-// lead's transcript tails live over SSE on its own); Refresh re-fetches on demand.
+// LOCAL-only. The Flow tab is the unfolding map (components/flowmap/FlowMap).
+// A `running` run re-fetches every 5 s (the lead's transcript tails live over
+// SSE on its own); Refresh re-fetches on demand.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
@@ -21,7 +21,7 @@ import {
 import { StatusPill } from '../components/StatusPill';
 import { CrewChip } from '../components/codename/CrewChip';
 import { AgentName } from '../components/codename/AgentName';
-import AgentiflowGraph from '../components/agentiflow/AgentiflowGraph';
+import FlowMap from '../components/flowmap/FlowMap';
 import AssetInventory from '../components/agentiflow/AssetInventory';
 import ChildrenPanel from '../components/run/ChildrenPanel';
 import MessageFeed from '../components/messages/MessageFeed';
@@ -141,7 +141,7 @@ export default function AgentiflowDetail() {
   useEffect(() => {
     if (tab === 'messages') setMessagesOpened(true);
   }, [tab]);
-  const messages = useMessageSpace({ route: 'agentiflows', id }, { live: running, load: running || messagesOpened, reading: tab === 'messages' });
+  const messages = useMessageSpace({ route: 'agentiflows', id }, { live: running, load: running || messagesOpened || tab === 'flow', reading: tab === 'messages' });
   const [transcriptFocus, setTranscriptFocus] = useState<TranscriptSelection | null>(null);
   // The transcript a participant's messages are in: a unit's own, or the
   // lead's latest round.
@@ -354,7 +354,7 @@ export default function AgentiflowDetail() {
             {detail.events.length === 0 && detail.units.length === 0 ? (
               <Muted>Nothing has happened yet.</Muted>
             ) : (
-              <AgentiflowGraph detail={detail} />
+              <FlowMap detail={detail} running={running} flowSpace={messages} />
             )}
           </Panel>
 

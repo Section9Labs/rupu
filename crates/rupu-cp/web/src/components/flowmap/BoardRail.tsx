@@ -1,8 +1,12 @@
 // BoardRail — the flow's board: claims (held / released / expired), the board
 // posts where they landed (each the end of its writer's arc), and the standing
-// directives with their retraction.
+// directives with their retraction. `anchor(key)` puts a connection point in
+// an item (the map's arcs land on it): `claim:<key>:<acquired_at>` for a
+// claim, the message id for a directive or a post. `compact` lays it out as
+// the strip along a workflow frame's foot.
+import type { ReactNode } from 'react';
 
-import { useTheme } from '../theme/ThemeProvider';
+import { useThemeMode } from '../codename/useThemeMode';
 import type { BoardSource, FlowMessage } from '../../lib/flow/flowModel';
 import type { ClaimView, DirectiveView } from '../../lib/api';
 import { identityOf } from '../../lib/messages';
@@ -27,12 +31,17 @@ export default function BoardRail({
   board,
   posts,
   onSelect,
+  anchor,
+  compact = false,
 }: {
   board: BoardSource | null;
   posts: FlowMessage[];
   onSelect: (id: string) => void;
+  anchor?: (key: string) => ReactNode;
+  compact?: boolean;
 }) {
-  const { mode } = useTheme();
+  const cls = compact ? 'afx-rail afx-rail-compact' : 'afx-rail';
+  const mode = useThemeMode();
   const who = (address: string) => (
     <span className="afx-rail-who" style={{ color: identityOf(address, mode).color }}>
       {address}
@@ -41,7 +50,7 @@ export default function BoardRail({
 
   if (board && 'kind' in board) {
     return (
-      <aside className="afx-rail" aria-label="Board">
+      <aside className={cls} aria-label="Board">
         <div className="afx-rail-note">
           this host can't show the board.
           {board.reason && <span className="afx-rail-sub"> {board.reason}</span>}
@@ -51,7 +60,7 @@ export default function BoardRail({
   }
 
   return (
-    <aside className="afx-rail" aria-label="Board">
+    <aside className={cls} aria-label="Board">
       {board === null && <div className="afx-rail-note">board not loaded.</div>}
       {board && (
         <>
@@ -60,6 +69,7 @@ export default function BoardRail({
             {board.claims.length === 0 && <div className="afx-rail-empty">none</div>}
             {board.claims.map((c, i) => (
               <div key={`${c.key}/${c.owner}/${i}`} className="afx-rail-item" data-state={c.state} style={{ ['--i' as string]: i }}>
+                {anchor?.(`claim:${c.key}:${c.acquired_at}`)}
                 <div className="afx-rail-line">
                   <span className="afx-rail-key">{c.key_known ? c.key : 'claim (key not recorded)'}</span>
                   <span className="afx-rail-state">{c.state}</span>
@@ -85,6 +95,7 @@ export default function BoardRail({
                 style={{ ['--i' as string]: i }}
                 onClick={() => onSelect(d.id)}
               >
+                {anchor?.(d.id)}
                 <div className="afx-rail-line">
                   {who(d.author)}
                   {d.addressed_to != null && <span className="afx-rail-sub">→ {d.addressed_to}</span>}
@@ -101,6 +112,7 @@ export default function BoardRail({
         {posts.length === 0 && <div className="afx-rail-empty">none</div>}
         {posts.map((p, i) => (
           <button key={p.id} type="button" className="afx-rail-item afx-rail-btn" style={{ ['--i' as string]: i }} onClick={() => onSelect(p.id)}>
+            {anchor?.(p.id)}
             <div className="afx-rail-line">
               {who(p.message.from)}
               {p.message.post_kind && <span className="afx-rail-sub">{p.message.post_kind}</span>}
