@@ -99,17 +99,15 @@ pub(crate) mod tests {
     /// A stand-in `rupu` in `dir` that prints `stderr` and exits 1, the way
     /// the real binary fails a command (`output::diag::fail`, no colour
     /// when stderr is not a terminal).
+    /// Through `exec_ready_script`, so the spawn under test can't fail with
+    /// ETXTBSY (another test thread forking while the script's write
+    /// descriptor is open — seen on the musl CI as "Text file busy").
     pub(crate) fn failing_rupu(dir: &Path, stderr: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::write(dir.join("stderr.txt"), stderr).unwrap();
-        let exe = dir.join("rupu");
-        std::fs::write(
-            &exe,
-            "#!/bin/sh\ncat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit 1\n",
+        crate::test_support::exec_ready_script(
+            &dir.join("rupu"),
+            "cat \"$(dirname \"$0\")/stderr.txt\" >&2\nexit 1\n",
         )
-        .unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        exe
     }
 
     fn send_req(prompt: Option<&str>, skills: &[&str]) -> SendMessageRequest {
