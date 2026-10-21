@@ -58,21 +58,33 @@ export function layoutFlow(model: FlowModel, sizes: ReadonlyMap<string, Size> = 
   const kids = new Map<string, FlowNodeRef[]>();
   for (const n of model.nodes) {
     if (n.kind === 'lead' || n.kind === 'round') continue;
-    kids.set(n.parentId, [...(kids.get(n.parentId) ?? []), n]);
+    const list = kids.get(n.parentId);
+    if (list) list.push(n);
+    else kids.set(n.parentId, [n]);
   }
 
-  // A frame's box: the measured size, else its inner graph's extent.
+  // A frame's box: its inner graph laid out with the measured inner sizes
+  // (`<frameId>/<stepId>` keys), grown to contain it; a measured frame size
+  // is a floor, never a clip.
   const frameOf = (n: FlowNodeRef): Frame => {
     const measured = sizes.get(n.id);
     if (!n.graph) return { size: measured ?? FRAME_PLACEHOLDER, inner: [] };
-    const laid = layoutGraph(n.graph);
+    const inner = new Map<string, Size>();
+    for (const node of n.graph.nodes) {
+      const s = sizes.get(`${n.id}/${node.id}`);
+      if (s) inner.set(node.id, s);
+    }
+    const laid = layoutGraph(n.graph, inner);
     let w = 0;
     let h = 0;
     for (const p of laid.values()) {
       w = Math.max(w, p.x + p.width);
       h = Math.max(h, p.y + p.height);
     }
-    const size = measured ?? { width: w + 2 * FRAME_PAD, height: h + 2 * FRAME_PAD + FRAME_HEAD };
+    const size = {
+      width: Math.max(measured?.width ?? 0, w + 2 * FRAME_PAD),
+      height: Math.max(measured?.height ?? 0, h + 2 * FRAME_PAD + FRAME_HEAD),
+    };
     return { size, inner: [...laid].map(([id, pos]) => ({ id, pos })) };
   };
 

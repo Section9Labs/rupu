@@ -1,16 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import type { AgentiflowEvent, RunChild, SpaceParticipant } from '../api';
+import type { Size } from '../graph/measured';
 import type { Pos } from '../graphLayout';
-import { GANNET_GRAPH, DETAIL, FLOW_ID, RUN, fixtureInput } from './fixtures';
-import { buildFlowModel, type FlowInput } from './flowModel';
+import { GANNET_GRAPH, RUN, bigFlow, fixtureInput } from './fixtures';
+import { buildFlowModel } from './flowModel';
 import { CARD_H, CARD_W, COL_GAP, RAIL_GAP, RAIL_W, layoutFlow } from './flowLayout';
 
 const overlap = (a: Pos, b: Pos) =>
   a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
 
 /** A frame's inner steps sit inside the frame by design; everything else is a card. */
-function overlaps(positions: Map<string, Pos>, frames: Map<string, Pos>): string[][] {
-  const entries = [...positions].filter(([id]) => !frames.has(id.split('/')[0]) || id.includes('/') || frames.has(id));
+function overlaps(positions: Map<string, Pos>): string[][] {
+  const entries = [...positions];
   const bad: string[][] = [];
   for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
@@ -21,43 +21,6 @@ function overlaps(positions: Map<string, Pos>, frames: Map<string, Pos>): string
     }
   }
   return bad;
-}
-
-function bigFlow(): FlowInput {
-  const MIN = 60_000;
-  const t0 = Date.UTC(2026, 9, 1);
-  const iso = (t: number) => new Date(t).toISOString();
-  const events: AgentiflowEvent[] = [{ kind: 'run_started', ts: iso(t0) }];
-  for (let r = 0; r < 199; r++) {
-    events.push({
-      kind: 'round', round: r, started_at: iso(t0 + r * 10 * MIN), ts: iso(t0 + (r * 10 + 9) * MIN),
-      goals_met: 0, goals_total: 1, spent_usd: r, spent_tokens: r * 1000, outcome: 'yielded',
-    });
-  }
-  const children: RunChild[] = [];
-  const participants: SpaceParticipant[] = [];
-  const add = (run_id: string, round: number, start: number, status: RunChild['status']) => {
-    const address = `${run_id}#1`;
-    children.push({
-      handle: address, kind: 'agent', name: 'worker', run_id, parent_run_id: FLOW_ID, depth: 1, codename: null,
-      address, status, success: null, error: null, tokens: null, duration_ms: null, started_at: iso(start),
-      finished_at: null, transcript_path: null, legacy: false, round,
-    });
-  };
-  for (let r = 0; r < 200; r++) {
-    if (r === 120) {
-      for (let i = 0; i < 23; i++) {
-        add(`run_u120_${i}`, r, t0 + (r * 10 + 1) * MIN + i * 1000, i === 9 ? 'failed' : i === 15 ? 'running' : 'done');
-      }
-    } else add(`run_r${r}`, r, t0 + (r * 10 + 1) * MIN, r === 199 ? 'running' : 'done');
-  }
-  return {
-    detail: { ...DETAIL, record: { ...DETAIL.record, started_at: iso(t0) }, events, lead_transcripts: [] },
-    children,
-    spaces: [{ id: 'flow', participants, messages: [] }],
-    boards: new Map(),
-    childGraphs: new Map(),
-  };
 }
 
 describe('layoutFlow', () => {
@@ -119,11 +82,43 @@ describe('layoutFlow', () => {
     expect(l.positions.has(RUN.lynx1)).toBe(false);
   });
 
+  it('measured_sizes_larger_than_defaults_keep_cards_apart_and_inner_steps_inside', () => {
+    const sizes = new Map<string, Size>([
+      [RUN.lynx1, { width: 400, height: 220 }],
+      [RUN.gannet1, { width: 1200, height: 700 }],
+    ]);
+    for (const n of GANNET_GRAPH.nodes) sizes.set(`${RUN.gannet1}/${n.id}`, { width: 500, height: 260 });
+    const l = layoutFlow(model, sizes);
+    expect(overlaps(l.positions)).toEqual([]);
+    const frame = l.frames.get(RUN.gannet1)!;
+    // The measured frame is a floor; the larger inner extent would grow it.
+    expect(frame.width).toBeGreaterThanOrEqual(1200);
+    expect(frame.height).toBeGreaterThanOrEqual(700);
+    for (const n of GANNET_GRAPH.nodes) {
+      const p = l.positions.get(`${RUN.gannet1}/${n.id}`)!;
+      expect(p).toMatchObject({ width: 500, height: 260 });
+      expect(p.x).toBeGreaterThanOrEqual(frame.x);
+      expect(p.y).toBeGreaterThanOrEqual(frame.y);
+      expect(p.x + p.width).toBeLessThanOrEqual(frame.x + frame.width);
+      expect(p.y + p.height).toBeLessThanOrEqual(frame.y + frame.height);
+    }
+    // A small measured frame never clips big inner steps: it grows.
+    sizes.set(RUN.gannet1, { width: 100, height: 100 });
+    const g = layoutFlow(model, sizes);
+    const f2 = g.frames.get(RUN.gannet1)!;
+    for (const n of GANNET_GRAPH.nodes) {
+      const p = g.positions.get(`${RUN.gannet1}/${n.id}`)!;
+      expect(p.x + p.width).toBeLessThanOrEqual(f2.x + f2.width);
+      expect(p.y + p.height).toBeLessThanOrEqual(f2.y + f2.height);
+    }
+    expect(overlaps(g.positions)).toEqual([]);
+  });
+
   it('no_two_cards_overlap', () => {
-    expect(overlaps(lay.positions, lay.frames)).toEqual([]);
+    expect(overlaps(lay.positions)).toEqual([]);
     const big = buildFlowModel(bigFlow());
     const bl = layoutFlow(big);
-    expect(overlaps(bl.positions, bl.frames)).toEqual([]);
+    expect(overlaps(bl.positions)).toEqual([]);
   });
 
   it('layout_is_bounded_and_grows_down_and_right', () => {

@@ -484,3 +484,63 @@ export function fixtureInput(): FlowInput {
     childGraphs: new Map([[RUN.gannet1, GANNET_GRAPH]]),
   };
 }
+
+/** A 200-round agentiflow, running in round 199: one child per round, except
+ *  round 120 with 23 (child 9 failed, child 15 still running), and
+ *  `messageCount` messages in the flow's space, every 50th from the
+ *  operator. */
+export function bigFlow(messageCount = 500): FlowInput {
+  const MIN = 60_000;
+  const t0 = Date.UTC(2026, 9, 1);
+  const iso = (t: number) => new Date(t).toISOString();
+  const events: AgentiflowEvent[] = [{ kind: 'run_started', ts: iso(t0) }];
+  for (let r = 0; r < 199; r++) {
+    events.push({
+      kind: 'round', round: r, started_at: iso(t0 + r * 10 * MIN), ts: iso(t0 + (r * 10 + 9) * MIN),
+      goals_met: 0, goals_total: 1, spent_usd: r, spent_tokens: r * 1000, outcome: 'yielded',
+    });
+  }
+  const children: RunChild[] = [];
+  const participants: SpaceParticipant[] = [
+    { address: 'lead', agent: 'lead', run_id: FLOW_ID, kind: 'flow_lead', live: true },
+  ];
+  const add = (run_id: string, round: number, start: number, status: RunChild['status']) => {
+    const address = `${run_id}#1`;
+    children.push({
+      handle: address, kind: 'agent', name: 'worker', run_id, parent_run_id: FLOW_ID, depth: 1, codename: null,
+      address, status, success: null, error: null, tokens: null, duration_ms: null, started_at: iso(start),
+      finished_at: null, transcript_path: null, legacy: false, round,
+    });
+    participants.push({ address, agent: 'worker', run_id, kind: 'flow_unit', live: status === 'running' });
+  };
+  for (let r = 0; r < 200; r++) {
+    if (r === 120) {
+      for (let i = 0; i < 23; i++) {
+        add(`run_u120_${i}`, r, t0 + (r * 10 + 1) * MIN + i * 1000, i === 9 ? 'failed' : i === 15 ? 'running' : 'done');
+      }
+    } else {
+      add(`run_r${r}`, r, t0 + (r * 10 + 1) * MIN, r === 199 ? 'running' : 'done');
+    }
+  }
+  const messages: SpaceMessage[] = [];
+  for (let i = 0; i < messageCount; i++) {
+    const op = i % 50 === 0;
+    const to = `run_r${i % 199}#1`;
+    messages.push({
+      id: `msg_${String(i).padStart(4, '0')}`, ts: iso(t0 + i * 1000), kind: op ? 'operator' : 'direct',
+      from: op ? 'operator' : 'lead', to, body: `m${i}`, delivery: { resolved: [to] }, seen: [],
+    });
+  }
+  return {
+    detail: {
+      ...DETAIL,
+      record: { ...DETAIL.record, started_at: iso(t0) },
+      events,
+      lead_transcripts: [],
+    },
+    children,
+    spaces: [{ id: 'flow', participants, messages }],
+    boards: new Map(),
+    childGraphs: new Map(),
+  };
+}
