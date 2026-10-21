@@ -16,7 +16,7 @@
 // hidden. The arcs and rail are the agentiflow map's (flowmap/), routed by
 // `flowEdges`.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   type FitViewOptions,
@@ -213,13 +213,17 @@ interface Props {
   overlay?: RunGraphOverlay;
 }
 
-export default function RunGraph(props: Props) {
+function RunGraph(props: Props) {
   return (
     <ReactFlowProvider>
       <RunGraphInner {...props} />
     </ReactFlowProvider>
   );
 }
+
+/** Memoized: a replay frame that reveals nothing new (the same `overlay`)
+ *  renders nothing here. */
+export default memo(RunGraph);
 
 function RunGraphInner({ model, positions, onOpenUnit, onExpandFanout, onSelectNode, gate, overlay }: Props) {
   const colors = useThemeColors();

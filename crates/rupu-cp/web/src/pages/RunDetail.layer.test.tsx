@@ -25,6 +25,8 @@ const seen = vi.hoisted(() => ({
   renders: 0,
   /** Whether the graph's first render already had its layer. */
   first: null as boolean | null,
+  /** Renders of the usage chart: the page around the graph. */
+  pageRenders: 0,
 }));
 
 vi.mock('../components/RunGraph', () => ({
@@ -53,7 +55,13 @@ vi.mock('../components/RunGraph', () => ({
 vi.mock('../components/TranscriptPanel', () => ({ __esModule: true, default: () => <div data-testid="transcript-panel" /> }));
 vi.mock('../components/run/StepTranscriptBrowser', () => ({ __esModule: true, default: () => <div /> }));
 vi.mock('../components/RunEventFeed', () => ({ __esModule: true, default: () => <div data-testid="event-feed" /> }));
-vi.mock('../components/charts/RunUsageTimeline', () => ({ __esModule: true, default: () => <div /> }));
+vi.mock('../components/charts/RunUsageTimeline', () => ({
+  __esModule: true,
+  default: () => {
+    seen.pageRenders += 1;
+    return <div />;
+  },
+}));
 
 import RunDetail from './RunDetail';
 
@@ -90,6 +98,7 @@ beforeEach(() => {
   seen.overlay = undefined;
   seen.renders = 0;
   seen.first = null;
+  seen.pageRenders = 0;
 });
 afterEach(() => {
   cleanup();
@@ -129,6 +138,21 @@ describe('RunDetail layer', () => {
     fireEvent.keyDown(screen.getByTestId('time-track'), { key: 'Home' });
     expect(seen.overlay?.revealed).toEqual(new Set(['collect']));
     expect(within(screen.getByTestId('run-layer-messages')).queryByTestId('msg-row-msg_r2')).toBeNull();
+  });
+
+  it('a_replay_renders_the_graph_not_the_page', async () => {
+    stub('present');
+    renderAt(`/runs/${RUN_ID}`);
+    await waitFor(() => expect(within(screen.getByTestId('run-layer-messages')).getByTestId('msg-row-msg_r6')).toBeInTheDocument());
+    await new Promise((r) => setTimeout(r, 50));
+    const page = seen.pageRenders;
+    const graph = seen.renders;
+    // Scrubbing through the run moves the timeline many times.
+    const track = screen.getByTestId('time-track');
+    fireEvent.keyDown(track, { key: 'Home' });
+    for (let i = 0; i < 8; i++) fireEvent.keyDown(track, { key: 'ArrowRight', shiftKey: true });
+    expect(seen.renders).toBeGreaterThan(graph);
+    expect(seen.pageRenders).toBe(page);
   });
 
   it('no_space_no_layer', async () => {
