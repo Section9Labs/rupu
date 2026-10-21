@@ -6,13 +6,20 @@
 //
 // A local live root is followed through the log's SSE stream; anything else
 // (a finished root, a remote host, a pre-log agentiflow) is read in pages of
-// 200 and re-read on `refresh` (remote hosts are never polled).
+// 200 (a remote host's in pages of REMOTE_PAGE_SIZE, so a typical log is one
+// call: an SSH host runs a command per page) and re-read on `refresh`
+// (remote hosts are never polled). A caller that must not hold a stream
+// open (the agentiflow map's workflow frames) passes `live: false` and a
+// `tick` instead: each new tick reads what was logged since the last read.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, apiErrorMessage, type MessageRoute, type MessageStreamFrame, type SpaceParticipant } from './api';
 import { EMPTY_LOG, withFrames, withMessages, type PendingSend, type SpaceLog } from './messages';
 
 export const PAGE_SIZE = 200;
+/** A remote host's page: each page is a round trip to the host (over SSH a
+ *  command), so its whole log is read in as few as the server allows. */
+export const REMOTE_PAGE_SIZE = 5000;
 /** How often a local live root's participants are re-read. */
 export const PARTICIPANTS_POLL_MS = 10_000;
 const FLUSH_MS = 60;
@@ -35,7 +42,9 @@ export interface MessageSpace {
   legacy: boolean;
   participants: SpaceParticipant[];
   log: SpaceLog;
-  /** The whole log has been read (a live stream may still add to it). */
+  /** The log has been read: after the last page of a paged read, or on a
+   *  live stream's first batch, which may be only part of its replay (a live
+   *  stream may still add to it; `caughtUp` says when the replay is over). */
   loaded: boolean;
   /** Everything the log held when it was opened has arrived: after the last
    *  page of a paged read, or once a live stream's replay has gone quiet. A
@@ -70,12 +79,18 @@ export function useMessageSpace(
     load: boolean;
     /** The feed is on screen: nothing in it is unread. */
     reading: boolean;
+    /** Without a stream: each new value reads what was logged since the
+     *  last read (the caller's poll, e.g. its detail tick). */
+    tick?: unknown;
   },
 ): MessageSpace {
   const { route, id, host } = source;
-  const { live, load, reading } = opts;
+  const { live, load, reading, tick } = opts;
   const local = isLocal(host);
   const remoteHost = local ? undefined : host;
+  const pageSize = local ? PAGE_SIZE : REMOTE_PAGE_SIZE;
+  /** The id of the last message a paged read returned (`after` for a tick). */
+  const cursor = useRef<string | undefined>(undefined);
 
   const [status, setStatus] = useState<MessageSpace['status']>('loading');
   const [reason, setReason] = useState<string | null>(null);
@@ -105,6 +120,7 @@ export function useMessageSpace(
     setSendError(null);
     setBlocked(null);
     setReadAt(Date.now());
+    cursor.current = undefined;
   }, [route, id, host]);
 
   // The probe: whether a space exists, who is in it. Re-read while a local
@@ -190,7 +206,7 @@ export function useMessageSpace(
     (async () => {
       let after: string | undefined;
       for (;;) {
-        const r = await api.getMessages(route, id, { host: remoteHost, after, limit: PAGE_SIZE, signal: ctl.signal });
+        const r = await api.getMessages(route, id, { host: remoteHost, after, limit: pageSize, signal: ctl.signal });
         if (ctl.signal.aborted) return;
         if (r.kind === 'unavailable') {
           setStatus('unavailable');
@@ -199,6 +215,8 @@ export function useMessageSpace(
         }
         setParticipants(r.view.participants);
         setLog((l) => withMessages(l, r.view.messages));
+        const last = r.view.messages[r.view.messages.length - 1];
+        if (last) cursor.current = last.id;
         if (!r.view.next) break;
         after = r.view.next;
       }
@@ -210,7 +228,40 @@ export function useMessageSpace(
       setReason(apiErrorMessage(e));
     });
     return () => ctl.abort();
-  }, [load, space, follow, route, id, remoteHost, generation]);
+  }, [load, space, follow, route, id, remoteHost, pageSize, generation]);
+
+  // A tick (no stream): what was logged since the last read.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
+  const readable = load && space === 'present' && !follow;
+  const readableRef = useRef(readable);
+  readableRef.current = readable;
+  const tickSeen = useRef(tick);
+  useEffect(() => {
+    if (Object.is(tickSeen.current, tick)) return;
+    tickSeen.current = tick;
+    // Before the first read is done, that read brings everything.
+    if (!readableRef.current || !loadedRef.current) return;
+    const ctl = new AbortController();
+    (async () => {
+      let after = cursor.current;
+      for (;;) {
+        const r = await api.getMessages(route, id, { host: remoteHost, after, limit: pageSize, signal: ctl.signal });
+        if (ctl.signal.aborted || r.kind === 'unavailable') return;
+        const next = r.view.participants;
+        // The same roster keeps its array, so a quiet tick redraws nothing.
+        setParticipants((p) => (JSON.stringify(p) === JSON.stringify(next) ? p : next));
+        if (r.view.messages.length > 0) setLog((l) => withMessages(l, r.view.messages));
+        const last = r.view.messages[r.view.messages.length - 1];
+        if (last) cursor.current = last.id;
+        if (!r.view.next) break;
+        after = r.view.next;
+      }
+    })().catch(() => {
+      // A failed tick keeps what was read; the next one tries again.
+    });
+    return () => ctl.abort();
+  }, [tick, route, id, remoteHost, pageSize]);
 
   // A pending send is done when its line is in the log.
   useEffect(() => {
