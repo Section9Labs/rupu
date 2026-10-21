@@ -733,6 +733,25 @@ impl RunAgentLeadDriver {
 }
 
 impl LeadDriver for RunAgentLeadDriver {
+    fn last_decision(&self) -> Option<String> {
+        use rupu_providers::types::{ContentBlock, Role};
+        let last = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)?;
+        let text: String = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
         if self.skills.is_none() {
             // Once per flow. A failure leaves them unresolved: the round's
