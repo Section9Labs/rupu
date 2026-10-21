@@ -1,4 +1,3 @@
-use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -23,19 +22,12 @@ impl Drop for ClaimGuard {
         // Compare-and-delete under the per-key reap lock: remove the file only
         // if it still holds OUR grant's token. A successor's re-grant has a
         // different token, so a stale guard can never delete a live claim.
-        let Ok(lock) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&self.lock_path)
-        else {
+        // Blocking lock (retried on EINTR): Drop is best-effort but must be
+        // correct. The OS drops the lock when `_lock` closes, so this can only
+        // wait on a live reaper.
+        let Ok(_lock) = crate::bus::lock_exclusive(&self.lock_path) else {
             return;
         };
-        // Blocking lock: Drop is best-effort but must be correct. The OS drops
-        // the lock when `lock` closes, so this can only wait on a live reaper.
-        if flock(&lock, FlockOperation::LockExclusive).is_err() {
-            return;
-        }
         if let Ok(bytes) = std::fs::read(&self.path) {
             if let Ok(rec) = serde_json::from_slice::<ClaimRecord>(&bytes) {
                 if rec.token == self.token && std::fs::remove_file(&self.path).is_ok() {
