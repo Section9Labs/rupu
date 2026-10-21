@@ -51,6 +51,21 @@ export interface FlowData extends FlowInput {
 }
 
 const boardSource = (r: BoardResult): BoardSource => (r.kind === 'ok' ? r.board : r);
+
+/** `next`, each child that reads the same as before kept as the object it
+ *  was (and the whole list when every one is): a poll that changed one child
+ *  re-renders only that child's card. */
+export function reuseChildren(prev: RunChild[], next: RunChild[]): RunChild[] {
+  const before = new Map(prev.map((c) => [c.run_id, c]));
+  let same = prev.length === next.length;
+  const out = next.map((c, i) => {
+    const p = before.get(c.run_id);
+    const keep = p && JSON.stringify(p) === JSON.stringify(c) ? p : c;
+    if (keep !== prev[i]) same = false;
+    return keep;
+  });
+  return same ? prev : out;
+}
 const isLive = (c: RunChild | undefined) => c?.status === 'running' || c?.status === 'pending';
 
 export function useFlowData(
@@ -90,7 +105,7 @@ export function useFlowData(
       .getAgentiflowChildren(id, ctl.signal)
       .then((c) => {
         if (ctl.signal.aborted) return;
-        setChildren(c);
+        setChildren((prev) => reuseChildren(prev, c));
         setChildrenError(null);
         setChildrenLoaded(true);
       })

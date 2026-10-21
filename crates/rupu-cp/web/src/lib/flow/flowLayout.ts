@@ -10,7 +10,7 @@
 import { layoutGraph, type Pos } from '../graphLayout';
 import { STEP_AGENT_H, STEP_W } from '../nodeSize';
 import type { Size } from '../graph/measured';
-import type { FlowModel, FlowNodeRef } from './flowModel';
+import type { FlowNodeRef, FlowStructure } from './flowModel';
 
 export const CARD_W = STEP_W;
 export const CARD_H = STEP_AGENT_H;
@@ -51,7 +51,7 @@ interface Frame {
   inner: { id: string; pos: Pos }[];
 }
 
-export function layoutFlow(model: FlowModel, sizes: ReadonlyMap<string, Size> = new Map()): FlowLayout {
+export function layoutFlow(model: Pick<FlowStructure, 'nodes' | 'rounds'>, sizes: ReadonlyMap<string, Size> = new Map()): FlowLayout {
   const positions = new Map<string, Pos>();
   const frames = new Map<string, Pos>();
   const sizeOf = (id: string): Size => sizes.get(id) ?? { width: CARD_W, height: CARD_H };

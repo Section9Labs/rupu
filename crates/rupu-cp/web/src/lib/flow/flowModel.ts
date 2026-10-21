@@ -154,12 +154,19 @@ export interface FlowBoard extends FlowBoardSpace {
   frames: Map<string, FlowBoardSpace>;
 }
 
-export interface FlowModel {
+/** What the map lays out: the rounds and the cards, with their timeline
+ *  (bands, round and child arrivals). Built from the detail, the children
+ *  and the loaded graphs, never the messages, so a message flush (every
+ *  60 ms on a live stream) doesn't lay the map out again. */
+export interface FlowStructure {
   rounds: FlowRound[];
   nodes: FlowNodeRef[];
+  timeline: { items: TimelineItem[]; bands: TimelineBand[] };
+}
+
+export interface FlowModel extends FlowStructure {
   messages: FlowMessage[];
   board: FlowBoard;
-  timeline: { items: TimelineItem[]; bands: TimelineBand[] };
 }
 
 const roundId = (n: number) => `round:${n}`;
@@ -391,6 +398,14 @@ function boardSpace(view: BoardSource | null, posts: FlowMessage[], resolve: Res
 }
 
 export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet<string> }): FlowModel {
+  return withFlowMessages(buildFlowStructure(input, opts), input);
+}
+
+/** The rounds, the cards and their timeline (`FlowStructure`). */
+export function buildFlowStructure(
+  input: Pick<FlowInput, 'detail' | 'children' | 'childGraphs'>,
+  opts?: { expanded?: ReadonlySet<string> },
+): FlowStructure {
   const expanded = opts?.expanded ?? new Set<string>();
   const { detail, children } = input;
   const byId = new Map(children.map((c) => [c.run_id, c]));
@@ -503,8 +518,36 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     });
   });
 
+  // --- timeline: the rounds and the cards ------------------------------
+  const items: TimelineItem[] = [];
+  const bands: TimelineBand[] = [];
+  const startOf = new Map<number, number | null>();
+  for (const s of spans) {
+    startOf.set(s.round, s.from);
+    if (s.from !== null) {
+      items.push({ key: roundId(s.round), at: s.from, kind: 'round' });
+      bands.push({ key: roundId(s.round), label: `Round ${s.round}`, from: s.from, to: s.endedAt, row: 'round' });
+    }
+  }
+  for (const r of rounds) {
+    for (const id of r.childIds) {
+      const at = time(byId.get(id)?.started_at) ?? startOf.get(r.round) ?? null;
+      if (at !== null) items.push({ key: id, at, kind: 'child' });
+    }
+  }
+
+  return { rounds, nodes, timeline: { items, bands } };
+}
+
+/** `structure` with every loaded space's messages (endpoints on its cards),
+ *  the boards, and their timeline items. */
+export function withFlowMessages(
+  structure: FlowStructure,
+  input: Pick<FlowInput, 'children' | 'spaces' | 'boards' | 'childGraphs'>,
+): FlowModel {
+  const { children } = input;
   // --- messages and boards ---------------------------------------------
-  const childIds = new Set(byId.keys());
+  const childIds = new Set(children.map((c) => c.run_id));
   const childByAddress = new Map<string, string>();
   for (const c of children) if (c.address && !childByAddress.has(c.address)) childByAddress.set(c.address, c.run_id);
   const resolvers = new Map<string, Resolve>();
@@ -536,23 +579,8 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
   }
   const board: FlowBoard = { ...boardOf(FLOW_SPACE), frames };
 
-  // --- timeline --------------------------------------------------------
-  const items: TimelineItem[] = [];
-  const bands: TimelineBand[] = [];
-  const startOf = new Map<number, number | null>();
-  for (const s of spans) {
-    startOf.set(s.round, s.from);
-    if (s.from !== null) {
-      items.push({ key: roundId(s.round), at: s.from, kind: 'round' });
-      bands.push({ key: roundId(s.round), label: `Round ${s.round}`, from: s.from, to: s.endedAt, row: 'round' });
-    }
-  }
-  for (const r of rounds) {
-    for (const id of r.childIds) {
-      const at = time(byId.get(id)?.started_at) ?? startOf.get(r.round) ?? null;
-      if (at !== null) items.push({ key: id, at, kind: 'child' });
-    }
-  }
+  // --- timeline: the messages and the board ----------------------------
+  const items: TimelineItem[] = [...structure.timeline.items];
   for (const m of messages) if (m.atKnown) items.push({ key: m.id, at: m.at, kind: 'message', sub: m.kind });
   for (const [spaceId, view] of input.boards) {
     if ('kind' in view) continue;
@@ -566,5 +594,5 @@ export function buildFlowModel(input: FlowInput, opts?: { expanded?: ReadonlySet
     }
   }
 
-  return { rounds, nodes, messages, board, timeline: { items, bands } };
+  return { ...structure, messages, board, timeline: { items, bands: structure.timeline.bands } };
 }

@@ -20,7 +20,7 @@ import {
   makeRoundAt,
   type BoardSource,
   type FlowMessage,
-  type FlowModel,
+  type FlowStructure,
   type FlowUndelivered,
 } from './flowModel';
 
@@ -52,7 +52,7 @@ export const claimKey = (c: Pick<ClaimView, 'key' | 'acquired_at'>) => `claim:${
 
 export const boardKey = (m: FlowMessage) => (m.kind === 'retract' ? (m.message.refs?.retracts ?? m.id) : m.id);
 
-export function makeRouter(model: FlowModel, visible: ReadonlySet<string>): Router {
+export function makeRouter(model: Pick<FlowStructure, 'nodes' | 'rounds'>, visible: ReadonlySet<string>): Router {
   const roundOf = new Map<string, number>();
   for (const n of model.nodes) if (n.kind !== 'lead') roundOf.set(n.id, n.round);
   for (const r of model.rounds) for (const id of r.childIds) roundOf.set(id, r.round);

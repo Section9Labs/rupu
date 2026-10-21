@@ -1,10 +1,12 @@
 // The agentiflow map's panels around the canvas (FlowMap): the header strip
 // (round, goals met, spend, tokens, time), the summary chip over the canvas,
-// and the Goals panel under it.
+// and the Goals panel under it. The strip and the panel read the rounds, not
+// the messages, and are memoized: a message flush renders neither.
 
+import { memo } from 'react';
 import { CheckCircle2, Circle } from 'lucide-react';
 import type { AgentiflowDetail, RunChild } from '../../lib/api';
-import type { buildFlowModel } from '../../lib/flow/flowModel';
+import type { FlowRound } from '../../lib/flow/flowModel';
 import type { StepState } from '../../lib/runGraphModel';
 import { formatSpendTokens, formatSpendUsd, goalViews } from '../../lib/agentiflow';
 import { formatDuration } from '../../lib/duration';
@@ -38,9 +40,9 @@ export function MapSummary({ list, messages }: { list: RunChild[]; messages: num
 
 /** Goals met after the latest assessed round (the record's once the flow
  *  completes), and the run's spend. */
-function latestGoals(detail: AgentiflowDetail, model: ReturnType<typeof buildFlowModel>) {
+function latestGoals(detail: AgentiflowDetail, rounds: readonly FlowRound[]) {
   if (detail.record.status === 'completed' && detail.record.goals.length > 0) return detail.record.goals;
-  for (let i = model.rounds.length - 1; i >= 0; i--) if (model.rounds[i].goalsAfter) return model.rounds[i].goalsAfter!;
+  for (let i = rounds.length - 1; i >= 0; i--) if (rounds[i].goalsAfter) return rounds[i].goalsAfter!;
   return detail.record.goals;
 }
 
@@ -52,17 +54,17 @@ function Meter({ value, tone }: { value: number; tone: 'ok' | 'brand' }) {
   );
 }
 
-export function HeaderStrip({
+export const HeaderStrip = memo(function HeaderStrip({
   detail,
-  model,
+  rounds,
   running,
 }: {
   detail: AgentiflowDetail;
-  model: ReturnType<typeof buildFlowModel>;
+  rounds: readonly FlowRound[];
   running: boolean;
 }) {
   const { record, def } = detail;
-  const goals = latestGoals(detail, model);
+  const goals = latestGoals(detail, rounds);
   const total = def?.goals.length ?? record.goals_total;
   const met = goals.filter((g) => g.met).length;
   const capUsd = def?.budget?.usd ?? null;
@@ -72,7 +74,7 @@ export function HeaderStrip({
   return (
     <div className="afx-head" data-testid="flow-head">
       <span>
-        <span className="k">round</span> <b>{model.rounds.length}</b>
+        <span className="k">round</span> <b>{rounds.length}</b>
         {capRounds ? ` / ${capRounds}` : ''}
       </span>
       <span>
@@ -94,23 +96,23 @@ export function HeaderStrip({
       )}
     </div>
   );
-}
+});
 
-export function GoalsPanel({
+export const GoalsPanel = memo(function GoalsPanel({
   detail,
-  model,
+  rounds,
   list,
-  spaces,
+  participants,
 }: {
   detail: AgentiflowDetail;
-  model: ReturnType<typeof buildFlowModel>;
+  rounds: readonly FlowRound[];
   list: RunChild[];
-  spaces: { participants: { live: boolean }[] }[];
+  /** Every loaded space's participants. */
+  participants: readonly { live: boolean }[];
 }) {
-  const after = new Map(latestGoals(detail, model).map((g) => [g.id, g]));
+  const after = new Map(latestGoals(detail, rounds).map((g) => [g.id, g]));
   const views = goalViews(detail.record, detail.def);
   const count = (s: StepState) => list.filter((c) => childState(c) === s).length;
-  const participants = spaces.flatMap((s) => s.participants);
   const metNow = views.filter((g) => after.get(g.id)?.met ?? g.met).length;
   return (
     <CollapsiblePanel
@@ -152,4 +154,4 @@ export function GoalsPanel({
       </dl>
     </CollapsiblePanel>
   );
-}
+});

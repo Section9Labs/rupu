@@ -5,6 +5,8 @@ import {
   KEEP_EXPANDED_ROUNDS,
   MAX_CARDS_PER_ROUND,
   buildFlowModel,
+  buildFlowStructure,
+  withFlowMessages,
   type FlowModel,
 } from './flowModel';
 import { timeBounds } from '../timeline/timeline';
@@ -561,3 +563,19 @@ describe('flow model', () => {
   });
 });
 
+
+describe('flow structure and messages', () => {
+  it('messages_ride_on_the_structure_without_rebuilding_it', () => {
+    const input = fixtureInput();
+    const structure = buildFlowStructure(input);
+    const model = withFlowMessages(structure, input);
+    // The cards and rounds the layout reads are the structure's own objects:
+    // a message flush (a new `spaces`) keeps them, so nothing is laid out again.
+    expect(model.nodes).toBe(structure.nodes);
+    expect(model.rounds).toBe(structure.rounds);
+    const flushed = withFlowMessages(structure, { ...input, spaces: input.spaces.map((s) => ({ ...s, messages: [...s.messages] })) });
+    expect(flushed.nodes).toBe(structure.nodes);
+    // The whole model is the same as building it at once.
+    expect(JSON.stringify(model)).toBe(JSON.stringify(buildFlowModel(input)));
+  });
+});

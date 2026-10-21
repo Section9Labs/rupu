@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { api, type RunEvent, type RunGraphResponse } from '../api';
-import { useFlowData } from './useFlowData';
+import { reuseChildren, useFlowData } from './useFlowData';
 import { CHILDREN, DETAIL, FLOW_BOARD, GANNET_BOARD, RUN } from './fixtures';
 
 afterEach(() => {
@@ -187,5 +187,18 @@ describe('useFlowData', () => {
     );
     await waitFor(() => expect(unit()?.model).toBe('claude-opus-5-5'), { timeout: 2500 });
     expect(unit()!.provider).toBe('anthropic');
+  });
+});
+
+describe('reuseChildren', () => {
+  it('keeps_unchanged_children_and_the_list_when_nothing_changed', () => {
+    const copy = CHILDREN.map((c) => ({ ...c }));
+    expect(reuseChildren(CHILDREN, copy)).toBe(CHILDREN);
+    const changed = copy.map((c, i) => (i === 1 ? { ...c, status: 'failed' as const } : c));
+    const out = reuseChildren(CHILDREN, changed);
+    expect(out).not.toBe(CHILDREN);
+    expect(out[0]).toBe(CHILDREN[0]);
+    expect(out[1]).toBe(changed[1]);
+    expect(out[2]).toBe(CHILDREN[2]);
   });
 });

@@ -35,7 +35,8 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { api, apiErrorMessage, type AgentiflowDetail, type RunChild } from '../../lib/api';
 import {
-  buildFlowModel,
+  buildFlowStructure,
+  withFlowMessages,
   FLOW_SPACE,
   type BoardSource,
   type FlowBoardSpace,
@@ -60,6 +61,7 @@ import {
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
 import { useArrivals } from '../../lib/flow/useArrivals';
+import { useStableList } from '../../lib/flow/useStableList';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
 import { countAtOrBefore, timeBounds } from '../../lib/timeline/timeline';
@@ -239,11 +241,17 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     [expanded, focusRound],
   );
   const { children, spaces, boards, childGraphs } = data;
-  const model = useMemo(
-    () => buildFlowModel({ detail, children, spaces, boards, childGraphs }, { expanded: open }),
-    [detail, children, spaces, boards, childGraphs, open],
+  // The structure (rounds, cards) is laid out; the messages ride on it, so a
+  // message flush doesn't lay the map (or a frame's dagre graph) out again.
+  const structure = useMemo(
+    () => buildFlowStructure({ detail, children, childGraphs }, { expanded: open }),
+    [detail, children, childGraphs, open],
   );
-  const layout = useMemo(() => layoutFlow(model, measured), [model, measured]);
+  const model = useMemo(
+    () => withFlowMessages(structure, { children, spaces, boards, childGraphs }),
+    [structure, children, spaces, boards, childGraphs],
+  );
+  const layout = useMemo(() => layoutFlow(structure, measured), [structure, measured]);
 
   // --- the timeline --------------------------------------------------------
   // The reveal is keyed on how many items are at or before `t`, so a replay
@@ -266,22 +274,22 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   );
 
   // --- what is on the canvas ----------------------------------------------
-  const refById = useMemo(() => new Map(model.nodes.map((n) => [n.id, n])), [model]);
+  const refById = useMemo(() => new Map(structure.nodes.map((n) => [n.id, n])), [structure]);
   const childById = useMemo(() => new Map(children.map((c) => [c.run_id, c])), [children]);
-  const liveRound = running ? (model.rounds.find((r) => r.endedAt === null)?.round ?? null) : null;
+  const liveRound = running ? (structure.rounds.find((r) => r.endedAt === null)?.round ?? null) : null;
   const visible = useMemo(() => {
     const v = new Set<string>(['lead', 'spine', RAIL]);
-    for (const n of model.nodes) {
+    for (const n of structure.nodes) {
       if (n.kind === 'lead') continue;
       if (!isShown(`round:${n.round}`)) continue;
       if ((n.kind === 'child' || n.kind === 'frame') && !isShown(n.id)) continue;
       v.add(n.id);
       if (n.kind === 'frame' && n.graph) for (const s of n.graph.nodes) v.add(`${n.id}/${s.id}`);
     }
-    for (const r of model.rounds) if (r.collapsed && isShown(`round:${r.round}`)) v.add(`summary:${r.round}`);
+    for (const r of structure.rounds) if (r.collapsed && isShown(`round:${r.round}`)) v.add(`summary:${r.round}`);
     return v;
-  }, [model, isShown]);
-  const router = useMemo(() => makeRouter(model, visible), [model, visible]);
+  }, [structure, isShown]);
+  const router = useMemo(() => makeRouter(structure, visible), [structure, visible]);
   const routerRef = useRef(router);
   routerRef.current = router;
 
@@ -455,7 +463,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       };
     };
     const dots: number[] = [];
-    for (const r of model.rounds) {
+    for (const r of structure.rounds) {
       const p = layout.positions.get(`round:${r.round}`);
       if (p && visible.has(`round:${r.round}`)) dots.push(p.y + Math.min(p.height, 60) / 2);
     }
@@ -471,7 +479,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     out.push(
       node('lead', 'lead', { codename: record.codename, agent: detail.def?.lead ?? null, startedAt: record.started_at }, { selectable: false }),
     );
-    for (const r of model.rounds) {
+    for (const r of structure.rounds) {
       const id = `round:${r.round}`;
       out.push(
         node(id, 'round', {
@@ -495,13 +503,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         );
       }
     }
-    for (const n of model.nodes) {
+    for (const n of structure.nodes) {
       if (n.kind === 'child' && n.child) {
         out.push(
           node(n.id, 'child', { child: n.child, inferred: n.inferred, messages: counts.get(n.id) ?? 0, slot: slots.get(n.id) ?? 0 }),
         );
       } else if (n.kind === 'more') {
-        const r = model.rounds.find((x) => x.round === n.round)!;
+        const r = structure.rounds.find((x) => x.round === n.round)!;
         const inRound = new Set(r.childIds);
         out.push(
           node(n.id, 'more', {
@@ -585,7 +593,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     );
     return out;
   }, [
-    model,
+    structure,
     layout,
     measured,
     visible,
@@ -637,10 +645,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         },
       } satisfies RunFlowEdge);
     };
-    for (const n of model.nodes) {
+    for (const n of structure.nodes) {
       if (n.kind === 'child' || n.kind === 'frame' || n.kind === 'more') tree(n.parentId, n.id, refById.get(n.parentId), n);
     }
-    for (const r of model.rounds) {
+    for (const r of structure.rounds) {
       if (r.collapsed) tree(`round:${r.round}`, `summary:${r.round}`, refById.get(`round:${r.round}`), undefined);
     }
     // A source with several children shares one trunk (RunEdge): the edge to
@@ -654,11 +662,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       for (const e of list) e.data = { ...e.data!, trunk: e === far ? 'trunk' : 'branch' };
     }
     // Each loaded frame's own run graph.
-    for (const n of model.nodes) {
+    for (const n of structure.nodes) {
       if (n.kind === 'frame' && n.graph && visible.has(n.id)) out.push(...runEdges(n.graph, colors, slots, `${n.id}/`));
     }
     return out;
-  }, [model, visible, liveRound, colors, slots, refById, layout]);
+  }, [structure, visible, liveRound, colors, slots, refById, layout]);
 
   const arcs = useMemo(
     () =>
@@ -723,7 +731,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const onNodeLeave = useCallback<NodeMouseHandler>(() => setHoverNode(null), []);
 
   const pane = useRef<HTMLDivElement>(null);
-  const cardCount = model.nodes.filter((n) => n.kind === 'child' || n.kind === 'frame' || n.kind === 'round').length;
+  const cardCount = structure.nodes.filter((n) => n.kind === 'child' || n.kind === 'frame' || n.kind === 'round').length;
   const paneWidth = usePaneWidth(pane);
   const showMinimap = cardCount > MINIMAP_MIN_NODES && paneWidth >= MINIMAP_MIN_PANE;
 
@@ -733,7 +741,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const panned = useRef(false);
   const placed = useRef(false);
   const placedWidth = useRef(0);
-  const lastRound = model.rounds[model.rounds.length - 1];
+  const lastRound = structure.rounds[structure.rounds.length - 1];
   const lastRoundPos = lastRound ? layout.positions.get(`round:${lastRound.round}`) : undefined;
   const followKey = running && lastRound ? `round:${lastRound.round}` : null;
   useEffect(() => {
@@ -792,7 +800,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   const geo = useMemo<RoundsGeometry>(() => {
     const tops: number[] = [];
     const labels: number[] = [];
-    for (const r of model.rounds) {
+    for (const r of structure.rounds) {
       const p = layout.positions.get(`round:${r.round}`);
       if (p) {
         tops.push(p.y);
@@ -800,10 +808,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
       }
     }
     return { tops, end: layout.height, labels };
-  }, [model, layout]);
+  }, [structure, layout]);
   const roundStates = useMemo(
-    () => model.rounds.filter((r) => layout.positions.has(`round:${r.round}`)).map((r) => roundState(r, liveRound, childById)),
-    [model, layout, liveRound, childById],
+    () => structure.rounds.filter((r) => layout.positions.has(`round:${r.round}`)).map((r) => roundState(r, liveRound, childById)),
+    [structure, layout, liveRound, childById],
   );
   /** The operator moved the camera: live follow and replay follow stop. */
   const tookOver = useCallback(() => {
@@ -886,6 +894,10 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, [followNode, replayFollow]);
 
   // --- the panels ----------------------------------------------------------
+  // Every loaded space's participants, the same array while none changed.
+  const participants = useStableList(
+    useMemo(() => spaces.flatMap((sp) => sp.participants), [spaces]),
+  );
   const participantNames = useMemo(() => {
     const s = new Set<string>();
     for (const sp of spaces) for (const p of sp.participants) s.add(p.address);
@@ -899,7 +911,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, [spaces, childById]);
   return (
     <div className="afx-map space-y-3" data-testid="flow-map">
-      <HeaderStrip detail={detail} model={model} running={running} />
+      <HeaderStrip detail={detail} rounds={structure.rounds} running={running} />
       <TimeAxis
         bands={bands}
         items={items}
@@ -997,7 +1009,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
         <CollapsiblePanel name="flow-messages" title="Messages" count={listed.length}>
           <MessageListPanel messages={listed} spaces={spaceLabels} selected={selectedMsg} onSelect={selectFromList} />
         </CollapsiblePanel>
-        <GoalsPanel detail={detail} model={model} list={children} spaces={spaces} />
+        <GoalsPanel detail={detail} rounds={structure.rounds} list={children} participants={participants} />
       </div>
       {definition && (
         <DialogFrame
