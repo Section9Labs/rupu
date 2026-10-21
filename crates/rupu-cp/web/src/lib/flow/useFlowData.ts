@@ -271,13 +271,18 @@ export function useFlowData(
 }
 
 /** What the map draws of a run graph: each step's state, identity, loop
- *  round and warnings, its units' and members' states and codenames. Two
+ *  round and warnings, its units' states, identities (codename, agent,
+ *  provider/model) and warnings, its members' states and identities. Two
  *  models with the same signature draw the same. */
 export function graphSignature(m: RunGraphModel): string {
   return m.nodes
     .map((n) => {
-      const units = n.fanout?.units.map((u) => `${u.state},${u.codename ?? ''},${u.warnings?.length ?? 0}`).join(';') ?? '';
-      const subs = n.parallel?.map((p) => `${p.state},${p.codename ?? ''},${p.model ?? ''}`).join(';') ?? '';
+      const units =
+        n.fanout?.units
+          .map((u) => `${u.state},${u.codename ?? ''},${u.agent ?? ''},${u.provider ?? ''},${u.model ?? ''},${u.warnings?.length ?? 0}`)
+          .join(';') ?? '';
+      const subs =
+        n.parallel?.map((p) => `${p.state},${p.codename ?? ''},${p.agent ?? ''},${p.provider ?? ''},${p.model ?? ''}`).join(';') ?? '';
       const who = `${n.codename ?? ''},${n.agent ?? ''},${n.provider ?? ''},${n.model ?? ''}`;
       return `${n.id}:${n.state}:${n.round?.current ?? ''}:${who}:${n.warnings?.length ?? 0}:${units}:${subs}`;
     })

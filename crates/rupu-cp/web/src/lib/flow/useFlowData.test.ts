@@ -118,4 +118,32 @@ describe('useFlowData', () => {
     act(() => result.current.setFrameSpace(RUN.gannet1, { id: RUN.gannet1, participants: [], messages: [] }));
     expect(result.current.spaces.map((s) => s.id)).toEqual(['flow', RUN.gannet1]);
   });
+
+  it('a_units_agent_started_redraws_the_frame', async () => {
+    const running = CHILDREN.map((c) => (c.run_id === RUN.gannet1 ? { ...c, status: 'running' as const } : c));
+    const m = mockApi(running);
+    m.getRunGraph.mockResolvedValue({
+      ...GRAPH,
+      workflow: { steps: [{ id: 'probe', kind: 'for_each', agent: 'auth-prober' }], edges: [] },
+    } as unknown as RunGraphResponse);
+    const { result } = renderHook(() => useFlowData(DETAIL, { running: true }));
+    await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
+    act(() => result.current.loadFrame(RUN.gannet1));
+    act(() =>
+      m.emit({ type: 'unit_started', step_id: 'probe', index: 0, unit_key: '/api/login', agent: 'auth-prober', transcript_path: '/t' } as RunEvent),
+    );
+    const unit = () => result.current.childGraphs.get(RUN.gannet1)?.nodeById('probe')?.fanout?.units[0];
+    await waitFor(() => expect(unit()?.state).toBe('running'), { timeout: 2500 });
+    expect(unit()!.model).toBeUndefined();
+    // The unit's agent starts on a model: same state, same codename, but
+    // the card names its provider/model, so the frame is redrawn.
+    act(() =>
+      m.emit({
+        type: 'agent_started', step_id: 'probe', unit_index: 0, agent: 'auth-prober', provider: 'anthropic',
+        model: 'claude-opus-5-5', agent_run_id: 'run_01M5GPROBE0', transcript_path: '/t',
+      } as RunEvent),
+    );
+    await waitFor(() => expect(unit()?.model).toBe('claude-opus-5-5'), { timeout: 2500 });
+    expect(unit()!.provider).toBe('anthropic');
+  });
 });
