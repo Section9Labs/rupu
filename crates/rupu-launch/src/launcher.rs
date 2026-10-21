@@ -2014,11 +2014,12 @@ impl RunLauncher {
     }
 }
 
-/// Whether `file` lies inside `<children_dir>/generated/`, where
-/// `workflows.generate` writes: `generated` must be a real directory (a
-/// symlinked one would widen what counts as inside), and `file`'s canonical
-/// path must be under the canonical `<children_dir>` joined with
-/// `generated`. The one containment rule for a generated workflow: the
+/// Whether `file` is a regular file inside `<children_dir>/generated/`,
+/// where `workflows.generate` writes: `generated` must be a real directory (a
+/// symlinked one would widen what counts as inside), `file`'s canonical path
+/// must be under the canonical `<children_dir>` joined with `generated`, and
+/// what it resolves to must be a regular file (a directory there is no
+/// definition). The one containment rule for a generated workflow: the
 /// launcher's dispatch and the CP's `GET /api/agentiflows/:id/generated/:handle`
 /// both ask it.
 pub fn is_generated_file(children_dir: &Path, file: &Path) -> bool {
@@ -2028,7 +2029,10 @@ pub fn is_generated_file(children_dir: &Path, file: &Path) -> bool {
         return false;
     }
     match (children_dir.canonicalize(), file.canonicalize()) {
-        (Ok(root), Ok(f)) => f.starts_with(root.join("generated")),
+        (Ok(root), Ok(f)) => {
+            f.starts_with(root.join("generated"))
+                && std::fs::metadata(&f).is_ok_and(|m| m.is_file())
+        }
         _ => false,
     }
 }
@@ -2456,6 +2460,10 @@ mod tests {
             &run,
             &run.join("generated/missing.yaml")
         ));
+        // A directory under `generated/` is no definition.
+        std::fs::create_dir_all(run.join("generated/sub.yaml")).unwrap();
+        assert!(!is_generated_file(&run, &run.join("generated/sub.yaml")));
+        assert!(!is_generated_file(&run, &run.join("generated")));
 
         let linked = tmp.path().join("linked");
         std::fs::create_dir_all(&linked).unwrap();

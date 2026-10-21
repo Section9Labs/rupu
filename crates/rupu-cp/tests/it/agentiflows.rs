@@ -848,6 +848,18 @@ async fn generated_definition_is_served_and_path_checked() {
         Some(1),
         Some((&link, true)),
     );
+    // A directory under `generated/`: no definition, refused like one outside.
+    let dir = generated.join("dir.yaml");
+    std::fs::create_dir_all(&dir).unwrap();
+    launched(
+        &run,
+        "ch_dir",
+        ChildKind::Workflow,
+        "run_01GENF",
+        1,
+        Some(1),
+        Some((&dir, true)),
+    );
     // A named pool workflow, and an agent child.
     launched(
         &run,
@@ -880,7 +892,7 @@ async fn generated_definition_is_served_and_path_checked() {
             "yaml": yaml,
         })
     );
-    for handle in ["ch_dots", "ch_link"] {
+    for handle in ["ch_dots", "ch_link", "ch_dir"] {
         let (status, body) = get(addr, &format!("/api/agentiflows/{af}/generated/{handle}")).await;
         assert_eq!(status, 403, "{handle}: {body}");
     }

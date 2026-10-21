@@ -1165,7 +1165,7 @@ fn generated_definition(
         .into_iter()
         .rev()
         .find(|e| e.started.handle == handle)
-        .ok_or_else(|| GeneratedRefusal::NotFound(format!("no child `{handle}`")))?;
+        .ok_or_else(|| GeneratedRefusal::NotFound(format!("no direct child `{handle}`")))?;
     let file = entry
         .started
         .request
@@ -1184,7 +1184,7 @@ fn generated_definition(
     // canonical file under it): what it would dispatch is what is served.
     if !rupu_launch::launcher::is_generated_file(run_dir, &file) {
         return Err(GeneratedRefusal::Outside(format!(
-            "child `{handle}`'s definition is not under the flow's generated/ directory"
+            "child `{handle}`'s definition is not a regular file under the flow's generated/ directory"
         )));
     }
     let yaml = std::fs::read_to_string(&canonical).map_err(|e| {
@@ -1205,7 +1205,8 @@ fn generated_definition(
 /// the lead wrote with `workflows.generate` and dispatched as the direct
 /// child `handle`, read only: `{handle, name, file_name, yaml}`. 404 unless
 /// that child is a generated workflow whose file still exists; 403 when its
-/// recorded file resolves outside the flow's `generated/` directory. Local
+/// recorded file is not a regular file under the flow's `generated/`
+/// directory. Local
 /// only — a `?host=` is a 501.
 async fn get_agentiflow_generated(
     State(s): State<AppState>,
