@@ -960,6 +960,67 @@ export type AgentiflowBudgetState = string;
  *  `run_stopped`) plus kind-specific fields (see `rupu_agentiflow::run`). */
 export type AgentiflowEvent = { ts?: string; kind?: string } & Record<string, unknown>;
 
+/** A `kind: 'round'` event, typed. `started_at`, `decision`, `goals` (the
+ *  assessment the round STARTED from) and `warnings` are absent on runs that
+ *  predate them. */
+export interface AgentiflowRoundEvent {
+  round: number;
+  ts?: string;
+  started_at?: string;
+  decision?: string;
+  goals?: { id: string; met: boolean; current: string }[];
+  warnings?: string[];
+  goals_met: number;
+  goals_total: number;
+  spent_usd: number;
+  spent_tokens: number;
+  outcome: string;
+  error?: string;
+}
+
+/** The `round` events of `events`, in order, as `AgentiflowRoundEvent`s. */
+export function roundEvents(events: AgentiflowEvent[]): AgentiflowRoundEvent[] {
+  return events.filter((e) => e.kind === 'round') as unknown as AgentiflowRoundEvent[];
+}
+
+/** `ClaimView` of `GET …/board`. */
+export interface ClaimView {
+  key: string;
+  key_known: boolean;
+  owner: string;
+  acquired_at: string;
+  lease_expires_at: string | null;
+  ended_at: string | null;
+  state: 'held' | 'released' | 'expired';
+}
+
+/** `DirectiveView` of `GET …/board`. */
+export interface DirectiveView {
+  id: string;
+  author: string;
+  ts: string;
+  body: string;
+  addressed_to: string | null;
+  retracted_at: string | null;
+  retracted: boolean;
+}
+
+export interface BoardView {
+  claims: ClaimView[];
+  directives: DirectiveView[];
+  journal: boolean;
+}
+
+export type BoardResult = { kind: 'ok'; board: BoardView } | MessagesUnavailable;
+
+/** `GET /api/agentiflows/:id/generated/:handle`. */
+export interface GeneratedDefinition {
+  handle: string;
+  name: string;
+  file_name: string;
+  yaml: string;
+}
+
 /** `GET /api/agentiflows/:id`. */
 export interface AgentiflowDetail {
   record: AgentiflowRecord;
@@ -1893,6 +1954,11 @@ export interface RunChild {
   finished_at: string | null;
   transcript_path: string | null;
   legacy: boolean;
+  /** The agentiflow round that launched it; absent when unknown. */
+  round?: number;
+  /** A workflow the lead generated (its YAML is at `…/generated/:handle`). */
+  generated?: boolean;
+  output_excerpt?: string;
 }
 
 export interface SessionSummary {
@@ -3203,6 +3269,30 @@ export const api = {
       { signal },
     );
     return res.children;
+  },
+  /** A LOCAL agentiflow's board: claims and directives. 501 = unavailable. */
+  getAgentiflowBoard(id: string, opts?: Cancellable): Promise<BoardResult> {
+    return orUnavailable(
+      request<BoardView>(`/api/agentiflows/${encodeURIComponent(id)}/board`, { signal: opts?.signal }).then(
+        (board) => ({ kind: 'ok' as const, board }),
+      ),
+    );
+  },
+  /** A run's board, here or on `host`; a host that can't serve it is `unavailable`. */
+  getRunBoard(id: string, opts?: { host?: string } & Cancellable): Promise<BoardResult> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return orUnavailable(
+      request<BoardView>(`/api/runs/${encodeURIComponent(id)}/board${qs}`, { signal: opts?.signal }).then(
+        (board) => ({ kind: 'ok' as const, board }),
+      ),
+    );
+  },
+  /** The YAML of a workflow the agentiflow's lead generated (404 if `handle` isn't one). */
+  getAgentiflowGenerated(id: string, handle: string, opts?: Cancellable): Promise<GeneratedDefinition> {
+    return request<GeneratedDefinition>(
+      `/api/agentiflows/${encodeURIComponent(id)}/generated/${encodeURIComponent(handle)}`,
+      { signal: opts?.signal },
+    );
   },
   /** One unit's final answer, fetched on demand — the units list omits it
    *  (it can be multi-KB / a whole transcript read). `null` = no answer. */
