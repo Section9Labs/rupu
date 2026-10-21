@@ -1131,6 +1131,30 @@ async function orUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable>
   }
 }
 
+/** Why a board can't be shown, said plainly: a control plane without the
+ *  board route (404, or a peer's 501 naming the missing route) predates it;
+ *  a host that can't serve it (501) says so with its reason; anything else
+ *  is a failed read. */
+export function boardUnavailable(e: unknown): MessagesUnavailable {
+  const reason = apiErrorMessage(e);
+  if (e instanceof ApiError && (e.status === 404 || (e.status === 501 && /no API route/i.test(reason)))) {
+    return { kind: 'unavailable', reason: "This control plane can't show the board (it predates the board API)." };
+  }
+  if (e instanceof ApiError && e.status === 501) {
+    return { kind: 'unavailable', reason: `This host can't show the board: ${reason}` };
+  }
+  return { kind: 'unavailable', reason: `Couldn't read the board: ${reason}` };
+}
+
+async function orBoardUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable> {
+  try {
+    return await p;
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 501)) return boardUnavailable(e);
+    throw e;
+  }
+}
+
 function messagesPath(route: MessageRoute, id: string): string {
   return `/api/${route}/${encodeURIComponent(id)}/messages`;
 }
@@ -3272,7 +3296,7 @@ export const api = {
   },
   /** A LOCAL agentiflow's board: claims and directives. 501 = unavailable. */
   getAgentiflowBoard(id: string, opts?: Cancellable): Promise<BoardResult> {
-    return orUnavailable(
+    return orBoardUnavailable(
       request<BoardView>(`/api/agentiflows/${encodeURIComponent(id)}/board`, { signal: opts?.signal }).then(
         (board) => ({ kind: 'ok' as const, board }),
       ),
@@ -3281,7 +3305,7 @@ export const api = {
   /** A run's board, here or on `host`; a host that can't serve it is `unavailable`. */
   getRunBoard(id: string, opts?: { host?: string } & Cancellable): Promise<BoardResult> {
     const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
-    return orUnavailable(
+    return orBoardUnavailable(
       request<BoardView>(`/api/runs/${encodeURIComponent(id)}/board${qs}`, { signal: opts?.signal }).then(
         (board) => ({ kind: 'ok' as const, board }),
       ),

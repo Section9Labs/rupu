@@ -11,6 +11,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   apiErrorMessage,
+  boardUnavailable,
   type AgentiflowDetail,
   type BoardResult,
   type RunChild,
@@ -107,7 +108,7 @@ export function useFlowData(
       .catch((e: unknown) => {
         // A failed read keeps the last board; with none yet, the rail says
         // why it has none.
-        if (!ctl.signal.aborted) setFlowBoard((b) => b ?? { kind: 'unavailable', reason: apiErrorMessage(e) });
+        if (!ctl.signal.aborted) setFlowBoard((b) => b ?? boardUnavailable(e));
       });
     return () => ctl.abort();
   }, [id, boardTick]);
@@ -196,7 +197,7 @@ export function useFlowData(
       },
       (e: unknown) => {
         if (ctl.signal.aborted) return;
-        setFrameBoards((m) => (m.has(f) ? m : new Map(m).set(f, { kind: 'unavailable', reason: apiErrorMessage(e) })));
+        setFrameBoards((m) => (m.has(f) ? m : new Map(m).set(f, boardUnavailable(e))));
       },
     );
     const unsubscribe = live

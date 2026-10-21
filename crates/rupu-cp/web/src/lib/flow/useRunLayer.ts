@@ -7,7 +7,7 @@
 // message space: the page then shows today's graph.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, apiErrorMessage, type RunEvent, type SpaceParticipant } from '../api';
+import { api, boardUnavailable, type RunEvent, type SpaceParticipant } from '../api';
 import type { RunGraphModel } from '../runGraphModel';
 import type { MessageSpace } from '../useMessageSpace';
 import { countAtOrBefore, timeBounds } from '../timeline/timeline';
@@ -83,7 +83,7 @@ export function useRunLayer({
           if (ctl.signal.aborted) return;
           // A host that can't serve it (an older CP's 404 included) says why
           // in place; a failed re-read keeps what was read.
-          setBoard((cur) => cur ?? { kind: 'unavailable', reason: apiErrorMessage(e) });
+          setBoard((cur) => cur ?? boardUnavailable(e));
         },
       );
     void read();

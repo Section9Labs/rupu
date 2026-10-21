@@ -10,7 +10,7 @@ import type { Node, NodeProps } from '@xyflow/react';
 import { Flag } from 'lucide-react';
 import type { FlowRound } from '../../lib/flow/flowModel';
 import type { StepState } from '../../lib/runGraphModel';
-import { formatSpendUsd } from '../../lib/agentiflow';
+import { formatSpendShort } from '../../lib/agentiflow';
 import { CARD_H, CARD_W } from '../../lib/flow/flowLayout';
 import { NodeFrame, StatusCapsule } from '../graph/NodeFrame';
 import { MessageCount } from './ChildNode';
@@ -49,7 +49,7 @@ function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
           </div>
         )}
         <div className="gx-sub afx-result">
-          {r.spentUsd != null && <span>{formatSpendUsd(r.spentUsd)} spent · </span>}
+          {r.spentUsd != null && <span>{formatSpendShort(r.spentUsd)} spent · </span>}
           {r.transcriptPath ? (
             <Link
               className="afx-link nodrag"

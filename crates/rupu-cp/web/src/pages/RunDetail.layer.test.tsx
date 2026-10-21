@@ -148,13 +148,12 @@ describe('RunDetail layer', () => {
 
   it('board_unavailable_is_said_in_place', async () => {
     const board = stub('present');
-    board.mockResolvedValue({ kind: 'unavailable', reason: 'host h-abc has no board route' });
+    board.mockResolvedValue({ kind: 'unavailable', reason: "This host can't show the board: host h-abc has no board route" });
     renderAt(`/runs/${RUN_ID}?host=h-abc`);
     await waitFor(() => expect(screen.getByTestId('overlay-board')).toHaveTextContent('unavailable'));
     expect(board).toHaveBeenCalledWith(RUN_ID, expect.objectContaining({ host: 'h-abc' }));
     const panel = screen.getByTestId('run-layer-board');
-    expect(within(panel).getByText(/this host can't show the board/)).toBeInTheDocument();
-    expect(within(panel).getByText(/host h-abc has no board route/)).toBeInTheDocument();
+    expect(within(panel).getByText("This host can't show the board: host h-abc has no board route")).toBeInTheDocument();
     // The posts are messages: still listed.
     expect(within(panel).getByText('claim: package-lock.json')).toBeInTheDocument();
   });

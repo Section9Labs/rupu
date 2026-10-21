@@ -1049,3 +1049,26 @@ describe('subscribeEvents shared firehose', () => {
     expect(FakeEventSource.instances[0].closed).toBe(true);
   });
 });
+
+describe('board reads that come back without a board', () => {
+  it('an_older_control_plane_is_said_plainly', async () => {
+    mockFetch(404, { error: 'no API route for /api/agentiflows/af_1/board' });
+    await expect(api.getAgentiflowBoard('af_1')).resolves.toEqual({
+      kind: 'unavailable',
+      reason: "This control plane can't show the board (it predates the board API).",
+    });
+  });
+
+  it('a_host_that_cannot_serve_it_keeps_its_reason', async () => {
+    mockFetch(501, { error: 'tunnel hosts have no board' });
+    await expect(api.getRunBoard('run_1', { host: 'edge' })).resolves.toEqual({
+      kind: 'unavailable',
+      reason: "This host can't show the board: tunnel hosts have no board",
+    });
+  });
+
+  it('any_other_failure_is_a_failed_read', async () => {
+    mockFetch(500, { error: 'boom' });
+    await expect(api.getRunBoard('run_1')).rejects.toBeInstanceOf(ApiError);
+  });
+});

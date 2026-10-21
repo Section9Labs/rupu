@@ -51,7 +51,7 @@ describe('agentiflow flow api', () => {
   it('getRunBoard_turns_501_into_unavailable', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ error: 'tunnel host' }, 501));
     const res = await api.getRunBoard('run_1', { host: 'h1' });
-    expect(res).toEqual({ kind: 'unavailable', reason: 'tunnel host' });
+    expect(res).toEqual({ kind: 'unavailable', reason: "This host can't show the board: tunnel host" });
   });
 
   it('getRunBoard_passes_host', async () => {
