@@ -309,6 +309,11 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     [shownMessages, kinds, participant],
   );
   const counts = useMemo(() => messageCounts(shownMessages, router), [shownMessages, router]);
+  // The selected message's cards, lit (a row picked in the list, or an arc).
+  const lit = useMemo(() => {
+    const m = selectedMsg ? shownMessages.find((x) => x.id === selectedMsg) : undefined;
+    return new Set(m ? router.endsOf(m) : []);
+  }, [selectedMsg, shownMessages, router]);
 
   // The packets (useArrivals): a message landing after its space caught up
   // travels once.
@@ -505,6 +510,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           live: r.round === liveRound,
           launched: r.childIds.length,
           messages: counts.get(id) ?? 0,
+          lit: lit.has(id) || undefined,
           slot: slots.get(id) ?? 0,
         }),
       );
@@ -516,6 +522,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
             round: r.round,
             children: r.childIds.map((c) => childById.get(c)).filter((c): c is RunChild => !!c),
             onExpand,
+            lit: lit.has(sid) || undefined,
             slot: slots.get(sid) ?? 0,
           }),
         );
@@ -524,7 +531,13 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     for (const n of structure.nodes) {
       if (n.kind === 'child' && n.child) {
         out.push(
-          node(n.id, 'child', { child: n.child, inferred: n.inferred, messages: counts.get(n.id) ?? 0, slot: slots.get(n.id) ?? 0 }),
+          node(n.id, 'child', {
+            child: n.child,
+            inferred: n.inferred,
+            messages: counts.get(n.id) ?? 0,
+            lit: lit.has(n.id) || undefined,
+            slot: slots.get(n.id) ?? 0,
+          }),
         );
       } else if (n.kind === 'more') {
         const r = structure.rounds.find((x) => x.round === n.round)!;
@@ -539,6 +552,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               .map((c) => childById.get(c))
               .filter((c): c is RunChild => !!c && !inRound.has(c.parent_run_id)),
             onExpand,
+            lit: lit.has(n.id) || undefined,
             slot: slots.get(n.id) ?? 0,
           }),
         );
@@ -570,6 +584,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               boardOpen: frameOpen.get(n.id) ?? EMPTY_OPEN,
               onBoardOpen: onRailOpen,
               messages: counts.get(n.id) ?? 0,
+              lit: lit.has(n.id) || undefined,
               onLoad: data.loadFrame,
               onDefinition,
               onSelectMessage: selectMessage,
@@ -593,6 +608,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
                   onOpenUnit: h.open,
                   onExpandFanout: h.expand,
                   messages: counts.get(id),
+                  lit: lit.has(id) || undefined,
                 },
                 { zIndex: 1 },
               ),
@@ -618,6 +634,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     visible,
     slots,
     counts,
+    lit,
     liveRound,
     running,
     replaying,
@@ -711,6 +728,8 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
     () => [...layout.positions].filter(([id]) => visible.has(id) && !layout.frames.has(id) && id !== 'lead').map(([, p]) => p),
     [layout, visible],
   );
+  // The selected message's body shows on its first arc.
+  const tipArc = useMemo(() => arcs.find((a) => a.message.id === selectedMsg)?.id ?? null, [arcs, selectedMsg]);
   const edges = useMemo<Edge[]>(
     () => [
       ...treeEdges,
@@ -735,11 +754,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
               stub: a.stub,
               label: a.label,
               dead: a.dead,
+              tip: a.id === tipArc || undefined,
             },
           }) satisfies MessageFlowEdge,
       ),
     ],
-    [treeEdges, arcs, arrivals, claimIds, selectMessage, layout, obstacles],
+    [treeEdges, arcs, arrivals, claimIds, selectMessage, layout, obstacles, tipArc],
   );
 
   // --- interaction ---------------------------------------------------------

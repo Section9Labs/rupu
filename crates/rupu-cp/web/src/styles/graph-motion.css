@@ -1496,6 +1496,11 @@
   animation: gx-breathe 2.8s var(--ease-in-out) infinite;
 }
 .afx-frame[data-state='failed'] { border-color: rgb(var(--c-status-failed) / 0.6); }
+/* An end of the selected message: the frame's border in the brand ring. */
+.afx-frame[data-lit] {
+  border-style: solid; border-color: rgb(var(--c-brand-500) / 0.7);
+  transition: border-color 160ms ease;
+}
 .afx-frame-head {
   display: flex; align-items: center; gap: 8px; padding: 0 14px; min-width: 0;
   font-size: 11px; color: rgb(var(--c-ink-dim)); white-space: nowrap;

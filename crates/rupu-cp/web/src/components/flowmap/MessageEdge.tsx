@@ -1,7 +1,8 @@
 // MessageEdge — a message as an arc between two cards (xyflow edge `message`).
 // The run graph's edge family: same round caps and draw-in, a packet that
 // travels once when the message arrives, a dashed red dead end when it
-// reached nobody. Hover shows the body. The route (`arcRoute`) leaves a card
+// reached nobody. Hover shows the body; so does selection (`tip`: on one arc
+// of the selected message, until it is unselected). The route (`arcRoute`) leaves a card
 // from its side and runs through the gutters, from the card boxes the map
 // hands over (`from` / `to`) and xyflow's anchor point for a board item; a
 // stub is drawn short at its one card. Motion is in styles/graph-motion.css.
@@ -34,6 +35,9 @@ export interface MessageEdgeData extends Record<string, unknown> {
   label?: string;
   /** The recipient this end never reached (else looked up by target). */
   dead?: FlowUndelivered;
+  /** Show the body without hover: the arc of the selected message that
+   *  carries its tip. */
+  tip?: boolean;
 }
 
 export type MessageFlowEdge = Edge<MessageEdgeData, 'message'>;
@@ -163,7 +167,7 @@ function MessageEdgeView({
           }
         }}
       />
-      {hover && (
+      {(hover || data.tip) && (
         <foreignObject
           x={f(full.mid.x) - 130}
           y={f(full.mid.y) - 8}

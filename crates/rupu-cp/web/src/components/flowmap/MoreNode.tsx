@@ -18,6 +18,8 @@ export interface MoreNodeData extends Record<string, unknown> {
   /** The children it stands for. */
   children: RunChild[];
   onExpand: (round: number) => void;
+  /** An end of the selected message (folded into this card). */
+  lit?: boolean;
   slot: number;
 }
 
@@ -44,7 +46,7 @@ function MoreNodeView({ data }: NodeProps<MoreFlowNode>) {
     variant === 'more' ? `+${n} more` : `${n} ${n === 1 ? 'child' : 'children'}${n ? ` · ${stateCounts(children)}` : ''}`;
   const Icon = variant === 'more' ? ChevronsDown : Layers;
   return (
-    <NodeFrame state="pending" kind="for_each" slot={slot} width={CARD_W} minHeight={0} testId={`flow-${variant}`}>
+    <NodeFrame state="pending" kind="for_each" slot={slot} lit={data.lit} width={CARD_W} minHeight={0} testId={`flow-${variant}`}>
       <button
         type="button"
         className="afx-more nodrag"

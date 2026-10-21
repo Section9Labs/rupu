@@ -94,6 +94,8 @@ export interface ChildNodeData extends Record<string, unknown> {
   inferred: boolean;
   /** Messages it sent or received. */
   messages: number;
+  /** An end of the selected message. */
+  lit?: boolean;
   slot: number;
 }
 
@@ -117,7 +119,7 @@ function ChildNodeView({ data }: NodeProps<ChildFlowNode>) {
   ) : null;
   const spend = childSpend(c);
   return (
-    <NodeFrame state={state} kind={kind.run} slot={slot} width={CARD_W} minHeight={CARD_H} testId="flow-child">
+    <NodeFrame state={state} kind={kind.run} slot={slot} lit={data.lit} width={CARD_W} minHeight={CARD_H} testId="flow-child">
       <div className="gx-head">
         <span className="gx-tile" title={kind.label}>
           <kind.Icon size={12} strokeWidth={1.9} aria-hidden />

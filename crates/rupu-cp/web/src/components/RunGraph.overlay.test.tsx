@@ -195,6 +195,8 @@ describe('RunGraph overlay', () => {
     expect(lit).toEqual(['probe', 'report']);
     expect(screen.getByTestId('node-report').querySelector('[data-lit]')).not.toBeNull();
     expect(screen.getByTestId('node-collect').querySelector('[data-lit]')).toBeNull();
+    // Its body shows without hover.
+    expect(screen.getByText('Token reuse confirmed on /api/tokens.', { selector: '.afx-msg-tip-body' })).toBeInTheDocument();
   });
 
   it('reveal_hides_what_has_not_happened_yet', () => {

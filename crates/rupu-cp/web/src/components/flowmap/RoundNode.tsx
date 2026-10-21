@@ -24,6 +24,8 @@ export interface RoundNodeData extends Record<string, unknown> {
   launched: number;
   /** The lead's messages this round. */
   messages: number;
+  /** An end of the selected message. */
+  lit?: boolean;
   slot: number;
 }
 
@@ -41,7 +43,7 @@ function RoundNodeView({ data }: NodeProps<RoundFlowNode>) {
   const state: StepState = roundCardState(r, live);
   const met = r.goalsAfter?.filter((g) => g.met).length;
   return (
-    <NodeFrame state={state} kind="step" slot={slot} width={CARD_W} minHeight={CARD_H} testId="flow-round">
+    <NodeFrame state={state} kind="step" slot={slot} lit={data.lit} width={CARD_W} minHeight={CARD_H} testId="flow-round">
       <div className="gx-head">
         <span className="gx-tile" title="lead round">
           <Flag size={12} strokeWidth={1.9} aria-hidden />

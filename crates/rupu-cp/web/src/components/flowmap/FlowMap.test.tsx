@@ -271,6 +271,23 @@ describe('FlowMap', () => {
     expect(node('round:1')!.querySelector('.gx-node')).toHaveAttribute('data-state', 'done');
   });
 
+  it('selecting_a_message_lights_both_its_cards_and_shows_its_body', async () => {
+    mount();
+    await waitFor(() => expect(screen.getByTestId('msg-arc-msg_015')).toBeInTheDocument());
+    expect(document.querySelectorAll('[data-lit]')).toHaveLength(0);
+    expect(document.querySelector('.afx-msg-tip')).toBeNull();
+    // A row picked in the Messages list: the lead's round and kite#3.
+    fireEvent.click(screen.getByTestId('msg-row-msg_015'));
+    expect(node('round:2')!.querySelector('[data-lit]')).not.toBeNull();
+    expect(node(RUN.kite3)!.querySelector('[data-lit]')).not.toBeNull();
+    expect(document.querySelectorAll('[data-lit]')).toHaveLength(2);
+    expect(screen.getByText('Take reset-token reuse, kite#2 dropped it.', { selector: '.afx-msg-tip-body' })).toBeInTheDocument();
+    // Picking the row again clears it.
+    fireEvent.click(screen.getByTestId('msg-row-msg_015'));
+    expect(document.querySelectorAll('[data-lit]')).toHaveLength(0);
+    expect(document.querySelector('.afx-msg-tip')).toBeNull();
+  });
+
   it('generated_frame_opens_its_definition', async () => {
     mount();
     await waitFor(() => expect(node(RUN.gannet1)).not.toBeNull());

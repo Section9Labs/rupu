@@ -204,6 +204,8 @@ export function useRunLayerCanvas(
   const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
   // The step cards an arc keeps clear of.
   const obstacles = useMemo(() => [...positions.values()], [positions]);
+  // The selected message's body shows on its first arc.
+  const tipArc = useMemo(() => arcs.find((a) => a.message.id === selected)?.id ?? null, [arcs, selected]);
   const edges = useMemo<Edge[]>(
     () =>
       arcs.map(
@@ -227,10 +229,11 @@ export function useRunLayerCanvas(
               stub: a.stub,
               label: a.label,
               dead: a.dead,
+              tip: a.id === tipArc || undefined,
             },
           }) satisfies MessageFlowEdge,
       ),
-    [arcs, arrivals, claimIds, select, positions, obstacles],
+    [arcs, arrivals, claimIds, select, positions, obstacles, tipArc],
   );
 
   const shownCount = shown.length;

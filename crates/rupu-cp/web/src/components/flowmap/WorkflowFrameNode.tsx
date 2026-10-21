@@ -40,6 +40,9 @@ export interface WorkflowFrameData extends Record<string, unknown> {
   boardOpen: ReadonlySet<RailSection>;
   onBoardOpen: (node: string, section: RailSection, open: boolean) => void;
   messages: number;
+  /** An end of the selected message (its own space's messages land on its
+   *  inner steps). */
+  lit?: boolean;
   onLoad: (childRunId: string) => void;
   onDefinition: (child: RunChild) => void;
   onSelectMessage: (id: string) => void;
@@ -62,6 +65,7 @@ function WorkflowFrameView({ data }: NodeProps<FrameFlowNode>) {
     <div
       className="afx-frame gx-s"
       data-state={state}
+      data-lit={data.lit || undefined}
       data-testid="flow-frame"
       style={{ width: data.width, ['--i' as string]: data.slot }}
     >
