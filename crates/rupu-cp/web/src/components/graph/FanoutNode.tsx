@@ -77,20 +77,24 @@ function unitTitle(node: GraphNode, u: UnitView, stateLabel: string): string {
 function UnitCell({ node, unit, onOpen }: { node: GraphNode; unit: UnitView; onOpen?: () => void }) {
   const colors = useThemeColors();
   const { cue } = useStateCue(unit.state);
+  // The grid cell holds the button and, beside it (a handle is a div, which
+  // a button may not contain), the points a message arc to or from this
+  // unit ends on (the run's message layer).
   return (
-    <button
-      type="button"
-      data-state={unit.state}
-      data-cue={cue ?? undefined}
-      title={unitTitle(node, unit, stateStyle(colors, unit.state).label)}
-      onClick={onOpen}
-      className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
-    >
-      <StatusGlyph state={unit.state} />
-      {/* Where a message arc to or from this unit ends (the run's message layer). */}
+    <span className="gx-cell-slot">
+      <button
+        type="button"
+        data-state={unit.state}
+        data-cue={cue ?? undefined}
+        title={unitTitle(node, unit, stateStyle(colors, unit.state).label)}
+        onClick={onOpen}
+        className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
+      >
+        <StatusGlyph state={unit.state} />
+      </button>
       <Handle type="source" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
       <Handle type="target" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
-    </button>
+    </span>
   );
 }
 

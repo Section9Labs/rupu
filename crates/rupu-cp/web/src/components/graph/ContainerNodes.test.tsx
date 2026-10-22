@@ -164,6 +164,23 @@ describe('FanoutNode', () => {
     expect(cells.map((c) => c.getAttribute('data-state'))).toEqual(['done', 'done', 'running']);
   });
 
+  it('a unit square is a button with no element inside it but its glyph, its arc ends beside it', () => {
+    renderFanout(FANOUT);
+    const slots = Array.from(document.querySelectorAll('.gx-cell-slot'));
+    expect(slots).toHaveLength(3);
+    for (const [i, slot] of slots.entries()) {
+      const button = slot.querySelector(':scope > button.gx-cell')!;
+      // Valid HTML: no div (an xyflow handle) inside the button.
+      expect(button.querySelector('div')).toBeNull();
+      expect(button.querySelector('.react-flow__handle')).toBeNull();
+      expect(button).toHaveAttribute('type', 'button');
+      expect(button.getAttribute('title')).toBeTruthy();
+      // The unit's arc ends: a source and a target handle beside the button.
+      const handles = Array.from(slot.querySelectorAll(':scope > .react-flow__handle.gx-unit-port'));
+      expect(handles.map((h) => h.getAttribute('data-handleid'))).toEqual([`unit:${i}`, `unit:${i}`]);
+    }
+  });
+
   it('the container tint uses the for_each kind accent (brand.500)', () => {
     const { container } = renderFanout(FANOUT);
     expect(kindVar(container)).toBe('var(--c-brand-500)');

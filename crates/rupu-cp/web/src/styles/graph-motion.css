@@ -508,9 +508,10 @@
   .gx-cell:hover { scale: 1.06; }
 }
 .gx-cell:active { scale: 0.96; }
-/* A unit's message-arc end: an invisible point at the cell's centre. */
-.gx-cell { position: relative; }
-.gx-cell > .react-flow__handle.gx-unit-port {
+/* A unit's grid cell: its button, and its message-arc ends beside it (an
+ * invisible point at the cell's centre). */
+.gx-cell-slot { position: relative; display: grid; }
+.gx-cell-slot > .react-flow__handle.gx-unit-port {
   top: 50%; left: 50%; width: 1px; height: 1px; min-width: 0; min-height: 0;
   border: 0; background: none; opacity: 0; pointer-events: none; transform: none;
 }
