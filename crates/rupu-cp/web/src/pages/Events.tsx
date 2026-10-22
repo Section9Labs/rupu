@@ -3,9 +3,12 @@
 //   • PulseStrip  — fleet vitals (active runs / awaiting from GET /api/dashboard,
 //                   findings-by-severity from GET /api/findings, events/min +
 //                   errors derived from the live stream).
-//   • EventStream — center: a newest-first editorial stream MERGING the SSE +
-//                   history event firehose (GET /api/events[/stream]) with the
-//                   REST findings list (findings are not on the event wire).
+//   • EventStream — center: the event rail (components/events), newest first,
+//                   MERGING the SSE + history event firehose (GET
+//                   /api/events[/stream]) with the REST findings list
+//                   (findings are not on the event wire), under the Needs-you
+//                   deck (gates answered here, failures and severe findings
+//                   until seen).
 //   • ProjectRoster — right: one card per project (GET /api/projects), status +
 //                   current action folded from the stream, findings pips.
 //
@@ -37,7 +40,10 @@ import EventStream from '../components/situationRoom/EventStream';
 import ProjectRoster from '../components/situationRoom/ProjectRoster';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
 import { ListQueryBar, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
-import { EVENT_FIELDS, EVENT_HISTORY_NOTE, HISTORY_ATTRIBUTION_KEYS, eventRow, findingRow, type EventRow } from '../lib/query/lists/events';
+import { EVENT_FIELDS, EVENT_HISTORY_NOTE, eventRow, findingRow, type EventRow } from '../lib/query/lists/events';
+import { identityOf } from '../lib/events/identity';
+import type { GateDecision } from '../components/graph/GateActions';
+import { IDLE_GATE, type EventGate } from '../components/events/GateButtons';
 import { parseQuery } from '../lib/findingQuery/grammar';
 
 const PAGE_SIZE = 200;
@@ -45,7 +51,6 @@ const MAX_EVENTS = 5000;
 const AGG_POLL_MS = 15_000; // findings / projects / dashboard refresh cadence
 const SPARK_TICK_MS = 5_000; // events/min sampling window
 const SPARK_LEN = 16;
-const FRESH_MS = 2500;
 const STREAM_FINDINGS_CAP = 60; // most-recent findings merged into the stream
 const STALE_RUN_MS = 2 * 60_000; // silent this long + still live-looking → re-check run.json
 const STALE_RECHECK_MS = 60_000; // per-run floor between those re-checks
@@ -54,32 +59,6 @@ interface EventItem {
   key: string;
   ts: number;
   event: RunEvent;
-}
-
-/** Deterministic stringify (sorted keys) → stable content identity. */
-function stableStringify(v: unknown): string {
-  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`;
-  if (v !== null && typeof v === 'object') {
-    const o = v as Record<string, unknown>;
-    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(o[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(v);
-}
-/** Keys a history row carries that a live frame of the same event lacks. */
-const NOT_IDENTITY = new Set<string>(['ts', 'pos', ...HISTORY_ATTRIBUTION_KEYS]);
-
-/** Content identity excluding `ts`/`pos` and the history row's run
- *  attribution — the SSE firehose replays a run's already-written events
- *  (different `ts`, no `pos`, no attribution), so those can't be part of
- *  identity. Used for history↔live dedup and as the stable React key. */
-function identityOf(ev: RunEvent): string {
-  const raw = ev as Record<string, unknown>;
-  const rest: Record<string, unknown> = {};
-  for (const k of Object.keys(raw)) {
-    if (NOT_IDENTITY.has(k)) continue;
-    rest[k] = raw[k];
-  }
-  return stableStringify(rest);
 }
 
 /** History rows as items, skipping any `seen` already holds (and adding the
@@ -103,6 +82,11 @@ function posOf(ev: RunEvent): number | undefined {
   return typeof raw.pos === 'number' ? raw.pos : undefined;
 }
 
+/** One gate: its run and step. */
+function gateKey(c: StreamCard): string {
+  return `${c.approvable?.runId ?? c.runId ?? ''}\u0000${c.approvable?.stepId ?? c.stepId ?? ''}`;
+}
+
 /** Persisted `run.json` statuses that mean the run is over — used to stop
  *  the lazy `getRun` resolution from re-checking a run that already ended. */
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'rejected']);
@@ -112,7 +96,6 @@ export default function Events() {
   const [connection, setConnection] = useState<ConnectionState>('connecting');
   const [hasMoreOlder, setHasMoreOlder] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [freshKeys, setFreshKeys] = useState<ReadonlySet<string>>(new Set());
 
   const [findings, setFindings] = useState<FindingOut[]>([]);
   const [findingsSummary, setFindingsSummary] = useState<FindingsSummary | null>(null);
@@ -191,12 +174,6 @@ export default function Events() {
         sparkCounterRef.current += 1;
         const item: EventItem = { key: id, ts: tsOf(ev) ?? Date.now(), event: ev };
         setItems((prev) => [item, ...prev].slice(0, MAX_EVENTS));
-        setFreshKeys((prev) => {
-          const next = new Set(prev);
-          next.add(id);
-          setTimeout(() => setFreshKeys((p) => { const n = new Set(p); n.delete(id); return n; }), FRESH_MS);
-          return next;
-        });
       },
       undefined,
       () => setConnection('reconnecting'),
@@ -399,13 +376,13 @@ export default function Events() {
   );
 
   const resolveProject = useCallback(
-    (card: StreamCard): { label?: string; branch?: string; workflow?: string } => {
+    (card: StreamCard): { project?: string; workflow?: string } => {
       const workflow = card.workflow ?? (card.runId ? runToWorkflow.get(card.runId) : undefined);
-      if (card.projectName) return { label: card.projectName, workflow };
+      if (card.projectName) return { project: card.projectName, workflow };
       if (card.runId) {
         const ws = runToWs.get(card.runId);
         const p = ws ? wsById.get(ws) : undefined;
-        if (p) return { label: p.name, branch: p.branch ?? undefined, workflow };
+        if (p) return { project: p.name, workflow };
       }
       return { workflow };
     },
@@ -428,8 +405,37 @@ export default function Events() {
     [dashboard, findingsSummary, projectsLiveCount, projects.length, errors, eventsPerMin],
   );
 
-  const onApprove = useCallback((runId: string) => api.approveRun(runId), []);
-  const onReject = useCallback((runId: string) => api.rejectRun(runId, 'Rejected from Live Events'), []);
+  // Gate answers given here: pending-state, never optimistic. A decision
+  // stays "approved · resuming…" until the run's own events close the gate.
+  const [gateStates, setGateStates] = useState<ReadonlyMap<string, GateDecision>>(new Map());
+  const decide = useCallback((card: StreamCard, decision: 'approved' | 'rejected') => {
+    const runId = card.approvable?.runId ?? card.runId;
+    if (!runId) return;
+    const key = gateKey(card);
+    const stepId = card.approvable?.stepId ?? card.stepId;
+    setGateStates((m) => new Map(m).set(key, { pending: true, decision: null, error: null }));
+    const req = decision === 'approved'
+      ? api.approveRun(runId, undefined, undefined, stepId)
+      : api.rejectRun(runId, 'Rejected from Live Events', undefined, stepId);
+    req.then(
+      () => setGateStates((m) => new Map(m).set(key, { pending: false, decision, error: null })),
+      (e: unknown) =>
+        setGateStates((m) =>
+          new Map(m).set(key, { pending: false, decision: null, error: e instanceof Error ? e.message : String(e) }),
+        ),
+    );
+  }, []);
+  const gate = useMemo<EventGate>(
+    () => ({
+      state: (c) => gateStates.get(gateKey(c)) ?? IDLE_GATE,
+      approve: (c) => decide(c, 'approved'),
+      reject: (c) => decide(c, 'rejected'),
+    }),
+    [gateStates, decide],
+  );
+  const terminal = useCallback((runId: string) => runStatus.get(runId), [runStatus]);
+  const isRunLive = useCallback((runId: string) => activity.get(runId)?.state === 'running', [activity]);
+  const liveRuns = useMemo(() => [...activity.values()].filter((a) => a.state === 'running').length, [activity]);
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
@@ -455,10 +461,11 @@ export default function Events() {
               placeholder="Filter events… e.g. group:error workflow:nightly · agent:recon since:1h"
             />
           }
-          freshKeys={freshKeys}
           resolve={resolveProject}
-          onApprove={onApprove}
-          onReject={onReject}
+          gate={gate}
+          terminal={terminal}
+          isRunLive={isRunLive}
+          liveRuns={liveRuns}
           hasMoreOlder={query === null ? hasMoreOlder : qHasMoreOlder}
           loadingOlder={loadingOlder}
           onLoadOlder={loadOlder}

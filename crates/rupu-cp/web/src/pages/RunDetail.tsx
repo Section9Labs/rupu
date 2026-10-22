@@ -1749,7 +1749,13 @@ export default function RunDetail() {
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">
-            <RunEventFeed events={feedEvents} connection={connection} crewByRun={crewByRun} />
+            <RunEventFeed
+              events={feedEvents}
+              connection={connection}
+              crewByRun={crewByRun}
+              gate={gateControl}
+              status={effectiveStatus}
+            />
           </div>
         )}
         {tab === 'findings' && (
