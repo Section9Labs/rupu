@@ -3293,11 +3293,17 @@ export const api = {
    *  under each unit that is a `rupu run`, that run's own launch tree. Same
    *  shape as `getRunChildren`; no `?host=`. */
   async getAgentiflowChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
-    const res = await request<{ children: RunChild[] }>(
+    return (await api.getAgentiflowChildTree(id, signal)).children;
+  },
+  /** `getAgentiflowChildren` with the walk's `truncated` flag: past its cap
+   *  (2000 run directories) the children of the runs it didn't reach are
+   *  missing, and a view drawing the tree says so. */
+  async getAgentiflowChildTree(id: string, signal?: AbortSignal): Promise<{ children: RunChild[]; truncated: boolean }> {
+    const res = await request<{ children: RunChild[]; truncated?: boolean }>(
       `/api/agentiflows/${encodeURIComponent(id)}/children`,
       { signal },
     );
-    return res.children;
+    return { children: res.children, truncated: res.truncated === true };
   },
   /** A LOCAL agentiflow's board: claims and directives. 501 = unavailable. */
   getAgentiflowBoard(id: string, opts?: Cancellable): Promise<BoardResult> {

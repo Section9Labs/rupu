@@ -148,7 +148,7 @@ beforeEach(() => {
   rf.instance.setViewport.mockClear();
   rf.instance.setCenter.mockClear();
   rf.instance.getViewport.mockImplementation(() => ({ x: 0, y: 0, zoom: 1 }));
-  vi.spyOn(api, 'getAgentiflowChildren').mockImplementation(async () => children);
+  vi.spyOn(api, 'getAgentiflowChildTree').mockImplementation(async () => ({ children, truncated: false }));
   vi.spyOn(api, 'getAgentiflowBoard').mockResolvedValue({ kind: 'ok', board: FLOW_BOARD });
   vi.spyOn(api, 'getRunBoard').mockResolvedValue({ kind: 'ok', board: GANNET_BOARD });
   vi.spyOn(api, 'getRunGraph').mockResolvedValue(GANNET_RESPONSE);
@@ -252,8 +252,10 @@ describe('FlowMap', () => {
     // only the flow's space): probe's units wrote all five of the frame's.
     expect(within(node(`${RUN.gannet1}/probe`)!).getByTestId('flow-mcount')).toHaveTextContent('5');
     expect(within(node(`${RUN.gannet1}/collect`)!).queryByTestId('flow-mcount')).toBeNull();
-    rerenderWith({ ...FLOW });
-    await waitFor(() => expect(api.getAgentiflowChildren).toHaveBeenCalledTimes(2));
+    // A poll that changed the flow (a round ended) re-reads the children,
+    // never the loaded frame's graph.
+    rerenderWith({ ...FLOW, record: { ...FLOW.record, status: 'completed' } });
+    await waitFor(() => expect(api.getAgentiflowChildTree).toHaveBeenCalledTimes(2));
     expect(api.getRunGraph).toHaveBeenCalledTimes(1);
   });
 
@@ -307,6 +309,12 @@ describe('FlowMap', () => {
       sourceHandle: 'unit:6',
       targetHandle: 'unit:5',
     });
+  });
+
+  it('a_launch_tree_past_the_walks_cap_says_so_in_place', async () => {
+    vi.mocked(api.getAgentiflowChildTree).mockImplementation(async () => ({ children, truncated: true }));
+    mount();
+    expect(await screen.findByTestId('flow-children-truncated')).toHaveTextContent(/sub-agents beyond that are not drawn/);
   });
 
   it('generated_frame_opens_its_definition', async () => {

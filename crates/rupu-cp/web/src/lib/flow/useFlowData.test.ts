@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { api, type RunEvent, type RunGraphResponse } from '../api';
-import { reuseChildren, useFlowData } from './useFlowData';
+import { api, type AgentiflowDetail, type AgentiflowUnit, type RunEvent, type RunGraphResponse } from '../api';
+import { CHILDREN_LIVE_MS, reuseChildren, useFlowData } from './useFlowData';
 import { CHILDREN, DETAIL, FLOW_BOARD, GANNET_BOARD, RUN } from './fixtures';
 
 afterEach(() => {
@@ -24,7 +24,7 @@ const GRAPH = {
 } as unknown as RunGraphResponse;
 
 function mockApi(children = CHILDREN) {
-  const getChildren = vi.spyOn(api, 'getAgentiflowChildren').mockResolvedValue(children);
+  const getChildren = vi.spyOn(api, 'getAgentiflowChildTree').mockResolvedValue({ children, truncated: false });
   const getBoard = vi.spyOn(api, 'getAgentiflowBoard').mockResolvedValue({ kind: 'ok', board: FLOW_BOARD });
   const getRunBoard = vi.spyOn(api, 'getRunBoard').mockResolvedValue({ kind: 'ok', board: GANNET_BOARD });
   const getRunGraph = vi.spyOn(api, 'getRunGraph').mockResolvedValue(GRAPH);
@@ -52,10 +52,20 @@ function mockApi(children = CHILDREN) {
   };
 }
 
+/** A fixed clock (children are re-read past CHILDREN_LIVE_MS while running). */
+let clock = 0;
+const now = () => clock;
+/** A poll whose detail shows `n` units: a change the children follow. */
+const withUnits = (n: number): AgentiflowDetail => ({
+  ...DETAIL,
+  units: Array.from({ length: n }, (_, i) => ({ unit_id: `u${i}`, status: 'running' }) as unknown as AgentiflowUnit),
+});
+
 describe('useFlowData', () => {
-  it('children_and_board_reread_on_each_poll_while_running', async () => {
+  it('children_reread_when_the_detail_changes_the_board_on_each_poll', async () => {
+    clock = 0;
     const m = mockApi();
-    const { result, rerender } = renderHook(({ detail, running }) => useFlowData(detail, { running }), {
+    const { result, rerender } = renderHook(({ detail, running }) => useFlowData(detail, { running, now }), {
       initialProps: { detail: DETAIL, running: true },
     });
     await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
@@ -63,23 +73,42 @@ describe('useFlowData', () => {
     expect(m.getChildren).toHaveBeenCalledTimes(1);
     expect(m.getBoard).toHaveBeenCalledTimes(1);
 
-    // A poll: a new detail object.
+    // A poll that changed nothing: the board is re-read, the children
+    // (a walk of every ledger) are not.
     rerender({ detail: { ...DETAIL }, running: true });
+    await waitFor(() => expect(m.getBoard).toHaveBeenCalledTimes(2));
+    expect(m.getChildren).toHaveBeenCalledTimes(1);
+    // A unit appeared: they are.
+    rerender({ detail: withUnits(1), running: true });
     await waitFor(() => expect(m.getChildren).toHaveBeenCalledTimes(2));
-    expect(m.getBoard).toHaveBeenCalledTimes(2);
-
-    // Stopped: children follow the detail, the board no longer does.
-    rerender({ detail: { ...DETAIL }, running: false });
+    // While it runs, at most every CHILDREN_LIVE_MS without a change.
+    clock += CHILDREN_LIVE_MS;
+    rerender({ detail: withUnits(1), running: true });
     await waitFor(() => expect(m.getChildren).toHaveBeenCalledTimes(3));
-    rerender({ detail: { ...DETAIL }, running: false });
+
+    // Stopped: once more, then the board and children rest.
+    rerender({ detail: withUnits(1), running: false });
     await waitFor(() => expect(m.getChildren).toHaveBeenCalledTimes(4));
-    expect(m.getBoard).toHaveBeenCalledTimes(3);
+    const boards = m.getBoard.mock.calls.length;
+    clock += CHILDREN_LIVE_MS;
+    rerender({ detail: { ...withUnits(1) }, running: false });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(m.getChildren).toHaveBeenCalledTimes(4);
+    expect(m.getBoard).toHaveBeenCalledTimes(boards);
+  });
+
+  it('a_truncated_walk_is_said', async () => {
+    const m = mockApi();
+    m.getChildren.mockResolvedValue({ children: CHILDREN, truncated: true });
+    const { result } = renderHook(() => useFlowData(DETAIL, { running: false, now }));
+    await waitFor(() => expect(result.current.childrenTruncated).toBe(true));
   });
 
   it('a_frame_loads_once_and_follows_only_while_its_child_runs', async () => {
     const running = CHILDREN.map((c) => (c.run_id === RUN.gannet1 ? { ...c, status: 'running' as const } : c));
     const m = mockApi(running);
-    const { result, rerender } = renderHook(({ detail }) => useFlowData(detail, { running: true }), {
+    clock = 0;
+    const { result, rerender } = renderHook(({ detail }) => useFlowData(detail, { running: true, now }), {
       initialProps: { detail: DETAIL },
     });
     await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
@@ -117,15 +146,16 @@ describe('useFlowData', () => {
     await waitFor(() => expect(m.getRunBoard).toHaveBeenCalledTimes(2));
     expect(m.getRunGraph).toHaveBeenCalledTimes(1);
 
-    // The child ended: one last read of its graph, and the follow stops.
-    m.getChildren.mockResolvedValue(CHILDREN);
-    rerender({ detail: { ...DETAIL } });
+    // The child ended (the detail changed with it): one last read of its
+    // graph, and the follow stops.
+    m.getChildren.mockResolvedValue({ children: CHILDREN, truncated: false });
+    rerender({ detail: withUnits(1) });
     await waitFor(() => expect(m.unsubscribe).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(m.getRunGraph).toHaveBeenCalledTimes(2));
     expect(m.subscribe).toHaveBeenCalledTimes(1);
     const boards = m.getRunBoard.mock.calls.length;
-    rerender({ detail: { ...DETAIL } });
-    await waitFor(() => expect(m.getChildren).toHaveBeenCalledTimes(4));
+    rerender({ detail: withUnits(2) });
+    await waitFor(() => expect(m.getChildren).toHaveBeenCalledTimes(3));
     expect(m.getRunBoard).toHaveBeenCalledTimes(boards);
     expect(m.getRunGraph).toHaveBeenCalledTimes(2);
   });

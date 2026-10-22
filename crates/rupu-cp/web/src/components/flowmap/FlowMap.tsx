@@ -996,6 +996,12 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           couldn't read this flow's children: {data.childrenError}
         </div>
       )}
+      {data.childrenTruncated && (
+        <div className="afx-note" role="status" data-testid="flow-children-truncated">
+          This flow's launch tree is larger than the control plane walks (2000 runs): sub-agents beyond that are not
+          drawn.
+        </div>
+      )}
       <div
         ref={pane}
         className="gx-canvas afx-canvas relative w-full overflow-hidden rounded-xl border border-border shadow-card"

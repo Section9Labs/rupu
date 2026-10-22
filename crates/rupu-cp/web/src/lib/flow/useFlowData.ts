@@ -34,6 +34,19 @@ import { FLOW_SPACE, type BoardSource, type FlowInput, type FlowSpace } from './
 const FRAME_FLUSH_MS = 1000;
 /** A followed frame keeps at most this many events (as RunDetail does). */
 const FRAME_MAX_EVENTS = 5000;
+/** While the flow runs, its children (a walk of every child's ledger) are
+ *  re-read at most this often when the detail shows no change of its own
+ *  (a unit's sub-agents appear without one). */
+export const CHILDREN_LIVE_MS = 15_000;
+
+/** When the children are worth re-reading: the flow's status, its units'
+ *  statuses and its rounds changed, or (while it runs) CHILDREN_LIVE_MS
+ *  passed. A poll that changed none of it re-walks nothing. */
+export function childrenKey(detail: AgentiflowDetail, running: boolean, now: number): string {
+  const units = detail.units.map((u) => `${u.unit_id}:${u.status}`).join(',');
+  const rounds = detail.events.filter((e) => e.kind === 'round').length;
+  return `${detail.record.status}|${rounds}|${units}|${running ? Math.floor(now / CHILDREN_LIVE_MS) : ''}`;
+}
 
 export interface FlowData extends FlowInput {
   /** Asks for a workflow child's graph, board and messages (once). */
@@ -46,6 +59,8 @@ export interface FlowData extends FlowInput {
   childrenLoaded: boolean;
   /** Why the children could not be read; `null` when they were. */
   childrenError: string | null;
+  /** The server's walk stopped at its cap: sub-agents past it are missing. */
+  childrenTruncated: boolean;
   /** Why a frame's graph could not be read, by its run id. */
   frameErrors: ReadonlyMap<string, string>;
 }
@@ -70,14 +85,21 @@ const isLive = (c: RunChild | undefined) => c?.status === 'running' || c?.status
 
 export function useFlowData(
   detail: AgentiflowDetail,
-  opts: { running: boolean; flowSpace?: MessageSpace | null },
+  opts: {
+    running: boolean;
+    flowSpace?: MessageSpace | null;
+    /** The clock `childrenKey` reads (tests). */
+    now?: () => number;
+  },
 ): FlowData {
   const { running, flowSpace } = opts;
+  const now = opts.now ?? Date.now;
   const id = detail.record.id;
 
   const [children, setChildren] = useState<RunChild[]>([]);
   const [childrenError, setChildrenError] = useState<string | null>(null);
   const [childrenLoaded, setChildrenLoaded] = useState(false);
+  const [childrenTruncated, setChildrenTruncated] = useState(false);
   const [flowBoard, setFlowBoard] = useState<BoardSource | null>(null);
   const [loadedFrames, setLoadedFrames] = useState<string[]>([]);
   const [graphs, setGraphs] = useState<Map<string, RunGraphModel>>(new Map());
@@ -90,6 +112,7 @@ export function useFlowData(
     setChildren([]);
     setChildrenError(null);
     setChildrenLoaded(false);
+    setChildrenTruncated(false);
     setFlowBoard(null);
     setLoadedFrames([]);
     setGraphs(new Map());
@@ -98,14 +121,17 @@ export function useFlowData(
     setFrameErrors(new Map());
   }, [id]);
 
-  // Children: re-read on each detail (each poll while running).
+  // Children: re-read when the detail says something changed (see
+  // `childrenKey`), not on every poll.
+  const childKey = childrenKey(detail, running, now());
   useEffect(() => {
     const ctl = new AbortController();
     api
-      .getAgentiflowChildren(id, ctl.signal)
-      .then((c) => {
+      .getAgentiflowChildTree(id, ctl.signal)
+      .then(({ children: c, truncated }) => {
         if (ctl.signal.aborted) return;
         setChildren((prev) => reuseChildren(prev, c));
+        setChildrenTruncated(truncated);
         setChildrenError(null);
         setChildrenLoaded(true);
       })
@@ -115,7 +141,7 @@ export function useFlowData(
         setChildrenLoaded(true);
       });
     return () => ctl.abort();
-  }, [id, detail]);
+  }, [id, childKey]);
 
   // The flow's board: once, then with each detail while the flow runs.
   const boardTick = running ? detail : null;
@@ -314,6 +340,7 @@ export function useFlowData(
     setFrameSpace,
     childrenLoaded,
     childrenError,
+    childrenTruncated,
     frameErrors,
   };
 }
