@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Customers</title>
+<meta name="description" content="Group projects under customers with their own config layer, attribute every run, and filter and price the control plane by customer.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item active" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Customers</h1>
+    <p class="intro">Group projects under a customer, give that customer its own config layer &mdash; its provider account, SCM rules, pricing and locks &mdash; and see every run, finding and dollar attributed to it.</p>
+
+    <h2>What a customer is</h2>
+    <p>A customer is a named record (slug, display name, optional notes, contact and color) with a config layer of its own. Assign a project to it and every run launched in that project:</p>
+    <ul>
+      <li>resolves its config through the customer&rsquo;s layer, between the global config and the project&rsquo;s own;</li>
+      <li><strong>records</strong> the customer it ran under, so history stays attributed even if the project is reassigned later;</li>
+      <li>is priced with that customer&rsquo;s pricing, and shows up under the customer in the control plane&rsquo;s filters and rollups.</li>
+    </ul>
+    <p>Customers live under the global directory: <code class="inline">~/.rupu/customers/&lt;slug&gt;/customer.toml</code> (metadata) and <code class="inline">~/.rupu/customers/&lt;slug&gt;/config.toml</code> (the layer). A slug is 1&ndash;63 characters of <code class="inline">a-z</code>, <code class="inline">0-9</code> and <code class="inline">-</code>; <code class="inline">none</code> is reserved, because it means &ldquo;no customer&rdquo; in filters.</p>
+
+    <h2>The <code class="inline">rupu customer</code> command</h2>
+    <pre class="code"><span class="k">rupu customer list</span> [--archived]                  <span class="c">List customers (slug, name, projects, archived, color)</span>
+<span class="k">rupu customer show</span> &lt;slug&gt;                       <span class="c">Metadata, assigned projects, effective config with sources and locks</span>
+<span class="k">rupu customer create</span> &lt;slug&gt; --name &lt;name&gt;       <span class="c">Create one (also --notes, --contact, --color #rrggbb)</span>
+<span class="k">rupu customer set</span> &lt;slug&gt; [--name|--notes|--contact|--color]  <span class="c">Change metadata; "" clears notes/contact/color</span>
+<span class="k">rupu customer edit</span> &lt;slug&gt; [--editor &lt;cmd&gt;]       <span class="c">Edit the config layer in $EDITOR, validated on save</span>
+<span class="k">rupu customer archive</span> &lt;slug&gt;                    <span class="c">Hide from pickers; its projects keep running</span>
+<span class="k">rupu customer unarchive</span> &lt;slug&gt;
+<span class="k">rupu customer delete</span> &lt;slug&gt;                     <span class="c">Refused while any project is assigned</span>
+<span class="k">rupu customer assign</span> &lt;slug&gt; [--project &lt;dir|ws_id&gt;]  <span class="c">Assign a project (default: the current directory)</span>
+<span class="k">rupu customer unassign</span> [--project &lt;dir|ws_id&gt;]       <span class="c">Remove a project's customer</span></pre>
+    <p>A typical setup, run from the repo root:</p>
+    <pre class="code"><span class="c"># declare the accounts once, globally</span>
+<span class="k">rupu auth login</span> --account anthropic-acme --kind anthropic
+<span class="k">rupu auth login</span> --account github-acme --kind github
+
+<span class="c"># create the customer and point its layer at those accounts</span>
+<span class="k">rupu customer create</span> acme --name <span class="s">"Acme Corp"</span> --color <span class="s">"#2563eb"</span>
+<span class="k">rupu customer edit</span> acme
+
+<span class="c"># assign this checkout, then check what its runs will use</span>
+<span class="k">rupu customer assign</span> acme
+<span class="k">rupu customer show</span> acme</pre>
+    <p><code class="inline">edit</code> validates the layer on top of the global config when you save; <code class="inline">show</code> prints a <code class="inline">KEY / VALUE / SOURCE / LOCKED BY</code> table of the effective config. <code class="inline">list</code> honours the global <code class="inline">--format table|json|csv</code>.</p>
+
+    <h2>The customer config layer</h2>
+    <p>The customer&rsquo;s <code class="inline">config.toml</code> sits between the global file and the project&rsquo;s <code class="inline">.rupu/config.toml</code>. Precedence, highest first:</p>
+    <pre class="code">global lock  &rsaquo;  customer lock  &rsaquo;  project  &rsaquo;  customer  &rsaquo;  global  &rsaquo;  default</pre>
+    <figure class="diagram">
+      <svg viewBox="0 0 640 170" role="img" aria-label="Config layers: global, then customer, then project, with locks able to pin a key above the project">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+
+        <rect class="d-box" x="20" y="60" width="160" height="52" rx="10"></rect>
+        <text class="d-label" x="100" y="83" text-anchor="middle">global</text>
+        <text class="d-sub" x="100" y="99" text-anchor="middle">~/.rupu/config.toml</text>
+
+        <line class="d-edge" x1="180" y1="86" x2="233" y2="86" marker-end="url(#ar)"></line>
+
+        <rect class="d-box-accent" x="235" y="60" width="170" height="52" rx="10"></rect>
+        <text class="d-label" x="320" y="83" text-anchor="middle">customer</text>
+        <text class="d-sub" x="320" y="99" text-anchor="middle">customers/&lt;slug&gt;/config.toml</text>
+
+        <line class="d-edge" x1="405" y1="86" x2="458" y2="86" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="460" y="60" width="160" height="52" rx="10"></rect>
+        <text class="d-label" x="540" y="83" text-anchor="middle">project</text>
+        <text class="d-sub" x="540" y="99" text-anchor="middle">&lt;repo&gt;/.rupu/config.toml</text>
+
+        <text class="d-sub" x="320" y="146" text-anchor="middle">each layer overrides the one before it &mdash; except keys a [policy].lock above it pins</text>
+      </svg>
+      <figcaption>Layers merge left to right; a lock in the global or customer layer pins a key so the project can&rsquo;t move it.</figcaption>
+    </figure>
+    <ul>
+      <li>The project still wins on any key the customer hasn&rsquo;t locked.</li>
+      <li>A customer locks keys with its own <code class="inline">[policy].lock</code> &mdash; e.g. <code class="inline">["default_provider"]</code>, so a repo&rsquo;s config can&rsquo;t move the customer&rsquo;s runs onto another account. It can&rsquo;t unlock anything the global <code class="inline">[policy].lock</code> names. A lock covers config keys only: an agent whose frontmatter names its own <code class="inline">provider:</code> still runs on it.</li>
+      <li>Arrays replace rather than merge: a customer that declares <code class="inline">[[scm.rules]]</code> replaces the global rules for its projects.</li>
+      <li>A run uses the customer of the nearest assigned ancestor of its working directory, so subdirectories inherit their project&rsquo;s customer and a repo needs no <code class="inline">.rupu/</code> of its own.</li>
+      <li>A project assigned to a customer that no longer exists, or a customer layer that doesn&rsquo;t parse, <strong>fails the run</strong> &mdash; it never silently falls back to the global config.</li>
+    </ul>
+    <pre class="code"><span class="c"># ~/.rupu/customers/acme/config.toml</span>
+<span class="k">default_provider</span> = <span class="s">"anthropic-acme"</span>
+
+[[<span class="k">scm.rules</span>]]
+<span class="k">owner</span>   = <span class="s">"acme-corp"</span>
+<span class="k">account</span> = <span class="s">"github-acme"</span>
+
+[<span class="k">policy</span>]
+<span class="k">lock</span> = [<span class="s">"default_provider"</span>]</pre>
+    <p>Accounts are declared once, globally (<code class="inline">rupu auth login --account &hellip;</code>); the customer layer only references them through <code class="inline">default_provider</code> or <code class="inline">[[scm.rules]]</code>. A customer layer can also carry its own <code class="inline">[pricing]</code>, which prices that customer&rsquo;s runs.</p>
+
+    <h2>Run attribution</h2>
+    <p>A run records the customer it ran under at launch &mdash; in <code class="inline">run.json</code>, in every transcript&rsquo;s <code class="inline">RunStart</code>, and in a session&rsquo;s <code class="inline">session.json</code>. The field is tri-state:</p>
+    <table>
+      <thead><tr><th>On disk</th><th>Means</th><th>Attributed as</th></tr></thead>
+      <tbody>
+        <tr><td><code>"customer": "acme"</code></td><td>recorded slug</td><td><code>acme</code></td></tr>
+        <tr><td><code>"customer": null</code></td><td>recorded <strong>no customer</strong></td><td>none &mdash; even if the project has been assigned since</td></tr>
+        <tr><td>no <code>customer</code> key</td><td>legacy, written before customers existed</td><td>the project&rsquo;s <em>current</em> assignment, marked <strong>derived</strong></td></tr>
+      </tbody>
+    </table>
+    <p>Reassigning a project never rewrites history. <code class="inline">rupu workflow resume</code> / <code class="inline">approve</code> run on what was recorded: the recorded customer (a recorded customer that no longer exists fails the resume), or no customer for a recorded <code class="inline">null</code>. Findings and projects record no customer of their own &mdash; they follow the project&rsquo;s current assignment.</p>
+    <div class="callout"><strong>Multi-host note.</strong> A remote host resolves customers from its <em>own</em> customer store and assignments; the coordinator&rsquo;s customer layer and credentials are not shipped to remote hosts yet. A host whose runs can&rsquo;t report a customer is never counted as &ldquo;no customer&rdquo; &mdash; it&rsquo;s named as unfilterable instead.</div>
+
+    <h2>In the control plane</h2>
+    <h3>Customer scope</h3>
+    <p>A global <strong>customer picker</strong> (sidebar and top bar) sets the scope every scoped page filters to: <em>All customers</em>, a single customer, or <em>Unassigned</em> (work with no customer). The scope persists in the browser, and a deep link such as <code class="inline">/runs?customer=acme</code> opens already filtered. Archived customers stay valid scopes; the picker lists them on demand.</p>
+    <table>
+      <thead><tr><th>Filters by the scope</th><th>Shows an &ldquo;unscoped&rdquo; note instead</th></tr></thead>
+      <tbody>
+        <tr><td>Dashboard (runs, findings, autoflow cycles, spend), workflow-run and agent-run lists, Sessions, Findings, Projects, Usage (headline, timeline, run rows, outliers)</td><td>autoflow listings, Coverage, the concern catalog, fleet counts, definition lists and pages, Live Events, Network, the &#8984;K palette</td></tr>
+      </tbody>
+    </table>
+    <p>A page that can&rsquo;t be filtered says so while a scope is set, so a number that isn&rsquo;t the customer&rsquo;s is never passed off as theirs. Remote hosts that can&rsquo;t be filtered are named in a banner, never counted as zero.</p>
+
+    <h3>Customers page and detail</h3>
+    <ul>
+      <li><strong>Customers page</strong> (<code class="inline">/customers</code>): one row per customer with its <strong>rollup</strong> &mdash; projects, runs, spend, open findings, last activity &mdash; over a 7d / 30d / all range, with search, an Active / Archived / All view, and create.</li>
+      <li><strong>Customer detail</strong>: Overview, Projects, Runs, Findings, Usage and Config tabs; edit, archive, delete, and assign or unassign projects. The <strong>Config</strong> tab edits the customer layer, showing each field as inherited from global, owned by the customer (with a &ldquo;Lock for projects&rdquo; switch), or pinned by the global lock.</li>
+      <li><strong>Projects</strong>: a customer column, and an &ldquo;Assign to customer&rdquo; menu in the project header that previews the effect (which keys the customer locks, which default applies) before you commit.</li>
+      <li><strong>Runs</strong>: a customer column and chip; derived attributions are marked as such.</li>
+    </ul>
+
+    <h3>Pricing rollups</h3>
+    <p>Each run is priced with the pricing of the customer it&rsquo;s attributed to (global + that customer&rsquo;s layer); work with no customer is priced at the global rates. A run costs the same everywhere it appears &mdash; its list row, its detail, the usage views and the rollups. A customer whose layer doesn&rsquo;t parse is still listed, and its work is priced at the global rates <em>visibly</em>, with a pricing error naming the customer.</p>
+
+    <h3>Launch preview</h3>
+    <p>The workflow and agent launchers include a <strong>billing panel</strong> that shows, before anything runs, which customer the launch falls under and which provider, fallback and SCM accounts it will authenticate as &mdash; each with where the choice came from (&ldquo;agent frontmatter&rdquo;, &ldquo;customer default&rdquo;, &ldquo;global default &middot; locked&rdquo;, &ldquo;rule owner = acme-corp&rdquo;, &hellip;) &mdash; plus any warnings. It resolves exactly like a launch, so a launch that would fail (a dangling customer assignment, a config that doesn&rsquo;t load) is blocked with the same error.</p>
+
+    <h3>API</h3>
+    <p>The web UI is a thin client of <code class="inline">rupu cp serve</code>&rsquo;s routes, which are also usable directly: <code class="inline">/api/customers</code> (list, create, detail with rollups, edit, archive, delete, project assignment), <code class="inline">GET /api/config?customer=&lt;slug&gt;</code> and <code class="inline">PUT /api/config/customer/:slug</code> for the layer, <code class="inline">POST /api/launch/preview</code>, and a <code class="inline">?customer=&lt;slug&gt;|none</code> filter on the runs, sessions, findings, projects, usage and dashboard endpoints.</p>
+
+    <div class="doc-nav">
+      <a href="/docs/findings.html">&#8592; Findings</a>
+      <a href="/docs/cli.html">CLI reference &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
