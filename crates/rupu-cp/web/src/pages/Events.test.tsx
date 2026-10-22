@@ -64,7 +64,7 @@ describe('Live Events (Situation Room) page', () => {
     renderPage();
 
     await waitFor(() => expect(api.getEvents).toHaveBeenCalled());
-    expect(await screen.findByText('Workflow run started')).toBeInTheDocument();
+    expect(await screen.findByText('run started')).toBeInTheDocument();
     expect(screen.queryByText(/Waiting for events/)).not.toBeInTheDocument();
   });
 
@@ -74,13 +74,15 @@ describe('Live Events (Situation Room) page', () => {
     vi.spyOn(api, 'subscribeEvents').mockImplementation((onEvent) => { emit = onEvent; return () => {}; });
 
     renderPage();
-    await screen.findByText('Workflow run started');
+    await screen.findByText('run started');
 
     emit?.({ type: 'run_failed', run_id: 'run_live_1', error: 'boom-live-xyz', finished_at: new Date().toISOString() });
 
-    expect(await screen.findByText('boom-live-xyz')).toBeInTheDocument();
+    // a fresh failure: its row, and its card pinned in the Needs-you deck
+    expect((await screen.findAllByText('boom-live-xyz')).length).toBe(2);
+    expect(screen.getByTestId('needs-you-deck')).toHaveTextContent('1 failure');
     // The history row is still present — the live event prepended, not replaced.
-    expect(screen.getByText('Workflow run started')).toBeInTheDocument();
+    expect(screen.getByText('run started')).toBeInTheDocument();
   });
 
   it('a step_warning from history renders as a warning row on the global feed', async () => {
@@ -94,9 +96,12 @@ describe('Live Events (Situation Room) page', () => {
 
     renderPage();
 
-    expect(await screen.findByText('host gpu-9 did not stream coverage')).toHaveClass('text-warn');
-    expect(screen.getByText('Warning', { selector: 'span' })).toHaveClass('text-warn');
-    expect(screen.getByText('sweep · unit 3 warning')).toBeInTheDocument();
+    const headline = await screen.findByText('host gpu-9 did not stream coverage');
+    expect(headline).toHaveClass('evx-hl');
+    const row = headline.closest('[data-evkey]')!;
+    expect(row).toHaveAttribute('data-mark', 'warning');
+    expect(row).not.toHaveAttribute('data-raised');
+    expect(screen.queryByTestId('needs-you-deck')).toBeNull();
   });
 
   it('an SSE replay of an already-loaded history event renders once, not twice', async () => {
@@ -106,8 +111,8 @@ describe('Live Events (Situation Room) page', () => {
     vi.spyOn(api, 'subscribeEvents').mockImplementation((onEvent) => { emit = onEvent; return () => {}; });
 
     renderPage();
-    await screen.findByText('Workflow run started');
-    expect(screen.getByText('1 events')).toBeInTheDocument();
+    await screen.findByText('run started');
+    await waitFor(() => expect(screen.getByTestId('stream-count')).toHaveTextContent('1 events'));
 
     // Same occurrence, replayed via SSE with no ts/pos — identity dedup must
     // recognize it (see identityOf in Events.tsx) and NOT add a second row.
@@ -117,8 +122,8 @@ describe('Live Events (Situation Room) page', () => {
     });
 
     await waitFor(() => expect(screen.getByText('Live')).toBeInTheDocument());
-    expect(screen.getAllByText('Workflow run started')).toHaveLength(1);
-    expect(screen.getByText('1 events')).toBeInTheDocument();
+    expect(screen.getAllByText('run started')).toHaveLength(1);
+    await waitFor(() => expect(screen.getByTestId('stream-count')).toHaveTextContent('1 events'));
   });
 
   it('flips the connection badge to Live once an SSE frame arrives', async () => {
@@ -205,7 +210,7 @@ describe('Live Events (Situation Room) page', () => {
     await waitFor(() => expect(api.getEvents).toHaveBeenCalled());
 
     emit?.({ type: 'run_failed', run_id: 'r1', error: 'after-error-xyz', finished_at: new Date().toISOString() });
-    expect(await screen.findByText('after-error-xyz')).toBeInTheDocument();
+    expect((await screen.findAllByText('after-error-xyz')).length).toBeGreaterThan(0);
   });
 });
 
@@ -228,8 +233,8 @@ describe('Live Events: the query line', () => {
     renderAt('/events?q=group:error%20workflow:nightly');
     await screen.findByText('scan failed');
     expect(getEvents).toHaveBeenCalledWith(200, undefined, undefined, undefined, 'group:error workflow:nightly');
-    expect(screen.queryByText('Workflow run started')).not.toBeInTheDocument();
-    expect(screen.getByText('1 events')).toBeInTheDocument();
+    expect(screen.queryByText('run started')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('stream-count')).toHaveTextContent('1 events'));
     expect(screen.getByText(/Event history holds the most recent runs the query's/)).toBeInTheDocument();
 
     // A live frame the query doesn't keep stays out; the same event replayed
@@ -248,8 +253,8 @@ describe('Live Events: the query line', () => {
     vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
 
     renderAt('/events?q=type:agent_started');
-    await waitFor(() => expect(screen.getByText('1 events')).toBeInTheDocument());
-    expect(screen.getByText('repo-delta')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('stream-count')).toHaveTextContent('1 events'));
+    expect(screen.getByText(/repo-delta/)).toBeInTheDocument();
   });
 
   it('pages the filtered history with the query', async () => {
@@ -271,7 +276,7 @@ describe('Live Events: the query line', () => {
     const getEvents = vi.spyOn(api, 'getEvents').mockResolvedValue([runStarted('run_new', 9_000)]);
     vi.spyOn(api, 'subscribeEvents').mockImplementation(() => () => {});
     renderAt('/events?q=grop:error');
-    await screen.findByText('Workflow run started');
+    await screen.findByText('run started');
     expect(getEvents).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('alert')).toHaveTextContent('unknown key `grop`');
   });

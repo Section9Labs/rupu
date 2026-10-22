@@ -206,13 +206,15 @@ describe('AgentiflowDetail', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('/tmp/lead/transcript.r1.jsonl:false');
 
-    // Events tab: the shared live-events feed (RunEventFeed / EventCard), fed by
+    // Events tab: the shared event rail (RunEventFeed / EventRail), fed by
     // GET /api/agentiflows/:id/events (fetched async, hence findByText).
     fireEvent.click(screen.getByRole('button', { name: 'Events' }));
     expect(await screen.findByText('3 events')).toBeInTheDocument();
-    expect(screen.getByText('Engagement started')).toBeInTheDocument();
-    expect(screen.getByText('Engagement stopped')).toBeInTheDocument();
-    expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+    expect(screen.getByText('engagement started')).toBeInTheDocument();
+    expect(screen.getByText('engagement stopped')).toBeInTheDocument();
+    // The failed round is a raised row; older than a day, it is not pinned.
+    expect(screen.getByText('provider: API error 401').closest('[data-evkey]')).toHaveAttribute('data-kind', 'error');
+    expect(screen.queryByTestId('needs-you-deck')).toBeNull();
   });
 
   it('shows the Children tab — the deep launch tree under the flow', async () => {
