@@ -1059,6 +1059,14 @@ describe('board reads that come back without a board', () => {
     });
   });
 
+  it('a_run_the_route_does_not_know_is_not_an_older_control_plane', async () => {
+    mockFetch(404, { error: 'no run `run_01PENDING`' });
+    await expect(api.getRunBoard('run_01PENDING')).resolves.toEqual({
+      kind: 'unavailable',
+      reason: 'No board to show: no run `run_01PENDING`',
+    });
+  });
+
   it('a_host_that_cannot_serve_it_keeps_its_reason', async () => {
     mockFetch(501, { error: 'tunnel hosts have no board' });
     await expect(api.getRunBoard('run_1', { host: 'edge' })).resolves.toEqual({

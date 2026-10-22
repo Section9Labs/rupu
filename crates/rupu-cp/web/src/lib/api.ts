@@ -1132,13 +1132,18 @@ async function orUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable>
 }
 
 /** Why a board can't be shown, said plainly: a control plane without the
- *  board route (404, or a peer's 501 naming the missing route) predates it;
- *  a host that can't serve it (501) says so with its reason; anything else
- *  is a failed read. */
+ *  board route (the API's 404 "no API route for …", or a peer's 501 naming
+ *  it) predates it; a route that answers 404 for the run itself (no such
+ *  run, or not yet: a workflow child still starting) says so with its
+ *  reason; a host that can't serve it (501) says so with its reason;
+ *  anything else is a failed read. */
 export function boardUnavailable(e: unknown): MessagesUnavailable {
   const reason = apiErrorMessage(e);
-  if (e instanceof ApiError && (e.status === 404 || (e.status === 501 && /no API route/i.test(reason)))) {
+  if (e instanceof ApiError && (e.status === 404 || e.status === 501) && /no API route/i.test(reason)) {
     return { kind: 'unavailable', reason: "This control plane can't show the board (it predates the board API)." };
+  }
+  if (e instanceof ApiError && e.status === 404) {
+    return { kind: 'unavailable', reason: `No board to show: ${reason}` };
   }
   if (e instanceof ApiError && e.status === 501) {
     return { kind: 'unavailable', reason: `This host can't show the board: ${reason}` };
