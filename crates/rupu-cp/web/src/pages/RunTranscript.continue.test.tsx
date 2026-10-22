@@ -48,7 +48,7 @@ function agentRow(over: Partial<AgentRunRow> = {}): AgentRunRow {
 
 function stub(row: AgentRunRow | null) {
   vi.spyOn(api, 'getAgentRuns').mockResolvedValue(row ? [row] : []);
-  vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
+  vi.spyOn(api, 'getRunChildTree').mockResolvedValue({ truncated: false, children: [] });
   vi.spyOn(api, 'getModelCatalog').mockResolvedValue([
     { provider: 'anthropic', fetched_at: null, stale: false, models: [{ id: 'claude-opus-5-5', input_tokens: null, output_tokens: null, source: 'live' }, { id: 'claude-sonnet-5-5', input_tokens: null, output_tokens: null, source: 'live' }] },
     { provider: 'openai', fetched_at: null, stale: false, models: [{ id: 'gpt-6', input_tokens: null, output_tokens: null, source: 'live' }, { id: 'gpt-6-mini', input_tokens: null, output_tokens: null, source: 'live' }] },

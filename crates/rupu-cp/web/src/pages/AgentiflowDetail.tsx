@@ -416,7 +416,7 @@ export default function AgentiflowDetail() {
         >
           <ChildrenPanel
             runId={id}
-            fetchChildren={(sig) => api.getAgentiflowChildren(id, sig)}
+            fetchChildren={(sig) => api.getAgentiflowChildTree(id, sig)}
             onCount={setChildrenCount}
           />
         </Panel>

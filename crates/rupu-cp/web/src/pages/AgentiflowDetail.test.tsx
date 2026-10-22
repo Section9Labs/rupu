@@ -211,7 +211,7 @@ describe('AgentiflowDetail', () => {
 
   it('shows the Children tab — the deep launch tree under the flow', async () => {
     vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
-    const getChildren = vi.spyOn(api, 'getAgentiflowChildren').mockResolvedValue([
+    const getChildren = vi.spyOn(api, 'getAgentiflowChildTree').mockResolvedValue({ truncated: false, children: [
       {
         handle: 'u_recon',
         kind: 'agent',
@@ -250,7 +250,7 @@ describe('AgentiflowDetail', () => {
         transcript_path: '/tmp/run_sub.jsonl',
         legacy: false,
       },
-    ]);
+    ] });
     renderDetail();
     await screen.findByRole('heading', { name: 'rupu-self-review' });
 

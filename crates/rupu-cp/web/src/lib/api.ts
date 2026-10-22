@@ -740,6 +740,13 @@ export interface AgentIdentityDto {
   model?: string;
 }
 
+/** `GET /api/runs/:id/children` (and the agentiflow's): every child, and
+ *  whether the server's walk stopped at its cap (2000 run directories). */
+export interface ChildTree {
+  children: RunChild[];
+  truncated: boolean;
+}
+
 export interface RunGraphResponse {
   run: RunRecord;
   /** `edges` is the workflow's real DAG (split/join/branch/next/depends_on, or
@@ -3283,11 +3290,16 @@ export const api = {
   /** Every child a LOCAL run launched, in launch order per parent. There is
    *  no `?host=`: the endpoint reads this CP's run store only. */
   async getRunChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
-    const res = await request<{ children: RunChild[] }>(
+    return (await api.getRunChildTree(id, signal)).children;
+  },
+  /** `getRunChildren` with the walk's `truncated` flag (past the server's
+   *  cap the children of the runs it didn't reach are missing). */
+  async getRunChildTree(id: string, signal?: AbortSignal): Promise<ChildTree> {
+    const res = await request<{ children: RunChild[]; truncated?: boolean }>(
       `/api/runs/${encodeURIComponent(id)}/children`,
       { signal },
     );
-    return res.children;
+    return { children: res.children, truncated: res.truncated === true };
   },
   /** Every child under a LOCAL agentiflow: the units its lead launched and,
    *  under each unit that is a `rupu run`, that run's own launch tree. Same
@@ -3298,7 +3310,7 @@ export const api = {
   /** `getAgentiflowChildren` with the walk's `truncated` flag: past its cap
    *  (2000 run directories) the children of the runs it didn't reach are
    *  missing, and a view drawing the tree says so. */
-  async getAgentiflowChildTree(id: string, signal?: AbortSignal): Promise<{ children: RunChild[]; truncated: boolean }> {
+  async getAgentiflowChildTree(id: string, signal?: AbortSignal): Promise<ChildTree> {
     const res = await request<{ children: RunChild[]; truncated?: boolean }>(
       `/api/agentiflows/${encodeURIComponent(id)}/children`,
       { signal },

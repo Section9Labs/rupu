@@ -1156,8 +1156,8 @@ describe('RunDetail — Children tab', () => {
   it('loads the children the first time the tab opens and counts them in its label', async () => {
     stubApi();
     const children = vi
-      .spyOn(api, 'getRunChildren')
-      .mockResolvedValue([CHILD, { ...CHILD, handle: 'ch_2', run_id: 'run_wf', kind: 'workflow', name: 'triage' }]);
+      .spyOn(api, 'getRunChildTree')
+      .mockResolvedValue({ truncated: false, children: [CHILD, { ...CHILD, handle: 'ch_2', run_id: 'run_wf', kind: 'workflow', name: 'triage' }] });
     renderPage();
 
     const tabBtn = await screen.findByRole('button', { name: 'Children' });
@@ -1171,7 +1171,7 @@ describe('RunDetail — Children tab', () => {
 
   it('has no Children tab for a remote run', async () => {
     stubApi();
-    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
+    const children = vi.spyOn(api, 'getRunChildTree').mockResolvedValue({ truncated: false, children: [] });
     renderRemotePage();
 
     await waitFor(() => expect(screen.getByTestId('run-graph-mock')).toBeInTheDocument());
