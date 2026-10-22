@@ -106,6 +106,43 @@ describe('buildRunLayer', () => {
     expect(l.timeline.items.find((i) => i.key === 'unit:probe:0')!.at).toBe(ms(5));
   });
 
+  it('a_recorded_start_keeps_a_band_exact_without_its_events', () => {
+    // collect's record carries its start: with its events (and so its
+    // completion's duration) scrolled out of the window, its band is still
+    // exact. Without it (the case above, an older record) it has no band.
+    const record = {
+      ...RUN_RECORD,
+      step_results: RUN_RECORD.step_results.map((r) => (r.step_id === 'collect' ? { ...r, started_at: at(0) } : r)),
+    };
+    const l = buildRunLayer(RUN_MODEL, windowFrom('probe'), space, RUN_BOARD, { record });
+    expect(l.timeline.bands).toEqual([
+      { key: 'collect', label: 'collect', from: ms(0), to: ms(5), row: 'step' },
+      { key: 'probe', label: 'probe', from: ms(5), to: ms(15), row: 'step' },
+      { key: 'report', label: 'report', from: ms(15), to: ms(20), row: 'step' },
+    ]);
+    expect(l.timeline.items.find((i) => i.key === 'collect')).toEqual({ key: 'collect', at: ms(0), kind: 'step' });
+    // With no events at all, every step with a recorded start still bands.
+    const bare = buildRunLayer(RUN_MODEL, [], { participants: [], messages: [] }, null, { record });
+    expect(bare.timeline.bands).toEqual([{ key: 'collect', label: 'collect', from: ms(0), to: ms(5), row: 'step' }]);
+  });
+
+  it('a_later_row_without_a_start_is_not_paired_with_an_earlier_rows', () => {
+    // collect ran twice; its latest row (an older runner's) has no start, so
+    // the first row's start is not stretched to the second row's end: the
+    // band comes from the latest completion's duration instead.
+    const record = {
+      ...RUN_RECORD,
+      step_results: [
+        { run_id: RUN_RECORD.run.id, step_id: 'collect', success: false, started_at: at(-9), finished_at: at(-8) },
+        ...RUN_RECORD.step_results,
+      ],
+    };
+    const l = buildRunLayer(RUN_MODEL, RUN_EVENTS, space, RUN_BOARD, { record });
+    expect(l.timeline.bands.find((b) => b.key === 'collect')).toEqual({
+      key: 'collect', label: 'collect', from: ms(0), to: ms(5), row: 'step',
+    });
+  });
+
   it('a_step_without_its_start_appears_at_its_end', () => {
     // No events at all: a step appears when its record says it ended, with
     // no band; nothing is placed by guess.

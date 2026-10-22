@@ -7,11 +7,13 @@
 // address is and when each step ran.
 //
 // When a step ran. Run events carry no time of their own, but a finished
-// step's record has its `finished_at` and its `step_completed` event the
-// `duration_ms` the runner timed from the step's (latest attempt's) start,
-// so its start is `finished_at − duration_ms`: exact. A step with no
-// duration (running, failed, or its completion event outside the page's
-// event window) gets a band from a lower bound, marked `inferred`: the last
+// step's record has its `finished_at` and, from runners that record it, the
+// `started_at` of its (latest) attempt: exact. A record without it (written
+// before the field existed) still has its `step_completed` event's
+// `duration_ms`, timed from that start, so its start is
+// `finished_at − duration_ms`: exact too. A step with neither (running, or
+// an older record whose completion event is outside the page's event
+// window) gets a band from a lower bound, marked `inferred`: the last
 // known time before its `step_started` in the event log (the run's start,
 // exact starts, each step's and unit's recorded end). A step with neither a
 // start event nor a duration appears at its recorded end, with no band; one
@@ -174,9 +176,13 @@ export function stepTimeline(
 ): { items: TimelineItem[]; bands: TimelineBand[]; untimed: string[] } {
   const known = new Set(steps.map((s) => s.id));
   const stepEnd = new Map<string, number>();
+  // The latest row's own start, paired with that row's end: a later row
+  // without one (an older runner's) clears an earlier row's.
+  const recordedStart = new Map<string, number | null>();
   for (const r of record?.step_results ?? []) {
     const t = time(r.finished_at);
     if (t !== null) stepEnd.set(r.step_id, t);
+    recordedStart.set(r.step_id, time(r.started_at));
   }
   const unitEnd = new Map<string, number>();
   for (const u of record?.units ?? []) {
@@ -194,6 +200,9 @@ export function stepTimeline(
   for (const [id, d] of duration) {
     const end = stepEnd.get(id);
     if (end !== undefined && known.has(id)) exactStart.set(id, end - d);
+  }
+  for (const [id, t] of recordedStart) {
+    if (t !== null && known.has(id)) exactStart.set(id, t);
   }
 
   // The lower bound: the last known time before each start event.

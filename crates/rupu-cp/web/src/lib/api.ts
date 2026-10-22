@@ -333,6 +333,9 @@ export interface StepResultRecord {
   }>;
   iterations?: number;
   resolved?: boolean;
+  /** When the step's (latest) attempt started. Absent on a skipped step and
+   *  on records written before the field existed. */
+  started_at?: string;
   finished_at?: string;
   [k: string]: unknown;
 }
