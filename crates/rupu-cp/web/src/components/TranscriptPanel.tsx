@@ -14,7 +14,7 @@ import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
 import { Spinner } from './ui/Spinner';
-import { buildTranscriptView } from './transcript/transcriptView';
+import { buildTranscriptView, windowTurns } from './transcript/transcriptView';
 import { parseMsgHash } from '../lib/messages';
 import Turn from './transcript/Turn';
 import TranscriptControls from './transcript/TranscriptControls';
@@ -57,6 +57,7 @@ export default function TranscriptPanel({
   runId,
   embedded = false,
   onComplete,
+  calls,
 }: {
   path: string;
   live: boolean;
@@ -83,6 +84,10 @@ export default function TranscriptPanel({
   /** Called once when the live SSE stream receives a run_complete or run_failed
    *  event. Allows the parent to trigger a reload on turn completion. */
   onComplete?: () => void;
+  /** Show only the turns holding these model calls (1-based, inclusive; the
+   *  usage timeline's `transcript_turn`): a window the page selected on the
+   *  Token flow. Turns keep their own numbers. */
+  calls?: [number, number];
 }) {
   // The REST snapshot and the live SSE stream are kept apart: both start at
   // byte 0 of the same file, so each is a prefix of the other (see
@@ -285,13 +290,19 @@ export default function TranscriptPanel({
   const hasChrome =
     view.header != null || (typeof unparsed === 'number' && unparsed > 0) || partial;
 
+  // A window over the run: the turns holding its calls (1-based numbers).
+  const only = calls ? windowTurns(view.turns, calls) : undefined;
+
   // The feed: every turn mounted up front (the outline observes `#turn-<n>`).
   const feed = (
     <div className="flex min-w-0 flex-1 flex-col">
       {isEmpty && (
         <div className="p-6 text-center text-sm text-ink-mute">No transcript events yet.</div>
       )}
-      {view.turns.map((turn, ti) => (
+      {only && only.size === 0 && !isEmpty && (
+        <div className="p-6 text-center text-sm text-ink-mute">None of this transcript&apos;s turns are in the window yet.</div>
+      )}
+      {view.turns.map((turn, ti) => only && !only.has(ti + 1) ? null : (
         <div key={ti} id={`turn-${ti + 1}`}>
           <Turn
             turn={turn}
@@ -389,7 +400,13 @@ export default function TranscriptPanel({
           className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-meta tabular-nums text-ink-dim"
           data-testid="transcript-metrics"
         >
-          <span>{view.turns.length} {view.turns.length === 1 ? 'turn' : 'turns'}</span>
+          {only ? (
+            <span data-testid="transcript-window">
+              {only.size} of {view.turns.length} {view.turns.length === 1 ? 'turn' : 'turns'} in the window
+            </span>
+          ) : (
+            <span>{view.turns.length} {view.turns.length === 1 ? 'turn' : 'turns'}</span>
+          )}
           <span>{toolCalls} tool {toolCalls === 1 ? 'call' : 'calls'}</span>
           <span>{counts.commands} {counts.commands === 1 ? 'command' : 'commands'}</span>
           <span>{counts.findings} {counts.findings === 1 ? 'finding' : 'findings'}</span>
@@ -411,7 +428,7 @@ export default function TranscriptPanel({
         )}
         <div className="flex gap-3">
           {feed}
-          {!isEmpty && <TranscriptOutline turns={view.turns} filter={filter} />}
+          {!isEmpty && <TranscriptOutline turns={view.turns} filter={filter} only={only} />}
         </div>
       </TranscriptViewProvider>
     </div>

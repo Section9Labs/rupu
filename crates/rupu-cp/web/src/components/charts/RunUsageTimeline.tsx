@@ -12,10 +12,15 @@ export default function RunUsageTimeline({
   series,
   separators = false,
   live = false,
+  zoom,
+  onZoomChange,
 }: {
   series: UsageTimelinePoint[];
   separators?: boolean;
   live?: boolean;
+  /** The selected range of turns (point indices), when the page owns it. */
+  zoom?: [number, number] | null;
+  onZoomChange?: (zoom: [number, number] | null) => void;
 }) {
-  return <TokenFlow points={series} stages={separators} live={live} />;
+  return <TokenFlow points={series} stages={separators} live={live} zoom={zoom} onZoomChange={onZoomChange} />;
 }

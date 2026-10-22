@@ -2073,3 +2073,230 @@ async fn usage_not_double_counted() {
         assert_eq!(r[0]["workflow_name"], "", "{id} has no workflow");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Turn locations: every series point says when (`at`, ledger points only) and
+// where (`transcript` + `transcript_turn`, the N-th non-compaction call in
+// that file) it happened, so the web can map a selected range of turns onto
+// transcripts, events, findings and messages.
+// ---------------------------------------------------------------------------
+
+/// One ledger row with an explicit time, transcript and kind.
+fn located_ledger_line(
+    id: &str,
+    step: &str,
+    transcript: &std::path::Path,
+    at: chrono::DateTime<chrono::Utc>,
+    kind: rupu_orchestrator::usage_ledger::LedgerKind,
+    input: u64,
+) -> Vec<u8> {
+    use rupu_orchestrator::usage_ledger::{LedgerRow, LEDGER_VERSION};
+    let row = LedgerRow {
+        v: LEDGER_VERSION,
+        id: id.into(),
+        at,
+        kind,
+        step_id: Some(step.into()),
+        unit_index: None,
+        unit_key: None,
+        agent_run_id: transcript.file_stem().unwrap().to_string_lossy().into(),
+        parent_agent_run_id: None,
+        transcript: transcript.to_path_buf(),
+        agent: "builder".into(),
+        provider: FOLD_PROVIDER.into(),
+        model: FOLD_MODEL.into(),
+        input_tokens: input,
+        output_tokens: 1,
+        cached_tokens: 0,
+        cache_write_tokens: 0,
+        rollup: false,
+    };
+    let mut line = serde_json::to_vec(&row).unwrap();
+    line.push(b'\n');
+    line
+}
+
+fn at_secs(s: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_790_000_000 + s, 0).unwrap()
+}
+
+/// The exact JSON of a point (turn, label, tokens and location).
+fn point_json(
+    turn: u64,
+    label: &str,
+    input: u64,
+    output: u64,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    transcript: &std::path::Path,
+    transcript_turn: Option<u64>,
+) -> serde_json::Value {
+    let mut p = serde_json::json!({
+        "turn": turn,
+        "label": label,
+        "tokens_in": input,
+        "tokens_out": output,
+        "tokens_cached": 0,
+        "tokens_cache_write": 0,
+        "transcript": transcript.to_str().unwrap(),
+    });
+    if let Some(at) = at {
+        p["at"] = serde_json::to_value(at).unwrap();
+    }
+    if let Some(n) = transcript_turn {
+        p["transcript_turn"] = n.into();
+    }
+    p
+}
+
+#[tokio::test]
+async fn ledger_points_carry_time_transcript_and_per_transcript_ordinals() {
+    use rupu_orchestrator::usage_ledger::LedgerKind::{Compaction, Turn};
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let store = create_workflow_run(global, "run_LOC", rupu_orchestrator::RunStatus::Running);
+    let ledger = store.usage_ledger_path("run_LOC");
+    let a = global.join("transcripts").join("run_STEP_A.jsonl");
+    let b = global.join("transcripts").join("run_STEP_B.jsonl");
+    // Two transcripts interleaved, and a compaction call in `a`.
+    for (id, step, t, s, kind, input) in [
+        ("l1", "a", &a, 1, Turn, 10),
+        ("l2", "b", &b, 2, Turn, 20),
+        ("l3", "a", &a, 3, Turn, 30),
+        ("l4", "a", &a, 4, Compaction, 40),
+        ("l5", "b", &b, 5, Turn, 50),
+        ("l6", "a", &a, 6, Turn, 60),
+    ] {
+        append_bytes(
+            &ledger,
+            &located_ledger_line(id, step, t, at_secs(s), kind, input),
+        );
+    }
+
+    let srv = spawn_server(global).await;
+    let want = serde_json::json!([
+        point_json(1, "a", 10, 1, Some(at_secs(1)), &a, Some(1)),
+        point_json(2, "b", 20, 1, Some(at_secs(2)), &b, Some(1)),
+        point_json(3, "a", 30, 1, Some(at_secs(3)), &a, Some(2)),
+        point_json(4, "a", 40, 1, Some(at_secs(4)), &a, None),
+        point_json(5, "b", 50, 1, Some(at_secs(5)), &b, Some(2)),
+        point_json(6, "a", 60, 1, Some(at_secs(6)), &a, Some(3)),
+    ]);
+    let timeline = get_json(format!("{}/api/runs/run_LOC/usage-timeline", srv.base_url)).await;
+    assert_eq!(timeline, want, "usage-timeline");
+    let v = get_json(format!("{}/api/runs/run_LOC/usage", srv.base_url)).await;
+    assert_eq!(v["points"], want, "/usage points");
+
+    // The incremental path keeps counting per transcript: the next `a` turn
+    // is its 4th, the next `b` its 3rd, after the fold drained only the
+    // appended rows.
+    let epoch = v["epoch"].as_str().unwrap().to_string();
+    append_bytes(
+        &ledger,
+        &located_ledger_line("l7", "b", &b, at_secs(7), Turn, 70),
+    );
+    append_bytes(
+        &ledger,
+        &located_ledger_line("l8", "a", &a, at_secs(8), Turn, 80),
+    );
+    let v2 = get_json(format!(
+        "{}/api/runs/run_LOC/usage?since=6&epoch={epoch}",
+        srv.base_url
+    ))
+    .await;
+    assert_eq!(v2["epoch"], epoch.as_str(), "{v2}");
+    assert_eq!(v2["points_from"], 6, "{v2}");
+    assert_eq!(
+        v2["points"],
+        serde_json::json!([
+            point_json(7, "b", 70, 1, Some(at_secs(7)), &b, Some(3)),
+            point_json(8, "a", 80, 1, Some(at_secs(8)), &a, Some(4)),
+        ]),
+        "{v2}"
+    );
+}
+
+/// A transcript of raw events: `RunStart`, then one `Usage` per entry
+/// (`Some("compaction")` marks a compaction call).
+fn write_usage_events(path: &std::path::Path, usages: &[(u32, Option<&str>)]) {
+    write_fold_transcript(path, "builder", "ws_wf", &[]);
+    let mut buf = Vec::new();
+    for (input, purpose) in usages {
+        let ev = rupu_transcript::Event::Usage {
+            provider: FOLD_PROVIDER.into(),
+            model: FOLD_MODEL.into(),
+            served_model: None,
+            input_tokens: *input,
+            output_tokens: 1,
+            cached_tokens: 0,
+            cache_write_tokens: 0,
+            purpose: purpose.map(str::to_string),
+        };
+        buf.extend(serde_json::to_vec(&ev).unwrap());
+        buf.push(b'\n');
+    }
+    append_bytes(path, &buf);
+}
+
+#[tokio::test]
+async fn ledgerless_points_carry_the_recorded_transcript_and_ordinals_but_no_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let store = create_workflow_run(global, "run_OLD", rupu_orchestrator::RunStatus::Completed);
+    let review = global.join("proj").join("run_OLD_review.jsonl");
+    let fix = global.join("proj").join("run_OLD_fix.jsonl");
+    write_usage_events(&review, &[(10, None), (5, Some("compaction")), (20, None)]);
+    write_usage_events(&fix, &[(30, None)]);
+    for (step, path) in [("review", &review), ("fix", &fix)] {
+        store
+            .append_step_result("run_OLD", &step_result("run_OLD", step, path.clone()))
+            .unwrap();
+    }
+
+    let srv = spawn_server(global).await;
+    let want = serde_json::json!([
+        point_json(1, "review", 10, 1, None, &review, Some(1)),
+        point_json(2, "review", 5, 1, None, &review, None),
+        point_json(3, "review", 20, 1, None, &review, Some(2)),
+        point_json(4, "fix", 30, 1, None, &fix, Some(1)),
+    ]);
+    let timeline = get_json(format!("{}/api/runs/run_OLD/usage-timeline", srv.base_url)).await;
+    assert_eq!(timeline, want, "usage-timeline");
+    assert!(
+        timeline
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p.get("at").is_none()),
+        "a transcript usage event carries no time: {timeline}"
+    );
+    let v = get_json(format!("{}/api/runs/run_OLD/usage", srv.base_url)).await;
+    assert_eq!(v["points"], want, "/usage points");
+}
+
+#[tokio::test]
+async fn session_timeline_points_carry_each_turns_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path();
+    let tdir = global.join("proj").join(".rupu").join("transcripts");
+    let t1 = tdir.join("run_S1.jsonl");
+    let t2 = tdir.join("run_S2.jsonl");
+    write_usage_events(&t1, &[(10, None), (20, None)]);
+    write_usage_events(&t2, &[(5, Some("compaction")), (30, None)]);
+    write_session(global, "ses_LOC", &[("run_S1", &t1), ("run_S2", &t2)]);
+
+    let srv = spawn_server(global).await;
+    let points = get_json(format!(
+        "{}/api/sessions/ses_LOC/usage-timeline",
+        srv.base_url
+    ))
+    .await;
+    assert_eq!(
+        points,
+        serde_json::json!([
+            point_json(1, "run_S1", 10, 1, None, &t1, Some(1)),
+            point_json(2, "run_S1", 20, 1, None, &t1, Some(2)),
+            point_json(3, "run_S2", 5, 1, None, &t2, None),
+            point_json(4, "run_S2", 30, 1, None, &t2, Some(1)),
+        ])
+    );
+}

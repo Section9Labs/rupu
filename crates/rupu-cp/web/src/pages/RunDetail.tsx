@@ -55,6 +55,9 @@ import CollapsiblePanel from '../components/flowmap/CollapsiblePanel';
 import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
+import TurnWindowBar from '../components/run/TurnWindowBar';
+import WindowTranscripts from '../components/run/WindowTranscripts';
+import { turnWindow } from '../lib/run/turnWindow';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
 import ChildrenPanel from '../components/run/ChildrenPanel';
@@ -360,6 +363,10 @@ export default function RunDetail() {
   // a global index across all of the run's steps (see effect below).
   // Only populated for local runs (remote gating skips this fetch).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
+  // Turns selected on the Token flow (point indices): a window the
+  // Transcript, Events, Findings and Messages follow. Null = the whole run.
+  const [turnZoom, setTurnZoom] = useState<[number, number] | null>(null);
+  useEffect(() => setTurnZoom(null), [id]);
 
   // This run's finding count for the tab label, reported by the Findings tab
   // once it has been opened. `null` = not known yet.
@@ -825,6 +832,12 @@ export default function RunDetail() {
   }, [retryRequestedAt, retryFollowing, id]);
   // Usage for the header row: live summary, else the graph's one-shot numbers.
   const displayUsage = usageFromGraph ? (graph?.usage ?? liveUsage?.summary) : (liveUsage?.summary ?? graph?.usage);
+  const chartPoints = (usageFromGraph ? null : liveUsage?.points) ?? series;
+  const turnWin = useMemo(
+    () => (turnZoom ? turnWindow(chartPoints, turnZoom[0], turnZoom[1]) : null),
+    [chartPoints, turnZoom],
+  );
+  const windowSpan = turnWin?.span ?? null;
   // Pause is only offered while the run is actively `running` (not merely
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
@@ -1041,9 +1054,16 @@ export default function RunDetail() {
   // Events filtered to the selected step (run-level events, which carry no
   // step_id, drop out naturally); the whole feed when nothing is selected.
   const feedEvents = useMemo<SeqEvent[]>(() => {
-    if (!selection) return events;
-    return events.filter((e) => eventStepId(e.event) === selection.stepId);
-  }, [events, selection]);
+    const inStep = selection ? events.filter((e) => eventStepId(e.event) === selection.stepId) : events;
+    if (!turnWin) return inStep;
+    // Run events carry no time of their own, so a window keeps the events of
+    // the steps its turns belong to.
+    const steps = new Set(turnWin.labels);
+    return inStep.filter((e) => {
+      const step = eventStepId(e.event);
+      return step !== undefined && step !== null && steps.has(step);
+    });
+  }, [events, selection, turnWin]);
 
   // RunGraph wiring → selection cursor. A normal step's NodeSelection.label is
   // its node id (== step id); for_each expand/open-unit pass the step id (and
@@ -1599,9 +1619,11 @@ export default function RunDetail() {
         >
           <RunUsageTimeline
             key={id}
-            series={(usageFromGraph ? null : liveUsage?.points) ?? series}
+            series={chartPoints}
             separators
             live={isRunning}
+            zoom={turnZoom}
+            onZoomChange={setTurnZoom}
           />
         </section>
 
@@ -1631,6 +1653,12 @@ export default function RunDetail() {
           )}
         </TabBar>
       </div>
+
+      {turnWin && (
+        <div className="px-8 pt-2">
+          <TurnWindowBar window={turnWin} onClear={() => setTurnZoom(null)} />
+        </div>
+      )}
 
       <div className="px-8 pt-2 text-note text-ink-dim">
         <span data-testid="run-selected-label" className="inline-flex flex-wrap items-center gap-1.5">
@@ -1666,7 +1694,16 @@ export default function RunDetail() {
           <MessageLinksContext.Provider value={messages.space === 'present' ? messageLinks : {}}>
           <SubrunIdentityContext.Provider value={subrunIdentities}>
             <div className="flex h-full min-h-0 flex-col overflow-auto">
-              {selection && selectedFanout ? (
+              {turnWin ? (
+                <WindowTranscripts
+                  window={turnWin}
+                  model={model}
+                  preferred={selectedTranscriptPath}
+                  live={isRunning}
+                  runId={id}
+                  host={host}
+                />
+              ) : selection && selectedFanout ? (
                 <StepTranscriptBrowser
                   stepId={selection.stepId}
                   units={selectedFanout.units}
@@ -1706,6 +1743,7 @@ export default function RunDetail() {
                 return p && model && selectionOf(model, p) ? () => messageLinks.openParticipant?.(m.from, m.id) : null;
               }}
               highlightId={parseMsgHash(hash)}
+              within={windowSpan}
             />
           </div>
         )}
@@ -1718,6 +1756,7 @@ export default function RunDetail() {
           <div className="h-full min-h-0 overflow-auto">
             <FindingsExplorer
               scope={{ runId: id }}
+              within={windowSpan}
               exportTitle="Run findings report"
               onCount={setFindingsCount}
               empty={{

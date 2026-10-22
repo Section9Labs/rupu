@@ -20,6 +20,7 @@
 
 use crate::runs::RunStore;
 use crate::usage_index::{RunUsage, UsageIndex};
+use chrono::{DateTime, Utc};
 use rupu_config::PricingConfig;
 use rupu_transcript::UsageRow;
 use serde::{Deserialize, Serialize};
@@ -203,8 +204,13 @@ pub fn rollup(summaries: impl Iterator<Item = UsageSummary>) -> UsageSummary {
 
 /// One per-turn point for the usage timeline. `turn` is a 1-based global index
 /// across all contributing transcripts (in order); `label` is the grouping key
-/// (step id for a run, run id for a session).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// (step id for a run, run id for a session). `at`, `transcript` and
+/// `transcript_turn` say when and where the call happened, so a client can map
+/// a range of points onto transcripts, events, findings and messages.
+///
+/// The location fields default to absent on `Deserialize`, so a point from a
+/// peer that predates them still parses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnPoint {
     pub turn: u64,
     pub label: String,
@@ -213,6 +219,26 @@ pub struct TurnPoint {
     pub tokens_cached: u64,
     #[serde(default)]
     pub tokens_cache_write: u64,
+    /// When the call finished (the usage-ledger row's `at`). Absent for
+    /// points read from a transcript with no ledger row (runs that predate
+    /// the ledger): transcript `usage` events carry no time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+    /// The transcript file this call is in: the ledger row's `transcript` as
+    /// written, or — for a transcript folded without ledger rows — the path
+    /// the run records for it (its step result's / unit checkpoint's
+    /// `transcript_path`, a live event's path, a dispatched sub-run's file;
+    /// for a session, the turn's `transcript_path`), never a coordinator
+    /// mirror path it was resolved to. So it matches the `transcript_path`
+    /// the CP serves on steps and units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+    /// 1-based ordinal of this call among the transcript's non-compaction
+    /// `usage` events — the N-th model call in that file, counting every such
+    /// event in the file (ledger: among its `kind: turn` rows). Absent for a
+    /// compaction call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_turn: Option<u64>,
 }
 
 /// A run id we are willing to join onto `<runs>/<id>/sub/` (no separators,

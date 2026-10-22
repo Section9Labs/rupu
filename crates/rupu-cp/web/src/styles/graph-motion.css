@@ -1605,3 +1605,6 @@
   .afx-follow { animation: none; }
   .afx-follow:active { scale: none; }
 }
+
+/* The run page's turn window bar settles in when a selection is made. */
+.gx-window { animation: rgx-fade 220ms ease-out; }
