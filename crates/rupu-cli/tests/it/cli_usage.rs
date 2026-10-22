@@ -239,6 +239,7 @@ fn sample_step_result(run_id: &str, transcript_path: &Path) -> StepResultRecord 
         codename: None,
         cause: None,
         error: None,
+        started_at: None,
     }
 }
 

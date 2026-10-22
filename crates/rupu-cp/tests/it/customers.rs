@@ -425,6 +425,7 @@ fn seed_run_at(
                 codename: None,
                 cause: None,
                 error: None,
+                started_at: None,
             },
         )
         .unwrap();

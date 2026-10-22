@@ -937,6 +937,12 @@ pub struct StepResult {
     /// outcome. Boxed for the same reason as `run_outcome`: an inline
     /// record would grow every `StepResult` the hot enums carry.
     pub cause: Option<Box<rupu_transcript::OutcomeRecord>>,
+    /// When this step's (latest) attempt started — the moment its
+    /// `StepStarted` was emitted. `None` for a step that never started
+    /// (skipped) and for one rebuilt from a record written before the
+    /// field existed. Persisted into
+    /// [`crate::runs::StepResultRecord::started_at`].
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Runtime form of one finding emitted by a panelist. Aggregated
@@ -977,6 +983,7 @@ impl Default for StepResult {
             codename: None,
             error: None,
             cause: None,
+            started_at: None,
         }
     }
 }
@@ -3710,6 +3717,7 @@ async fn run_scheduler_scoped(
 
             if let Some(branch) = &step.branch {
                 let branch_timer = std::time::Instant::now();
+                let started_at = chrono::Utc::now();
                 if let Some(sink) = opts.event_sink.as_ref() {
                     sink.emit(
                         run_id,
@@ -3775,6 +3783,7 @@ async fn run_scheduler_scoped(
                     success: true,
                     skipped: false,
                     kind: crate::runs::StepKind::Branch,
+                    started_at: Some(started_at),
                     loop_iteration: current_loop_iteration,
                     ..Default::default()
                 };
@@ -3813,6 +3822,7 @@ async fn run_scheduler_scoped(
             // `split:` orchestration no-op — see this function's doc.
             if step.split.is_some() {
                 let split_timer = std::time::Instant::now();
+                let started_at = chrono::Utc::now();
                 if let Some(sink) = opts.event_sink.as_ref() {
                     sink.emit(
                         run_id,
@@ -3832,6 +3842,7 @@ async fn run_scheduler_scoped(
                     success: true,
                     skipped: false,
                     kind: crate::runs::StepKind::Split,
+                    started_at: Some(started_at),
                     loop_iteration: current_loop_iteration,
                     ..Default::default()
                 };
@@ -3897,6 +3908,7 @@ async fn run_scheduler_scoped(
             // why it was `Split` in the first place.
             if let Some(loop_suffix) = step.id.strip_prefix("loop:") {
                 if let Some(loop_def) = opts.workflow.loops.get(loop_suffix) {
+                    let started_at = chrono::Utc::now();
                     if let Some(sink) = opts.event_sink.as_ref() {
                         sink.emit(
                             run_id,
@@ -3924,7 +3936,8 @@ async fn run_scheduler_scoped(
                     ))
                     .await;
                     match loop_result {
-                        Ok(LoopNodeOutcome::Completed(result, progress)) => {
+                        Ok(LoopNodeOutcome::Completed(mut result, progress)) => {
+                            result.started_at = Some(started_at);
                             let duration_ms = loop_timer.elapsed().as_millis() as u64;
                             if let Some(sink) = opts.event_sink.as_ref() {
                                 sink.emit(
@@ -4084,6 +4097,7 @@ async fn run_scheduler_scoped(
                 step.continue_on_error.unwrap_or(workflow_default_continue);
             persist_active_step(opts, run_id, step, None).await;
             let step_kind = step_kind_for_run_record(step);
+            let started_at = chrono::Utc::now();
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
                     run_id,
@@ -4125,6 +4139,7 @@ async fn run_scheduler_scoped(
                     &ctx_owned,
                     &opts_task,
                     effective_continue_on_error,
+                    started_at,
                 )
                 .await;
                 (i, outcome)
@@ -5473,6 +5488,7 @@ fn drain_joins(
         }
 
         let join_timer = std::time::Instant::now();
+        let started_at = chrono::Utc::now();
         let mut items = Vec::with_capacity(winners.len());
         let mut outputs = Vec::with_capacity(winners.len());
         let mut all_success = true;
@@ -5521,6 +5537,7 @@ fn drain_joins(
             success: all_success,
             skipped: false,
             kind: crate::runs::StepKind::Join,
+            started_at: Some(started_at),
             items,
             ..Default::default()
         };
@@ -5944,6 +5961,7 @@ async fn run_steps_over(
         // machinery below; it emits its own StepStarted/StepCompleted pair.
         if let Some(branch) = &step.branch {
             let branch_timer = std::time::Instant::now();
+            let started_at = chrono::Utc::now();
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
                     run_id,
@@ -5978,6 +5996,7 @@ async fn run_steps_over(
                 success: true,
                 skipped: false,
                 kind: crate::runs::StepKind::Branch,
+                started_at: Some(started_at),
                 ..Default::default()
             };
             let duration_ms = branch_timer.elapsed().as_millis() as u64;
@@ -6003,6 +6022,7 @@ async fn run_steps_over(
         persist_active_step(opts, run_id, step, None).await;
 
         let step_kind = step_kind_for_run_record(step);
+        let started_at = chrono::Utc::now();
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
                 run_id,
@@ -6028,7 +6048,16 @@ async fn run_steps_over(
                 );
             }
         }
-        match run_node(run_id, step, &ctx, opts, effective_continue_on_error).await? {
+        match run_node(
+            run_id,
+            step,
+            &ctx,
+            opts,
+            effective_continue_on_error,
+            started_at,
+        )
+        .await?
+        {
             NodeOutcome::Paused {
                 step_id,
                 seed,
@@ -6095,12 +6124,16 @@ enum NodeOutcome {
 /// including the `workflow_has_sync_step` guard) bypass it entirely,
 /// exactly as they bypassed the equivalent code when it lived inline in
 /// the loop.
+///
+/// `started_at` is when the caller emitted this step's `StepStarted`; the
+/// completed result carries it into the step's record.
 async fn run_node(
     run_id: &str,
     step: &Step,
     ctx: &StepContext,
     opts: &OrchestratorRunOpts,
     effective_continue_on_error: bool,
+    started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<NodeOutcome, RunWorkflowError> {
     let step_timer = std::time::Instant::now();
 
@@ -6220,6 +6253,10 @@ async fn run_node(
     };
 
     let duration_ms = step_timer.elapsed().as_millis() as u64;
+    let dispatch_result = dispatch_result.map(|mut result| {
+        result.started_at = Some(started_at);
+        result
+    });
 
     match &dispatch_result {
         Ok(result) => {
@@ -7214,12 +7251,13 @@ pub fn gate_decision_result(
     reason: Option<&str>,
     loop_iteration: Option<u32>,
 ) -> StepResult {
+    let decided_at = chrono::Utc::now();
     let output = serde_json::json!({
         "decision": decision,
         "via": via,
         "approver": approver,
         "reason": reason,
-        "decided_at": chrono::Utc::now().to_rfc3339(),
+        "decided_at": decided_at.to_rfc3339(),
     })
     .to_string();
     StepResult {
@@ -7229,6 +7267,9 @@ pub fn gate_decision_result(
         skipped: false,
         kind: crate::runs::StepKind::ApprovalGate,
         loop_iteration,
+        // A gate's row is written as it is decided, with the
+        // `StepStarted` / `StepCompleted` (0 ms) pair around it.
+        started_at: Some(decided_at),
         ..Default::default()
     }
 }
@@ -7526,6 +7567,7 @@ async fn run_on_reject_chain(
                 step_results,
                 &opts.workspace_path,
             );
+            let started_at = chrono::Utc::now();
             if let Some(sink) = opts.event_sink.as_ref() {
                 sink.emit(
                     run_id,
@@ -7558,7 +7600,7 @@ async fn run_on_reject_chain(
                 }),
             };
             let duration_ms = step_timer.elapsed().as_millis() as u64;
-            let result = match outcome {
+            let mut result = match outcome {
                 Ok(result) => {
                     if let Some(sink) = opts.event_sink.as_ref() {
                         sink.emit(
@@ -7602,6 +7644,7 @@ async fn run_on_reject_chain(
                     }
                 }
             };
+            result.started_at = Some(started_at);
             persist_step_result(opts, run_id, &result);
             step_results.push(result);
             continue;
@@ -7620,6 +7663,7 @@ async fn run_on_reject_chain(
         let transcript_path = opts.transcript_dir.join(format!("{step_run_id}.jsonl"));
         let codename = naming.sub(rejected_step_id, &step.id, agent_name);
 
+        let started_at = chrono::Utc::now();
         if let Some(sink) = opts.event_sink.as_ref() {
             sink.emit(
                 run_id,
@@ -7660,6 +7704,7 @@ async fn run_on_reject_chain(
                     kind: crate::runs::StepKind::Linear,
                     codename: Some(codename.to_string()),
                     error: Some(e.to_string()),
+                    started_at: Some(started_at),
                     ..Default::default()
                 };
                 persist_step_result(opts, run_id, &result);
@@ -7746,6 +7791,7 @@ async fn run_on_reject_chain(
             codename: Some(codename.to_string()),
             error: (!success).then_some(error_text),
             cause: cause.map(Box::new),
+            started_at: Some(started_at),
             ..Default::default()
         };
         persist_step_result(opts, run_id, &result);
@@ -11159,6 +11205,8 @@ impl PanelPass {
             codename: None,
             error: None,
             cause: None,
+            // Stamped by `run_node`, which runs every panel step.
+            started_at: None,
         }
     }
 }

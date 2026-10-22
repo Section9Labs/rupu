@@ -333,6 +333,9 @@ export interface StepResultRecord {
   }>;
   iterations?: number;
   resolved?: boolean;
+  /** When the step's (latest) attempt started. Absent on a skipped step and
+   *  on records written before the field existed. */
+  started_at?: string;
   finished_at?: string;
   [k: string]: unknown;
 }
@@ -1007,8 +1010,11 @@ export interface DirectiveView {
   author: string;
   ts: string;
   body: string;
-  addressed_to: string | null;
-  retracted_at: string | null;
+  /** Omitted by the server when the directive is for everyone. */
+  addressed_to?: string | null;
+  /** Omitted by the server while the directive stands, and for a retraction
+   *  written before retractions carried a time. */
+  retracted_at?: string | null;
   retracted: boolean;
 }
 

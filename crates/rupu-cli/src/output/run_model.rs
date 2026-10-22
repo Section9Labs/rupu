@@ -1220,6 +1220,7 @@ mod tests {
             codename: None,
             cause: None,
             error: None,
+            started_at: None,
         };
         let mut triage = record("triage", StepKind::Panel);
         triage.findings = vec![finding("High"), finding("high"), finding("low")];

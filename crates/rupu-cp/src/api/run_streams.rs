@@ -2790,6 +2790,7 @@ mod tests {
                     codename: None,
                     cause: None,
                     error: None,
+                    started_at: None,
                 },
             )
             .unwrap();

@@ -799,6 +799,7 @@ impl NodeMirror {
             codename: None,
             cause: None,
             error: None,
+            started_at: Some(record.started_at),
         };
         if let Err(e) = self.run_store.append_step_result(&record.id, &row) {
             tracing::warn!(
