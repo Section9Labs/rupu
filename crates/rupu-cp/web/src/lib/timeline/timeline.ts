@@ -67,6 +67,25 @@ export function countAtOrBefore(sorted: readonly TimelineItem[], t: number): num
   return lo;
 }
 
+/** Under reduced motion a replay steps (no sweep): at most this many steps,
+ *  this far apart, each revealing what happened by then (it fades in). */
+export const REDUCED_STEPS = 12;
+export const REDUCED_STEP_MS = 700;
+
+/** The instants a reduced-motion replay shows, in order: the start, then up
+ *  to `max - 1` of the items' times after it (evenly picked when there are
+ *  more), ending on the last; a run with nothing after its start is the
+ *  start alone. */
+export function reducedSteps(times: readonly number[], start: number, end: number, max = REDUCED_STEPS): number[] {
+  const after = [...new Set(times.filter((t) => t > start && t <= end))].sort((a, b) => a - b);
+  if (after.length === 0) return [start];
+  const room = Math.max(1, max - 1);
+  if (after.length <= room) return [start, ...after];
+  const picked: number[] = [];
+  for (let i = 1; i <= room; i++) picked.push(after[Math.round((i * (after.length - 1)) / room)]);
+  return [start, ...new Set(picked)];
+}
+
 /** 40 ms of replay per second of run, clamped to 6-16 s. */
 export function replayDuration(start: number, end: number): number {
   return Math.min(16000, Math.max(6000, ((end - start) / 1000) * 40));

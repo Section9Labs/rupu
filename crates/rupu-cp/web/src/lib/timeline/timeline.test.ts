@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook } from '@testing-library/react';
-import { replayDuration, revealed, timeBounds, type TimelineItem } from './timeline';
+import { REDUCED_STEP_MS, reducedSteps, replayDuration, revealed, timeBounds, type TimelineItem } from './timeline';
 import { useTimeline } from './useTimeline';
 
 const items: TimelineItem[] = [
@@ -27,6 +27,17 @@ describe('timeline', () => {
   it('bounds_survive_a_huge_log', () => {
     const big = Array.from({ length: 100_000 }, (_, k) => ({ key: `k${k}`, at: k, kind: 'message' as const }));
     expect(timeBounds(big, [], null)).toEqual({ start: 0, end: 99_999 });
+  });
+
+  it('reduced_steps_are_the_start_then_what_happened_at_most_max', () => {
+    expect(reducedSteps([1000, 5000, 9000, 5000], 1000, 9000)).toEqual([1000, 5000, 9000]);
+    expect(reducedSteps([], 1000, 9000)).toEqual([1000]);
+    const many = Array.from({ length: 100 }, (_, i) => 1000 + (i + 1) * 10);
+    const steps = reducedSteps(many, 1000, 5000, 12);
+    expect(steps).toHaveLength(12);
+    expect(steps[0]).toBe(1000);
+    expect(steps[steps.length - 1]).toBe(2000);
+    expect([...steps].sort((a, b) => a - b)).toEqual(steps);
   });
 
   it('replay_duration_is_clamped', () => {
@@ -111,11 +122,27 @@ describe('useTimeline', () => {
     expect(result.current.t).toBeNull();
   });
 
-  it('reduced_motion_replay_jumps_to_whole', () => {
-    window.matchMedia = ((q: string) => ({ matches: q.includes('reduce') })) as unknown as typeof window.matchMedia;
-    const { result } = renderHook(() => useTimeline(props));
-    act(() => result.current.replay());
-    expect(result.current.t).toBeNull();
-    expect(result.current.playing).toBe(false);
+  it('reduced_motion_replay_steps_through_the_run', () => {
+    vi.useFakeTimers();
+    try {
+      window.matchMedia = ((q: string) => ({ matches: q.includes('reduce') })) as unknown as typeof window.matchMedia;
+      const { result } = renderHook(() => useTimeline(props));
+      act(() => result.current.replay());
+      // No sweep (no animation frame), but it plays: from the start, one
+      // step at a time through what happened, then back to the whole run.
+      expect(cbs).toHaveLength(0);
+      expect(result.current.playing).toBe(true);
+      const seen = [result.current.t];
+      for (let i = 0; i < 20 && result.current.t !== null; i++) {
+        act(() => vi.advanceTimersByTime(REDUCED_STEP_MS));
+        seen.push(result.current.t);
+      }
+      const { start, end } = timeBounds(items, [], null);
+      expect(seen).toEqual([...reducedSteps(items.map((i) => i.at), start, end), null]);
+      expect(seen.length).toBeGreaterThan(2);
+      expect(result.current.playing).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
