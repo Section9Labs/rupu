@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { api, type MessageStreamFrame, type SpaceMessage } from './api';
+import { api, ApiError, type MessageStreamFrame, type SpaceMessage } from './api';
 import { CAUGHT_UP_QUIET_MS, REMOTE_PAGE_SIZE, useMessageSpace } from './useMessageSpace';
 
 afterEach(() => vi.restoreAllMocks());
@@ -105,5 +105,33 @@ describe('useMessageSpace reads', () => {
     const pages = get.mock.calls.filter((c) => c[2]?.limit !== 1);
     expect(pages).toHaveLength(1);
     expect(pages[0][2]).toMatchObject({ host: 'mini', limit: REMOTE_PAGE_SIZE });
+  });
+});
+
+describe('useMessageSpace by tick', () => {
+  it('a_space_that_appears_later_is_found_on_a_tick', async () => {
+    // The run isn't there yet (a workflow child still starting), then its
+    // space is empty-absent, then present with a message.
+    let state: 'missing' | 'absent' | 'present' = 'missing';
+    vi.spyOn(api, 'getMessages').mockImplementation(async () => {
+      if (state === 'missing') throw new ApiError(404, 'no run', '{"error":"no run `run_1`"}');
+      return {
+        kind: 'ok',
+        view: { participants: [], messages: state === 'present' ? [msg(1)] : [], legacy: false, space: state },
+      };
+    });
+    const { result, rerender } = renderHook(
+      ({ tick }) => useMessageSpace({ route: 'runs', id: 'run_1' }, { live: false, load: true, reading: false, tick }),
+      { initialProps: { tick: 0 as unknown } },
+    );
+    await waitFor(() => expect(result.current.status).toBe('error'));
+    state = 'absent';
+    rerender({ tick: 1 });
+    await waitFor(() => expect(result.current.space).toBe('absent'));
+    state = 'present';
+    rerender({ tick: 2 });
+    await waitFor(() => expect(result.current.space).toBe('present'));
+    await waitFor(() => expect(result.current.log.messages.map((m) => m.id)).toEqual(['msg_1']));
+    expect(result.current.status).toBe('ready');
   });
 });

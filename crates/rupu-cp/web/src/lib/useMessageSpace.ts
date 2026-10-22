@@ -102,6 +102,8 @@ export function useMessageSpace(
   const [caughtUp, setCaughtUp] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [generation, setGeneration] = useState(0);
+  /** Bumped by a tick that finds no space yet: the probe asks again. */
+  const [probeGen, setProbeGen] = useState(0);
   const [pending, setPending] = useState<PendingSend[]>([]);
   const [sendError, setSendError] = useState<string | null>(null);
   const [blocked, setBlocked] = useState<string | null>(null);
@@ -154,7 +156,7 @@ export function useMessageSpace(
       ctl.abort();
       if (timer) clearInterval(timer);
     };
-  }, [route, id, remoteHost, local, live, generation]);
+  }, [route, id, remoteHost, local, live, generation, probeGen]);
 
   const follow = load && space === 'present' && live && local && !legacy;
 
@@ -236,10 +238,18 @@ export function useMessageSpace(
   const readable = load && space === 'present' && !follow;
   const readableRef = useRef(readable);
   readableRef.current = readable;
+  const spaceRef = useRef(space);
+  spaceRef.current = space;
   const tickSeen = useRef(tick);
   useEffect(() => {
     if (Object.is(tickSeen.current, tick)) return;
     tickSeen.current = tick;
+    // No space yet (the run is still starting, or wasn't there when the
+    // probe asked): ask again; once it is there, the paged read follows.
+    if (spaceRef.current !== 'present' && !live) {
+      setProbeGen((g) => g + 1);
+      return;
+    }
     // Before the first read is done, that read brings everything.
     if (!readableRef.current || !loadedRef.current) return;
     const ctl = new AbortController();
@@ -261,7 +271,7 @@ export function useMessageSpace(
       // A failed tick keeps what was read; the next one tries again.
     });
     return () => ctl.abort();
-  }, [tick, route, id, remoteHost, pageSize]);
+  }, [tick, route, id, remoteHost, pageSize, live]);
 
   // A pending send is done when its line is in the log.
   useEffect(() => {
