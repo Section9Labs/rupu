@@ -105,7 +105,7 @@ catalog tools for everything.
 
 ## Operator tools
 
-185 tools over the CP's own endpoints, one per route (`GET /api/tools` and
+188 tools over the CP's own endpoints, one per route (`GET /api/tools` and
 `tools/list` give each tool's full input schema). Each takes the arguments of
 the endpoint it wraps (path parameters, the handler's query struct, the JSON
 body), an optional `host` where the API takes `?host=`, refuses unknown
@@ -117,11 +117,11 @@ gate nothing.
 
 | Area | Tools |
 |---|---|
-| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.usage` `runs.usage_timeline` `runs.source` `runs.ast` `runs.autoflow` `runs.retry` |
+| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.board` `runs.usage` `runs.usage_timeline` `runs.source` `runs.ast` `runs.autoflow` `runs.retry` |
 | Agent runs and transcripts | `agent_runs.list` `agent_runs.continue` `transcripts.get` `transcripts.archive` `transcripts.delete` `events.recent` |
 | Autoflow runs | `autoflow_runs.list` `autoflow_runs.problems` `autoflow_runs.cycles` `autoflow_runs.events` |
 | Sessions and messages | `sessions.list` `sessions.get` `sessions.turns` `sessions.usage_timeline` `sessions.start` `sessions.send` `sessions.archive` `sessions.restore` `sessions.delete` `sessions.stop` `sessions.compact` `messages.list` `messages.send` |
-| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.steer` `agentiflows.run` `agentiflows.stop` `agentiflow_defs.list` `agentiflow_defs.get` `agentiflow_defs.create` `agentiflow_defs.save` `agentiflow_defs.delete` `agentiflow_defs.validate` |
+| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.board` `agentiflows.generated` `agentiflows.steer` `agentiflows.run` `agentiflows.stop` `agentiflow_defs.list` `agentiflow_defs.get` `agentiflow_defs.create` `agentiflow_defs.save` `agentiflow_defs.delete` `agentiflow_defs.validate` |
 | Definitions | `workflows.list` `workflows.get` `workflows.create` `workflows.save` `workflows.delete` `workflows.validate` `workflows.generate` `workflows.run` `workflows.run_yaml` `agents.list` `agents.get` `agents.create` `agents.save` `agents.delete` `agents.generate` `agents.run` `agents.validate` `agents.validate_all` `generate.models` `autoflows.list` `autoflows.get` `autoflows.enable` `autoflows.disable` `autoflows.run` `autoflows.explain` `autoflows.doctor` `autoflows.wakes` `claims.list` `claims.release` `claims.requeue` `claims.repair` `skills.list` `skills.get` `skills.install` `skills.update` `skills.validate` `tools.list` `models.list` `models.refresh` |
 | Findings, coverage, assets | `findings.list` `findings.get` `findings.tags` `findings.tag` `findings.export` `findings.export_many` `findings.artifact` `findings.import` `findings.schema` `coverage.list` `coverage.get` `coverage.audit` `coverage.catalog` `coverage.runs` `coverage.diff` `coverage.templates` `coverage.template` `coverage.gap` `coverage.rerun` `assets.list` `query.fields` `query.check` |
 | Observability | `netflow.run` `netflow.agentiflow` `netflow.project` `netflow.global` `netflow.graph` `netflow.explorer` `netflow.index` `netflow.latest` `usage.get` `usage.timeline` `usage.runs` `usage.outliers` `dashboard.get` |

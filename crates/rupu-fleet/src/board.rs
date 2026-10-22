@@ -1,6 +1,10 @@
 use crate::error::FleetError;
-use crate::types::{BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord, Directive, DirectiveEvent};
-use chrono::Utc;
+use crate::types::{
+    BoardPost, ClaimGuard, ClaimOutcome, ClaimRecord, ClaimState, ClaimView, Directive,
+    DirectiveEvent,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
@@ -57,11 +61,21 @@ impl Board {
         }
         let mut last_holder = String::new();
         for _ in 0..CLAIM_ATTEMPTS {
-            if let Some(token) = self.try_create_claim(&path, owner, ttl)? {
+            if let Some(rec) = self.try_create_claim(&path, key, owner, ttl)? {
+                self.journal_claim(&JournalLine::Claimed {
+                    key: key.to_string(),
+                    owner: owner.to_string(),
+                    token: Some(rec.token.clone()),
+                    at: rec.acquired_at,
+                    lease_expires_at: rec.lease_expires_at,
+                });
                 return Ok(ClaimOutcome::Granted(ClaimGuard {
                     path,
+                    board_root: self.root.clone(),
+                    key: key.to_string(),
+                    owner: owner.to_string(),
                     lock_path: self.reap_lock_path(key),
-                    token,
+                    token: rec.token,
                 }));
             }
             // A lease exists. Inspect it.
@@ -84,15 +98,16 @@ impl Board {
         })
     }
 
-    /// `Ok(Some(token))` if the create succeeded (the token is unique to this
-    /// grant and recorded in the claim file), `Ok(None)` if a lease already
-    /// exists (contention is not an error).
+    /// `Ok(Some(record))` if the create succeeded (the record's token is unique
+    /// to this grant), `Ok(None)` if a lease already exists (contention is not
+    /// an error).
     fn try_create_claim(
         &self,
         path: &Path,
+        key: &str,
         owner: &str,
         ttl: Duration,
-    ) -> Result<Option<String>, FleetError> {
+    ) -> Result<Option<ClaimRecord>, FleetError> {
         let now = Utc::now();
         let expires =
             now + chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(0));
@@ -101,7 +116,8 @@ impl Board {
             owner: owner.to_string(),
             acquired_at: now.to_rfc3339(),
             lease_expires_at: expires.to_rfc3339(),
-            token: token.clone(),
+            token,
+            key: Some(key.to_string()),
         };
         match std::fs::OpenOptions::new()
             .create_new(true)
@@ -114,7 +130,7 @@ impl Board {
                     action: format!("write claim {}", path.display()),
                     source: e,
                 })?;
-                Ok(Some(token))
+                Ok(Some(rec))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(FleetError::Io {
@@ -161,7 +177,12 @@ impl Board {
         if let Some(rec) = read_claim(claim_path)? {
             if is_expired(&rec) {
                 match std::fs::remove_file(claim_path) {
-                    Ok(()) => {}
+                    Ok(()) => self.journal_claim(&JournalLine::Expired {
+                        key: key.to_string(),
+                        owner: rec.owner.clone(),
+                        token: Some(rec.token.clone()).filter(|t| !t.is_empty()),
+                        at: Utc::now().to_rfc3339(),
+                    }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
                         return Err(FleetError::Io {
@@ -173,6 +194,164 @@ impl Board {
             }
         }
         Ok(true)
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.root.join("board").join("claims.jsonl")
+    }
+
+    /// Whether this board keeps a claim journal (a space older than the
+    /// journal has none).
+    pub fn has_journal(&self) -> bool {
+        self.journal_path().exists()
+    }
+
+    /// Append one event to the claim journal under `claims.jsonl.lock`. The
+    /// journal is observability: a failure to write it is logged, never a
+    /// failed claim or release.
+    pub(crate) fn journal_claim(&self, line: &JournalLine) {
+        let path = self.journal_path();
+        if let Err(e) = append_jsonl_locked(&path, line) {
+            tracing::warn!(path = %path.display(), error = %e, "could not journal a claim event");
+        }
+    }
+
+    /// The claims the board has seen, oldest acquisition first: the journal
+    /// folded per key and acquisition, plus any live claim file the journal
+    /// lacks (a board written before the journal) as `Held`. A `Held` claim
+    /// whose lease has passed `now` is reported `Expired`.
+    pub fn claims_view(&self, now: DateTime<Utc>) -> Result<Vec<ClaimView>, FleetError> {
+        let mut views: Vec<ClaimView> = Vec::new();
+        // The grant token of each view, parallel to `views`.
+        let mut tokens: Vec<Option<String>> = Vec::new();
+        let path = self.journal_path();
+        let text = read_log_text(&path)?;
+        // A concurrent append can leave a half-written last line (the journal
+        // is read without its lock): only newline-terminated lines count.
+        let complete = match text.rfind('\n') {
+            Some(i) => &text[..i],
+            None => "",
+        };
+        for (n, line) in complete
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+        {
+            let Ok(line) = serde_json::from_str::<JournalLine>(line) else {
+                tracing::warn!(path = %path.display(), line = n + 1, "skipping an unreadable claim journal line");
+                continue;
+            };
+            match line {
+                JournalLine::Claimed {
+                    key,
+                    owner,
+                    token,
+                    at,
+                    lease_expires_at,
+                } => {
+                    let (Some(acquired_at), expires) =
+                        (parse_time(&at), parse_time(&lease_expires_at))
+                    else {
+                        continue;
+                    };
+                    views.push(ClaimView {
+                        key,
+                        owner,
+                        acquired_at,
+                        lease_expires_at: expires,
+                        ended_at: None,
+                        state: ClaimState::Held,
+                        key_known: true,
+                    });
+                    tokens.push(token);
+                }
+                JournalLine::Released {
+                    key,
+                    owner,
+                    token,
+                    at,
+                } => end_latest(
+                    &mut views,
+                    &tokens,
+                    &key,
+                    &owner,
+                    token.as_deref(),
+                    &at,
+                    ClaimState::Released,
+                ),
+                JournalLine::Expired {
+                    key,
+                    owner,
+                    token,
+                    at,
+                } => end_latest(
+                    &mut views,
+                    &tokens,
+                    &key,
+                    &owner,
+                    token.as_deref(),
+                    &at,
+                    ClaimState::Expired,
+                ),
+            }
+        }
+        // Live claim files the journal does not account for.
+        if let Ok(entries) = std::fs::read_dir(self.claims_dir()) {
+            let mut files: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|x| x == "json"))
+                .collect();
+            files.sort();
+            for file in files {
+                let Some(stem) = file.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let rec = match read_claim(&file) {
+                    Ok(Some(rec)) => rec,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(path = %file.display(), error = %e, "skipping an unreadable claim file");
+                        continue;
+                    }
+                };
+                let Some(acquired_at) = parse_time(&rec.acquired_at) else {
+                    continue;
+                };
+                let key_known = rec.key.is_some();
+                let key = rec.key.clone().unwrap_or_else(|| stem.to_string());
+                let known = views.iter().zip(&tokens).any(|(v, t)| {
+                    v.state == ClaimState::Held
+                        && claim_stem(&v.key) == stem
+                        && match t {
+                            Some(t) if !rec.token.is_empty() => *t == rec.token,
+                            _ => v.owner == rec.owner && v.acquired_at == acquired_at,
+                        }
+                });
+                if !known {
+                    views.push(ClaimView {
+                        key,
+                        owner: rec.owner,
+                        acquired_at,
+                        lease_expires_at: parse_time(&rec.lease_expires_at),
+                        ended_at: None,
+                        state: ClaimState::Held,
+                        key_known,
+                    });
+                }
+            }
+        }
+        for v in &mut views {
+            if v.state == ClaimState::Held {
+                if let Some(expires) = v.lease_expires_at {
+                    if expires <= now {
+                        v.state = ClaimState::Expired;
+                        v.ended_at = Some(expires);
+                    }
+                }
+            }
+        }
+        views.sort_by_key(|v| v.acquired_at);
+        Ok(views)
     }
 
     pub fn claim_holder(&self, key: &str) -> Result<Option<String>, FleetError> {
@@ -223,6 +402,7 @@ impl Board {
             &self.directives_path(),
             &DirectiveEvent::Retract {
                 retract: id.to_string(),
+                at: Some(Utc::now().to_rfc3339()),
             },
         )
     }
@@ -281,7 +461,7 @@ impl Board {
                         slots.push(Some(d));
                     }
                 },
-                DirectiveEvent::Retract { retract } => {
+                DirectiveEvent::Retract { retract, .. } => {
                     if let Some(slot) = slot_of.remove(&retract) {
                         slots[slot] = None;
                     }
@@ -297,6 +477,78 @@ impl Board {
         }
         Ok(slots.into_iter().flatten().collect())
     }
+}
+
+/// One line of the claim journal, `<root>/board/claims.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "ev", rename_all = "snake_case")]
+pub(crate) enum JournalLine {
+    Claimed {
+        key: String,
+        owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        at: String,
+        lease_expires_at: String,
+    },
+    Released {
+        key: String,
+        owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        at: String,
+    },
+    Expired {
+        key: String,
+        owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        at: String,
+    },
+}
+
+fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// End the latest still-held acquisition of `key`: the one with this grant
+/// `token`, or, for a journal line written without one, by `owner`.
+fn end_latest(
+    views: &mut [ClaimView],
+    tokens: &[Option<String>],
+    key: &str,
+    owner: &str,
+    token: Option<&str>,
+    at: &str,
+    state: ClaimState,
+) {
+    let found = views.iter().zip(tokens).rposition(|(v, t)| {
+        v.state == ClaimState::Held
+            && v.key == key
+            && match (token, t) {
+                (Some(want), Some(have)) => want == have,
+                _ => v.owner == owner,
+            }
+    });
+    if let Some(i) = found {
+        views[i].state = state;
+        views[i].ended_at = parse_time(at);
+    }
+}
+
+/// [`append_jsonl`] serialized by a sidecar `<path>.lock` (`flock`).
+fn append_jsonl_locked<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FleetError> {
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+            action: format!("create dir {}", parent.display()),
+            source: e,
+        })?;
+    }
+    let _lock = crate::bus::lock_exclusive(&lock_path)?;
+    append_jsonl(path, value)
 }
 
 /// Whether `id` names a directive. A blank id is "no id": minted over on a put,
@@ -795,7 +1047,8 @@ mod tests {
         assert_eq!(after.len(), 3, "2 directives + 1 retract: {after:?}");
         assert_eq!(after[..2], before[..]);
         let retract: serde_json::Value = serde_json::from_str(&after[2]).unwrap();
-        assert_eq!(retract, serde_json::json!({ "retract": id }));
+        assert_eq!(retract["retract"], id);
+        assert!(retract["at"].is_string());
     }
 
     #[test]
@@ -931,7 +1184,7 @@ mod tests {
         assert!(matches!(&put, DirectiveEvent::Put(d) if d.id == "x"));
         // A retract line is a retract, never a put.
         let retract: DirectiveEvent = serde_json::from_str(r#"{"retract":"x"}"#).unwrap();
-        assert!(matches!(&retract, DirectiveEvent::Retract { retract } if retract == "x"));
+        assert!(matches!(&retract, DirectiveEvent::Retract { retract, .. } if retract == "x"));
         // Neither shape parses as the other: a half-formed line is an error.
         assert!(serde_json::from_str::<DirectiveEvent>(r#"{"id":"x"}"#).is_err());
         assert!(serde_json::from_str::<DirectiveEvent>(r#"{"author":"a"}"#).is_err());
@@ -944,6 +1197,7 @@ mod tests {
         assert!(line.get("retract").is_none());
         let line = serde_json::to_value(DirectiveEvent::Retract {
             retract: "x".into(),
+            at: None,
         })
         .unwrap();
         assert_eq!(line, serde_json::json!({ "retract": "x" }));

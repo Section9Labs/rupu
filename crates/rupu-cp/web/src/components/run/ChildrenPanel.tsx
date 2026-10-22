@@ -5,7 +5,7 @@
 // `?host=`.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, apiErrorMessage, type ChildKind, type RunChild, type RunStatusStr } from '../../lib/api';
+import { api, apiErrorMessage, type ChildKind, type ChildTree, type RunChild, type RunStatusStr } from '../../lib/api';
 import SortableTable, { type Column } from '../lists/SortableTable';
 import { StatusPill } from '../StatusPill';
 import { Badge, type BadgeTone } from '../ui/Badge';
@@ -177,12 +177,13 @@ export default function ChildrenPanel({
   /** Override the source — e.g. an agentiflow's children endpoint. Must be
    *  keyed by `runId`: the load re-runs when `runId` changes, not when this
    *  closure's identity does. */
-  fetchChildren?: (signal: AbortSignal) => Promise<RunChild[]>;
+  fetchChildren?: (signal: AbortSignal) => Promise<ChildTree>;
   /** Called with the number of children after every load. */
   onCount?: (n: number) => void;
 }) {
   const [children, setChildren] = useState<RunChild[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const onCountRef = useRef(onCount);
   onCountRef.current = onCount;
   const fetchRef = useRef(fetchChildren);
@@ -193,12 +194,14 @@ export default function ChildrenPanel({
     let timer: ReturnType<typeof setTimeout> | undefined;
     setChildren(null);
     setError(null);
+    setTruncated(false);
     const load = async () => {
       try {
-        const fetcher = fetchRef.current ?? ((sig: AbortSignal) => api.getRunChildren(runId, sig));
-        const next = await fetcher(controller.signal);
+        const fetcher = fetchRef.current ?? ((sig: AbortSignal) => api.getRunChildTree(runId, sig));
+        const { children: next, truncated: cut } = await fetcher(controller.signal);
         if (controller.signal.aborted) return;
         setChildren(next);
+        setTruncated(cut);
         setError(null);
         onCountRef.current?.(next.length);
         if (next.some(isActive)) timer = setTimeout(load, POLL_MS);
@@ -222,6 +225,11 @@ export default function ChildrenPanel({
   return (
     <div data-testid="children-panel" className="space-y-2">
       {error && <ErrorBanner>{error}</ErrorBanner>}
+      {truncated && (
+        <p className="text-note text-warn" role="status" data-testid="children-truncated">
+          This launch tree is larger than the control plane walks (2000 runs): children beyond that are not listed.
+        </p>
+      )}
       <SortableTable<ChildRow>
         columns={COLUMNS}
         rows={childTree(children)}

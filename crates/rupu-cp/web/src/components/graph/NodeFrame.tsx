@@ -23,6 +23,7 @@ import { useStateCue } from '../../lib/graph/runMotion';
 import { colorChannels } from '../../lib/useThemeColors';
 import { cn } from '../../lib/cn';
 import { runKindAccent, runKindIcon, runKindLabel, type RunKind } from './kindBridge';
+import { MessageCount } from './MessageCount';
 
 export function NodeFrame({
   state,
@@ -32,6 +33,7 @@ export function NodeFrame({
   minHeight,
   testId = 'rg-node',
   live = state === 'running',
+  lit,
   className,
   style,
   children,
@@ -45,6 +47,9 @@ export function NodeFrame({
   testId?: string;
   /** Show the progress line along the foot (a running card). */
   live?: boolean;
+  /** An end of the selected (or hovered) message: ringed like a selection,
+   *  lighter. */
+  lit?: boolean;
   className?: string;
   style?: CSSProperties;
   children: ReactNode;
@@ -54,6 +59,7 @@ export function NodeFrame({
     <div
       data-state={state}
       data-cue={cue ?? undefined}
+      data-lit={lit || undefined}
       className="gx-node gx-s"
       style={{ ['--i' as string]: slot ?? 0, ['--k' as string]: colorChannels(runKindAccent(kind)), width }}
     >
@@ -96,11 +102,14 @@ export function NodeHead({
   name,
   state,
   mono,
+  messages,
   children,
 }: {
   kind: RunKind;
   name: string;
   state: StepState;
+  /** Messages the card sent or received (a badge; none when 0). */
+  messages?: number;
   /** Set the name as a code identifier (an action's tool name). */
   mono?: boolean;
   /** Extras between the name and the capsule (counts, warnings). */
@@ -113,6 +122,7 @@ export function NodeHead({
         {name}
       </span>
       {children}
+      <MessageCount n={messages} />
       <StatusCapsule state={state} />
     </div>
   );

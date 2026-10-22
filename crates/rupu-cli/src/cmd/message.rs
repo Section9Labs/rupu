@@ -482,17 +482,19 @@ pub enum HelperAction {
     },
 }
 
-/// The exit status of a failed `rupu __message`.
+/// The exit status of a failed hidden helper (`rupu __message`, `rupu
+/// __board`).
 const HELPER_FAILED: u8 = 3;
 
-pub fn handle_helper(action: HelperAction) -> ExitCode {
-    let reply = paths::global_dir()
-        .map_err(|e| MessageError::new(MessageErrorCode::Internal, e.to_string()))
-        .and_then(|global| helper(&global, action))
-        .and_then(|json| {
-            serde_json::to_string(&json)
-                .map_err(|e| MessageError::new(MessageErrorCode::Internal, e.to_string()))
-        });
+/// A hidden helper's reply on stdout — the wire contract the SSH connector's
+/// `helper_call` parses: `r`'s JSON and exit 0, or `{"error": {"code",
+/// "message"}}` (`MessageErrorReply`) and exit [`HELPER_FAILED`]. Nothing
+/// else is printed.
+pub(crate) fn emit_helper_reply<T: serde::Serialize>(r: Result<T, MessageError>) -> ExitCode {
+    let reply = r.and_then(|v| {
+        serde_json::to_string(&v)
+            .map_err(|e| MessageError::new(MessageErrorCode::Internal, e.to_string()))
+    });
     match reply {
         Ok(json) => {
             println!("{json}");
@@ -506,6 +508,14 @@ pub fn handle_helper(action: HelperAction) -> ExitCode {
             ExitCode::from(HELPER_FAILED)
         }
     }
+}
+
+pub fn handle_helper(action: HelperAction) -> ExitCode {
+    emit_helper_reply(
+        paths::global_dir()
+            .map_err(|e| MessageError::new(MessageErrorCode::Internal, e.to_string()))
+            .and_then(|global| helper(&global, action)),
+    )
 }
 
 fn helper(global: &Path, action: HelperAction) -> Result<serde_json::Value, MessageError> {

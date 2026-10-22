@@ -10,6 +10,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt as _};
 use rupu_orchestrator::runs::RunStore;
+use rupu_runtime::services::board::BoardView;
 use rupu_runtime::services::operator::{MessagesView, OperatorSendReply, ViewQuery};
 use serde::{Deserialize, Serialize};
 
@@ -447,6 +448,11 @@ pub trait HostConnector: Send + Sync {
         id: &str,
         msg: OperatorMessageRequest,
     ) -> Result<OperatorSendReply, HostConnectorError>;
+
+    /// Run `id`'s board as `GET /api/runs/:id/board` serves it (a `run_…`
+    /// id). A transport with no way to read it is `Unsupported`. No default:
+    /// every transport must say how, or refuse.
+    async fn run_board(&self, id: &str) -> Result<BoardView, HostConnectorError>;
 
     /// Generic GET passthrough: issue `GET {base_url}{path_and_query}` (bearer
     /// token attached) and return the parsed JSON body.
@@ -1646,6 +1652,12 @@ pub(crate) mod testing {
         {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -1766,6 +1778,12 @@ pub(crate) mod testing {
                 _msg: crate::host::connector::OperatorMessageRequest,
             ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
             {
+                Err(HostConnectorError::Unsupported("fake".into()))
+            }
+            async fn run_board(
+                &self,
+                _id: &str,
+            ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
                 Err(HostConnectorError::Unsupported("fake".into()))
             }
             async fn pull_finding_artifact(

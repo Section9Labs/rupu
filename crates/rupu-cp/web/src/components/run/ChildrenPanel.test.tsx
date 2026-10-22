@@ -117,6 +117,27 @@ describe('ChildrenPanel', () => {
     expect(ownSegment('jade-reef/heron#1')).toBe('heron#1');
   });
 
+  it('says in place that children past the walks cap are not listed', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ children: [child({ run_id: 'run_agent', parent_run_id: 'run_root', name: 'scanner' })], truncated: true }),
+          { status: 200 },
+        ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    renderPanel();
+    expect(await screen.findByTestId('children-truncated')).toHaveTextContent(/children beyond that are not listed/);
+    expect(screen.getByTestId('children-panel')).toHaveTextContent('scanner');
+  });
+
+  it('says nothing of a cap when the walk was whole', async () => {
+    stubFetch([child({ run_id: 'run_agent', parent_run_id: 'run_root', name: 'scanner' })]);
+    renderPanel();
+    await screen.findByTestId('children-panel');
+    expect(screen.queryByTestId('children-truncated')).toBeNull();
+  });
+
   it('says so when the run launched none', async () => {
     const onCount = vi.fn();
     stubFetch([]);

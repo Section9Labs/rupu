@@ -129,6 +129,10 @@ pub struct Started {
     /// anything can still continue the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<PathBuf>,
+    /// The agentiflow lead round that launched it (`None`: not launched by
+    /// a lead, or a ledger written before rounds were recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 impl Started {
@@ -160,6 +164,7 @@ impl Started {
             continues: None,
             prior_tokens: None,
             tree: None,
+            round: None,
         }
     }
 }
@@ -181,6 +186,10 @@ pub struct Request {
     pub workflow: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, String>,
+    /// A workflow child dispatched from a file the caller wrote with
+    /// `workflows.generate` (inside its `<children dir>/generated/`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
 }
 
 /// An earlier run of a child.

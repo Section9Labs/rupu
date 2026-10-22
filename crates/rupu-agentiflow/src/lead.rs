@@ -422,6 +422,9 @@ pub struct RunAgentLeadDriver {
     provider: LeadProvider,
     rt: tokio::runtime::Runtime,
     history: Vec<Message>,
+    /// What the latest round itself said (its own assistant text, not the
+    /// carried-over history's); `None` when it said nothing.
+    last_decision: Option<String>,
     /// The skills loaded into `history` (its latest round's), carried into
     /// the next round so its compactions re-attach them.
     loaded_skills: Vec<rupu_agent::LoadedSkill>,
@@ -475,6 +478,7 @@ impl RunAgentLeadDriver {
             provider,
             rt,
             history: Vec::new(),
+            last_decision: None,
             loaded_skills: Vec::new(),
             unseen_messages: Vec::new(),
             skills: None,
@@ -732,7 +736,43 @@ impl RunAgentLeadDriver {
     }
 }
 
+/// The trimmed text of `m` when it is an assistant message that has any.
+fn reply_text(m: &Message) -> Option<String> {
+    use rupu_providers::types::{ContentBlock, Role};
+    if m.role != Role::Assistant {
+        return None;
+    }
+    let text: String = m
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// What a round that ended well said: its last message is its own reply, so
+/// this holds however compaction reshaped the history.
+fn finished_round_decision(messages: &[Message]) -> Option<String> {
+    reply_text(messages.last()?)
+}
+
+/// What a failed round said before it failed. Its history may end on content
+/// carried over from earlier rounds, so only messages past the `carried`
+/// length the round started with count; none when the history no longer
+/// extends past it (compaction rewrote it).
+fn failed_round_decision(messages: &[Message], carried: usize) -> Option<String> {
+    messages.get(carried..)?.iter().rev().find_map(reply_text)
+}
+
 impl LeadDriver for RunAgentLeadDriver {
+    fn last_decision(&self) -> Option<String> {
+        self.last_decision.clone()
+    }
+
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
         if self.skills.is_none() {
             // Once per flow. A failure leaves them unresolved: the round's
@@ -743,6 +783,8 @@ impl LeadDriver for RunAgentLeadDriver {
                 .block_on(assembler.resolve_skills(&self.cfg.agent, &Overrides::default()))
                 .ok();
         }
+        self.last_decision = None;
+        let carried = self.history.len();
         let (spec, pause, ceiling) = self.round_launch(ctx);
 
         let RunExit {
@@ -809,6 +851,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // The conversation carries over whatever the status: a bust or
                 // an errored-but-completed run still holds the round's work.
                 self.total_turns = self.total_turns.saturating_add(run.turns);
+                self.last_decision = finished_round_decision(&run.final_messages);
                 self.history = run.final_messages;
                 self.loaded_skills = loaded_skills;
                 self.unseen_messages = unseen_messages;
@@ -821,6 +864,7 @@ impl LeadDriver for RunAgentLeadDriver {
                 // failed before it loaded the history; adopting that would drop
                 // everything.
                 if !messages.is_empty() {
+                    self.last_decision = failed_round_decision(&messages, carried);
                     self.history = messages;
                     self.loaded_skills = loaded_skills;
                     self.unseen_messages = unseen_messages;
@@ -1117,6 +1161,32 @@ mod tests {
         Box::new(move || -> Box<dyn rupu_providers::LlmProvider> {
             Box::new(MockProvider::new(rounds.next().unwrap_or_default()))
         })
+    }
+
+    #[test]
+    fn a_finished_round_keeps_its_decision_after_compaction_and_a_failed_one_does_not() {
+        let reply = |t: &str| Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        };
+        // Compaction rewrote the history to something shorter than it began.
+        let compacted = vec![Message::user("summary"), reply("  Pivot to auth.  ")];
+        assert_eq!(
+            finished_round_decision(&compacted).as_deref(),
+            Some("Pivot to auth.")
+        );
+        // A finished round ending on a user message said nothing.
+        assert_eq!(
+            finished_round_decision(&[reply("old"), Message::user("x")]),
+            None
+        );
+        // A failed round: carried-over replies are not its own.
+        let carried = vec![Message::user("a"), reply("old")];
+        assert_eq!(failed_round_decision(&carried, 2), None);
+        assert_eq!(failed_round_decision(&compacted, 5), None);
+        let mut grown = carried.clone();
+        grown.push(reply("own"));
+        assert_eq!(failed_round_decision(&grown, 2).as_deref(), Some("own"));
     }
 
     fn text_of(m: &Message) -> String {

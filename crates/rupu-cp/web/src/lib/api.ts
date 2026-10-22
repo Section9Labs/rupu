@@ -740,6 +740,13 @@ export interface AgentIdentityDto {
   model?: string;
 }
 
+/** `GET /api/runs/:id/children` (and the agentiflow's): every child, and
+ *  whether the server's walk stopped at its cap (2000 run directories). */
+export interface ChildTree {
+  children: RunChild[];
+  truncated: boolean;
+}
+
 export interface RunGraphResponse {
   run: RunRecord;
   /** `edges` is the workflow's real DAG (split/join/branch/next/depends_on, or
@@ -960,6 +967,67 @@ export type AgentiflowBudgetState = string;
  *  `run_stopped`) plus kind-specific fields (see `rupu_agentiflow::run`). */
 export type AgentiflowEvent = { ts?: string; kind?: string } & Record<string, unknown>;
 
+/** A `kind: 'round'` event, typed. `started_at`, `decision`, `goals` (the
+ *  assessment the round STARTED from) and `warnings` are absent on runs that
+ *  predate them. */
+export interface AgentiflowRoundEvent {
+  round: number;
+  ts?: string;
+  started_at?: string;
+  decision?: string;
+  goals?: { id: string; met: boolean; current: number }[];
+  warnings?: string[];
+  goals_met: number;
+  goals_total: number;
+  spent_usd: number;
+  spent_tokens: number;
+  outcome: string;
+  error?: string;
+}
+
+/** The `round` events of `events`, in order, as `AgentiflowRoundEvent`s. */
+export function roundEvents(events: AgentiflowEvent[]): AgentiflowRoundEvent[] {
+  return events.filter((e) => e.kind === 'round') as unknown as AgentiflowRoundEvent[];
+}
+
+/** `ClaimView` of `GET …/board`. */
+export interface ClaimView {
+  key: string;
+  key_known: boolean;
+  owner: string;
+  acquired_at: string;
+  lease_expires_at: string | null;
+  ended_at: string | null;
+  state: 'held' | 'released' | 'expired';
+}
+
+/** `DirectiveView` of `GET …/board`. */
+export interface DirectiveView {
+  id: string;
+  author: string;
+  ts: string;
+  body: string;
+  addressed_to: string | null;
+  retracted_at: string | null;
+  retracted: boolean;
+}
+
+export interface BoardView {
+  claims: ClaimView[];
+  directives: DirectiveView[];
+  journal: boolean;
+}
+
+export type BoardResult = { kind: 'ok'; board: BoardView } | MessagesUnavailable;
+
+/** `GET /api/agentiflows/:id/generated/:handle`. */
+export interface GeneratedDefinition {
+  handle: string;
+  name: string;
+  file_name: string;
+  yaml: string;
+}
+
 /** `GET /api/agentiflows/:id`. */
 export interface AgentiflowDetail {
   record: AgentiflowRecord;
@@ -1066,6 +1134,35 @@ async function orUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable>
   } catch (e) {
     const failure = classifyFailure(e);
     if (failure.kind === 'unavailable') return { kind: 'unavailable', reason: failure.reason };
+    throw e;
+  }
+}
+
+/** Why a board can't be shown, said plainly: a control plane without the
+ *  board route (the API's 404 "no API route for …", or a peer's 501 naming
+ *  it) predates it; a route that answers 404 for the run itself (no such
+ *  run, or not yet: a workflow child still starting) says so with its
+ *  reason; a host that can't serve it (501) says so with its reason;
+ *  anything else is a failed read. */
+export function boardUnavailable(e: unknown): MessagesUnavailable {
+  const reason = apiErrorMessage(e);
+  if (e instanceof ApiError && (e.status === 404 || e.status === 501) && /no API route/i.test(reason)) {
+    return { kind: 'unavailable', reason: "This control plane can't show the board (it predates the board API)." };
+  }
+  if (e instanceof ApiError && e.status === 404) {
+    return { kind: 'unavailable', reason: `No board to show: ${reason}` };
+  }
+  if (e instanceof ApiError && e.status === 501) {
+    return { kind: 'unavailable', reason: `This host can't show the board: ${reason}` };
+  }
+  return { kind: 'unavailable', reason: `Couldn't read the board: ${reason}` };
+}
+
+async function orBoardUnavailable<T>(p: Promise<T>): Promise<T | MessagesUnavailable> {
+  try {
+    return await p;
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 501)) return boardUnavailable(e);
     throw e;
   }
 }
@@ -1893,6 +1990,11 @@ export interface RunChild {
   finished_at: string | null;
   transcript_path: string | null;
   legacy: boolean;
+  /** The agentiflow round that launched it; absent when unknown. */
+  round?: number;
+  /** A workflow the lead generated (its YAML is at `…/generated/:handle`). */
+  generated?: boolean;
+  output_excerpt?: string;
 }
 
 export interface SessionSummary {
@@ -3188,21 +3290,56 @@ export const api = {
   /** Every child a LOCAL run launched, in launch order per parent. There is
    *  no `?host=`: the endpoint reads this CP's run store only. */
   async getRunChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
-    const res = await request<{ children: RunChild[] }>(
+    return (await api.getRunChildTree(id, signal)).children;
+  },
+  /** `getRunChildren` with the walk's `truncated` flag (past the server's
+   *  cap the children of the runs it didn't reach are missing). */
+  async getRunChildTree(id: string, signal?: AbortSignal): Promise<ChildTree> {
+    const res = await request<{ children: RunChild[]; truncated?: boolean }>(
       `/api/runs/${encodeURIComponent(id)}/children`,
       { signal },
     );
-    return res.children;
+    return { children: res.children, truncated: res.truncated === true };
   },
   /** Every child under a LOCAL agentiflow: the units its lead launched and,
    *  under each unit that is a `rupu run`, that run's own launch tree. Same
    *  shape as `getRunChildren`; no `?host=`. */
   async getAgentiflowChildren(id: string, signal?: AbortSignal): Promise<RunChild[]> {
-    const res = await request<{ children: RunChild[] }>(
+    return (await api.getAgentiflowChildTree(id, signal)).children;
+  },
+  /** `getAgentiflowChildren` with the walk's `truncated` flag: past its cap
+   *  (2000 run directories) the children of the runs it didn't reach are
+   *  missing, and a view drawing the tree says so. */
+  async getAgentiflowChildTree(id: string, signal?: AbortSignal): Promise<ChildTree> {
+    const res = await request<{ children: RunChild[]; truncated?: boolean }>(
       `/api/agentiflows/${encodeURIComponent(id)}/children`,
       { signal },
     );
-    return res.children;
+    return { children: res.children, truncated: res.truncated === true };
+  },
+  /** A LOCAL agentiflow's board: claims and directives. 501 = unavailable. */
+  getAgentiflowBoard(id: string, opts?: Cancellable): Promise<BoardResult> {
+    return orBoardUnavailable(
+      request<BoardView>(`/api/agentiflows/${encodeURIComponent(id)}/board`, { signal: opts?.signal }).then(
+        (board) => ({ kind: 'ok' as const, board }),
+      ),
+    );
+  },
+  /** A run's board, here or on `host`; a host that can't serve it is `unavailable`. */
+  getRunBoard(id: string, opts?: { host?: string } & Cancellable): Promise<BoardResult> {
+    const qs = opts?.host ? `?host=${encodeURIComponent(opts.host)}` : '';
+    return orBoardUnavailable(
+      request<BoardView>(`/api/runs/${encodeURIComponent(id)}/board${qs}`, { signal: opts?.signal }).then(
+        (board) => ({ kind: 'ok' as const, board }),
+      ),
+    );
+  },
+  /** The YAML of a workflow the agentiflow's lead generated (404 if `handle` isn't one). */
+  getAgentiflowGenerated(id: string, handle: string, opts?: Cancellable): Promise<GeneratedDefinition> {
+    return request<GeneratedDefinition>(
+      `/api/agentiflows/${encodeURIComponent(id)}/generated/${encodeURIComponent(handle)}`,
+      { signal: opts?.signal },
+    );
   },
   /** One unit's final answer, fetched on demand — the units list omits it
    *  (it can be multi-KB / a whole transcript read). `null` = no answer. */
@@ -3863,6 +4000,57 @@ export const api = {
     es.onmessage = (m) => onEvent(JSON.parse(m.data) as RunEvent);
     recheckAfterEnd(es, onError);
     return () => es.close();
+  },
+
+  /**
+   * A local run's events so far, read once from its log stream: the stream
+   * replays the whole log first, so it is closed once it has been quiet for
+   * `quietMs` after opening (or its last frame), when it ends, or after
+   * `maxMs`. Holds no connection after it resolves — for a view that follows
+   * the run through the shared firehose instead of a stream of its own.
+   * Rejects only when the stream fails before delivering anything.
+   */
+  readRunLog(id: string, opts?: { quietMs?: number; maxMs?: number; signal?: AbortSignal }): Promise<RunEvent[]> {
+    const quietMs = opts?.quietMs ?? 400;
+    const maxMs = opts?.maxMs ?? 10_000;
+    return new Promise((resolve, reject) => {
+      const events: RunEvent[] = [];
+      const es = new EventSource(`/api/runs/${encodeURIComponent(id)}/log`);
+      let quiet: ReturnType<typeof setTimeout> | null = null;
+      const cap = setTimeout(() => done(), maxMs);
+      const close = () => {
+        es.close();
+        if (quiet) clearTimeout(quiet);
+        clearTimeout(cap);
+        opts?.signal?.removeEventListener('abort', onAbort);
+      };
+      const done = () => {
+        close();
+        resolve(events);
+      };
+      const onAbort = () => {
+        close();
+        reject(new DOMException('aborted', 'AbortError'));
+      };
+      const settle = () => {
+        if (quiet) clearTimeout(quiet);
+        quiet = setTimeout(done, quietMs);
+      };
+      opts?.signal?.addEventListener('abort', onAbort);
+      es.onopen = settle;
+      es.onmessage = (m) => {
+        events.push(JSON.parse(m.data) as RunEvent);
+        settle();
+      };
+      es.addEventListener('end', done);
+      es.onerror = () => {
+        if (events.length > 0) done();
+        else {
+          close();
+          reject(new Error(`couldn't read run ${id}'s events`));
+        }
+      };
+    });
   },
 
   /**

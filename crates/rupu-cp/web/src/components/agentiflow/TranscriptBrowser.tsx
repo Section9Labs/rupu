@@ -82,7 +82,7 @@ function StatusDot({ state, mode }: { state: DotState; mode: Mode }) {
   return <span className={cn('ml-auto h-1.5 w-1.5 shrink-0 rounded-full', state === 'running' && 'animate-pulse')} style={{ background: dotColor(state, mode) }} aria-label={state} />;
 }
 
-// --- round bucketing (mirrors AgentiflowGraph) -----------------------------
+// --- round bucketing: a unit belongs to the first round that ended after it started
 
 interface Buckets {
   leadByRound: Map<number, string>;

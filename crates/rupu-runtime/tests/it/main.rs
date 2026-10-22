@@ -15,6 +15,7 @@
 mod anthropic_prompt_cache;
 mod assembly;
 mod assembly_skills;
+mod board;
 mod gemini_code_assist_project;
 mod hop_builder;
 mod model_limits;

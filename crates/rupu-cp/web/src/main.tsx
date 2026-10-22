@@ -4,7 +4,6 @@ import App from './App';
 import { ThemeProvider } from './components/theme/ThemeProvider';
 import './styles.css';
 import './styles/graph-motion.css';
-import './styles/agentiflow-flow.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

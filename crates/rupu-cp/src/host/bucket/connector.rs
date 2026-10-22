@@ -495,6 +495,14 @@ impl HostConnector for BucketHostConnector {
         Err(crate::host::messages::no_message_transport("bucket"))
     }
 
+    /// A bucket carries no boards.
+    async fn run_board(
+        &self,
+        _id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        Err(crate::host::messages::no_board_transport("bucket"))
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,

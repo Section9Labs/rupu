@@ -27,7 +27,8 @@ pub use participants::{
     Member, Participant, ParticipantEvent, Resolution, Roster, Sender, Undeliverable,
 };
 pub use types::{
-    BoardPost, ClaimGuard, ClaimOutcome, Directive, DirectiveEvent, FleetMessage, PostKind,
+    BoardPost, ClaimGuard, ClaimOutcome, ClaimState, ClaimView, Directive, DirectiveEvent,
+    FleetMessage, PostKind,
 };
 
 #[cfg(test)]

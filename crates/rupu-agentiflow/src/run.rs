@@ -332,7 +332,11 @@ fn pool_workflow_ids(spec: &WorkflowsSpec, catalog: &dyn rupu_tools::CatalogPort
 /// ending, so its `finish` does nothing — units dispatched in one round are
 /// joined in a later one. The flow stops the unjoined ones when it winds
 /// down ([`run_agentiflow`]).
-struct AcrossRounds(Arc<rupu_launch::RunLauncher>);
+struct AcrossRounds {
+    launcher: Arc<rupu_launch::RunLauncher>,
+    /// The lead's current round; each child's `started` line records it.
+    round: Arc<AtomicU32>,
+}
 
 #[async_trait::async_trait]
 impl rupu_tools::Launcher for AcrossRounds {
@@ -341,7 +345,7 @@ impl rupu_tools::Launcher for AcrossRounds {
         req: &rupu_tools::ChildRequest,
         from: &rupu_tools::ToolContext,
     ) -> Result<(), rupu_tools::LaunchError> {
-        self.0.check(req, from).await
+        self.launcher.check(req, from).await
     }
 
     async fn launch(
@@ -349,7 +353,9 @@ impl rupu_tools::Launcher for AcrossRounds {
         req: rupu_tools::ChildRequest,
         from: &rupu_tools::ToolContext,
     ) -> Result<rupu_tools::ChildHandle, rupu_tools::LaunchError> {
-        self.0.launch(req, from).await
+        self.launcher
+            .launch_in_round(req, from, Some(self.round.load(Ordering::Relaxed)))
+            .await
     }
 
     async fn join(
@@ -359,13 +365,13 @@ impl rupu_tools::Launcher for AcrossRounds {
         timeout: std::time::Duration,
         until: rupu_tools::Until,
     ) -> Vec<rupu_tools::ChildStatus> {
-        self.0.join(from, which, timeout, until).await
+        self.launcher.join(from, which, timeout, until).await
     }
 
     async fn finish(&self, _from: &rupu_tools::RunIdentity, _how: rupu_tools::ParentEnd) {}
 
     fn children(&self, from: &rupu_tools::RunIdentity) -> Vec<rupu_tools::ChildStatus> {
-        self.0.children(from)
+        self.launcher.children(from)
     }
 }
 
@@ -509,6 +515,27 @@ impl Spend {
     }
 }
 
+/// Most characters of a lead's decision kept on a `round` event.
+const DECISION_CAP: usize = 600;
+
+/// `text` trimmed and capped at [`DECISION_CAP`] characters: cut on a char
+/// boundary at the last whitespace before the cap (or at the cap when there is
+/// none), with `…` appended when anything was cut.
+pub fn decision_excerpt(text: &str) -> String {
+    let text = text.trim();
+    let Some((cap, _)) = text.char_indices().nth(DECISION_CAP) else {
+        return text.to_string();
+    };
+    let head = &text[..cap];
+    // A cap that falls exactly before whitespace already ends on a word.
+    let cut = if text[cap..].starts_with(char::is_whitespace) {
+        head
+    } else {
+        head.rfind(char::is_whitespace).map_or(head, |i| &head[..i])
+    };
+    format!("{}\u{2026}", cut.trim_end())
+}
+
 /// Wraps the real lead driver to write a `round` event, and refresh the
 /// record's spend, as each round ends. The envelope owns the round loop and
 /// has no hook of its own, so both are recorded at the one seam every round
@@ -532,6 +559,7 @@ struct RecordingLead<'a> {
 impl LeadDriver for RecordingLead<'_> {
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome {
         self.round.store(ctx.round, Ordering::Relaxed);
+        let started_at = (self.now)();
         let out = self.inner.run_round(ctx);
         let d = &ctx.digest;
         let (outcome, error) = match &out {
@@ -550,7 +578,26 @@ impl LeadDriver for RecordingLead<'_> {
             "outcome": outcome,
             "spent_usd": spend.usd,
             "spent_tokens": spend.tokens,
+            "started_at": started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            // The assessment this round started from; the round's own result
+            // is read from the next round's `goals` (or the record's).
+            "goals": d.goals.iter().map(|g| json!({
+                "id": g.id,
+                "met": g.met,
+                "current": g.current,
+            })).collect::<Vec<_>>(),
         });
+        if let Some(obj) = fields.as_object_mut() {
+            if let Some(decision) = self.inner.last_decision() {
+                obj.insert(
+                    "decision".into(),
+                    Value::String(decision_excerpt(&decision)),
+                );
+            }
+            if !d.warnings.is_empty() {
+                obj.insert("warnings".into(), json!(d.warnings));
+            }
+        }
         if let (Some(e), Some(obj)) = (error, fields.as_object_mut()) {
             obj.insert("error".into(), Value::String(e.to_string()));
         }
@@ -900,7 +947,10 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                 project: project.clone(),
             });
             let lead_launcher: Arc<dyn rupu_tools::Launcher> =
-                Arc::new(AcrossRounds(Arc::clone(&launcher)));
+                Arc::new(AcrossRounds {
+                    launcher: Arc::clone(&launcher),
+                    round: Arc::clone(&round),
+                });
             let workflow_generator = generation
                 .is_some()
                 .then(|| Arc::clone(&launcher) as Arc<dyn rupu_tools::WorkflowGenerator>);

@@ -1,0 +1,265 @@
+// The run graph's message and board layer on its canvas (RunGraph's
+// `overlay`, spec `2026-10-21-rupu-agentiflow-flow-design.md` goal 6): the
+// board rail a gutter right of the cards and the messages as arcs between
+// the cards (the operator's, an off-map address's and a dead end as short
+// stubs at the card they touch), routed by `flowEdges` over a run router.
+// The rail and arcs are the agentiflow map's own components (flowmap/).
+
+import { useCallback, useMemo, useState } from 'react';
+import { Handle, Position, type Edge, type Node, type NodeMouseHandler } from '@xyflow/react';
+import type { RunGraphModel } from '../../lib/runGraphModel';
+import type { Pos } from '../../lib/graphLayout';
+import type { Size } from '../../lib/graph/measured';
+import { KIND_FILTERS, type KindFilter } from '../../lib/messages';
+import {
+  BOARD,
+  isDeadEnd,
+  isOutside,
+  showsUnit,
+  splitUnit,
+  type BoardSource,
+  type FlowMessage,
+} from '../../lib/flow/flowModel';
+import {
+  RAIL,
+  RAIL_LIMIT,
+  boardAnchors,
+  boardKey,
+  claimMessages,
+  messageArcs,
+  messageCounts,
+  railWindow,
+  unitHandle,
+  withUnit,
+  type Anchor,
+  type RailSection,
+  type Router,
+} from '../../lib/flow/flowEdges';
+import { boardAt, RUN_SPACE } from '../../lib/flow/runLayer';
+import { useArrivals } from '../../lib/flow/useArrivals';
+import { useStableList } from '../../lib/flow/useStableList';
+import type { MessageFlowEdge } from '../flowmap/MessageEdge';
+
+const sameId = (a: FlowMessage, b: FlowMessage) => a.id === b.id;
+/** An arc between two unit squares of one card. */
+export const unitLoop = (a: { source: string; target: string; sourceUnit?: number; targetUnit?: number }) =>
+  a.source === a.target && a.sourceUnit != null && a.targetUnit != null;
+const ALL_KINDS: ReadonlySet<KindFilter> = new Set(KIND_FILTERS.map((k) => k.key));
+/** The rail sits this far right of the rightmost card: one wide gutter, so
+ *  board arcs stay short. */
+export const RUN_RAIL_GAP = 64;
+
+/** The run's message and board layer (RunDetail, when the run has a space). */
+export interface RunGraphOverlay {
+  /** The run's messages, endpoints on step ids (`buildRunLayer`). */
+  messages: FlowMessage[];
+  /** The run's board; the unavailable shape says why there is none. */
+  board: BoardSource | null;
+  /** Each claim owner's (and directive author's) card, by address. */
+  writers?: ReadonlyMap<string, string>;
+  /** What the replay has revealed (step ids, message ids, board item keys);
+   *  `null` = the whole run, as today. */
+  revealed: Set<string> | null;
+  selected?: string | null;
+  onSelect?(id: string | null): void;
+  /** The space's log was read whole: messages landing after this travel. */
+  caughtUp?: boolean;
+  /** While the replay shows a time: the newest revealed step, which the
+   *  camera follows. */
+  follow?: string | null;
+}
+
+/** The run graph's arc router: a message endpoint is its step's card (a
+ *  step not yet revealed is not drawn), a fan-out unit's square on it, or
+ *  its item on the board rail; the operator, an address off the map and a
+ *  dead end are no card (stubs). */
+function runRouter(visible: ReadonlySet<string>, model: RunGraphModel): Router {
+  const shows = (card: string, unit: number) => showsUnit(model.nodeById(card), unit);
+  const anchorOf = (endpoint: string, m: FlowMessage): Anchor | null => {
+    const { card, unit } = splitUnit(endpoint);
+    if (unit !== null) return withUnit(anchorOf(card, m), card, unit, shows);
+    if (isOutside(endpoint) || isDeadEnd(endpoint)) return null;
+    if (endpoint === BOARD) return { node: RAIL, handle: boardKey(m) };
+    return visible.has(endpoint) ? { node: endpoint } : null;
+  };
+  return {
+    anchorOf,
+    endsOf: (m) => [m.from, ...m.to].map((e) => anchorOf(e, m)?.node).filter((x): x is string => !!x),
+    roundOfNode: () => undefined,
+  };
+}
+
+export interface RunLayerCanvas {
+  nodes: Node[];
+  edges: Edge[];
+  onEnter: NodeMouseHandler;
+  onLeave: NodeMouseHandler;
+  /** Each step card's message count (the messages revealed now). */
+  counts: ReadonlyMap<string, number>;
+  /** The cards the selected message touches: lit. */
+  lit: ReadonlySet<string>;
+  /** The messages revealed now. */
+  shown: number;
+}
+
+const NO_LIT: ReadonlySet<string> = new Set();
+
+/** The layer on the canvas: the rail, the entries and the message arcs. */
+export function useRunLayerCanvas(
+  overlay: RunGraphOverlay | undefined,
+  model: RunGraphModel,
+  positions: Map<string, Pos>,
+  measured: ReadonlyMap<string, Size>,
+  focus: string | null,
+): RunLayerCanvas | null {
+  const [hover, setHover] = useState<string | null>(null);
+  const onEnter = useCallback<NodeMouseHandler>((_e, n) => setHover(n.id), []);
+  const onLeave = useCallback<NodeMouseHandler>(() => setHover(null), []);
+  const revealed = overlay?.revealed ?? null;
+  const isShown = useCallback((key: string) => revealed === null || revealed.has(key), [revealed]);
+
+  const messages = overlay?.messages;
+  const shown = useMemo(() => (messages ?? []).filter((m) => isShown(m.id)), [messages, isShown]);
+  const arrivals = useArrivals(shown, overlay?.caughtUp ? RUN_SPACE : '');
+
+  const board = overlay?.board ?? null;
+  const railView = useMemo(() => boardAt(board, revealed), [board, revealed]);
+  // Rebuilt with the shown messages; kept while its posts are the same ones.
+  const posts = useStableList(
+    useMemo(() => shown.filter((m) => m.kind === 'post' || m.kind === 'mention'), [shown]),
+    sameId,
+  );
+  const [railOpen, setRailOpen] = useState<ReadonlySet<RailSection>>(() => new Set());
+  const onOpen = useCallback((_node: string, section: RailSection, open: boolean) => {
+    setRailOpen((cur) => {
+      const next = new Set(cur);
+      if (open) next.add(section);
+      else next.delete(section);
+      return next;
+    });
+  }, []);
+  const anchors = useMemo(
+    () => new Map(boardAnchors(RAIL, railWindow(railView, posts, railOpen, RAIL_LIMIT))),
+    [railView, posts, railOpen],
+  );
+  const writers = overlay?.writers;
+  const claims = useMemo(
+    () =>
+      claimMessages(
+        RUN_SPACE,
+        railView,
+        writers ?? new Map(),
+        (messages ?? []).every((m) => m.atRest),
+      ),
+    [railView, writers, messages],
+  );
+
+  const visible = useMemo(() => {
+    const v = new Set<string>([RAIL]);
+    for (const n of model.nodes) if (isShown(n.id)) v.add(n.id);
+    return v;
+  }, [model, isShown]);
+  const router = useMemo(() => runRouter(visible, model), [visible, model]);
+  const counts = useMemo(() => messageCounts(shown, router), [shown, router]);
+
+  const selected = overlay?.selected ?? null;
+  const lit = useMemo(() => {
+    const m = selected ? shown.find((x) => x.id === selected) : undefined;
+    return m ? new Set(router.endsOf(m)) : NO_LIT;
+  }, [selected, shown, router]);
+  const onSelect = overlay?.onSelect;
+  const select = useCallback((id: string) => onSelect?.(id), [onSelect]);
+  const anchor = useCallback(
+    (key: string) => <Handle key={`a:${key}`} id={key} type="target" position={Position.Left} className="afx-anchor" />,
+    [],
+  );
+
+  // The rail right of every card.
+  const box = useMemo(() => {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const p of positions.values()) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + p.width);
+      maxY = Math.max(maxY, p.y + p.height);
+    }
+    return minX === Infinity ? { minX: 0, minY: 0, maxX: 0, maxY: 0 } : { minX, minY, maxX, maxY };
+  }, [positions]);
+
+  const on = !!overlay;
+  const nodes = useMemo<Node[]>(() => {
+    if (!on) return [];
+    return [
+      {
+        id: RAIL,
+        type: 'rail',
+        position: { x: box.maxX + RUN_RAIL_GAP, y: box.minY },
+        draggable: false,
+        selectable: false,
+        measured: measured.get(RAIL),
+        data: { view: railView, posts, open: railOpen, onOpen, onSelect: select, anchor },
+      },
+    ];
+  }, [on, box, measured, railView, posts, railOpen, onOpen, select, anchor]);
+
+  const arcs = useMemo(
+    () =>
+      messageArcs([...shown, ...claims], router, {
+        kinds: ALL_KINDS,
+        participant: null,
+        focus,
+        hover,
+        selected,
+        anchors,
+        arriving: arrivals,
+      }),
+    [shown, claims, router, focus, hover, selected, anchors, arrivals],
+  );
+  const claimIds = useMemo(() => new Set(claims.map((c) => c.id)), [claims]);
+  // The step cards an arc keeps clear of.
+  const obstacles = useMemo(() => [...positions.values()], [positions]);
+  // The selected message's body shows on its first arc.
+  const tipArc = useMemo(() => arcs.find((a) => a.message.id === selected)?.id ?? null, [arcs, selected]);
+  const edges = useMemo<Edge[]>(
+    () =>
+      arcs.map(
+        (a) =>
+          ({
+            id: a.id,
+            source: a.source,
+            target: a.target,
+            sourceHandle: a.sourceUnit != null ? unitHandle(a.sourceUnit) : undefined,
+            targetHandle: a.targetHandle ?? (a.targetUnit != null ? unitHandle(a.targetUnit) : undefined),
+            type: 'message',
+            // Under the cards at rest; a lit arc, or one between the unit
+            // squares of one card (drawn over it), lifts over them.
+            zIndex: a.highlighted || unitLoop(a) ? 20 : 0,
+            data: {
+              message: a.message,
+              highlighted: a.highlighted,
+              arriving: arrivals.has(a.message.id),
+              onSelect: claimIds.has(a.message.id) ? undefined : select,
+              from: positions.get(a.source),
+              to: a.targetHandle ? undefined : positions.get(a.target),
+              obstacles,
+              stub: a.stub,
+              label: a.label,
+              dead: a.dead,
+              fromUnit: a.sourceUnit != null || undefined,
+              toUnit: a.targetUnit != null || undefined,
+              tip: a.id === tipArc || undefined,
+            },
+          }) satisfies MessageFlowEdge,
+      ),
+    [arcs, arrivals, claimIds, select, positions, obstacles, tipArc],
+  );
+
+  const shownCount = shown.length;
+  return useMemo(
+    () => (on ? { nodes, edges, onEnter, onLeave, counts, lit, shown: shownCount } : null),
+    [on, nodes, edges, onEnter, onLeave, counts, lit, shownCount],
+  );
+}

@@ -3,13 +3,14 @@
 //   no units yet  the card with a line saying where the fan-out stands;
 //   N ≤ 12        a grid of unit cells, each a button selecting that unit's
 //                 transcript, its glyph morphing as the unit runs and lands
-//                 (a landing cell pops once);
+//                 (a landing cell pops once); each carries a hidden handle
+//                 (`unit:<index>`) a message arc to or from that unit ends on;
 //   N > 12        a summary card: done / total, the percentage, a progress
 //                 bar, the counts by state, a density preview of the first 60
 //                 units, and "expand all" opening the unit browser.
 
 import { memo } from 'react';
-import type { NodeProps, Node } from '@xyflow/react';
+import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { GraphNode, UnitView } from '../../lib/runGraphModel';
 import { stateStyle } from './stepStyle';
 import { useThemeColors } from '../../lib/useThemeColors';
@@ -28,6 +29,10 @@ export interface FanoutNodeData extends Record<string, unknown> {
   onExpandFanout?: (stepId: string) => void;
   /** Entrance slot (see `useEntranceSlots`). */
   slot?: number;
+  /** Messages the step's agents sent or received (the run's message layer). */
+  messages?: number;
+  /** An end of the selected (or hovered) message. */
+  lit?: boolean;
 }
 
 type FanoutFlowNode = Node<FanoutNodeData, 'fanout'>;
@@ -72,17 +77,24 @@ function unitTitle(node: GraphNode, u: UnitView, stateLabel: string): string {
 function UnitCell({ node, unit, onOpen }: { node: GraphNode; unit: UnitView; onOpen?: () => void }) {
   const colors = useThemeColors();
   const { cue } = useStateCue(unit.state);
+  // The grid cell holds the button and, beside it (a handle is a div, which
+  // a button may not contain), the points a message arc to or from this
+  // unit ends on (the run's message layer).
   return (
-    <button
-      type="button"
-      data-state={unit.state}
-      data-cue={cue ?? undefined}
-      title={unitTitle(node, unit, stateStyle(colors, unit.state).label)}
-      onClick={onOpen}
-      className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
-    >
-      <StatusGlyph state={unit.state} />
-    </button>
+    <span className="gx-cell-slot">
+      <button
+        type="button"
+        data-state={unit.state}
+        data-cue={cue ?? undefined}
+        title={unitTitle(node, unit, stateStyle(colors, unit.state).label)}
+        onClick={onOpen}
+        className={cn('gx-cell gx-s nodrag', unit.warnings?.length && 'ring-warn')}
+      >
+        <StatusGlyph state={unit.state} />
+      </button>
+      <Handle type="source" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
+      <Handle type="target" id={`unit:${unit.index}`} position={Position.Top} className="gx-unit-port" isConnectable={false} />
+    </span>
   );
 }
 
@@ -94,6 +106,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
     state: node.state,
     kind: node.kind,
     slot: data.slot,
+    lit: data.lit,
     width: box.width,
     minHeight: box.height,
   } as const;
@@ -113,7 +126,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
               : 'awaiting units…';
     return (
       <NodeFrame {...frame} testId="rg-container">
-        <NodeHead kind={node.kind} name={node.id} state={node.state}>
+        <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
           <WarnMark warnings={node.warnings} />
         </NodeHead>
         <div key={message} className="gx-body gx-sub gx-swap">
@@ -133,7 +146,7 @@ function FanoutNodeView({ data }: NodeProps<FanoutFlowNode>) {
 
   // The summary card says done / total in its body; the grid says it here.
   const head = (count: boolean) => (
-    <NodeHead kind={node.kind} name={node.id} state={node.state}>
+    <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
       <WarnMark warnings={node.warnings} />
       {count && (
         <span className="gx-count" aria-label={`${done} of ${total} done`}>

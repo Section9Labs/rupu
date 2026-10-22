@@ -506,6 +506,19 @@ impl HostConnector for LocalHostConnector {
         .await
     }
 
+    async fn run_board(
+        &self,
+        id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        let global = self.global_dir.clone();
+        let id = id.to_string();
+        blocking_host(move || {
+            crate::api::board::local_run_board(&global, &id)
+                .map_err(|e| messages::connector_error(e, HostConnectorError::Internal))
+        })
+        .await
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         self.stream_run_events_after(run_id, 0).await
     }

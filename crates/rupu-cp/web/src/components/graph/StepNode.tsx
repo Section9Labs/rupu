@@ -16,6 +16,10 @@ export interface StepNodeData extends Record<string, unknown> {
   node: GraphNode;
   /** Entrance slot (see `useEntranceSlots`). */
   slot?: number;
+  /** Messages the step's agents sent or received (the run's message layer). */
+  messages?: number;
+  /** An end of the selected (or hovered) message. */
+  lit?: boolean;
 }
 
 type StepFlowNode = Node<StepNodeData, 'step'>;
@@ -24,8 +28,15 @@ function StepNodeView({ data }: NodeProps<StepFlowNode>) {
   const { node } = data;
   const box = nodeSize(node);
   return (
-    <NodeFrame state={node.state} kind={node.kind} slot={data.slot} width={box.width} minHeight={box.height}>
-      <NodeHead kind={node.kind} name={node.id} state={node.state}>
+    <NodeFrame
+      state={node.state}
+      kind={node.kind}
+      slot={data.slot}
+      lit={data.lit}
+      width={box.width}
+      minHeight={box.height}
+    >
+      <NodeHead kind={node.kind} name={node.id} state={node.state} messages={data.messages}>
         <WarnMark warnings={node.warnings} />
       </NodeHead>
       <AgentIdentity

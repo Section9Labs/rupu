@@ -10,6 +10,13 @@ import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
 import { agentiflowsApi } from '../lib/api3b/agentiflows';
 
+// The Flow tab's map has its own tests (components/flowmap); its canvas
+// can't mount under jsdom.
+vi.mock('../components/flowmap/FlowMap', () => ({
+  __esModule: true,
+  default: ({ running }: { running: boolean }) => <div data-testid="flow-map" data-running={String(running)} />,
+}));
+
 vi.mock('../components/TranscriptPanel', () => ({
   __esModule: true,
   default: () => <div data-testid="transcript-panel" />,

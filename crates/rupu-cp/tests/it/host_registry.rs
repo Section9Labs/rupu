@@ -113,6 +113,12 @@ impl HostConnector for StubLocal {
     ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError> {
         Err(HostConnectorError::Unsupported("test double".into()))
     }
+    async fn run_board(
+        &self,
+        _id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        Err(HostConnectorError::Unsupported("test double".into()))
+    }
     async fn pull_finding_artifact(
         &self,
         _sha256: &str,
