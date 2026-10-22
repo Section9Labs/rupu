@@ -208,7 +208,8 @@ export function useFlowData(
   function followFrame(f: string, live: boolean): () => void {
     const ctl = new AbortController();
     let graph: RunGraphResponse | null = null;
-    const events: RunEvent[] = [];
+    const log = eventWindow(FRAME_MAX_EVENTS);
+    const events = log.events;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let signature = '';
     const rebuild = () => {
@@ -248,12 +249,10 @@ export function useFlowData(
       },
     );
     const push = (ev: RunEvent) => {
-      events.push(ev);
-      if (events.length > FRAME_MAX_EVENTS) events.splice(0, events.length - FRAME_MAX_EVENTS);
-      if (!timer) timer = setTimeout(rebuild, FRAME_FLUSH_MS);
+      if (log.add(ev) && !timer) timer = setTimeout(rebuild, FRAME_FLUSH_MS);
     };
     // Live: the firehose's lines for this run, held until the log's replay
-    // is in (a line in both is kept once).
+    // is in, so the replay's order comes first.
     let held: RunEvent[] | null = live ? [] : null;
     const unsubscribe = live
       ? api.subscribeEvents((ev) => {
@@ -266,8 +265,7 @@ export function useFlowData(
       api.readRunLog(f, { signal: ctl.signal }).then(
         (history) => {
           if (ctl.signal.aborted) return;
-          const replayed = new Set(history.map((e) => JSON.stringify(e)));
-          const late = (held ?? []).filter((e) => !replayed.has(JSON.stringify(e)));
+          const late = held ?? [];
           held = null;
           for (const e of [...history, ...late]) push(e);
         },
@@ -342,6 +340,35 @@ export function useFlowData(
     childrenError,
     childrenTruncated,
     frameErrors,
+  };
+}
+
+/** A followed frame's events: the latest `max`, each line kept once for the
+ *  frame's whole life. The firehose replays a run's log from its start when
+ *  it first attaches it and on every reconnect, so lines the log's replay
+ *  already brought come again; a line's identity is its serialized form
+ *  (firehose frames carry no id; both streams frame a line identically).
+ *  `add` says whether the line was new. */
+export function eventWindow(max: number): { events: RunEvent[]; add(ev: RunEvent): boolean } {
+  const events: RunEvent[] = [];
+  const seen = new Set<string>();
+  return {
+    events,
+    add(ev) {
+      const key = JSON.stringify(ev);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      events.push(ev);
+      if (events.length > max) {
+        events.splice(0, events.length - max);
+        // Keep the identity set near the window.
+        if (seen.size > 2 * max) {
+          seen.clear();
+          for (const e of events) seen.add(JSON.stringify(e));
+        }
+      }
+      return true;
+    },
   };
 }
 

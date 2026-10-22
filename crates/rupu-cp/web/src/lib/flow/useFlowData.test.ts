@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { api, type AgentiflowDetail, type AgentiflowUnit, type RunEvent, type RunGraphResponse } from '../api';
-import { CHILDREN_LIVE_MS, reuseChildren, useFlowData } from './useFlowData';
+import { CHILDREN_LIVE_MS, eventWindow, reuseChildren, useFlowData } from './useFlowData';
 import { CHILDREN, DETAIL, FLOW_BOARD, GANNET_BOARD, RUN } from './fixtures';
 
 afterEach(() => {
@@ -179,6 +179,31 @@ describe('useFlowData', () => {
     });
   });
 
+  it('a_frame_keeps_each_line_once_when_the_firehose_replays_it_later', async () => {
+    const running = CHILDREN.map((c) => (c.run_id === RUN.gannet1 ? { ...c, status: 'running' as const } : c));
+    const m = mockApi(running);
+    const warn = { type: 'step_warning', run_id: RUN.gannet1, step_id: 'collect', message: 'slow host' } as RunEvent;
+    const started = { type: 'step_started', run_id: RUN.gannet1, step_id: 'collect' } as RunEvent;
+    m.readLog.mockResolvedValue([started, warn]);
+    const { result } = renderHook(() => useFlowData(DETAIL, { running: true, now }));
+    await waitFor(() => expect(result.current.children).toHaveLength(CHILDREN.length));
+    act(() => result.current.loadFrame(RUN.gannet1));
+    const collect = () => result.current.childGraphs.get(RUN.gannet1)?.nodeById('collect');
+    const warnings = () => collect()?.warnings?.map((w) => w.message);
+    await waitFor(() => expect(warnings()).toEqual(['slow host']), { timeout: 2500 });
+    // The firehose attaches the run after the replay resolved (or
+    // reconnects) and drains its log from the start: the same lines again.
+    act(() => {
+      m.emit(started);
+      m.emit(warn);
+    });
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(warnings()).toEqual(['slow host']);
+    // A new line still lands.
+    act(() => m.emit({ type: 'step_warning', run_id: RUN.gannet1, step_id: 'collect', message: 'retrying' } as RunEvent));
+    await waitFor(() => expect(warnings()).toEqual(['slow host', 'retrying']), { timeout: 2500 });
+  });
+
   it('frame_spaces_join_the_flow_space', async () => {
     mockApi();
     const { result } = renderHook(() => useFlowData(DETAIL, { running: false }));
@@ -230,5 +255,22 @@ describe('reuseChildren', () => {
     expect(out[0]).toBe(CHILDREN[0]);
     expect(out[1]).toBe(changed[1]);
     expect(out[2]).toBe(CHILDREN[2]);
+  });
+});
+
+describe('eventWindow', () => {
+  it('keeps_each_line_once_for_its_whole_life', () => {
+    const w = eventWindow(5);
+    const line = (n: number) => ({ type: 'step_warning', run_id: 'run_1', step_id: 's', message: `w${n}` }) as RunEvent;
+    // The log's replay, then the firehose's backlog of the same lines
+    // (attached late, or after a reconnect), then a new one.
+    for (const n of [1, 2, 3]) expect(w.add(line(n))).toBe(true);
+    for (const n of [1, 2, 3]) expect(w.add(line(n))).toBe(false);
+    expect(w.add(line(4))).toBe(true);
+    expect(w.events.map((e) => (e as { message: string }).message)).toEqual(['w1', 'w2', 'w3', 'w4']);
+    // Past its size it keeps the latest.
+    for (const n of [5, 6, 7]) w.add(line(n));
+    expect(w.events.map((e) => (e as { message: string }).message)).toEqual(['w3', 'w4', 'w5', 'w6', 'w7']);
+    expect(w.add(line(7))).toBe(false);
   });
 });
