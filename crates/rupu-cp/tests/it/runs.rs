@@ -82,6 +82,7 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
         codename: None,
         cause: None,
         error: None,
+        started_at: None,
     }
 }
 

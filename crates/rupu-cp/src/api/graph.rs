@@ -752,6 +752,7 @@ fn agent_run_result(run: &rupu_orchestrator::RunRecord) -> Option<StepResultReco
         codename: None,
         error: run.error_message.clone(),
         cause: run.cause.clone(),
+        started_at: Some(run.started_at),
     })
 }
 

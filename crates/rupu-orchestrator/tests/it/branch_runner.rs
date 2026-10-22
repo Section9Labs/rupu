@@ -154,6 +154,10 @@ async fn branch_take_then_skips_else_arm_and_reconverges() {
     let arm_b = step(&res, "arm_b");
     assert!(arm_b.skipped, "not-taken arm_b should be skipped");
     assert_eq!(arm_b.output, "", "skipped arm has empty output");
+    // A step that ran knows when it started; a skipped one never started.
+    assert!(route.started_at.is_some() && arm_a.started_at.is_some());
+    assert!(route.started_at <= arm_a.started_at);
+    assert_eq!(arm_b.started_at, None);
 
     // Reconvergence: join ran, and saw arm_b's output as empty.
     let join = step(&res, "join");

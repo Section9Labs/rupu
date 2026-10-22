@@ -178,6 +178,7 @@ fn seed_transcript_with_model(dir: &std::path::Path, run_id: &str, model: &str) 
                 codename: None,
                 cause: None,
                 error: None,
+                started_at: None,
             },
         )
         .unwrap();
@@ -322,6 +323,7 @@ async fn usage_priced_only_reports_empty_unpriced_gap() {
                 codename: None,
                 cause: None,
                 error: None,
+                started_at: None,
             },
         )
         .unwrap();
@@ -688,6 +690,7 @@ fn seed_run_with_usage(
                 codename: None,
                 cause: None,
                 error: None,
+                started_at: None,
             },
         )
         .unwrap();
@@ -1318,6 +1321,7 @@ fn step_result(
         host: None,
         cause: None,
         error: None,
+        started_at: None,
     }
 }
 

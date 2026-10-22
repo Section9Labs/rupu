@@ -852,6 +852,24 @@ async fn run_store_records_run_metadata_and_per_step_rows() {
     assert_eq!(rows[1].step_id, "b");
     assert!(rows[0].success);
     assert!(rows[1].success);
+    // Each row carries when its step started, at or before it finished, and
+    // `b` started no earlier than `a`.
+    let started: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let at = r
+                .started_at
+                .unwrap_or_else(|| panic!("{} has no start", r.step_id));
+            assert!(
+                at <= r.finished_at,
+                "{}: {at} > {}",
+                r.step_id,
+                r.finished_at
+            );
+            at
+        })
+        .collect();
+    assert!(started[0] <= started[1], "{started:?}");
     // The second step's persisted rendered_prompt shows `steps.a.output` resolved.
     assert!(
         rows[1]

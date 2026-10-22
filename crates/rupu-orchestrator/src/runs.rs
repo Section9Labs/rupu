@@ -774,6 +774,12 @@ pub struct StepResultRecord {
     /// outcome. Absent otherwise and on legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<rupu_transcript::OutcomeRecord>,
+    /// When the step's (latest) attempt started — the moment its
+    /// `StepStarted` was emitted, so `finished_at - started_at` is the
+    /// span the run page draws. Absent for a step that never started
+    /// (skipped) and on records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// Captured process outcome for a `run:` step. `None` for every other
@@ -956,6 +962,7 @@ impl From<&StepResult> for StepResultRecord {
             codename: sr.codename.clone(),
             error: sr.error.clone(),
             cause: sr.cause.as_deref().cloned(),
+            started_at: sr.started_at,
         }
     }
 }
@@ -1010,6 +1017,7 @@ impl From<&StepResultRecord> for StepResult {
             codename: rec.codename.clone(),
             error: rec.error.clone(),
             cause: rec.cause.clone().map(Box::new),
+            started_at: rec.started_at,
         }
     }
 }
@@ -4673,6 +4681,7 @@ mod tests {
             codename: None,
             cause: None,
             error: None,
+            started_at: None,
         }
     }
 
@@ -8854,6 +8863,37 @@ mod tests {
         let again = StepResultRecord::from(&runtime);
         assert_eq!(again.error, failed.error);
         assert_eq!(again.cause, Some(refusal_cause()));
+    }
+
+    #[test]
+    fn step_result_record_started_at_round_trips_and_legacy_reads_none() {
+        // A record written before the field existed reads as `None`, and a
+        // `None` record writes no key at all.
+        let legacy = r#"{"step_id":"s","run_id":"r","transcript_path":"/t.jsonl","output":"","success":true,"skipped":false,"rendered_prompt":"","finished_at":"2026-10-22T10:05:00Z"}"#;
+        let rec: StepResultRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.started_at, None);
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(!json.contains("started_at"), "absent, not null: {json}");
+
+        let started = DateTime::parse_from_rfc3339("2026-10-22T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let timed = StepResultRecord {
+            started_at: Some(started),
+            ..rec
+        };
+        let json = serde_json::to_string(&timed).unwrap();
+        assert!(
+            json.contains(r#""started_at":"2026-10-22T10:00:00Z""#),
+            "{json}"
+        );
+        let back: StepResultRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.started_at, Some(started));
+
+        // It survives the runtime round trip the resume path takes.
+        let runtime = crate::runner::StepResult::from(&back);
+        assert_eq!(runtime.started_at, Some(started));
+        assert_eq!(StepResultRecord::from(&runtime).started_at, Some(started));
     }
 
     #[test]
