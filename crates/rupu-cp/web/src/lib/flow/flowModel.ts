@@ -569,7 +569,11 @@ export function buildFlowStructure(
     startOf.set(s.round, s.from);
     if (s.from !== null) {
       items.push({ key: roundId(s.round), at: s.from, kind: 'round' });
-      bands.push({ key: roundId(s.round), label: `Round ${s.round}`, from: s.from, to: s.endedAt, row: 'round' });
+      const band: TimelineBand = { key: roundId(s.round), label: `Round ${s.round}`, from: s.from, to: s.endedAt, row: 'round' };
+      // A start its event didn't record (an older run, the round still
+      // running, a round with no event) is a guess: the previous round's end.
+      if (s.startedAt === null || s.event === null) band.inferred = true;
+      bands.push(band);
     }
   }
   for (const r of rounds) {

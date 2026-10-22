@@ -147,12 +147,12 @@ describe('flow model', () => {
       [null, null, true],
     ]);
     // Its bands still span the rounds: from the previous end (round 0 from
-    // the run's start).
-    expect(om.timeline.bands.map((b) => [b.key, b.from, b.to])).toEqual([
-      ['round:0', ms(0), ms(23)],
-      ['round:1', ms(23), ms(84)],
-      ['round:2', ms(84), ms(111)],
-      ['round:3', ms(111), null],
+    // the run's start), each start marked inferred.
+    expect(om.timeline.bands.map((b) => [b.key, b.from, b.to, b.inferred])).toEqual([
+      ['round:0', ms(0), ms(23), true],
+      ['round:1', ms(23), ms(84), true],
+      ['round:2', ms(84), ms(111), true],
+      ['round:3', ms(111), null, true],
     ]);
   });
 
@@ -238,7 +238,10 @@ describe('flow model', () => {
     bare.detail = { ...bare.detail, record: { ...bare.detail.record, ended_at: null } };
     const bs = buildFlowModel(bare);
     expect(bs.rounds.map((r) => [r.round, r.startedAt, r.endedAt])).toEqual([[0, ms(2), ms(110)]]);
-    expect(bs.timeline.bands).toEqual([{ key: 'round:0', label: 'Round 0', from: ms(2), to: ms(110), row: 'round' }]);
+    // A round with no event spans its children; its start is inferred.
+    expect(bs.timeline.bands).toEqual([
+      { key: 'round:0', label: 'Round 0', from: ms(2), to: ms(110), row: 'round', inferred: true },
+    ]);
   });
 
   it('unmapped_addresses_still_produce_an_edge', () => {
@@ -552,7 +555,8 @@ describe('flow model', () => {
       { key: 'round:0', label: 'Round 0', from: ms(1), to: ms(23), row: 'round' },
       { key: 'round:1', label: 'Round 1', from: ms(24), to: ms(84), row: 'round' },
       { key: 'round:2', label: 'Round 2', from: ms(85), to: ms(111), row: 'round' },
-      { key: 'round:3', label: 'Round 3', from: ms(111), to: null, row: 'round' },
+      // The running round's start is the last round's end: inferred.
+      { key: 'round:3', label: 'Round 3', from: ms(111), to: null, row: 'round', inferred: true },
     ]);
 
     // A board the host couldn't serve adds no items and is passed through.
