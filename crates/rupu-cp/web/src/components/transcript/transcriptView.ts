@@ -202,6 +202,10 @@ export interface TurnView {
   blocks: TurnBlock[];
   tokensIn: number | null;
   tokensOut: number | null;
+  /** The 1-based ordinals of the model calls (non-compaction `usage` events,
+   *  counted over the whole file) this turn holds: what the usage timeline's
+   *  `transcript_turn` points at. */
+  calls?: number[];
   summary: {
     toolCount: number;
     findingCount: number;
@@ -445,6 +449,8 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   // excluded, as in `run_complete.total_tokens`) — the footer's token count
   // until `run_complete` supplies the authoritative figure.
   let usageSum = 0;
+  // Ordinal of the latest model call (non-compaction `usage`) in the file.
+  let callSeq = 0;
 
   const turns: TurnView[] = [];
   // The turn new blocks currently attach to. Created lazily (via `ensureTurn`)
@@ -854,6 +860,9 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
         // live figure from dropping when the authoritative total lands.
         if (asString(data.purpose) !== 'compaction') {
           usageSum += (asNumber(data.input_tokens) ?? 0) + (asNumber(data.output_tokens) ?? 0);
+          callSeq += 1;
+          const turn = ensureTurn();
+          turn.calls = [...(turn.calls ?? []), callSeq];
         }
         if (!sawRunComplete) {
           footer = {
@@ -968,4 +977,13 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
   const nonEmpty = turns.filter((t) => t.blocks.length > 0);
 
   return { header, self, turns: nonEmpty, footer };
+}
+
+/** The 1-based numbers of the turns holding any call in `calls`. */
+export function windowTurns(turns: readonly TurnView[], calls: [number, number]): Set<number> {
+  const out = new Set<number>();
+  turns.forEach((t, i) => {
+    if (t.calls?.some((c) => c >= calls[0] && c <= calls[1])) out.add(i + 1);
+  });
+  return out;
 }

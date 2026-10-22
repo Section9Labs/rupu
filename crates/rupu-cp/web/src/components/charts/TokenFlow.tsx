@@ -14,7 +14,7 @@
 // as a thin "typical" line. See lib/chart/flow.ts for the data rules and
 // styles.css "Chart motion" for the motion vocabulary.
 
-import { useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { RotateCcw } from 'lucide-react';
 import type { UsageTimelinePoint } from '../../lib/api';
 import { useThemeColors } from '../../lib/useThemeColors';
@@ -75,9 +75,21 @@ export interface TokenFlowProps {
   /** The run is still going: its end breathes and new turns glide in. */
   live?: boolean;
   className?: string;
+  /** The zoomed range of point indices (inclusive), when the page owns it;
+   *  `null` is the whole series. Omit to let the chart keep its own. */
+  zoom?: [number, number] | null;
+  /** Told whenever the zoom changes (a drag, a stage click, a reset). */
+  onZoomChange?: (zoom: [number, number] | null) => void;
 }
 
-export default function TokenFlow({ points, stages = true, live = false, className }: TokenFlowProps) {
+export default function TokenFlow({
+  points,
+  stages = true,
+  live = false,
+  className,
+  zoom: zoomProp,
+  onZoomChange,
+}: TokenFlowProps) {
   const colors = useThemeColors();
   const svgRef = useRef<SVGSVGElement>(null);
   const [width, boxRef] = useMeasuredWidth(DEFAULT_W);
@@ -87,7 +99,16 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
   const hover = useHoverIndex();
   const [focusSeries, setFocusSeries] = useState<SeriesKey | null>(null);
   const [focusStage, setFocusStage] = useState<string | null>(null);
-  const [zoom, setZoom] = useState<[number, number] | null>(null);
+  const [ownZoom, setOwnZoom] = useState<[number, number] | null>(null);
+  const zoom = zoomProp !== undefined ? zoomProp : ownZoom;
+  const controlled = zoomProp !== undefined;
+  const setZoom = useCallback(
+    (z: [number, number] | null) => {
+      if (!controlled) setOwnZoom(z);
+      onZoomChange?.(z);
+    },
+    [controlled, onZoomChange],
+  );
   const [drag, setDrag] = useState<{ x0: number; x1: number } | null>(null);
 
   const n = points.length;
@@ -95,7 +116,7 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
   const zoomed = zoom && zoom[1] <= n - 1 ? zoom : null;
   useEffect(() => {
     if (zoom && !zoomed) setZoom(null);
-  }, [zoom, zoomed]);
+  }, [zoom, zoomed, setZoom]);
   // The first data replaces the empty placeholder window: snap to it rather
   // than morph out of the placeholder (which would read as a zoom-out).
   const hadData = useRef(false);
@@ -221,7 +242,7 @@ export default function TokenFlow({ points, stages = true, live = false, classNa
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [zoom]);
+  }, [zoom, setZoom]);
 
   if (n === 0) {
     return <div className="py-8 text-center text-note text-ink-mute">No per-turn usage yet</div>;

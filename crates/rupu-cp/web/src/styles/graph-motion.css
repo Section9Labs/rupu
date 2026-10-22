@@ -1425,21 +1425,6 @@
 .afx-stepper-at b { color: rgb(var(--c-ink)); font-weight: 600; }
 .afx-stepper-keys { padding: 0 5px; border: 1px solid rgb(var(--c-border)); border-radius: 4px; font-size: 10px; color: rgb(var(--c-ink-mute)); }
 .afx-note { font-size: 12px; color: rgb(var(--c-warn)); }
-.afx-head {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px;
-  font-size: 12px; color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums;
-}
-.afx-head b { color: rgb(var(--c-ink)); font-weight: 600; }
-.afx-head .k { color: rgb(var(--c-ink-mute)); }
-.afx-meter {
-  display: inline-block; width: 64px; height: 4px; margin: 0 6px 1px 2px; vertical-align: middle;
-  border-radius: 2px; background: rgb(var(--c-surface)); overflow: hidden;
-}
-.afx-meter > i {
-  display: block; height: 100%; transform-origin: left; background: rgb(var(--c-brand-500));
-  transition: transform 300ms var(--ease-out);
-}
-.afx-meter[data-tone='ok'] > i { background: rgb(var(--c-status-done)); }
 
 /* Card parts. */
 .afx-mcount { gap: 3px; }
@@ -1609,17 +1594,6 @@
   transition: rotate 150ms var(--ease-out);
 }
 .afx-panel[data-collapsed='true'] .afx-panel-chev { rotate: -90deg; }
-.afx-panel-sub { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.afx-goals { margin: 0; padding: 0 12px; list-style: none; font-size: 12px; }
-.afx-goals li { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
-.afx-goals .o { flex: 1; min-width: 0; color: rgb(var(--c-ink)); }
-.afx-goals .c { color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums; }
-.afx-kv {
-  display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 8px 0 0; padding: 8px 12px 12px;
-  border-top: 1px solid rgb(var(--c-border)); font-size: 12px;
-}
-.afx-kv dt { color: rgb(var(--c-ink-mute)); }
-.afx-kv dd { margin: 0; color: rgb(var(--c-ink)); font-variant-numeric: tabular-nums; }
 .gx-summary .afx-dot { width: 6px; height: 6px; border-radius: 50%; background: rgb(var(--gx-c)); }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1627,8 +1601,10 @@
   .afx-spine-ring { animation: none; opacity: 0; }
   .afx-frame { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
   .afx-frame > .gx-glow { animation: none; }
-  .afx-meter > i { transition: none; }
   .afx-panel-chev { transition: none; }
   .afx-follow { animation: none; }
   .afx-follow:active { scale: none; }
 }
+
+/* The run page's turn window bar settles in when a selection is made. */
+.gx-window { animation: rgx-fade 220ms ease-out; }

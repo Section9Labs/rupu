@@ -28,6 +28,7 @@ use crate::runs::{
 use crate::transcript_paths::{agent_mirror_path, cache_path, global_dir_of};
 use crate::usage_ledger::{LedgerKind, LedgerRow};
 use crate::usage_summary::TurnPoint;
+use chrono::{DateTime, Utc};
 use rupu_transcript::{transcript_key, Event, JsonlCursor, UsageRow};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -108,6 +109,28 @@ struct AgentAgg {
     by_model: BTreeMap<ModelKey, Tokens>,
 }
 
+/// One ledger row's point, before labelling.
+#[derive(Debug, Clone)]
+struct LedgerPoint {
+    agent_run_id: String,
+    tokens: Tokens,
+    at: DateTime<Utc>,
+    /// The row's `transcript` as written; `None` when it is empty.
+    transcript: Option<Arc<str>>,
+    /// Its ordinal among its transcript's `kind: turn` rows; `None` for a
+    /// compaction row.
+    transcript_turn: Option<u64>,
+}
+
+/// Where in a transcript a fallback point is: the 1-based ordinal of its
+/// `usage` event among the file's non-compaction ones, `None` for a
+/// compaction call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FoldPoint {
+    tokens: Tokens,
+    transcript_turn: Option<u64>,
+}
+
 /// Fold state for one run's `usage.jsonl`.
 #[derive(Debug, Default)]
 struct LedgerFold {
@@ -119,8 +142,11 @@ struct LedgerFold {
     keys: HashSet<String>,
     /// Every row's transcript, first sighting per key, in arrival order.
     transcripts: Vec<(String, PathBuf)>,
-    /// `(agent_run_id, tokens)` per row, in arrival order.
-    points: Vec<(String, Tokens)>,
+    /// One per row, in arrival order.
+    points: Vec<LedgerPoint>,
+    /// `kind: turn` rows seen so far per transcript (its `transcript_key`, or
+    /// the path when it has none) — the next row's `transcript_turn`.
+    transcript_turns: HashMap<String, u64>,
     turns: u64,
 }
 
@@ -158,9 +184,18 @@ impl LedgerFold {
                 self.transcripts.push((key, row.transcript.clone()));
             }
         }
-        if row.kind == LedgerKind::Turn {
+        let transcript_turn = if row.kind == LedgerKind::Turn {
             self.turns += 1;
-        }
+            let file = transcript_key(&row.transcript)
+                .unwrap_or_else(|| row.transcript.to_string_lossy().into_owned());
+            let n = self.transcript_turns.entry(file).or_default();
+            *n += 1;
+            Some(*n)
+        } else {
+            None
+        };
+        let transcript = (!row.transcript.as_os_str().is_empty())
+            .then(|| Arc::from(row.transcript.to_string_lossy().as_ref()));
         let agg = self.agents.entry(row.agent_run_id.clone()).or_default();
         if agg.step_id.is_none() {
             agg.step_id = row.step_id;
@@ -175,7 +210,13 @@ impl LedgerFold {
             .entry((row.provider, row.model, row.agent))
             .or_default()
             .add(t);
-        self.points.push((row.agent_run_id, t));
+        self.points.push(LedgerPoint {
+            agent_run_id: row.agent_run_id,
+            tokens: t,
+            at: row.at,
+            transcript,
+            transcript_turn,
+        });
     }
 }
 
@@ -191,12 +232,15 @@ struct TranscriptFold {
     /// Tokens after `RunStart`, keyed by the event's own provider/model and
     /// the run-start agent.
     by_model: BTreeMap<ModelKey, Tokens>,
-    /// Every non-compaction `Usage`, even one before `RunStart`.
+    /// Every non-compaction `Usage`, even one before `RunStart` — so it is
+    /// also the ordinal of the latest one in the file.
     turns: u64,
     /// The last `RunComplete`.
     duration_ms: Option<u64>,
-    /// One per counted `Usage` (after `RunStart`), in file order.
-    points: Vec<Tokens>,
+    /// One per counted `Usage` (after `RunStart`), in file order, with its
+    /// ordinal among ALL the file's non-compaction `Usage` events (so a
+    /// reader counting every one in the file agrees, orphans included).
+    points: Vec<FoldPoint>,
     /// Bumped on every change, so a run whose view was built from an older
     /// generation knows to rebuild even when another caller drained this
     /// shared fold.
@@ -250,9 +294,12 @@ impl TranscriptFold {
                 purpose,
                 ..
             } => {
-                if purpose.as_deref() != Some(COMPACTION) {
+                let transcript_turn = if purpose.as_deref() != Some(COMPACTION) {
                     self.turns += 1;
-                }
+                    Some(self.turns)
+                } else {
+                    None
+                };
                 let Some((_, _, agent)) = &self.start else {
                     return; // no RunStart yet: an orphan, not counted in tokens
                 };
@@ -266,7 +313,10 @@ impl TranscriptFold {
                     .entry((provider, model, agent.clone()))
                     .or_default()
                     .add(t);
-                self.points.push(t);
+                self.points.push(FoldPoint {
+                    tokens: t,
+                    transcript_turn,
+                });
             }
             Event::RunComplete { duration_ms, .. } => self.duration_ms = Some(duration_ms),
             _ => {}
@@ -356,7 +406,14 @@ impl Acc {
         add_row(self.by_step.entry(label.to_string()).or_default(), key, t);
     }
 
-    fn point(&mut self, label: &str, t: Tokens) {
+    fn point(
+        &mut self,
+        label: &str,
+        t: Tokens,
+        at: Option<DateTime<Utc>>,
+        transcript: Option<&str>,
+        transcript_turn: Option<u64>,
+    ) {
         self.points.push(TurnPoint {
             turn: self.points.len() as u64 + 1,
             label: label.to_string(),
@@ -364,6 +421,9 @@ impl Acc {
             tokens_out: t.output,
             tokens_cached: t.cached,
             tokens_cache_write: t.cache_write,
+            at,
+            transcript: transcript.map(str::to_string),
+            transcript_turn,
         });
     }
 
@@ -406,12 +466,17 @@ impl Acc {
 /// One point of a run's owned per-turn series.
 #[derive(Debug, Clone)]
 enum SeriesPoint {
-    /// `LedgerFold::points[i]` — the raw `(agent_run_id, tokens)`, labelled
-    /// through the parent chain at build time (a child's row can arrive before
-    /// its ancestor's).
+    /// `LedgerFold::points[i]` — the raw row point, labelled through the
+    /// parent chain at build time (a child's row can arrive before its
+    /// ancestor's).
     Ledger(usize),
     /// A fallback transcript's point, labelled when observed.
-    Fallback(Arc<str>, Tokens),
+    Fallback {
+        label: Arc<str>,
+        /// The transcript's recorded path ([`FallbackSrc::transcript`]).
+        transcript: Arc<str>,
+        point: FoldPoint,
+    },
 }
 
 /// How much of one fallback transcript's fold the series has consumed.
@@ -426,7 +491,11 @@ struct Watermark {
 struct FallbackSrc {
     key: String,
     label: Arc<str>,
+    /// The resolved file the fold reads.
     path: PathBuf,
+    /// The path the run records for it (a point's `transcript`), which may
+    /// differ from `path` when it resolved to a mirror.
+    transcript: Arc<str>,
     fold: Arc<Mutex<TranscriptFold>>,
 }
 
@@ -501,11 +570,12 @@ impl Series {
                     };
                 }
                 let fresh = f.points.get(mark.taken..).unwrap_or_default();
-                self.points.extend(
-                    fresh
-                        .iter()
-                        .map(|t| SeriesPoint::Fallback(Arc::clone(&src.label), *t)),
-                );
+                self.points
+                    .extend(fresh.iter().map(|p| SeriesPoint::Fallback {
+                        label: Arc::clone(&src.label),
+                        transcript: Arc::clone(&src.transcript),
+                        point: *p,
+                    }));
                 mark.taken = f.points.len();
             }
             if !rebuild {
@@ -575,13 +645,31 @@ fn build_usage(
     for p in series {
         match p {
             SeriesPoint::Ledger(i) => {
-                let Some((id, t)) = ledger.points.get(*i) else {
+                let Some(lp) = ledger.points.get(*i) else {
                     continue; // unreachable: a ledger reset rebuilds the series
                 };
-                let label = attributed.get(id.as_str()).map_or("", String::as_str);
-                acc.point(label, *t);
+                let label = attributed
+                    .get(lp.agent_run_id.as_str())
+                    .map_or("", String::as_str);
+                acc.point(
+                    label,
+                    lp.tokens,
+                    Some(lp.at),
+                    lp.transcript.as_deref(),
+                    lp.transcript_turn,
+                );
             }
-            SeriesPoint::Fallback(label, t) => acc.point(label, *t),
+            SeriesPoint::Fallback {
+                label,
+                transcript,
+                point,
+            } => acc.point(
+                label,
+                point.tokens,
+                None,
+                Some(transcript),
+                point.transcript_turn,
+            ),
         }
     }
     acc.finish(partial, epoch)
@@ -1058,6 +1146,7 @@ impl UsageIndex {
                 key: k.kt.key.clone(),
                 label: Arc::from(k.kt.step_id.as_deref().unwrap_or_default()),
                 path,
+                transcript: Arc::from(k.kt.path.to_string_lossy().as_ref()),
                 fold,
             });
             views.push(view);
@@ -1152,10 +1241,12 @@ impl UsageIndex {
                 partial |= f.unreadable;
                 resets = resets.saturating_add(f.resets);
             }
+            let shown = path.to_string_lossy();
             fallback.push(FallbackSrc {
-                key: path.to_string_lossy().into_owned(),
+                key: shown.clone().into_owned(),
                 label: Arc::from(label.as_str()),
                 path: path.clone(),
+                transcript: Arc::from(shown.as_ref()),
                 fold,
             });
         }
@@ -2761,6 +2852,12 @@ mod tests {
         assert_eq!(total(&u), tok(100, 10));
         assert_eq!(step_total(&u, "a"), tok(100, 10));
         assert!(!u.partial);
+        let shown: Vec<Option<&str>> = u.points.iter().map(|p| p.transcript.as_deref()).collect();
+        assert_eq!(
+            shown,
+            [recorded.to_str(), recorded.to_str()],
+            "a point names the transcript the run records, not the mirror it was read from"
+        );
         assert_eq!(idx.resolved_transcripts(&store, "run_01USAGE"), vec![cache]);
     }
 
@@ -2918,5 +3015,170 @@ mod tests {
         let missing = idx.transcripts_usage(&[("z".into(), tmp.path().join("run_Z.jsonl"))]);
         assert!(missing.partial);
         assert_eq!(total(&missing), Tokens::default());
+    }
+
+    fn locations(u: &RunUsage) -> Vec<(Option<String>, Option<u64>)> {
+        u.points
+            .iter()
+            .map(|p| (p.transcript.clone(), p.transcript_turn))
+            .collect()
+    }
+
+    #[test]
+    fn fallback_ordinals_count_every_non_compaction_usage_in_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_ORD", RunStatus::Running);
+        let f = tmp.path().join("transcripts/run_F.jsonl");
+        // A usage before `RunStart` is not plotted (no agent to attribute it
+        // to) but is still the file's first model call, so the plotted ones
+        // are its 2nd and 3rd, the compaction between them has none.
+        append(
+            &f,
+            &(usage_line(PROVIDER, MODEL, 1, 1, None)
+                + &transcript_lines("legacy", PROVIDER, MODEL, &[(10, 1)])
+                + &usage_line(PROVIDER, MODEL, 500, 50, Some(COMPACTION))
+                + &usage_line(PROVIDER, MODEL, 20, 2, None)),
+        );
+        store
+            .append_step_result("run_ORD", &step_result("old", &f))
+            .unwrap();
+        let shown = Some(f.to_string_lossy().into_owned());
+        let idx = UsageIndex::default();
+        let u = idx.run_usage(&store, "run_ORD");
+        assert_eq!(
+            locations(&u),
+            [
+                (shown.clone(), Some(2)),
+                (shown.clone(), None),
+                (shown.clone(), Some(3))
+            ]
+        );
+        assert!(
+            u.points.iter().all(|p| p.at.is_none()),
+            "no time in a transcript"
+        );
+        assert_eq!(
+            u.turns, 3,
+            "the run's turn count agrees with the last ordinal"
+        );
+
+        // An appended call continues the count across an incremental drain.
+        append(&f, &usage_line(PROVIDER, MODEL, 30, 3, None));
+        let grown = idx.run_usage(&store, "run_ORD");
+        assert_extends(&u, &grown);
+        assert_eq!(grown.points[3].transcript_turn, Some(4));
+        assert_same_usage(
+            &grown,
+            &UsageIndex::default().run_usage(&store, "run_ORD"),
+            true,
+        );
+
+        // A replaced file counts from 1 again.
+        std::fs::write(&f, transcript_lines("legacy", PROVIDER, MODEL, &[(5, 5)])).unwrap();
+        let reset = idx.run_usage(&store, "run_ORD");
+        assert_eq!(locations(&reset), [(shown, Some(1))]);
+    }
+
+    #[test]
+    fn ledger_ordinals_are_per_transcript_and_restart_with_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = run_store(tmp.path());
+        create_run(&store, "run_LORD", RunStatus::Running);
+        let ledger = store.usage_ledger_path("run_LORD");
+        let a = tmp.path().join("transcripts/run_A.jsonl");
+        let b = tmp.path().join("transcripts/run_B.jsonl");
+        let row = |id: &str, t: &Path, kind: LedgerKind| {
+            let agent = t.file_stem().unwrap().to_str().unwrap().to_string();
+            ledger_line(id, Some("s"), None, &agent, None, t, 1, 1, kind)
+        };
+        append(
+            &ledger,
+            &[
+                row("01A1", &a, LedgerKind::Turn),
+                row("01B1", &b, LedgerKind::Turn),
+                row("01AK", &a, LedgerKind::Compaction),
+                row("01A2", &a, LedgerKind::Turn),
+            ]
+            .concat(),
+        );
+        let (sa, sb) = (
+            Some(a.to_string_lossy().into_owned()),
+            Some(b.to_string_lossy().into_owned()),
+        );
+        let idx = UsageIndex::default();
+        let u = idx.run_usage(&store, "run_LORD");
+        assert_eq!(
+            locations(&u),
+            [
+                (sa.clone(), Some(1)),
+                (sb.clone(), Some(1)),
+                (sa.clone(), None),
+                (sa.clone(), Some(2)),
+            ]
+        );
+        assert!(
+            u.points.iter().all(|p| p.at.is_some()),
+            "a ledger row has a time"
+        );
+
+        // A row replayed by a mirror is counted once, so it takes no ordinal.
+        append(
+            &ledger,
+            &[
+                row("01A1", &a, LedgerKind::Turn),
+                row("01B2", &b, LedgerKind::Turn),
+            ]
+            .concat(),
+        );
+        let grown = idx.run_usage(&store, "run_LORD");
+        assert_extends(&u, &grown);
+        assert_eq!(locations(&grown)[4], (sb, Some(2)));
+
+        // The ledger shrank: the fold restarts, and so do the ordinals.
+        std::fs::write(&ledger, row("01A9", &a, LedgerKind::Turn)).unwrap();
+        let reset = idx.run_usage(&store, "run_LORD");
+        assert_eq!(locations(&reset), [(sa, Some(1))]);
+    }
+
+    #[test]
+    fn session_points_name_the_given_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("run_A.jsonl");
+        append(
+            &a,
+            &(transcript_lines("one", PROVIDER, MODEL, &[(1, 1)])
+                + &usage_line(PROVIDER, MODEL, 2, 2, Some(COMPACTION))
+                + &usage_line(PROVIDER, MODEL, 3, 3, None)),
+        );
+        let u = UsageIndex::default().transcripts_usage(&[("x".into(), a.clone())]);
+        let shown = Some(a.to_string_lossy().into_owned());
+        assert_eq!(
+            locations(&u),
+            [
+                (shown.clone(), Some(1)),
+                (shown.clone(), None),
+                (shown, Some(2))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_point_without_locations_parses_and_serializes_without_them() {
+        let old = serde_json::json!({
+            "turn": 1, "label": "s", "tokens_in": 1, "tokens_out": 2, "tokens_cached": 0,
+        });
+        let p: TurnPoint = serde_json::from_value(old).unwrap();
+        assert_eq!(
+            (p.at, p.transcript.as_deref(), p.transcript_turn),
+            (None, None, None)
+        );
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            serde_json::json!({
+                "turn": 1, "label": "s", "tokens_in": 1, "tokens_out": 2, "tokens_cached": 0,
+                "tokens_cache_write": 0,
+            })
+        );
     }
 }

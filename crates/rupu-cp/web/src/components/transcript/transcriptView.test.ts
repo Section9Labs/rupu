@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildTranscriptView } from './transcriptView';
+import { buildTranscriptView, windowTurns } from './transcriptView';
 import type { TranscriptEvent } from '../../lib/transcript';
 import type { TurnView, TurnBlock, ToolView } from './transcriptView';
 
@@ -928,5 +928,26 @@ describe('v2 blocks model', () => {
     const kinds = view.turns.flatMap((t) => t.blocks.map((b) => b.kind));
     expect(kinds).toEqual(['assistant']);
     expect(kinds).not.toContain('unknown');
+  });
+});
+
+describe('model calls per turn (the usage timeline transcript_turn)', () => {
+  it('numbers every non-compaction usage over the file and gives each turn its calls', () => {
+    const ev = (type: string, data: Record<string, unknown> = {}) => ({ type, data }) as TranscriptEvent;
+    const view = buildTranscriptView([
+      ev('turn_start', { turn_idx: 0 }),
+      ev('usage', { input_tokens: 10, output_tokens: 1 }),
+      ev('assistant_message', { content: 'one' }),
+      ev('turn_start', { turn_idx: 1 }),
+      ev('usage', { input_tokens: 10, output_tokens: 1, purpose: 'compaction' }),
+      ev('usage', { input_tokens: 10, output_tokens: 1 }),
+      ev('assistant_message', { content: 'two' }),
+      ev('turn_start', { turn_idx: 2 }),
+      ev('usage', { input_tokens: 10, output_tokens: 1 }),
+      ev('assistant_message', { content: 'three' }),
+    ]);
+    expect(view.turns.map((t) => t.calls)).toEqual([[1], [2], [3]]);
+    expect([...windowTurns(view.turns, [2, 3])]).toEqual([2, 3]);
+    expect([...windowTurns(view.turns, [4, 9])]).toEqual([]);
   });
 });

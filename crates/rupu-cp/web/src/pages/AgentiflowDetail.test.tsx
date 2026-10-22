@@ -184,8 +184,14 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByRole('progressbar', { name: 'rounds used' })).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByRole('progressbar', { name: 'spend used' })).toHaveAttribute('aria-valuenow', '25');
 
-    // Fleet (the default Flow tab). Unit identities also render in the graph
-    // above, so scope these assertions to the Fleet panel.
+    // Goals and budget show once, in the one Status panel.
+    expect(screen.getAllByRole('heading', { name: 'Goals' })).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { name: 'Budget' })).toHaveLength(1);
+    expect(within(screen.getByTestId('af-status')).getByRole('heading', { name: 'Budget' })).toBeInTheDocument();
+
+    // Fleet (its own tab now; the flow map is always shown above the tabs).
+    // Unit identities also render in the map, so scope these to the panel.
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet/ }));
     const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
     expect(within(fleet).getByText('heron#1 · recon')).toBeInTheDocument();
     expect(within(fleet).getByText('lynx#1 · triage')).toBeInTheDocument();
@@ -297,6 +303,7 @@ describe('AgentiflowDetail', () => {
     renderDetail();
     await screen.findByRole('heading', { name: 'rupu-self-review' });
 
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet/ }));
     const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
     // Nothing is fetched until the row is expanded.
     expect(getOutput).not.toHaveBeenCalled();

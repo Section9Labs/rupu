@@ -64,7 +64,6 @@ import { unitLoop } from '../run/RunLayerCanvas';
 import { FRAME_HEAD, FRAME_PAD, layoutFlow } from '../../lib/flow/flowLayout';
 import { useFlowData } from '../../lib/flow/useFlowData';
 import { useArrivals } from '../../lib/flow/useArrivals';
-import { useStableList } from '../../lib/flow/useStableList';
 import { useMessageSpace, type MessageSpace } from '../../lib/useMessageSpace';
 import { useTimeline } from '../../lib/timeline/useTimeline';
 import { countAtOrBefore, timeBounds } from '../../lib/timeline/timeline';
@@ -93,7 +92,7 @@ import RoundNode, { roundCardState } from './RoundNode';
 import ChildNode, { CHILD_KIND, childState } from './ChildNode';
 import WorkflowFrameNode from './WorkflowFrameNode';
 import { LeadNode, RailNode, SpineNode } from './MapNodes';
-import { GoalsPanel, HeaderStrip, MapSummary } from './FlowPanels';
+import { MapSummary } from './FlowPanels';
 import MoreNode from './MoreNode';
 import { RoundNavigator, RoundStepper, type RoundsGeometry } from './RoundNav';
 
@@ -953,10 +952,6 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, [followNode, replayFollow]);
 
   // --- the panels ----------------------------------------------------------
-  // Every loaded space's participants, the same array while none changed.
-  const participants = useStableList(
-    useMemo(() => spaces.flatMap((sp) => sp.participants), [spaces]),
-  );
   const participantNames = useMemo(() => {
     const s = new Set<string>();
     for (const sp of spaces) for (const p of sp.participants) s.add(p.address);
@@ -970,7 +965,7 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
   }, [spaces, childById]);
   return (
     <div className="afx-map space-y-3" data-testid="flow-map">
-      <HeaderStrip detail={detail} rounds={structure.rounds} running={running} />
+      {/* The run's goals and budget sit once, in the page's Status panel. */}
       <TimeAxis
         bands={bands}
         items={items}
@@ -1069,13 +1064,9 @@ function FlowMapBody({ detail, running, flowSpace }: FlowMapProps & { flowSpace:
           onSpace={data.setFrameSpace}
         />
       ))}
-      {/* `items-start`: a folded panel keeps its width, and only its header's height. */}
-      <div className="grid items-start gap-3 lg:grid-cols-[3fr_2fr]">
-        <CollapsiblePanel name="flow-messages" title="Messages" count={listed.length}>
-          <MessageListPanel messages={listed} spaces={spaceLabels} selected={selectedMsg} onSelect={selectFromList} />
-        </CollapsiblePanel>
-        <GoalsPanel detail={detail} rounds={structure.rounds} list={children} participants={participants} />
-      </div>
+      <CollapsiblePanel name="flow-messages" title="Messages" count={listed.length}>
+        <MessageListPanel messages={listed} spaces={spaceLabels} selected={selectedMsg} onSelect={selectFromList} />
+      </CollapsiblePanel>
       {definition && (
         <DialogFrame
           title={`${definition.child.name}: the definition the lead wrote`}

@@ -25,6 +25,7 @@ import {
   type TagAcrossResult,
 } from '../../lib/api';
 import { SEVERITY_STYLE, type Severity } from '../../lib/severity';
+import { withinSpan } from '../../lib/run/turnWindow';
 import { FINDING_FIELDS } from '../../lib/findingQuery/fields';
 import { parseQuery } from '../../lib/findingQuery/grammar';
 import { soleValues, withTerm } from '../../lib/findingQuery/shortcut';
@@ -91,9 +92,12 @@ export interface FindingsExplorerProps {
   empty: { title: string; hint: ReactNode };
   /** The scope's finding count (the Total tile), once known. */
   onCount?: (n: number) => void;
+  /** Only findings declared inside this span (ms since the epoch): a window
+   *  the run page selected on its Token flow. */
+  within?: [number, number] | null;
 }
 
-export function FindingsExplorer({ scope, guard, pollMs, exportTitle, exportWsId, tableWsId, empty, onCount }: FindingsExplorerProps) {
+export function FindingsExplorer({ scope, guard, pollMs, exportTitle, exportWsId, tableWsId, empty, onCount, within }: FindingsExplorerProps) {
   const { wsId, runId, customer = null } = scope;
   const scopeKey = JSON.stringify([wsId ?? null, runId ?? null, customer]);
   const [params, setParams] = useSearchParams();
@@ -187,7 +191,15 @@ export function FindingsExplorer({ scope, guard, pollMs, exportTitle, exportWsId
     };
   }, [q, localError, reload, wsId, runId, customer, scopeKey, guard]);
 
-  const data = !localError && answer?.q === q && answer.scope === scopeKey ? answer.resp : null;
+  const answered = !localError && answer?.q === q && answer.scope === scopeKey ? answer.resp : null;
+  // A window keeps the findings declared inside it, and the severity tiles
+  // count those (the other facets keep describing the whole scope).
+  const data = useMemo(() => {
+    if (!answered || !within) return answered;
+    const findings = answered.findings.filter((f) => withinSpan(within, f.declared_at));
+    const severity = SEVS.map((value) => ({ value, count: findings.filter((f) => f.severity === value).length }));
+    return { ...answered, findings, facets: { ...answered.facets, severity } };
+  }, [answered, within]);
   const error = !localError && failure?.q === q && failure.scope === scopeKey ? failure.message : null;
 
   const tileSummary: FindingsSummary = useMemo(() => {

@@ -1937,6 +1937,15 @@ export interface UsageTimelinePoint {
   tokens_cached: number;
   /** Cache writes; absent from CPs that predate the field. */
   tokens_cache_write?: number;
+  /** When the call finished (RFC 3339). Absent for turns read from a
+   *  transcript with no usage-ledger row (runs that predate the ledger), and
+   *  from CPs that predate the field. */
+  at?: string;
+  /** The transcript file this turn is in. */
+  transcript?: string;
+  /** 1-based: the N-th model call (non-compaction `usage` event) of that
+   *  transcript. Absent for a compaction call. */
+  transcript_turn?: number;
 }
 
 /**
