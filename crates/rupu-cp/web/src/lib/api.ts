@@ -1010,8 +1010,11 @@ export interface DirectiveView {
   author: string;
   ts: string;
   body: string;
-  addressed_to: string | null;
-  retracted_at: string | null;
+  /** Omitted by the server when the directive is for everyone. */
+  addressed_to?: string | null;
+  /** Omitted by the server while the directive stands, and for a retraction
+   *  written before retractions carried a time. */
+  retracted_at?: string | null;
   retracted: boolean;
 }
 
