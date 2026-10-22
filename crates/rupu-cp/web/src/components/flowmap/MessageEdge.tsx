@@ -123,6 +123,10 @@ function MessageEdgeView({
   let shownD: string;
   let tip: Pt;
   let far: Pt | null = null;
+  // Where the body's tip hangs: below the arc's middle, or (over a card's
+  // unit squares) above the card, so it hides neither the squares nor the
+  // card's head.
+  let tipAbove = false;
   if (stub) {
     // A board item's stub sits at its anchor, a card's at the card.
     const at = targetHandleId ? point : (data.from ?? point);
@@ -135,6 +139,7 @@ function MessageEdgeView({
   } else if (source === target && data.fromUnit && data.toUnit) {
     full = unitArch({ x: sourceX, y: sourceY }, { x: targetX, y: targetY });
     shownD = full.d;
+    tipAbove = true;
     tip = { x: targetX, y: targetY };
   } else if (source === target && !targetHandleId) {
     const l = data.from ? topLoop(data.from) : null;
@@ -212,12 +217,12 @@ function MessageEdgeView({
       {(hover || data.tip) && (
         <foreignObject
           x={f(full.mid.x) - 130}
-          y={f(full.mid.y) - 8}
+          y={tipAbove ? f(Math.min(full.mid.y, data.from?.y ?? full.mid.y)) - 146 : f(full.mid.y) - 8}
           width={260}
           height={140}
           style={{ overflow: 'visible', pointerEvents: 'none' }}
         >
-          <div className="afx-msg-tip" data-edge={id}>
+          <div className="afx-msg-tip" data-edge={id} data-above={tipAbove || undefined}>
             <div className="afx-msg-tip-head">
               <span className="afx-msg-tip-dot" style={{ background: stroke }} />
               {message.kind} · {message.message.from_codename ?? message.message.from}

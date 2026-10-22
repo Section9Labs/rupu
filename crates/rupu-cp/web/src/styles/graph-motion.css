@@ -1280,6 +1280,8 @@
 .afx-msg-dead path { stroke-width: 1.5; }
 .afx-msg-hit { stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: default; outline: none; }
 .afx-msg-hit:focus-visible { stroke: rgb(var(--c-brand-500) / 0.25); }
+/* A tip over a card's unit squares hangs above the arch, its foot on it. */
+.afx-msg-tip[data-above] { position: absolute; bottom: 0; left: 0; right: 0; margin: 0 auto; }
 .afx-msg-tip {
   width: max-content;
   max-width: 260px;
