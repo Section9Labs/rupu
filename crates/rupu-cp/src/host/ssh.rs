@@ -5712,6 +5712,57 @@ mod tests {
         assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
     }
 
+    /// A dead host is unreachable on EVERY per-host read (a 502, shown
+    /// "offline", through `host_read_error` / `host_list_error`), never a
+    /// host that predates the command (a 501, "upgrade rupu there") —
+    /// `docs/cp-api.md`'s status table, which the detail reads broke.
+    #[tokio::test]
+    async fn a_down_host_is_unreachable_on_every_read() {
+        let stderr = "ssh: connect to host 192.0.2.1 port 22: Operation timed out";
+        let fake = std::sync::Arc::new(FakeExec::offline(stderr));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let errs = [
+            ("get_run", conn.get_run("run_x").await.unwrap_err()),
+            ("get_session", conn.get_session("ses_x").await.unwrap_err()),
+            ("session_runs", conn.session_runs("ses_x").await.unwrap_err()),
+            (
+                "session_usage_timeline",
+                conn.session_usage_timeline("ses_x").await.unwrap_err(),
+            ),
+            ("run_netflow", conn.run_netflow("run_x").await.unwrap_err()),
+            ("list_sessions", conn.list_sessions(None).await.unwrap_err()),
+            ("list_agent_runs", conn.list_agent_runs().await.unwrap_err()),
+            (
+                "usage_rollup",
+                conn.usage_rollup("2026-01-01", "2026-01-02", "model")
+                    .await
+                    .unwrap_err(),
+            ),
+        ];
+        for (what, err) in errs {
+            assert!(
+                matches!(&err, HostConnectorError::Unreachable(m) if m.contains("Operation timed out")),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    /// A remote rupu that ran and exited nonzero has answered: that is a
+    /// remote error, never "host unreachable", which sends an operator to
+    /// the network instead of the binary.
+    #[tokio::test]
+    async fn a_remote_rupu_failure_on_a_listing_is_a_remote_error_not_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "error: unrecognized subcommand 'transcript'",
+        ));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_agent_runs().await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Remote(_, m) if m.contains("unrecognized subcommand")),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn list_runs_still_reports_an_old_remote_rupu_as_unsupported() {
         let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
