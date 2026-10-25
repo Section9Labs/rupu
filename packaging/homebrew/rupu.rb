@@ -7,7 +7,7 @@
 class Rupu < Formula
   desc "Agentic code-development CLI"
   homepage "https://github.com/Section9Labs/rupu"
-  version "0.84.0"
+  version "0.85.0"
   license "Apache-2.0"
 
   # rupu shells out to `rg` and hard-errors without it. This is the
@@ -17,18 +17,18 @@ class Rupu < Formula
   on_macos do
     on_arm do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-darwin-arm64"
-      sha256 "d420cd7287dc1dd2d2ff5deeabc6f033beef4654c688f1fd653d8ef4344fb67f"
+      sha256 "dea16a095cf9a31a8421d4d1aecf855fd69e11170393605b93f1d7ce7c766ec8"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-linux-x64"
-      sha256 "d703cc323d2c46989ba0d39fb805052855577c8763aae1ccd9d9982bb0976ff2"
+      sha256 "65e8a49f36c9d07bc0dbc7256919c3fb5d7de6d6d3c423f372886871f6e8fe77"
     end
     on_arm do
       url "https://github.com/Section9Labs/rupu/releases/download/v#{version}/rupu-linux-arm64"
-      sha256 "cbf1919d5d373f55bd3731a13ff1ef5a5c3bace55d98873a18e751073f184879"
+      sha256 "2862a30fa91d1c2beda7fab2841ff308ac7c63273ce5efe4d174e99c99d480f3"
     end
   end
 
