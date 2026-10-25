@@ -1,7 +1,16 @@
 use crate::state::AppState;
-use axum::{http::HeaderName, middleware::from_fn_with_state, routing::get, Router};
+use axum::{
+    http::{HeaderName, StatusCode},
+    middleware::from_fn_with_state,
+    routing::get,
+    Router,
+};
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    classify::ServerErrorsFailureClass,
+    trace::{DefaultMakeSpan, OnFailure, TraceLayer},
+};
+use tracing::Level;
 
 /// Liveness probe. The body stays the bare `ok` every existing consumer
 /// compares against; the serving PID and crate version ride along as
@@ -159,6 +168,80 @@ pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> 
     app.layer(axum::middleware::from_fn(
         crate::path_guard::reject_unsafe_segments,
     ))
-    .layer(TraceLayer::new_for_http())
+    .layer(
+        TraceLayer::new_for_http()
+            // The span is what names the request on a failure line; at
+            // tower-http's default (DEBUG) `cp serve`'s `info` filter drops
+            // it, and a failed response logged with no route or host.
+            .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+            .on_failure(HostAwareOnFailure),
+    )
     .with_state(state)
+}
+
+/// The level a failed response is logged at. A 501 or a 502 is this
+/// server's honest answer about a REMOTE host — it can't serve the call, or
+/// it can't be reached (`docs/cp-api.md`'s status table) — and a fleet with
+/// a host down is a state the web shows as offline, not this server's
+/// fault: a warning, beside the handler's own. Every other failure (a 500,
+/// a transport error) is this server's, and stays an error.
+fn failure_level(class: &ServerErrorsFailureClass) -> Level {
+    match class {
+        ServerErrorsFailureClass::StatusCode(code)
+            if *code == StatusCode::NOT_IMPLEMENTED || *code == StatusCode::BAD_GATEWAY =>
+        {
+            Level::WARN
+        }
+        _ => Level::ERROR,
+    }
+}
+
+/// tower-http's default failure line, at [`failure_level`] instead of
+/// always ERROR; it is emitted inside the request span, so it names the
+/// method and uri (host id included).
+#[derive(Clone, Copy)]
+struct HostAwareOnFailure;
+
+impl OnFailure<ServerErrorsFailureClass> for HostAwareOnFailure {
+    fn on_failure(
+        &mut self,
+        class: ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        _span: &tracing::Span,
+    ) {
+        let latency_ms = latency.as_millis();
+        match failure_level(&class) {
+            Level::WARN => tracing::warn!(classification = %class, latency_ms, "response failed"),
+            _ => tracing::error!(classification = %class, latency_ms, "response failed"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remote host's answer (can't serve it, can't be reached) is a
+    /// warning; this server's own failure is an error.
+    #[test]
+    fn a_remote_hosts_answer_warns_and_this_servers_fault_errors() {
+        use ServerErrorsFailureClass as Class;
+        assert_eq!(
+            failure_level(&Class::StatusCode(StatusCode::NOT_IMPLEMENTED)),
+            Level::WARN
+        );
+        assert_eq!(
+            failure_level(&Class::StatusCode(StatusCode::BAD_GATEWAY)),
+            Level::WARN
+        );
+        assert_eq!(
+            failure_level(&Class::StatusCode(StatusCode::INTERNAL_SERVER_ERROR)),
+            Level::ERROR
+        );
+        assert_eq!(
+            failure_level(&Class::StatusCode(StatusCode::SERVICE_UNAVAILABLE)),
+            Level::ERROR
+        );
+        assert_eq!(failure_level(&Class::Error("io".into())), Level::ERROR);
+    }
 }

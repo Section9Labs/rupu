@@ -1854,6 +1854,23 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// The error a remote `rupu` command that exited nonzero stands for: the
+/// ONE place a per-host read tells a host that is down from one that
+/// answered. ssh itself exits nonzero and says why on `stderr` when the
+/// transport failed ([`is_ssh_transport_failure`]) — the remote command
+/// never ran, the host is `Unreachable` (a 502, shown offline). Anything
+/// else is the remote rupu's own failure, in its own words: `Remote(0,
+/// stderr)` (`RemoteOutput` carries no exit code). Before this, every
+/// nonzero exit was `Unreachable`, and each reader that wrapped it as
+/// `Unsupported` turned a dead host into "upgrade rupu there" (a 501).
+fn nonzero_exit(stderr: String) -> HostConnectorError {
+    if is_ssh_transport_failure(&stderr) {
+        HostConnectorError::Unreachable(stderr)
+    } else {
+        HostConnectorError::Remote(0, stderr)
+    }
+}
+
 /// Classify a failed remote `rupu run list` ([`run_list_command`]).
 ///
 /// - a remote rupu that FAILED and advertises [`CAP_RUN_LIST`] (its stderr
@@ -1876,16 +1893,18 @@ fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError 
         // failure is the remote rupu's own — even if its error text happens
         // to contain a transport phrase ("broken pipe", "connection refused"
         // from something it talked to) — never an offline host.
-        HostConnectorError::Unreachable(msg) if msg.contains(RUN_LIST_SUPPORTED) => {
+        HostConnectorError::Unreachable(msg) | HostConnectorError::Remote(_, msg)
+            if msg.contains(RUN_LIST_SUPPORTED) =>
+        {
             let reason: Vec<&str> = msg
                 .lines()
                 .filter(|l| l.trim() != RUN_LIST_SUPPORTED)
                 .collect();
             HostConnectorError::Invalid(reason.join("\n").trim().to_string())
         }
-        HostConnectorError::Unreachable(msg) if is_ssh_transport_failure(&msg) => {
-            HostConnectorError::Unreachable(msg)
-        }
+        // `nonzero_exit` already read the transport markers: an
+        // `Unreachable` here is a host that is down.
+        down @ HostConnectorError::Unreachable(_) => down,
         other => HostConnectorError::Unsupported(format!(
             "remote host {host_id} does not support `rupu run list` \
              (it doesn't advertise `{CAP_RUN_LIST}`): {other}"
@@ -2016,7 +2035,7 @@ async fn exec_json(
     }
     .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
     if !out.success {
-        return Err(HostConnectorError::Unreachable(out.stderr));
+        return Err(nonzero_exit(out.stderr));
     }
     serde_json::from_str(out.stdout.trim())
         .map_err(|e| HostConnectorError::Remote(0, format!("parse `rupu {label}` output: {e}")))
@@ -3003,30 +3022,45 @@ impl SshHostConnector {
         (lower.contains("unknown session") || lower.contains("not found")) && message.contains(id)
     }
 
-    /// The useful half of a failed `remote_json` call.
-    ///
-    /// [`remote_json`](Self::remote_json) maps a NON-ZERO EXIT to
-    /// `Unreachable`, whose Display prefixes "host unreachable:". For a host
-    /// that answered and simply rejected the command (an out-of-date `rupu`
-    /// printing "unrecognized subcommand"), that prefix is actively wrong —
-    /// it points an operator at the network instead of at the binary. Unwrap
-    /// the inner message so callers can report what the remote actually
-    /// said.
+    /// The useful half of a failed `remote_json` call: a remote rupu that
+    /// ran and exited nonzero is `Remote(0, stderr)` ([`nonzero_exit`]),
+    /// whose Display prefixes "remote error 0:" — report what it actually
+    /// said (an out-of-date `rupu` printing "unrecognized subcommand").
     fn remote_failure_detail(e: &HostConnectorError) -> String {
         match e {
-            HostConnectorError::Unreachable(m) => m.trim().to_string(),
+            HostConnectorError::Remote(0, m) => m.trim().to_string(),
             other => other.to_string(),
         }
+    }
+
+    /// The error a failed per-host read stands for, once the remote has NOT
+    /// said the entity is absent (that is the caller's `NotFound`). A host
+    /// that is down passes through as `Unreachable` (a 502, shown offline).
+    /// Everything else — an old rupu without `rupu <command>`, a malformed
+    /// reply — is `Unsupported`: "the host cannot report", never "the entity
+    /// is absent", which would render an empty page as truth.
+    fn cannot_report(&self, command: &str, e: HostConnectorError) -> HostConnectorError {
+        if let HostConnectorError::Unreachable(_) = e {
+            return e;
+        }
+        tracing::warn!(
+            host_id = %self.host_id,
+            error = %e,
+            "remote `rupu {command}` failed; host may predate it"
+        );
+        HostConnectorError::Unsupported(format!(
+            "remote host {} does not support `rupu {command}`: {}",
+            self.host_id,
+            Self::remote_failure_detail(&e)
+        ))
     }
 
     /// Fetch one session's `session show` report `item` over ssh.
     ///
     /// A remote that explicitly says the session is absent maps to
-    /// `NotFound`; anything else (a host predating the command, unreachable,
-    /// malformed body) maps to `Unsupported` — "the host cannot report" is
-    /// not the same as "the session does not exist", and rendering the
-    /// latter would present an empty page as truth. Same rule as
-    /// [`get_run`](Self::get_run).
+    /// `NotFound`; everything else is [`cannot_report`](Self::cannot_report)
+    /// (a down host stays unreachable, an old or malformed one is
+    /// `Unsupported`). Same rule as [`get_run`](Self::get_run).
     async fn session_show_item(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
         match self
             .remote_json_item(&["--format", "json", "session", "show", id])
@@ -3037,17 +3071,7 @@ impl SshHostConnector {
                 if Self::says_session_absent(&e.to_string(), id) {
                     return Err(HostConnectorError::NotFound(id.to_string()));
                 }
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    session_id = %id,
-                    error = %e,
-                    "session_show_item: remote `rupu session show` failed; host may predate it"
-                );
-                Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session show --format json`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                )))
+                Err(self.cannot_report("session show --format json", e))
             }
         }
     }
@@ -3399,19 +3423,9 @@ impl HostConnector for SshHostConnector {
                     );
                     return Err(HostConnectorError::NotFound(run_id.to_string()));
                 }
-                // Anything else (old host that can't parse `run show`,
-                // unreachable, malformed body): the host cannot report, not
-                // "the run is absent". Map to Unsupported, never NotFound.
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    run_id = %run_id,
-                    error = %e,
-                    "get_run: remote `rupu run show` failed; host may predate the command"
-                );
-                Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu run show`: {e}",
-                    self.host_id
-                )))
+                // Anything else: the host cannot report, not "the run is
+                // absent" — never NotFound.
+                Err(self.cannot_report("run show", e))
             }
         }
     }
@@ -3860,19 +3874,7 @@ impl HostConnector for SshHostConnector {
         let report = self
             .remote_json(&["--format", "json", "netflow", "show", run_id])
             .await
-            .map_err(|e| {
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    run_id = %run_id,
-                    error = %e,
-                    "run_netflow: remote command failed; host may predate it"
-                );
-                HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu netflow show`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                ))
-            })?;
+            .map_err(|e| self.cannot_report("netflow show", e))?;
         Ok(serde_json::json!({
             "flows": report.get("rows").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
             // A dropped record is data the sink could not write; carrying the
@@ -3924,17 +3926,7 @@ impl HostConnector for SshHostConnector {
                 if Self::says_session_absent(&e.to_string(), id) {
                     return HostConnectorError::NotFound(id.to_string());
                 }
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    session_id = %id,
-                    error = %e,
-                    "session_usage_timeline: remote command failed; host may predate it"
-                );
-                HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session usage-timeline`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                ))
+                self.cannot_report("session usage-timeline", e)
             })?;
         Ok(serde_json::Value::Array(rows))
     }
@@ -5724,7 +5716,10 @@ mod tests {
         let errs = [
             ("get_run", conn.get_run("run_x").await.unwrap_err()),
             ("get_session", conn.get_session("ses_x").await.unwrap_err()),
-            ("session_runs", conn.session_runs("ses_x").await.unwrap_err()),
+            (
+                "session_runs",
+                conn.session_runs("ses_x").await.unwrap_err(),
+            ),
             (
                 "session_usage_timeline",
                 conn.session_usage_timeline("ses_x").await.unwrap_err(),
