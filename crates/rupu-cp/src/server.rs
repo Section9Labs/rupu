@@ -180,11 +180,12 @@ pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> 
 }
 
 /// The level a failed response is logged at. A 501 or a 502 is this
-/// server's honest answer about a REMOTE host — it can't serve the call, or
-/// it can't be reached (`docs/cp-api.md`'s status table) — and a fleet with
-/// a host down is a state the web shows as offline, not this server's
-/// fault: a warning, beside the handler's own. Every other failure (a 500,
-/// a transport error) is this server's, and stays an error.
+/// server's honest answer that the call can't be served from here — a
+/// remote host that is down or too old, an adapter only `rupu cp serve`
+/// installs (`docs/cp-api.md`'s status table) — a state the caller is told
+/// and the web shows as offline or unavailable, not this server's fault: a
+/// warning, beside the handler's own. Every other failure (a 500, a
+/// transport error) is this server's, and stays an error.
 fn failure_level(class: &ServerErrorsFailureClass) -> Level {
     match class {
         ServerErrorsFailureClass::StatusCode(code)
