@@ -61,8 +61,10 @@ never affect the command or the run.
   run), object-store bucket traffic and the tunnel node's WebSocket.
 - **Traffic with no run behind it.** The updater, login and OAuth, the control
   plane's own host traffic and the ASN download are not recorded at all.
-- **Remote hosts' flows.** A unit placed on a remote host records its flows in
-  that host's ledger; they are not brought back to the coordinator.
+- **A remote host's flows while its unit is still running.** A unit placed on
+  a remote host records its flows in that host's ledger; the coordinator gets a
+  copy when the unit ends, not live (see
+  [Runs on remote hosts](#runs-on-remote-hosts)).
 - **Query strings and headers**, deliberately: they routinely carry tokens.
   There is no setting to record them.
 
@@ -164,6 +166,40 @@ had for it and a `recovered` line. A run that crashed or was killed never
 reaches its end. For such a run, its own view and its agentiflow's view
 still merge the transcripts of the run and of every run it launched, while
 project and global views show only what reached the ledger.
+
+### Runs on remote hosts
+
+A unit placed on a remote host (`host:`, `distribute:`, the fallback-host
+retry) and a run placed there whole write their ledgers on that host. The host
+also tees every ledger line of the run, and of every sub-agent and child
+beneath it, into one stream in the run's directory on the host
+(`runs/<id>/netflow.jsonl`), which starts with a `begin` line even when the run
+made no network calls, so "no flows" is never confused with "not collected".
+When the run ends, the coordinator collects the stream and lands it: split per
+ledger id into its own `~/.rupu/netflow/<id>.jsonl`, byte for byte, with a
+landing record, `~/.rupu/runs/<id>/netflow.landing.json`, that says what
+arrived: `complete`, `partial` (with the reason) or `unavailable` (a host too
+old to stream, or a stream that failed or was lost). A `complete` record is
+never downgraded by a later landing.
+
+How the stream reaches the coordinator depends on the host's transport:
+
+| Host | How the stream arrives |
+|------|------------------------|
+| `local` | Nothing to collect: the unit's ledgers are already in the coordinator's own netflow directories |
+| SSH | Pulled with the run's other ledgers (`usage.jsonl`, `coverage.jsonl`) in one ssh round trip once the run is terminal on the host; a copy pulled before that is `partial` |
+| tunnel | The node sends it with the run's other mirrored files, but only to a control plane that advertises `mirror.netflow` |
+| bucket | The worker uploads it before it writes the run's `finished` marker |
+| HTTP (placed units) | The coordinator fetches `GET /api/runs/:id/netflow/stream` from a peer whose features list `run.netflow_stream`; a read after a poll error or at the wall timeout is `partial` |
+
+Nothing lands while the unit is still running: until it ends, its flows show
+only through the transcript merge above. Once landed, the ledgers are read
+like any other at run, project, global and agentiflow scope, and a copy that
+is `partial`, `unavailable` or not collected at all is listed as `incomplete`
+at every scope, naming the host and the reason; the workflow run also gets a
+step warning for it. A missing or short copy never fails the unit and is never
+shown as whole. `rupu netflow prune` treats landed ledgers like any other
+ledger.
 
 ---
 
@@ -339,7 +375,8 @@ project layers combine.
   lookups. It is not built.
 - **Non-HTTP egress** (`git2` clones, bucket traffic, the tunnel WebSocket) is
   not captured.
-- **Remote hosts' flows** stay on the remote host.
+- **Remote hosts' flows arrive when the unit ends**, not live, and a copy that
+  is short or missing is listed as `incomplete` rather than shown as whole.
 - **GitHub connector flows are `coarse`.**
 - **No enforcement.** Netflow records connections; it does not block them.
 - **No automatic retention.** Use `rupu netflow prune`.
