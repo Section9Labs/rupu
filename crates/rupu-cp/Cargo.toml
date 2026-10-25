@@ -83,6 +83,7 @@ rupu-fleet = { path = "../rupu-fleet" }
 
 [dev-dependencies]
 chrono.workspace = true
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 serial_test.workspace = true
 git2.workspace = true

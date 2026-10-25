@@ -5756,6 +5756,42 @@ mod tests {
         );
     }
 
+    /// An `Unreachable` that is not a nonzero exit — a spawn failure, the
+    /// listing cache's own bound — is a host that is down, whatever its
+    /// wording: `run_list_failure` no longer re-reads the transport markers.
+    #[test]
+    fn run_list_failure_keeps_an_unreachable_without_a_transport_phrase() {
+        let err = run_list_failure(
+            "host_abc",
+            HostConnectorError::Unreachable("no data from host_abc for 60s".into()),
+        );
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m == "no data from host_abc for 60s"),
+            "{err}"
+        );
+    }
+
+    /// A remote rupu too old for `run show` is unsupported, in its own
+    /// words: neither "remote error 0" nor "host unreachable" reaches the
+    /// operator.
+    #[tokio::test]
+    async fn get_run_reports_an_old_host_in_the_remotes_own_words() {
+        let fake = std::sync::Arc::new(FakeExec::offline("error: unrecognized subcommand 'show'"));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.get_run("run_x").await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "{message}"
+        );
+        assert!(
+            message.contains("unrecognized subcommand 'show'"),
+            "{message}"
+        );
+        assert!(!message.contains("remote error 0"), "{message}");
+        assert!(!message.contains("host unreachable"), "{message}");
+    }
+
     #[tokio::test]
     async fn list_runs_still_reports_an_old_remote_rupu_as_unsupported() {
         let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
@@ -6176,8 +6212,9 @@ mod tests {
     /// A host whose `rupu` predates `session usage-timeline` must say so,
     /// not report an empty chart as if the session had no turns.
     /// A host that ANSWERED and rejected the command is not an unreachable
-    /// host. `remote_json` maps a non-zero exit to `Unreachable`, so the
-    /// reported reason must not carry that prefix onward — it would point an
+    /// host: `nonzero_exit` keeps the remote's own words as `Remote(0, _)`,
+    /// and the reported reason must carry neither that variant's "remote
+    /// error 0:" nor "host unreachable:" — the latter would point an
     /// operator at the network instead of at the out-of-date binary.
     #[tokio::test]
     async fn an_old_hosts_reason_does_not_claim_the_host_is_unreachable() {

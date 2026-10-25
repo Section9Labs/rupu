@@ -3026,20 +3026,25 @@ enum HostFlows {
 /// remote cannot return something that merely looks filtered.
 async fn host_raw_flows(s: &AppState, host_id: &str, run_id: &str) -> ApiResult<HostFlows> {
     let conn = resolve_host(s, host_id)?;
-    let value = match conn.run_netflow(run_id).await {
+    host_flows(host_id, conn.run_netflow(run_id).await)
+}
+
+/// What a host's [`HostConnector::run_netflow`] answer means here. No
+/// structured surface (`Unsupported` / `Invalid`) is [`HostFlows::NoStructuredSurface`]:
+/// the caller tries the generic-GET proxy, and falls back to THIS reason if
+/// that has nothing to offer either. Every other failure is the same
+/// status every remote read gives ([`crate::api::runs::host_read_error`]):
+/// 404 for a run the host doesn't have, 502 for a host that is down.
+fn host_flows(
+    host_id: &str,
+    answer: Result<serde_json::Value, HostConnectorError>,
+) -> ApiResult<HostFlows> {
+    let value = match answer {
         Ok(v) => v,
-        // No structured surface — the caller tries the generic-GET proxy,
-        // and falls back to THIS reason if that has nothing to offer either.
         Err(HostConnectorError::Unsupported(reason)) | Err(HostConnectorError::Invalid(reason)) => {
             return Ok(HostFlows::NoStructuredSurface { reason })
         }
-        Err(HostConnectorError::NotFound(m)) => return Err(ApiError::not_found(m)),
-        Err(HostConnectorError::Unreachable(m)) => {
-            return Err(ApiError::internal(format!(
-                "host {host_id} unreachable: {m}"
-            )))
-        }
-        Err(other) => return Err(ApiError::internal(other.to_string())),
+        Err(other) => return Err(crate::api::runs::host_read_error(host_id, other)),
     };
 
     let flows: Vec<FlowRecord> = serde_json::from_value(
@@ -3609,6 +3614,31 @@ mod tests {
     use super::*;
     use crate::netflow_index::DirectReader;
     use rupu_netflow::{Fidelity, FlowCtx, Origin, Outcome};
+
+    /// A host that is down is a 502 on the run netflow routes, as on every
+    /// other remote read — not a 500 of this server's own.
+    #[test]
+    fn a_down_hosts_netflow_is_a_502_and_an_old_one_falls_back_to_the_proxy() {
+        use axum::{http::StatusCode, response::IntoResponse};
+        let status = |answer| match host_flows("h", answer) {
+            Err(e) => e.into_response().status(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert_eq!(
+            status(Err(HostConnectorError::Unreachable(
+                "ssh: connect to host 192.0.2.1 port 22: Operation timed out".into()
+            ))),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status(Err(HostConnectorError::NotFound("run_x".into()))),
+            StatusCode::NOT_FOUND
+        );
+        assert!(matches!(
+            host_flows("h", Err(HostConnectorError::Unsupported("too old".into()))),
+            Ok(HostFlows::NoStructuredSurface { reason }) if reason == "too old"
+        ));
+    }
 
     fn ledger(dir: &std::path::Path, id: &str, flows: &[FlowRecord], dropped: u64) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
