@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rupu docs — Configuration</title>
-<meta name="description" content="Complete config.toml reference for rupu: layering, locks, providers, SCM, UI, runtime limits, recovery, findings, netflow, control plane, triggers, autoflows, pricing and more.">
+<meta name="description" content="Complete config.toml reference for rupu: layering, locks, the customer layer, providers, SCM, UI, runtime limits, dispatch, messaging, recovery, findings, coverage, netflow, control plane, triggers, autoflows, pricing, retention and updates.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -121,9 +124,10 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
 <span class="k">lock</span> = [<span class="s">"default_provider"</span>]   <span class="c"># a repo's .rupu/config.toml can't move these runs</span></pre>
     <ul>
       <li>Accounts are declared once, globally (<code class="inline">rupu auth login --account anthropic-northwind --kind anthropic</code>); the customer layer only references them.</li>
-      <li>A run records the customer it ran under; <code class="inline">workflow resume</code> / <code class="inline">approve</code> reuse that record even if the project was reassigned since.</li>
+      <li>Arrays replace, as between global and project: a customer that declares <code class="inline">[[scm.rules]]</code> replaces the global rules for its projects. The project still wins on any key the customer has not locked; a customer lock cannot unlock a key the global <code class="inline">[policy].lock</code> names.</li>
+      <li>A run records the customer it ran under (<code class="inline">"customer": null</code> when it ran with none); <code class="inline">workflow resume</code> / <code class="inline">approve</code> run on what was recorded even if the project was reassigned since, and a recorded customer that no longer exists fails the resume. Only a run from before customers existed falls back to the directory it was launched from. An autoflow run uses its repo's checkout, not its issue worktree.</li>
       <li>A dangling assignment or an unparseable customer layer fails the run — it never falls back to global.</li>
-      <li><code class="inline">rupu customer show &lt;slug&gt;</code> prints the effective config with sources and locks.</li>
+      <li><code class="inline">rupu customer show &lt;slug&gt;</code> prints the effective config with sources and locks; <code class="inline">rupu customer edit &lt;slug&gt;</code> edits and validates the layer. The control plane manages customers, filters its lists by <code class="inline">?customer=</code> and previews a launch's accounts.</li>
     </ul>
     <p>More in <a class="link" href="/docs/customers.html">Customers</a>.</p>
 
@@ -224,7 +228,7 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
       <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
       <tbody>
         <tr><td><code>timeout_secs</code></td><td>integer</td><td><code>120</code></td><td>Timeout for one <code>bash</code> tool invocation.</td></tr>
-        <tr><td><code>env_allowlist</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Extra env vars forwarded into the subprocess, beyond the always-allowed <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TERM</code>, <code>LANG</code>.</td></tr>
+        <tr><td><code>env_allowlist</code></td><td>array&lt;string&gt;</td><td><code>[]</code></td><td>Extra env vars forwarded into the subprocess, beyond the always-allowed <code>PATH</code>, <code>HOME</code>, <code>USER</code>, <code>TERM</code>, <code>LANG</code> (and <code>RUPU_RUN_ID</code>, the run marker a launched child carries).</td></tr>
       </tbody>
     </table>
 
@@ -234,7 +238,25 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
       <tbody>
         <tr><td><code>max_open_files</code></td><td>integer</td><td>unset</td><td>Soft open-file limit rupu raises itself to at startup, and the cap for automatic growth under fan-out. Unset: raise to 10240 (capped at the hard limit) and grow on demand. Past the cap, new agent runs are paced instead of failing with "Too many open files". Env: <code>RUPU_MAX_OPEN_FILES</code> / <code>--max-open-files</code>.</td></tr>
         <tr><td><code>max_concurrent_jobs</code></td><td>integer</td><td>RAM-derived</td><td>Process-wide ceiling on local agent jobs, whatever a workflow's <code>max_parallel:</code> / <code>max_concurrency:</code> says. Unset: <code>clamp(RAM_GB / 4, 4, 128)</code>. <code>0</code> means no ceiling. Remote (<code>distribute:</code>) units are bounded by their own host. Env: <code>RUPU_MAX_CONCURRENT_JOBS</code>.</td></tr>
-        <tr><td><code>min_free_memory_mb</code></td><td>integer</td><td>RAM-derived</td><td>Memory watchdog: a new local job waits until this much memory is free (proceeding anyway after 60 s, with a warning). Unset: <code>max(RAM × 10%, 4096)</code>. <code>0</code> disables the watchdog. Env: <code>RUPU_MIN_FREE_MEMORY_MB</code>.</td></tr>
+        <tr><td><code>min_free_memory_mb</code></td><td>integer</td><td>RAM-derived</td><td>Memory watchdog: a new local job waits until this much memory is free (proceeding anyway after 60 s, with a warning). Unset: <code>max(RAM × 10%, 4096)</code>. <code>0</code> disables the watchdog (the ceiling still applies). Available memory is read from <code>/proc/meminfo</code> (Linux) or <code>vm_stat</code> (macOS); where it can't be read, the watchdog does nothing. Env: <code>RUPU_MIN_FREE_MEMORY_MB</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="dispatch">Child runs — <code class="inline">[dispatch]</code></h2>
+    <p>Child runs an agent starts with <code class="inline">dispatch</code> (see <a class="link" href="/docs/agents.html">Agents</a>).</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>max_concurrent_children</code></td><td>integer</td><td><code>8</code></td><td>How many children of one parent run run at once, all kinds together. More wait as <code>pending</code> until a slot frees. <code>0</code> is read as <code>1</code>. Applies per run, so an agentiflow's units count against its lead's limit. In-process sub-agents also wait for <code>[runtime]</code> admission.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="messaging">Message spaces — <code class="inline">[messaging]</code></h2>
+    <p>A run's message space (see <a class="link" href="/docs/messaging.html">Messaging</a>).</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>log_max_mb</code></td><td>integer</td><td><code>64</code></td><td>Size past which a space's <code>log.jsonl</code> takes no more messages. A further send fails to its sender with an error and a <code>messaging_full</code> notice. The log is never trimmed. Receipts are still written.</td></tr>
       </tbody>
     </table>
 
@@ -255,15 +277,16 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td><code>fallbacks</code></td><td>array of <code>{ model, provider? }</code></td><td><code>[]</code></td><td>Fallback chain for every agent that declares no <code>fallbacks:</code> of its own (an agent's list replaces this one). An entry without <code>provider</code> means the provider the run started on; same-provider entries are tried first, then the others.</td></tr>
-        <tr><td><code>server_side_fallback</code></td><td>bool</td><td><code>true</code></td><td>Ask Anthropic to fall back server-side when the requested model refuses. API-key auth on supported models only, never OAuth.</td></tr>
+        <tr><td><code>fallbacks</code></td><td>array of <code>{ model, provider? }</code></td><td><code>[]</code></td><td>Ordered fallback chain for every agent that declares no <code>fallbacks:</code> of its own (an agent's list replaces this one, not merged). An entry without <code>provider</code> means the provider the run started on; entries on that provider are tried first, then other providers. A cross-provider entry sends the conversation to that provider's API. Unknown keys are an error.</td></tr>
+        <tr><td><code>server_side_fallback</code></td><td>bool</td><td><code>true</code></td><td>Ask Anthropic to fall back server-side when the requested model refuses. Applies only to API-key auth on <code>claude-fable-5</code>, <code>claude-fable-5-1</code>, <code>claude-opus-5</code>, <code>claude-opus-5-5</code> and <code>claude-sonnet-5-5</code>; never OAuth. Set <code>false</code> to stop sending it.</td></tr>
       </tbody>
     </table>
     <pre class="code"><span class="v">[recovery]</span>
 <span class="k">fallbacks</span> = [
-  { <span class="k">model</span> = <span class="s">"claude-sonnet-4-6"</span> },
-  { <span class="k">provider</span> = <span class="s">"openai"</span>, <span class="k">model</span> = <span class="s">"gpt-5"</span> },
-]</pre>
+  { <span class="k">model</span> = <span class="s">"claude-sonnet-5-5"</span> },
+  { <span class="k">provider</span> = <span class="s">"openai-codex"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
+]
+<span class="k">server_side_fallback</span> = <span class="v">true</span></pre>
 
     <h2 id="findings">Findings — <code class="inline">[findings]</code></h2>
     <table>
@@ -279,6 +302,15 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
     </table>
     <p><code class="inline">rupu findings import</code> reads the size limits from the global file only. See <a class="link" href="/docs/findings.html">Findings</a>.</p>
 
+    <h2 id="coverage">Concern catalogs — <code class="inline">[coverage]</code></h2>
+    <p>How a run's concern catalog is rendered into its system prompt; see <a class="link" href="/docs/coverage.html">Coverage</a> for render modes.</p>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>full_mode_max_concerns</code></td><td>integer</td><td><code>80</code></td><td>Most concerns a run's flattened catalog may hold for its <code>mode: auto</code> includes to render in full; a larger catalog renders them as the one-line index the agent searches with <code>coverage.concerns.search</code> / <code>coverage.concerns.detail</code>. Includes that say <code>mode: full</code> or <code>mode: index</code> keep their mode.</td></tr>
+      </tbody>
+    </table>
+
     <h2 id="netflow">Network capture — <code class="inline">[netflow]</code></h2>
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Notes</th></tr></thead>
@@ -289,7 +321,7 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
         <tr><td><code>asn_auto_refresh</code></td><td>bool</td><td><code>true</code></td><td>Keep the IP → ASN enrichment table fresh: the control plane downloads it in the background when it is missing or stale.</td></tr>
         <tr><td><code>asn_refresh_interval_days</code></td><td>integer</td><td><code>7</code></td><td>Age after which the ASN table is re-downloaded. <code>0</code> treats it as always stale.</td></tr>
         <tr><td><code>asn_source_url</code></td><td>string</td><td><code>https://iptoasn.com/data/ip2asn-combined.tsv.gz</code></td><td>Where the ASN table comes from (gzipped ip2asn TSV) — point it at a mirror on an air-gapped network.</td></tr>
-        <tr><td><code>cp_index_budget_mb</code></td><td>integer</td><td><code>256</code></td><td>Memory budget for the flow rows <code>rupu cp serve</code> keeps indexed. Over budget, the oldest files' rows are dropped and re-read from disk on demand — slower, never different. Status: <code>GET /api/netflow/index</code>.</td></tr>
+        <tr><td><code>cp_index_budget_mb</code></td><td>integer</td><td><code>256</code></td><td>Memory budget for the flow rows <code>rupu cp serve</code> keeps indexed. Over budget, the oldest files' rows are dropped and re-read from disk on demand — slower, never different; per-file summaries always stay in memory. Status: <code>GET /api/netflow/index</code>. Takes effect on the next request after a change made through the control plane; a hand edit needs a restart.</td></tr>
       </tbody>
     </table>
     <pre class="code"><span class="v">[netflow]</span>

@@ -7,6 +7,7 @@
 <meta name="description" content="Netflow is rupu's network-egress observability subsystem: every provider and SCM call rupu makes, and every connection an agent's bash commands open, is captured as a flow, written to a per-run ledger, enriched with ASN/org at read time, and explored in the Control Plane.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -75,12 +78,14 @@
       are tagged with the run and agent that produced them.
     </p>
     <p>
-      Those records land in an <strong>append-only JSONL ledger per run</strong>,
-      next to the run's transcripts. At read time the control plane resolves each
-      peer IP to an <strong>ASN and org</strong> and renders a
-      <strong>Network explorer</strong> — activity over time, a topology from
-      workflows to origins to the orgs they reached, per-endpoint timelines, and
-      a sortable flow table — at run, project and global scope.
+      Those records land in an <strong>append-only JSONL ledger per run</strong>.
+      At read time the control plane resolves each peer IP to an
+      <strong>ASN and org</strong> and renders a <strong>Network explorer</strong>
+      — activity over time, a topology from workflows to origins to the orgs
+      they reached, per-endpoint timelines, and a sortable flow table — at run,
+      project and global scope. A unit that ran on a
+      <a class="link" href="/docs/multi-host.html">remote host</a> sends its
+      ledgers back when it ends, so they are read at every scope too.
     </p>
     <p>
       The whole subsystem exists to let a viewer tell <em>"we could not observe
@@ -100,8 +105,10 @@
       <code class="inline">sendto</code> without <code class="inline">connect</code>
       has no destination; a process that detaches from its shell before
       connecting (macOS) or a connection that opens and closes between two polls
-      (Linux) can be missed; and a remote host's bash flows stay in that host's
-      ledger. Netflow also cannot see rupu's own <strong>non-HTTP egress</strong>:
+      (Linux) can be missed; and a unit placed on a remote host records its flows
+      in that host's ledger, which reaches the coordinator when the unit ends,
+      not live (see <em>Runs on remote hosts</em> below). Netflow also cannot
+      see rupu's own <strong>non-HTTP egress</strong>:
       git2 clones (often a run's largest byte volume by far), object-store bucket
       traffic, and the <a class="link" href="/docs/multi-host.html">tunnel node</a>
       WebSocket. Housekeeping with no run behind it — the updater, login, the
@@ -226,8 +233,8 @@
         </tr>
         <tr>
           <td><strong>Linux</strong></td>
-          <td><code class="inline">sock_diag</code> netlink: a short poll of every TCP/UDP socket (default every 50 ms) plus the kernel's socket-close notifications with final byte counts.</td>
-          <td>By cgroup: each bash call's shell moves itself into a per-call cgroup before running anything, so every descendant — even a detached one — is attributed. Where no delegated cgroup is available, capture is reported as <strong>unavailable</strong> on the run (naming the cgroup and why); there is no process-tree fallback on Linux.</td>
+          <td><code class="inline">sock_diag</code> netlink: a poll of every TCP/UDP socket (every <code class="inline">subprocess_poll_ms</code>, default 50 ms) plus the kernel's socket-close notifications with final byte counts.</td>
+          <td>By cgroup: each bash call's shell moves itself into a per-call cgroup before running anything, so every descendant — even a detached one — is attributed. This needs cgroup v2 and either a systemd user manager or a writable, delegated cgroup; without them, capture is reported as <strong>unavailable</strong> on the run, with the reason.</td>
         </tr>
       </tbody>
     </table>
@@ -235,7 +242,7 @@
       Each connection becomes one flow at <code class="inline">socket</code>
       fidelity: transport, remote IP and port, local address, the process name
       and pid, open and close times, and bytes in and out where
-      the OS reports them (UDP has none on Linux). It carries the
+      the OS reports them. It carries the
       <strong>tool-call id</strong> of the bash call that caused it, so the CP's
       flow table links straight to that call in the run's transcript. There is no
       URL, method or status — those live inside the encrypted stream, and the
@@ -248,8 +255,9 @@
       …") and the CP shows it, and a dropped kernel event becomes a note on the run
       rather than a silent gap. Subprocess capture is on by default; set
       <code class="inline">[netflow].subprocess_capture = false</code>, or
-      <code class="inline">RUPU_NETFLOW_SUBPROCESS=0</code> to force it off on one
-      host without editing config.
+      <code class="inline">RUPU_NETFLOW_SUBPROCESS=0</code> to force it off for
+      one process whatever the config says (only the value
+      <code class="inline">0</code> does). The backend is chosen once per process.
     </div>
 
     <h2>What a flow records</h2>
@@ -266,7 +274,7 @@
         <tr><td><code>id</code></td><td>ULID for this flow. Minted by the caller for streamed bodies so a later completion line can find it.</td></tr>
         <tr><td><code>ts</code></td><td>UTC timestamp, taken when the record is emitted.</td></tr>
         <tr><td><code>ctx</code></td><td>Attribution: <code>run_id</code>, <code>step_id</code>, <code>agent</code>, <code>workspace_id</code>, <code>tool_call_id</code> (each optional) and <code>origin</code>. Which run a flow belongs to is answered by the ledger file it landed in.</td></tr>
-        <tr><td><code>ctx.origin</code></td><td>Which subsystem opened the connection — <code>provider</code>, <code>scm</code> and <code>subprocess</code> carry a name (<code>anthropic</code>, <code>github</code>, <code>curl</code>); <code>update</code>, <code>cp</code>, <code>system</code> are bare.</td></tr>
+        <tr><td><code>ctx.origin</code></td><td>What opened the connection — <code>{"kind":"provider","name":"anthropic"}</code>, <code>{"kind":"scm","name":"github"}</code>, <code>{"kind":"subprocess","name":"curl"}</code>.</td></tr>
         <tr><td><code>ctx.tool_call_id</code></td><td>The bash tool call that caused a socket flow. Absent on HTTP flows.</td></tr>
         <tr><td><code>fidelity</code></td><td><code>coarse</code> | <code>socket</code> | <code>http</code> | <code>full</code> — how much of this record is actually known. See below.</td></tr>
         <tr><td><code>method</code></td><td>HTTP method.</td></tr>
@@ -278,7 +286,7 @@
         <tr><td><code>process</code></td><td>The process that owned the socket — <code>pid</code> and <code>name</code>. Socket flows only.</td></tr>
         <tr><td><code>local_addr</code></td><td>The local <code>ip:port</code>, for correlating with other logs. Socket flows only.</td></tr>
         <tr><td><code>direction</code></td><td><code>outbound</code> | <code>inbound</code>. Reserved in the schema; no capture backend fills it in yet.</td></tr>
-        <tr><td><code>resolved_ips</code></td><td>Every A/AAAA answer the custom DNS resolver saw for the host — strictly more than the one peer used.</td></tr>
+        <tr><td><code>resolved_ips</code></td><td>Every address DNS returned for the host — more than the one peer actually used.</td></tr>
         <tr><td><code>http_version</code></td><td>Negotiated HTTP version, when known.</td></tr>
         <tr><td><code>status</code></td><td>Response status code, when a response was received.</td></tr>
         <tr><td><code>outcome</code></td><td><code>ok</code> | <code>http_error</code> | <code>transport_error</code> | <code>timeout</code>.</td></tr>
@@ -362,7 +370,7 @@
     <h2>The ledger</h2>
     <p>
       Every run, workflow step, fan-out unit, sub-agent and session turn gets its
-      own append-only ledger, laid out exactly like transcripts:
+      own append-only ledger:
     </p>
     <table>
       <thead>
@@ -381,7 +389,7 @@
     </table>
     <p>
       The ledger is <strong>strictly append-only</strong> — a record written at
-      header time is never rewritten. Each line is one of five envelopes:
+      header time is never rewritten. Each line is one of six envelopes:
     </p>
     <table>
       <thead>
@@ -390,9 +398,10 @@
       <tbody>
         <tr><td><code>flow</code></td><td>A full <code>FlowRecord</code>.</td></tr>
         <tr><td><code>complete</code></td><td>Finalizes a streamed body written earlier — carries the flow id, observed <code>bytes_in</code>, and <code>duration_ms</code>. Folded into its flow at <em>read</em> time.</td></tr>
-        <tr><td><code>socket_complete</code></td><td>Finalizes a socket flow when the socket closes: byte counts, final outcome, duration.</td></tr>
-        <tr><td><code>capture</code></td><td>What subprocess capture could do on this run — active, or unavailable with the reason — plus any loss note.</td></tr>
-        <tr><td><code>dropped</code></td><td>Records visible loss when the writer channel overflowed, with a count and a timestamp.</td></tr>
+        <tr><td><code>socket_complete</code></td><td>Finalizes a socket flow when the socket closes: <code>id</code>, <code>duration_ms</code>, and the final <code>bytes_in</code>, <code>bytes_out</code>, <code>outcome</code> and <code>error</code> where known.</td></tr>
+        <tr><td><code>capture</code></td><td>What subprocess capture could do on this run — <code>state: active</code> with its <code>backend</code>, or <code>state: unavailable</code> with a <code>reason</code> — plus an optional loss <code>note</code>.</td></tr>
+        <tr><td><code>dropped</code></td><td>Records visible loss when the writer's buffer overflowed, with a <code>count</code> and a timestamp.</td></tr>
+        <tr><td><code>recovered</code></td><td>A <code>count</code> of flows a <code>dropped</code> line counted that are back in the ledger (see below), and when; subtracted from the dropped total.</td></tr>
       </tbody>
     </table>
     <p>
@@ -403,24 +412,93 @@
       transcript views render inline.
     </p>
     <p>
-      Ledgers are kept until you prune them, the same way transcripts are.
-      <code class="inline">rupu netflow show &lt;run-id&gt;</code> prints one run's
-      flows, and <code class="inline">rupu netflow prune</code> deletes ledgers
-      older than a cutoff (<code class="inline">--older-than 30d</code> by default,
-      <code class="inline">--dry-run</code> to preview). It matches on file age,
-      never touches anything modified in the last hour, and rejects a zero or
+      When a run ends, every flow its transcript holds and its ledger lacks (the
+      writer could not open the ledger, or dropped the line) is appended to the
+      ledger, followed by any <code class="inline">complete</code> /
+      <code class="inline">socket_complete</code> line the ledger already had for
+      it and a <code class="inline">recovered</code> line. A run that crashed or
+      was killed never reaches its end: its own view, and its agentiflow's, still
+      merge the transcripts of the run and of every run it launched, while project
+      and global views show only what reached the ledger.
+    </p>
+
+    <h3>Runs on remote hosts</h3>
+    <p>
+      A unit placed on a <a class="link" href="/docs/multi-host.html">remote
+      host</a> (<code class="inline">host:</code>,
+      <code class="inline">distribute:</code>, the fallback-host retry) and a run
+      placed there whole write their ledgers on that host. The host also tees
+      every ledger line of the run, and of every sub-agent and child beneath it,
+      into one stream in the run's directory on the host
+      (<code class="inline">runs/&lt;id&gt;/netflow.jsonl</code>), which starts
+      with a <code class="inline">begin</code> line even when the run made no
+      network calls — so "no flows" is never confused with "not collected". When
+      the run ends, the coordinator collects the stream and <strong>lands</strong>
+      it: split per ledger id into its own
+      <code class="inline">~/.rupu/netflow/&lt;id&gt;.jsonl</code>, byte for byte,
+      with a landing record,
+      <code class="inline">~/.rupu/runs/&lt;id&gt;/netflow.landing.json</code>,
+      that says what arrived: <code class="inline">complete</code>,
+      <code class="inline">partial</code> (with the reason) or
+      <code class="inline">unavailable</code> (a host too old to stream, or a
+      stream that failed or was lost). A <code class="inline">complete</code>
+      record is never downgraded by a later landing.
+    </p>
+    <table>
+      <thead>
+        <tr><th>Host</th><th>How the stream arrives</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>local</code></td><td>Nothing to collect: the unit's ledgers are already in the coordinator's own netflow directories.</td></tr>
+        <tr><td><strong>SSH</strong></td><td>Pulled with the run's other ledgers (<code class="inline">usage.jsonl</code>, <code class="inline">coverage.jsonl</code>) in one ssh round trip once the run is terminal on the host; a copy pulled before that is <code class="inline">partial</code>.</td></tr>
+        <tr><td><strong>Tunnel</strong></td><td>The node sends it with the run's other mirrored files, but only to a control plane that advertises <code class="inline">mirror.netflow</code>.</td></tr>
+        <tr><td><strong>Bucket</strong></td><td>The worker uploads it before it writes the run's <code class="inline">finished</code> marker.</td></tr>
+        <tr><td><strong>HTTP</strong> (placed units)</td><td>The coordinator fetches <code class="inline">GET /api/runs/:id/netflow/stream</code> from a peer whose features list <code class="inline">run.netflow_stream</code>; a read after a poll error or at the wall timeout is <code class="inline">partial</code>.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Nothing lands while the unit is still running: until it ends, its flows
+      show only through the transcript merge above. Once landed, the ledgers are
+      read like any other at run, project, global and agentiflow scope, and a copy
+      that is <code class="inline">partial</code>,
+      <code class="inline">unavailable</code> or not collected at all is listed as
+      <strong>incomplete</strong> at every scope, naming the host and the reason;
+      the workflow run also gets a step warning for it. A missing or short copy
+      never fails the unit and is never shown as whole.
+      <code class="inline">rupu netflow prune</code> treats landed ledgers like
+      any other ledger.
+    </p>
+
+    <h3>CLI</h3>
+    <pre class="code">rupu netflow show run_01J...                     <span class="c"># one run's flows</span>
+rupu <span class="v">--format</span> <span class="s">json</span> netflow show run_01J...       <span class="c"># full records, plus dropped_total</span>
+rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span> <span class="v">--dry-run</span>    <span class="c"># preview</span>
+rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span>              <span class="c"># delete</span></pre>
+    <p>
+      <code class="inline">rupu netflow show &lt;run-id&gt;</code> prints the run's
+      flows (time, method, host, path, status), merging its ledger with the
+      <code class="inline">net_flow</code> events in its transcript, and reports
+      any dropped records. It finds the run in the global run store or in any
+      registered project.
+    </p>
+    <p>
+      Ledgers are kept until you prune them; nothing deletes them automatically.
+      <code class="inline">rupu netflow prune</code> deletes ledgers older than
+      <code class="inline">--older-than</code> (default
+      <code class="inline">30d</code>) from the current project's
+      <code class="inline">.rupu/netflow/</code> and the global
+      <code class="inline">~/.rupu/netflow/</code>. It goes by file modification
+      time, never touches a file modified in the last hour, and rejects a zero or
       negative cutoff. A ledger whose run is still live is never deleted, however
-      long the run has been idle: a workflow run that hasn't finished (paused and
+      long the run has been idle: an unfinished workflow run (paused and
       awaiting-approval runs included, unless it is
       <code class="inline">running</code>/<code class="inline">pending</code> with a
       dead recorded runner pid) keeps its own, its steps', its fan-out units' and
       its sub-agents' ledgers, and a standalone <code class="inline">rupu run</code>
-      whose process is alive keeps its own and its sub-agents'. These rows report
-      <code class="inline">skipped_live</code>.
+      whose process is alive keeps its own and its sub-agents'. Those rows report
+      <code class="inline">skipped_live</code>. <code class="inline">--dry-run</code>
+      previews, and it supports <code class="inline">--format json|csv</code>.
     </p>
-    <pre class="code"><span class="c"># see what a 14-day cutoff would remove, then do it</span>
-rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span> <span class="v">--dry-run</span>
-rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span></pre>
     <div class="callout">
       <strong>The ledger directory ignores itself.</strong> It holds every host,
       IP, path and timing rupu contacted during a run, so
@@ -451,23 +529,29 @@ rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span
         </tr>
         <tr>
           <td><strong>Project &#8594; Network</strong></td>
-          <td>Every ledger in the project's <code class="inline">.rupu/netflow/</code>, plus any of the project's runs whose ledger fell back to the global directory. Opens on the last 24 hours.</td>
+          <td>Every ledger in the project's <code class="inline">.rupu/netflow/</code>, plus any of the project's runs whose ledger fell back to the global directory. Opens on the shorter of the last hour and the project's latest run with flows.</td>
         </tr>
         <tr>
           <td><strong>Network</strong> (global)</td>
-          <td>The union across every registered workspace and the global directory. Opens on the last 24 hours. A remote host's flows stay on that host, and the page says so.</td>
+          <td>Every registered project and the global directory. Opens on the shorter of the last hour and the latest run with flows.</td>
         </tr>
       </tbody>
     </table>
+    <p>
+      Ledgers landed from a remote host (<em>Runs on remote hosts</em> above)
+      are read at every scope like any other; a copy that is partial or missing
+      is listed as incomplete, with the host and the reason.
+    </p>
 
     <h3>The explorer</h3>
     <ul>
-      <li><strong>Activity strip.</strong> A histogram over the full retained range with a time-range picker; drag across it to zoom the window. Every other section describes the windowed set.</li>
-      <li><strong>KPIs.</strong> Flows, endpoints, networks (distinct orgs), error rate, bytes and p95 latency, computed server-side. Byte totals are sums of what was <em>observed</em>: a dash when nothing was, and marked partial when any flow in view had an unobservable count; a p95 with no measured duration is a dash, never <code class="inline">0 ms</code>.</li>
-      <li><strong>Topology.</strong> Workflows &#8594; origins (a provider, an SCM, or a subprocess such as <code class="inline">curl</code>) &#8594; the ASN orgs they reached, with org cards beside it. Hover to trace connectivity; everything else dims rather than disappears. Edge weight is by call count, never bytes.</li>
-      <li><strong>Timeline.</strong> One lane per endpoint, grouped by org, with dense heat cells you can click to zoom.</li>
-      <li><strong>Filters.</strong> Click a workflow, origin, org or host to cross-filter every section at once; chips show what's applied.</li>
-      <li><strong>Flow table.</strong> Every flow, sortable, with run and workflow columns above run scope and a detail panel on click (fidelity, peer, timings, ASN). Socket rows show <code class="inline">curl (pid 4412)</code> as their origin, <code class="inline">tcp &#8594; 203.0.113.7:443</code> as their network, a dash for path and status, and a link to the bash call in the run's transcript.</li>
+      <li><strong>Query line.</strong> The one place to narrow the view. <code class="inline">since:</code> and <code class="inline">until:</code> set the window (<code class="inline">since:6h</code>, <code class="inline">since:2026-10-01</code>, an RFC 3339 time), <code class="inline">window:all</code> reads every recorded flow, and <code class="inline">workflow:</code>, <code class="inline">origin:</code> (<code class="inline">provider:anthropic</code>, <code class="inline">scm:github</code>, <code class="inline">subprocess:curl</code>), <code class="inline">org:</code> (<code class="inline">as15169</code>, <code class="inline">unknown</code>) and <code class="inline">host:</code> (<code class="inline">api.github.com:443</code>) keep flows; a <code class="inline">-</code> in front leaves them out (<code class="inline">-origin:provider:anthropic</code> hides the model traffic). With no <code class="inline">since:</code> or <code class="inline">until:</code> the view opens small, on the window the table above names, and a line under the query says which window that is.</li>
+      <li><strong>Activity strip.</strong> Across the whole retained range; drag across it to zoom, which writes the window into the query (Zoom out undoes it).</li>
+      <li><strong>KPIs.</strong> Flows, endpoints, networks (distinct orgs), error rate, bytes and p95 latency. Byte totals are marked partial when any flow in view had an unknown count; a p95 with no measured duration is a dash, never <code class="inline">0 ms</code>.</li>
+      <li><strong>Topology.</strong> Workflows &#8594; origins (a provider, an SCM, or a subprocess such as <code class="inline">curl</code>) &#8594; the ASN orgs they reached, weighted by call count.</li>
+      <li><strong>Timeline.</strong> One lane per endpoint, grouped by org.</li>
+      <li><strong>Click to filter.</strong> Click a workflow, origin, org or host to add it to the query; click it again to take it out.</li>
+      <li><strong>Flow table.</strong> Sortable, with a detail panel per flow. Socket rows show the process (<code class="inline">curl (pid 4412)</code>), the transport and peer (<code class="inline">tcp &#8594; 203.0.113.7:443</code>), a dash for path and status, and a link to the bash call in the run's transcript.</li>
     </ul>
     <div class="callout">
       <strong>Why not a world map.</strong> A geographic map was considered and
@@ -506,10 +590,10 @@ rupu netflow prune <span class="v">--older-than</span> <span class="s">14d</span
       the files with the oldest flows are dropped and re-read from disk when a view
       needs them — a wide window gets slower, but the answer never changes. Each
       section of a Network page loads on its own, so the KPIs and topology appear
-      before a long flow list finishes, and tables over 500 rows are virtualized.
+      before a long flow list finishes, and long tables are virtualized.
     </p>
     <p>Behind those surfaces sit these read-only endpoints:</p>
-    <pre class="code"><span class="c"># flows at run, project and global scope (optional from= / to= window)</span>
+    <pre class="code"><span class="c"># flows at run, project and global scope (?from= / ?to= to window the run's)</span>
 GET <span class="s">/api/runs/:id/netflow</span>
 GET <span class="s">/api/projects/:id/netflow</span>
 GET <span class="s">/api/netflow</span>
@@ -517,8 +601,22 @@ GET <span class="s">/api/netflow</span>
 <span class="c"># the explorer's aggregates; scope is run:&lt;id&gt;, project:&lt;id&gt;, or absent for global</span>
 GET <span class="s">/api/netflow/explorer?scope=project:ws_01JB7…</span>
 
+<span class="c"># the topology graph</span>
+GET <span class="s">/api/netflow/graph</span>
+
 <span class="c"># the index: its size, budget and evictions</span>
-GET <span class="s">/api/netflow/index</span></pre>
+GET <span class="s">/api/netflow/index</span>
+
+<span class="c"># the latest run with flows (no scope = global)</span>
+GET <span class="s">/api/netflow/latest?scope=project:ws_01JB7…</span></pre>
+    <p>
+      Every read but the graph takes <code class="inline">workflow</code>,
+      <code class="inline">origin</code>, <code class="inline">org</code> and
+      <code class="inline">host</code> (keys to keep) and
+      <code class="inline">not_workflow</code>, <code class="inline">not_origin</code>,
+      <code class="inline">not_org</code> and <code class="inline">not_host</code>
+      (keys to leave out), each a comma-separated list.
+    </p>
 
     <h2>ASN enrichment</h2>
     <p>
@@ -592,13 +690,13 @@ GET <span class="s">/api/netflow/index</span></pre>
           <td><code>subprocess_poll_ms</code></td>
           <td>integer (ms)</td>
           <td><code>50</code></td>
-          <td>Socket-table poll cadence. Lower catches shorter-lived connections on Linux at a little more CPU.</td>
+          <td>Linux socket-table poll interval. Lower catches shorter connections at slightly more CPU. macOS is event-driven and ignores it.</td>
         </tr>
         <tr>
           <td><code>subprocess_linger_ms</code></td>
           <td>integer (ms)</td>
           <td><code>3000</code></td>
-          <td>How long a finished bash call stays attributable, so sockets that close just after the shell exits still count.</td>
+          <td>How long a finished bash call stays attributable, so sockets that close just after the shell exits still count (capped at one day).</td>
         </tr>
         <tr>
           <td><code>cp_index_budget_mb</code></td>
@@ -686,12 +784,12 @@ GET <span class="s">/api/netflow/index</span></pre>
           <td>git2 clones, object-store bucket traffic and the tunnel-node WebSocket are invisible to an HTTP-layer capture. They arrive with the frame-level backend, not before.</td>
         </tr>
         <tr>
-          <td>Remote hosts' flows in the coordinator</td>
-          <td>A run placed on a <a class="link" href="/docs/multi-host.html">remote host</a> records its flows in that host's ledger. Bringing them back to the coordinator's views is its own piece of transport work.</td>
+          <td>Remote hosts' flows, live</td>
+          <td>A unit on a <a class="link" href="/docs/multi-host.html">remote host</a> sends its ledgers back when it ends (<em>Runs on remote hosts</em> above), not while it runs; a copy that is short or missing is listed as incomplete rather than shown as whole.</td>
         </tr>
         <tr>
           <td>Lifting <code class="inline">coarse</code> to <code class="inline">http</code></td>
-          <td>The GitHub connector brings its own HTTP stack, so its flows are coarse. It exposes a service layer that a middleware could hook, which would give it exact bytes and peer IP.</td>
+          <td>The GitHub connector brings its own HTTP stack, so its flows are coarse: host, outcome and timing only.</td>
         </tr>
         <tr>
           <td>Egress enforcement</td>

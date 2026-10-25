@@ -7,6 +7,7 @@
 <meta name="description" content="rupu documentation: install rupu and learn to build agents, workflows, autoflows, and sessions.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -219,6 +222,16 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
         <h3>Sessions &#8594;</h3>
         <p>Long-lived, interactive agent conversations — in the terminal or live in the web control plane.</p>
       </a>
+      <a class="card" href="/docs/skills.html">
+        <div class="ic" aria-hidden="true">&#9998;</div>
+        <h3>Skills &#8594;</h3>
+        <p>Directories of instructions and scripts in the open <code class="inline">SKILL.md</code> format, installed with <code class="inline">rupu skill install</code> and granted to agents, steps and sessions.</p>
+      </a>
+      <a class="card" href="/docs/messaging.html">
+        <div class="ic" aria-hidden="true">&#9993;</div>
+        <h3>Messaging &#8594;</h3>
+        <p>Agents in one run tree share a board, message each other and follow directives — and you can message any of them while they run.</p>
+      </a>
     </div>
 
     <h2>Running it for real</h2>
@@ -248,6 +261,11 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
         <div class="ic" aria-hidden="true">&#9878;</div>
         <h3>Providers &amp; accounts &#8594;</h3>
         <p>Multiple named provider and SCM accounts, model limits discovered from the provider, and a live per-run usage ledger.</p>
+      </a>
+      <a class="card" href="/docs/mcp.html">
+        <div class="ic" aria-hidden="true">&#9881;</div>
+        <h3>Drive it from your agent (MCP) &#8594;</h3>
+        <p><code class="inline">rupu cp serve</code> exposes <code class="inline">/mcp</code>: 188 operator tools over the control plane's own routes, a <code class="inline">wait</code> tool, the tool catalog and the docs as resources — connect Claude Code, Cursor or Claude Desktop and let an agent operate rupu.</p>
       </a>
     </div>
     <p>Along the way: every run, unit and sub-agent gets a human codename, <code class="inline">rupu workflow run</code> shows a three-pane live view, and <a class="link" href="/docs/netflow.html">Netflow</a> now captures the connections <code class="inline">bash</code> commands open, too.</p>

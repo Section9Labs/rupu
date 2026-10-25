@@ -7,6 +7,7 @@
 <meta name="description" content="Get rupu running in about five minutes: install, connect a model, run your first agent and workflow, open the control plane, and add a host.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -26,6 +27,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -117,6 +120,18 @@ rupu host list</pre>
 rupu workflow run network-assessment --engagement-profile network \
   --input scope=<span class="s">"10.0.5.0/28"</span></pre>
     <p>What it ships, and how to drive it from an agentiflow lead: <a class="link" href="/docs/profiles.html#fleet">The stock security fleet</a>.</p>
+
+    <h2>8 &middot; (Optional) Connect Claude Code over MCP</h2>
+    <p>The control plane you started in step 5 also serves an MCP endpoint at <code class="inline">/mcp</code>, so an agent in Claude Code (or Cursor, or Claude Desktop) can launch workflows, watch runs, approve gates and message a live run itself. Point Claude Code at it:</p>
+    <pre class="code"><span class="c"># rupu cp serve without a token (loopback, the default)</span>
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp
+
+<span class="c"># if you started it with --token, pass the same token</span>
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp \
+  --header <span class="s">"Authorization: Bearer $CP_TOKEN"</span>
+
+claude mcp list      <span class="c"># shows whether it connected</span></pre>
+    <p><code class="inline">rupu cp serve</code> prints this command at startup. The MCP gives the client the same reach as the control plane's operator — rupu adds no permission layer of its own there, so narrow it with <code class="inline">--tools</code> if you want less. Every tool, the <code class="inline">wait</code> loop and the other clients are in <a class="link" href="/docs/mcp.html">MCP &amp; tools</a>.</p>
 
     <h2>Where to next</h2>
     <div class="doc-grid">

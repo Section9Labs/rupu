@@ -4,9 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rupu docs — MCP &amp; tools</title>
-<meta name="description" content="rupu speaks the Model Context Protocol both ways — it exposes its own tool catalog as an MCP server and lets agents consume MCP tools as native tools.">
+<meta name="description" content="rupu cp serve exposes an MCP endpoint at /mcp: 188 operator tools over the control plane's routes, a wait tool, the tool catalog, built-in docs as resources and four prompts — so an external agent can operate rupu.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -54,253 +57,385 @@
 
   <main class="docs-main">
     <h1>MCP &amp; tools</h1>
-    <p class="intro">rupu speaks the Model Context Protocol both ways — it exposes its own capabilities as an MCP server, and it lets agents consume MCP tools as if they were native.</p>
+    <p class="intro"><code class="inline">rupu cp serve</code> serves an MCP endpoint at <code class="inline">/mcp</code> beside the web UI and the HTTP API. An MCP client such as Claude Code, Cursor or Claude Desktop connects to it and operates rupu: it lists and launches workflows and agents, watches runs, approves gates, drives sessions and messages a live run. It also gets rupu's tool catalog — files, shell, SCM, issues, findings — as plain tools.</p>
 
-    <h2>rupu speaks MCP both ways</h2>
+    <h2>What <code class="inline">/mcp</code> is</h2>
     <p>
-      The <strong>Model Context Protocol</strong> (<a class="link" href="https://spec.modelcontextprotocol.io/" target="_blank" rel="noopener">MCP</a>)
-      is a standard way for tools to advertise themselves to AI clients. rupu sits on both sides of that
-      contract. As a <strong>server</strong>, <code class="inline">rupu mcp serve</code> publishes rupu's unified
-      SCM and issue-tracker tool catalog over JSON-RPC so any MCP-aware client — Claude Desktop, Cursor, an
-      IDE — can call the exact tools rupu's own agents call. As a <strong>consumer</strong>, the same catalog
-      is served in-process to rupu's agent runtime, where each MCP tool is wrapped so it appears in an agent's
-      tool list alongside the built-ins. One tool catalog, one permission model, two directions.
+      The endpoint is an adapter, not a second implementation. The <strong>operator tools</strong> call the
+      control plane's own endpoints in process and return the same JSON as the
+      <a class="link" href="/docs/api.html">HTTP API</a>; the <strong>catalog tools</strong> are the same tool
+      bodies rupu's agents and workflow <code class="inline">action:</code> steps call. On top of those it serves
+      a <code class="inline">wait</code> tool that stands in for the API's SSE streams, rupu's own documentation as
+      read-only <strong>resources</strong>, and four <strong>prompts</strong>.
     </p>
 
     <figure class="diagram">
-      <svg viewBox="0 0 720 220" role="img" aria-label="rupu both consumes and serves MCP">
+      <svg viewBox="0 0 720 220" role="img" aria-label="An MCP client reaches rupu's control plane routes and tool catalog through /mcp">
         <defs>
           <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
             <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
           </marker>
         </defs>
-        <!-- left: external MCP tools feeding the agent -->
+        <!-- left: the client -->
         <rect class="d-box" x="16" y="84" width="170" height="52" rx="10"></rect>
-        <text class="d-label" x="101" y="106" text-anchor="middle">MCP tool catalog</text>
-        <text class="d-sub" x="101" y="123" text-anchor="middle">scm.* · issues.*</text>
+        <text class="d-label" x="101" y="106" text-anchor="middle">MCP client</text>
+        <text class="d-sub" x="101" y="123" text-anchor="middle">Claude Code · Cursor · Desktop</text>
         <line class="d-edge" x1="186" y1="110" x2="266" y2="110" marker-end="url(#ar)"></line>
-        <text class="d-sub" x="226" y="100" text-anchor="middle">consume</text>
-        <!-- center: rupu -->
+        <text class="d-sub" x="226" y="100" text-anchor="middle">/mcp</text>
+        <!-- center: rupu cp serve -->
         <rect class="d-box-accent" x="266" y="60" width="188" height="100" rx="12"></rect>
-        <text class="d-label" x="360" y="100" text-anchor="middle">rupu</text>
-        <text class="d-sub" x="360" y="120" text-anchor="middle">agent runtime</text>
-        <text class="d-sub" x="360" y="136" text-anchor="middle">+ embedded MCP server</text>
-        <!-- right: serve to a client -->
-        <line class="d-edge" x1="454" y1="110" x2="534" y2="110" marker-end="url(#ar)"></line>
-        <text class="d-sub" x="494" y="100" text-anchor="middle">serve</text>
-        <rect class="d-box" x="534" y="84" width="170" height="52" rx="10"></rect>
-        <text class="d-label" x="619" y="106" text-anchor="middle">MCP client</text>
-        <text class="d-sub" x="619" y="123" text-anchor="middle">IDE · Claude Desktop</text>
+        <text class="d-label" x="360" y="100" text-anchor="middle">rupu cp serve</text>
+        <text class="d-sub" x="360" y="120" text-anchor="middle">operator tools · wait</text>
+        <text class="d-sub" x="360" y="136" text-anchor="middle">resources · prompts</text>
+        <!-- right: what it reaches -->
+        <line class="d-edge" x1="454" y1="92" x2="534" y2="72" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="454" y1="128" x2="534" y2="148" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="534" y="46" width="170" height="52" rx="10"></rect>
+        <text class="d-label" x="619" y="68" text-anchor="middle">CP routes</text>
+        <text class="d-sub" x="619" y="85" text-anchor="middle">/api, called in process</text>
+        <rect class="d-box" x="534" y="122" width="170" height="52" rx="10"></rect>
+        <text class="d-label" x="619" y="144" text-anchor="middle">Tool catalog</text>
+        <text class="d-sub" x="619" y="161" text-anchor="middle">fs · shell · scm · findings</text>
       </svg>
-      <figcaption>One catalog, two directions: rupu consumes MCP tools into its agents and serves them to outside clients.</figcaption>
+      <figcaption>One endpoint: every control-plane route as an operator tool, plus the catalog the agents themselves use.</figcaption>
     </figure>
 
-    <h2>The built-in tools</h2>
-    <p>
-      Every rupu <a class="link" href="/docs/agents.html">agent</a> ships with a set of built-in tools. They are
-      the bedrock surface an agent uses to read and change a workspace; no plugins are required.
-    </p>
+    <div class="callout">
+      <strong>Full access.</strong> The MCP gives a connected client the same reach as the control plane's operator.
+      rupu adds <strong>no permission layer of its own</strong> on <code class="inline">/mcp</code>: it does not prompt
+      and it has no <code class="inline">--mode</code>. What runs is decided by the client's harness — Claude Code's
+      permission prompts and <code class="inline">--allowedTools</code>, Cursor's approvals. Each tool carries
+      read-only / destructive / open-world hints so a client's permission UI can tell <code class="inline">runs.list</code>
+      from <code class="inline">runs.cancel</code>. Treat the bearer token like a key to the whole control plane, and
+      narrow what is served with <a class="link" href="#tools-flag"><code class="inline">--tools</code></a> if you want less.
+    </div>
+
+    <h2>Serve modes</h2>
     <table>
-      <thead><tr><th>Tool</th><th>What it does</th><th>Kind</th></tr></thead>
+      <thead><tr><th>Command</th><th>Serves</th></tr></thead>
       <tbody>
-        <tr><td><code>bash</code></td><td>Execute a shell command in the workspace cwd (controlled env; SIGTERM then SIGKILL on timeout)</td><td>write</td></tr>
-        <tr><td><code>read_file</code></td><td>Read full file contents, line-numbered</td><td>read</td></tr>
-        <tr><td><code>write_file</code></td><td>Create or overwrite a file</td><td>write</td></tr>
-        <tr><td><code>edit_file</code></td><td>Exact-match string replacement; errors if the string is not found</td><td>write</td></tr>
-        <tr><td><code>grep</code></td><td>Search across the workspace (ripgrep-backed)</td><td>read</td></tr>
-        <tr><td><code>glob</code></td><td>File-pattern matching</td><td>read</td></tr>
-        <tr><td><code>ast_grep</code></td><td>Structural (syntax-tree) code search — match by <em>shape</em>, not bytes, with <code class="inline">$VAR</code> metavariables across 20+ languages</td><td>read</td></tr>
+        <tr><td><code>rupu cp serve</code></td><td>web UI + <code>/api</code> + <code>/mcp</code></td></tr>
+        <tr><td><code>rupu cp serve --no-web</code></td><td><code>/api</code> + <code>/mcp</code>, no web UI (implies <code>--no-open</code>)</td></tr>
+        <tr><td><code>rupu cp serve --no-mcp</code></td><td>web UI + <code>/api</code>, no <code>/mcp</code></td></tr>
       </tbody>
     </table>
     <p>
-      <code class="inline">ast_grep</code> is the precise counterpart to <code class="inline">grep</code>: instead of
-      a regex over text, the agent writes a pattern in the code's own syntax — <code class="inline">impl Tool for $T</code>,
-      <code class="inline">async fn $F($$$) -&gt; Result&lt;$O&gt;</code> — and rupu matches it against the parsed
-      syntax tree. It takes a <code class="inline">pattern</code> plus a <code class="inline">lang</code>
-      (e.g. <code class="inline">rust</code>, <code class="inline">python</code>, <code class="inline">typescript</code>).
+      <code class="inline">--no-web --no-mcp</code> is refused (nothing to serve), and so is <code class="inline">--tools</code>
+      with <code class="inline">--no-mcp</code>. A bad <code class="inline">--tools</code> grant fails before the socket is
+      bound. At startup the server prints the MCP URL and the command that connects Claude Code to it.
     </p>
     <p>
-      Two more built-ins let an agent <strong>call other agents as tools</strong>:
-      <code class="inline">dispatch_agent</code> (one child, synchronously) and
-      <code class="inline">dispatch_agents_parallel</code> (several at once). A parent folds the children's
-      outputs back into its own run — composition at the agent layer. Which children it may spawn is
-      gated by the parent's <code class="inline">dispatchableAgents:</code> allowlist. See
-      <a class="link" href="/docs/agents.html">Agents &rarr; Sub-agent dispatch</a>.
+      <code class="inline">/mcp</code> sits behind the same bearer token as <code class="inline">/api</code>
+      (<code class="inline">--token</code>), and the server checks two things on every request: the
+      <code class="inline">Origin</code> header, when present, must equal the <code class="inline">Host</code>; and on a
+      loopback bind the <code class="inline">Host</code> must be a loopback name (<code class="inline">127.0.0.1</code>,
+      <code class="inline">localhost</code>, <code class="inline">[::1]</code>), which closes DNS rebinding. Binding
+      beyond loopback is allowed; do it only with <code class="inline">--token</code> (see
+      <a class="link" href="/docs/control-plane.html">Control plane</a>).
+    </p>
+
+    <h2 id="connect">Connecting a client</h2>
+    <h3>Claude Code</h3>
+    <pre class="code"><span class="c"># no token (loopback, default bind)</span>
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp
+
+<span class="c"># with a token</span>
+claude mcp add --transport http rupu http://127.0.0.1:7878/mcp \
+  --header <span class="s">"Authorization: Bearer $CP_TOKEN"</span></pre>
+    <p>
+      <code class="inline">claude mcp add --scope user</code> makes it available in every project. Claude Code names
+      each tool <code class="inline">mcp__rupu__&lt;tool&gt;</code> with dots turned to underscores
+      (<code class="inline">runs.list</code> is <code class="inline">mcp__rupu__runs_list</code>).
+      <code class="inline">claude mcp list</code> shows whether it connected.
+    </p>
+    <h3>Cursor</h3>
+    <p><code class="inline">~/.cursor/mcp.json</code> (or the project's <code class="inline">.cursor/mcp.json</code>); leave <code class="inline">headers</code> out when the server runs without a token:</p>
+    <pre class="code">{
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"rupu"</span>: {
+      <span class="k">"url"</span>: <span class="s">"http://127.0.0.1:7878/mcp"</span>,
+      <span class="k">"headers"</span>: { <span class="k">"Authorization"</span>: <span class="s">"Bearer &lt;token&gt;"</span> }
+    }
+  }
+}</pre>
+    <h3>Claude Desktop</h3>
+    <p>
+      Add the URL as a custom connector if your plan offers remote connectors that can reach it. Otherwise bridge it
+      with <a class="link" href="https://www.npmjs.com/package/mcp-remote" target="_blank" rel="noopener"><code class="inline">mcp-remote</code></a>
+      in <code class="inline">claude_desktop_config.json</code>:
+    </p>
+    <pre class="code">{
+  <span class="k">"mcpServers"</span>: {
+    <span class="k">"rupu"</span>: {
+      <span class="k">"command"</span>: <span class="s">"npx"</span>,
+      <span class="k">"args"</span>: [<span class="s">"-y"</span>, <span class="s">"mcp-remote"</span>, <span class="s">"http://127.0.0.1:7878/mcp"</span>,
+               <span class="s">"--header"</span>, <span class="s">"Authorization: Bearer &lt;token&gt;"</span>]
+    }
+  }
+}</pre>
+    <p>
+      Authentication to GitHub, GitLab and the model providers is shared with the CLI through the same credential
+      store, so <code class="inline">rupu auth login</code> once unlocks the catalog tools for everything.
+    </p>
+
+    <h2 id="operator-tools">Operator tools</h2>
+    <p>
+      188 tools over the control plane's own endpoints, one per route (<code class="inline">GET /api/tools</code> and
+      <code class="inline">tools/list</code> give each tool's full input schema). Each takes the arguments of the
+      endpoint it wraps (path parameters, the handler's query struct, the JSON body), an optional
+      <code class="inline">host</code> where the API takes <code class="inline">?host=</code>, refuses unknown arguments,
+      and returns the API's JSON as text. A JSON object is also sent as <code class="inline">structuredContent</code>;
+      a list is sent as text only, since MCP allows only an object there. Names are
+      <code class="inline">&lt;area&gt;.&lt;verb&gt;</code>; hints follow the HTTP method (GET read-only and idempotent,
+      PUT idempotent, DELETE destructive) and gate nothing.
+    </p>
+    <table>
+      <thead><tr><th>Area</th><th>Tools</th></tr></thead>
+      <tbody>
+        <tr><td>Workflow runs</td><td><code>runs.list</code> <code>runs.list_all</code> <code>runs.archived</code> <code>runs.get</code> <code>runs.approve</code> <code>runs.reject</code> <code>runs.cancel</code> <code>runs.pause</code> <code>runs.resume</code> <code>runs.archive</code> <code>runs.restore</code> <code>runs.delete</code> <code>runs.graph</code> <code>runs.children</code> <code>runs.board</code> <code>runs.usage</code> <code>runs.usage_timeline</code> <code>runs.source</code> <code>runs.ast</code> <code>runs.autoflow</code> <code>runs.retry</code></td></tr>
+        <tr><td>Agent runs and transcripts</td><td><code>agent_runs.list</code> <code>agent_runs.continue</code> <code>transcripts.get</code> <code>transcripts.archive</code> <code>transcripts.delete</code> <code>events.recent</code></td></tr>
+        <tr><td>Autoflow runs</td><td><code>autoflow_runs.list</code> <code>autoflow_runs.problems</code> <code>autoflow_runs.cycles</code> <code>autoflow_runs.events</code></td></tr>
+        <tr><td>Sessions and messages</td><td><code>sessions.list</code> <code>sessions.get</code> <code>sessions.turns</code> <code>sessions.usage_timeline</code> <code>sessions.start</code> <code>sessions.send</code> <code>sessions.archive</code> <code>sessions.restore</code> <code>sessions.delete</code> <code>sessions.stop</code> <code>sessions.compact</code> <code>messages.list</code> <code>messages.send</code></td></tr>
+        <tr><td>Agentiflows</td><td><code>agentiflows.list</code> <code>agentiflows.get</code> <code>agentiflows.events</code> <code>agentiflows.children</code> <code>agentiflows.unit_output</code> <code>agentiflows.board</code> <code>agentiflows.generated</code> <code>agentiflows.steer</code> <code>agentiflows.run</code> <code>agentiflows.stop</code> <code>agentiflow_defs.list</code> <code>agentiflow_defs.get</code> <code>agentiflow_defs.create</code> <code>agentiflow_defs.save</code> <code>agentiflow_defs.delete</code> <code>agentiflow_defs.validate</code></td></tr>
+        <tr><td>Definitions</td><td><code>workflows.list</code> <code>workflows.get</code> <code>workflows.create</code> <code>workflows.save</code> <code>workflows.delete</code> <code>workflows.validate</code> <code>workflows.generate</code> <code>workflows.run</code> <code>workflows.run_yaml</code> <code>agents.list</code> <code>agents.get</code> <code>agents.create</code> <code>agents.save</code> <code>agents.delete</code> <code>agents.generate</code> <code>agents.run</code> <code>agents.validate</code> <code>agents.validate_all</code> <code>generate.models</code> <code>autoflows.list</code> <code>autoflows.get</code> <code>autoflows.enable</code> <code>autoflows.disable</code> <code>autoflows.run</code> <code>autoflows.explain</code> <code>autoflows.doctor</code> <code>autoflows.wakes</code> <code>claims.list</code> <code>claims.release</code> <code>claims.requeue</code> <code>claims.repair</code> <code>skills.list</code> <code>skills.get</code> <code>skills.install</code> <code>skills.update</code> <code>skills.validate</code> <code>tools.list</code> <code>models.list</code> <code>models.refresh</code></td></tr>
+        <tr><td>Findings, coverage, assets</td><td><code>findings.list</code> <code>findings.get</code> <code>findings.tags</code> <code>findings.tag</code> <code>findings.export</code> <code>findings.export_many</code> <code>findings.artifact</code> <code>findings.import</code> <code>findings.schema</code> <code>coverage.list</code> <code>coverage.get</code> <code>coverage.audit</code> <code>coverage.catalog</code> <code>coverage.runs</code> <code>coverage.diff</code> <code>coverage.templates</code> <code>coverage.template</code> <code>coverage.gap</code> <code>coverage.rerun</code> <code>assets.list</code> <code>query.fields</code> <code>query.check</code></td></tr>
+        <tr><td>Observability</td><td><code>netflow.run</code> <code>netflow.agentiflow</code> <code>netflow.project</code> <code>netflow.global</code> <code>netflow.graph</code> <code>netflow.explorer</code> <code>netflow.index</code> <code>netflow.latest</code> <code>usage.get</code> <code>usage.timeline</code> <code>usage.runs</code> <code>usage.outliers</code> <code>dashboard.get</code></td></tr>
+        <tr><td>Fleet, config, customers</td><td><code>hosts.list</code> <code>hosts.registered</code> <code>hosts.add</code> <code>hosts.add_ssh</code> <code>hosts.add_bucket</code> <code>hosts.enroll_node</code> <code>hosts.remove</code> <code>host.info</code> <code>workers.list</code> <code>config.get</code> <code>config.put_global</code> <code>config.put_customer</code> <code>config.put_project</code> <code>config.put_policy</code> <code>customers.list</code> <code>customers.create</code> <code>customers.get</code> <code>customers.update</code> <code>customers.delete</code> <code>customers.archive</code> <code>customers.unarchive</code> <code>customers.assign_project</code> <code>customers.unassign_project</code> <code>launch.preview</code> <code>repos.list</code> <code>repos.tracked</code> <code>repos.attach</code> <code>repos.prefer</code> <code>repos.forget</code> <code>scm_accounts.list</code> <code>scm_rules.list</code> <code>scm_rules.bind</code> <code>auth.status</code></td></tr>
+        <tr><td>Projects</td><td><code>projects.list</code> <code>projects.get</code> <code>projects.runs</code> <code>projects.sessions</code> <code>projects.agents</code> <code>projects.workflows</code> <code>projects.autoflows</code> <code>projects.coverage</code> <code>projects.coverage_assessed</code> <code>projects.tree</code> <code>projects.source</code> <code>projects.files</code> <code>projects.init</code></td></tr>
+        <tr><td>Setup and housekeeping</td><td><code>fleet.list</code> <code>fleet.install</code> <code>engagement_profiles.list</code> <code>engagement_profiles.get</code> <code>cron.list</code> <code>cron.events</code> <code>cron.tick</code> <code>maintenance.prune</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      Every control-plane route is a tool except the SSE streams (<code class="inline">wait</code> replaces them), the
+      host-to-host transfer routes (workspace sync, skill bundles, coverage, netflow and artifact pulls), the node
+      WebSocket, <code class="inline">/healthz</code>, the web UI's filesystem browser and
+      <code class="inline">POST /mcp</code> itself.
+    </p>
+
+    <h3>Results</h3>
+    <ul>
+      <li><strong>Header notes.</strong> Any <code class="inline">x-rupu-*</code> response header (for example <code class="inline">x-rupu-hosts-unfilterable</code>, naming hosts a fan-out left out) comes back as an extra text note after the JSON and in the result's <code class="inline">_meta["rupu/headers"]</code>.</li>
+      <li><strong>Files.</strong> <code class="inline">findings.export</code>, <code class="inline">findings.export_many</code> and <code class="inline">findings.artifact</code> return an embedded resource: <code class="inline">text</code> for text types, a base64 <code class="inline">blob</code> otherwise, <code class="inline">uri</code> <code class="inline">rupu://api/...</code> (the API path and query) and the filename in <code class="inline">resource._meta.name</code>.</li>
+      <li><strong>Large bodies.</strong> A response over 16 MiB is an error that names the API path to fetch with the token instead.</li>
+      <li><strong>Route guard.</strong> A path argument that would reach a sibling route (an id spelled <code class="inline">workflows</code> for <code class="inline">/api/runs/:id</code>) is refused with a 400 before the handler runs.</li>
+      <li><strong>Host.</strong> The <code class="inline">/mcp</code> request's <code class="inline">Host</code> is forwarded to the route, so a handler that derives an address from it (<code class="inline">hosts.enroll_node</code>) sees the one the client reached.</li>
+    </ul>
+
+    <h2 id="wait">The <code class="inline">wait</code> tool</h2>
+    <p>An MCP client cannot read the control plane's SSE streams, so <code class="inline">wait</code> long-polls:</p>
+    <pre class="code">{ <span class="k">"watch"</span>: [ {<span class="k">"kind"</span>: <span class="s">"run_settled"</span>, <span class="k">"run"</span>: <span class="s">"run_01J..."</span>} ],
+  <span class="k">"cursor"</span>: {<span class="k">"run:run_01J..."</span>: 12}, <span class="k">"timeout_ms"</span>: 30000 }</pre>
+    <table>
+      <thead><tr><th>Condition</th><th>Fires when</th><th><code>host</code>?</th></tr></thead>
+      <tbody>
+        <tr><td><code>{kind: "run_settled", run}</code></td><td>the run reached a terminal status</td><td>yes</td></tr>
+        <tr><td><code>{kind: "run_gate", run}</code></td><td>the run has a parked approval gate</td><td>yes</td></tr>
+        <tr><td><code>{kind: "run_events", run, types?}</code></td><td>the run wrote an event (optionally only these types)</td><td>yes</td></tr>
+        <tr><td><code>{kind: "messages", root, kinds?}</code></td><td>the root's message log has a new message (optionally only these kinds)</td><td>yes</td></tr>
+        <tr><td><code>{kind: "agentiflow", id, types?}</code></td><td>the agentiflow wrote a line (optionally only these <code>kind</code>s: <code>round</code>, <code>run_stopped</code>, …)</td><td>local only</td></tr>
+        <tr><td><code>{kind: "agent_run_end", run}</code></td><td>a standalone agent run finished (read its <code>final_answer</code> from the reply)</td><td>local only</td></tr>
+        <tr><td><code>{kind: "session_turn", session, run?}</code></td><td>a session turn ended; pass the <code>run</code> id <code>sessions.send</code> returned, else it waits for the active turn (or the next one if the session is idle)</td><td>local only</td></tr>
+        <tr><td><code>{kind: "findings", project?, run?, q?}</code></td><td>new finding records were recorded (a tag change on an older finding is not one); <code>q</code> is the findings query language</td><td>local only</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>It checks state first, so a run that already settled or parked answers at once. Then it catches up from <code class="inline">cursor</code> (ids are the SSE <code class="inline">id:</code> lines, so it mixes safely with the streams) and waits for a new line.</li>
+      <li>The timeout defaults to 30 s and is capped at 55 s.</li>
+      <li>The reply carries <code class="inline">events</code>, the advanced <code class="inline">cursor</code>, which conditions <code class="inline">fired</code>, <code class="inline">timed_out</code>, and a <code class="inline">warnings</code> list when something needs saying (a remote host that stopped answering and is being retried). Pass the returned <code class="inline">cursor</code> back on the next call.</li>
+      <li><strong>Cursor keys</strong> name the watched source: <code class="inline">run:&lt;id&gt;</code> for <code class="inline">run_events</code>, <code class="inline">messages:&lt;root&gt;</code>, <code class="inline">agentiflow:&lt;id&gt;</code>, and <code class="inline">findings:&lt;ws_id&gt;/&lt;target&gt;</code> (one key per ledger). A source on a remote host adds <code class="inline">@&lt;host&gt;</code>. <code class="inline">run_settled</code>, <code class="inline">run_gate</code>, <code class="inline">agent_run_end</code> and <code class="inline">session_turn</code> watch state, so they keep no cursor.</li>
+      <li><strong>Cursor values</strong> are integers (line numbers) for local sources and for a remote run's events; a remote message space is polled, and its cursor value is the last message id, a string.</li>
+      <li><strong>Findings without a cursor start at the ledger's end</strong> (only records recorded after the call began), except when scoped to a <code class="inline">run</code>, which starts at the beginning.</li>
+      <li><strong>Remote hosts</strong> (<code class="inline">host</code> on the four run/message kinds): a remote run is read from the host's event stream; its gates and a remote message space are polled every 2 s, or every 10 s over SSH, where each poll is a new <code class="inline">ssh</code> connection. A remote <code class="inline">run_settled</code> fires once the host's stream ends, about 2 s after the run's last event. A call watching a remote host can wait up to 5 s from its start for that host's first answer, even with <code class="inline">timeout_ms: 0</code>. A host that stops answering after its first answer is retried and named in <code class="inline">warnings</code>.</li>
+      <li>A condition error (a run, session or turn that does not appear within 10 s) fails the whole call.</li>
+      <li><strong>Progress.</strong> When the client sends a <code class="inline">progressToken</code> and accepts SSE, the call streams <code class="inline">notifications/progress</code> every 5 s while it waits, so a client with an idle timeout keeps the connection.</li>
+      <li><strong>Once <code class="inline">run_gate</code> has fired, drop it from <code class="inline">watch</code></strong> (or approve / reject the gate): a parked gate is state, so it fires immediately on every call.</li>
+    </ul>
+
+    <h2 id="walkthrough">Operating rupu from an agent</h2>
+    <p>A loop that launches a workflow with a gate and finishes it:</p>
+    <ol>
+      <li><code class="inline">workflows.run {name: "release"}</code> returns the run id.</li>
+      <li><code class="inline">wait {watch: [{kind: "run_gate", run: ID}, {kind: "run_settled", run: ID}]}</code> returns with <code class="inline">run_gate</code> fired.</li>
+      <li><code class="inline">runs.approve {id: ID}</code>.</li>
+      <li><code class="inline">wait {watch: [{kind: "run_settled", run: ID}], cursor}</code> (no <code class="inline">run_gate</code>) returns when the run settles, or with <code class="inline">timed_out: true</code>, in which case call it again.</li>
+    </ol>
+    <p>
+      And one that runs an agent: <code class="inline">agents.run</code> returns the run id, then
+      <code class="inline">wait {watch: [{kind: "agent_run_end", run: ID}]}</code> returns when it ends.
+      To steer a run while it works, <code class="inline">messages.send</code> reaches any participant of its
+      message space (see <a class="link" href="/docs/messaging.html">Messaging</a>); to learn rupu's formats before
+      authoring, read the <a class="link" href="#resources">resources</a> and use the
+      <code class="inline">author-agent</code> / <code class="inline">author-workflow</code> prompts.
+    </p>
+
+    <h2 id="catalog">Catalog tools</h2>
+    <p>
+      Beside the operator tools the endpoint serves the <code class="inline">rupu-tools</code> catalog: the fs/shell
+      tools (<code class="inline">read_file</code>, <code class="inline">write_file</code>, <code class="inline">edit_file</code>,
+      <code class="inline">grep</code>, <code class="inline">glob</code>, <code class="inline">bash</code>, …), the SCM and
+      issue tools (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>, <code class="inline">github.*</code>,
+      <code class="inline">gitlab.*</code> — each described in <a class="link" href="/docs/integrations.html">Integrations</a>)
+      and <code class="inline">findings.report</code> / <code class="inline">findings.verify</code>.
     </p>
     <p>
-      By default an agent gets all the built-ins. To narrow the surface, list names in the frontmatter
-      <code class="inline">tools:</code> field — rupu builds a registry filtered to exactly those names, so the
-      model is only ever told about the tools it is allowed to call.
+      The fs/shell and findings tools take a required <strong><code class="inline">workspace</code></strong> argument:
+      a project id, or the absolute path of a registered project. The call runs with that project's layered config
+      (global, then customer, then project), its SCM registry and its findings ledger. A project's config and
+      registry are cached until the server restarts.
+    </p>
+    <p>
+      Where a catalog tool has the name of an operator tool (<code class="inline">agents.list</code>,
+      <code class="inline">workflows.list</code>, <code class="inline">agents.get</code>, …), the operator tool is the one
+      served. Every other catalog tool the server can serve is listed, <code class="inline">findings.query</code>,
+      <code class="inline">findings.tag</code> and <code class="inline">catalog.search</code> included. A catalog tool
+      whose service the server lacks is left out and named once in the server log at startup
+      (<code class="inline">RUST_LOG=info</code>). Findings filed over MCP record under the <code class="inline">mcp</code>
+      scope. A served <code class="inline">bash</code>'s network flows are not captured: the call is no run, so there
+      is no run ledger for them.
+    </p>
+
+    <h3 id="tools-flag">Choosing the tools: <code class="inline">--tools</code></h3>
+    <p>
+      <code class="inline">rupu cp serve --tools &lt;grant&gt;</code> narrows the MCP to the tools it names. It filters
+      <strong>every</strong> tool: the operator tools and <code class="inline">wait</code> as well as the catalog
+      tools. It uses the agent <code class="inline">tools:</code> grammar (exact names, legacy aliases,
+      <code class="inline">ns.*</code>, <code class="inline">core.*</code> and <code class="inline">*</code>, comma-separated
+      or repeated). Without <code class="inline">--tools</code> every tool is served.
+    </p>
+    <pre class="code"><span class="c"># operator tools, wait, messages and findings only</span>
+rupu cp serve --no-web --tools <span class="s">'runs.*,wait,messages.*,findings.*'</span>
+<span class="c"># a read-only code browser: no operator tools at all</span>
+rupu cp serve --no-web --tools read_file,grep</pre>
+    <p>
+      A narrow grant such as <code class="inline">read_file,grep</code> therefore drops the operator tools and
+      <code class="inline">wait</code>; name them (<code class="inline">runs.*,wait,…</code>) to keep them. A name that
+      matches no tool fails startup, listing the namespaces served and, for a near miss, a did-you-mean
+      (<code class="inline">--tools run.list</code> suggests <code class="inline">runs.list</code>).
+    </p>
+
+    <h2 id="resources">Resources and prompts</h2>
+    <p>
+      <code class="inline">/mcp</code> also serves read-only resources, built into the binary (never read from
+      <code class="inline">RUPU_HOME</code>), so an agent can learn rupu from the MCP alone and sees the docs of the
+      version it talks to:
+    </p>
+    <table>
+      <thead><tr><th>URI</th><th>Content</th></tr></thead>
+      <tbody>
+        <tr><td><code>rupu://docs/&lt;name&gt;</code></td><td>The 18 docs under <code>docs/</code>: <code>using-rupu</code>, <code>agent-format</code>, <code>agent-authoring</code>, <code>workflow-format</code>, <code>workflow-authoring</code>, <code>agentiflows</code>, <code>triggers</code>, <code>engagement-profiles</code>, <code>coverage</code>, <code>messaging</code>, <code>skills</code>, <code>transcript-schema</code>, <code>cp-api</code>, <code>control-plane</code>, <code>response-outcomes</code>, <code>netflow</code>, <code>configuration</code>, <code>mcp</code> (Markdown)</td></tr>
+        <tr><td><code>rupu://schema/finding-report</code></td><td>The finding report JSON Schema (what <code>findings.schema</code> answers)</td></tr>
+        <tr><td><code>rupu://query/&lt;list&gt;</code></td><td>A list query's field registry: <code>findings</code>, <code>workflow_runs</code>, <code>agent_runs</code>, <code>sessions</code>, <code>autoflow_runs</code>, <code>events</code> (what <code>query.fields</code> answers)</td></tr>
+        <tr><td><code>rupu://profiles/&lt;id&gt;</code></td><td>Each built-in engagement profile, as TOML. <code>engagement_profiles.list</code> also lists layered ones</td></tr>
+        <tr><td><code>rupu://tools</code></td><td>The tool catalog, the rows of <code>GET /api/tools</code></td></tr>
+        <tr><td><code>rupu://examples/&lt;path&gt;</code></td><td>The repo's <code>examples/</code> agents, workflows and contracts</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">resources/list</code> and <code class="inline">resources/templates/list</code> are cursor-paged;
+      <code class="inline">resources/read</code> of an unknown URI answers <code class="inline">-32002</code> with
+      <code class="inline">data.uri</code>.
+    </p>
+    <p>
+      Four prompts (<code class="inline">prompts/list</code>, <code class="inline">prompts/get</code>):
+      <code class="inline">author-agent</code>, <code class="inline">author-workflow</code>,
+      <code class="inline">author-agentiflow</code> and <code class="inline">triage-findings</code> (with a
+      <code class="inline">project</code> argument). Each is a short instruction that names the resources and tools to
+      use; the links are text, not embedded resources, because the docs run 5–73 KB.
+    </p>
+
+    <h2>Attribution</h2>
+    <p>
+      An operator message sent through <code class="inline">messages.send</code>, and a finding tag event written
+      through <code class="inline">findings.tag</code>, are recorded with <code class="inline">client: "mcp"</code> beside
+      <code class="inline">via: "cp"</code>, so the Messages tab and the logs can tell an MCP client from the web UI.
+      A gate decision or cancel through <code class="inline">runs.approve</code>, <code class="inline">runs.reject</code>
+      or <code class="inline">runs.cancel</code> on the local host records the actor <code class="inline">mcp</code>
+      where the web UI records <code class="inline">web</code>. The mark comes from the <code class="inline">/mcp</code>
+      endpoint itself, never from a request header, so a plain HTTP call can't claim it.
+    </p>
+
+    <h2>Protocol</h2>
+    <p>MCP streamable HTTP, JSON responses:</p>
+    <ul>
+      <li><strong>POST</strong> carries one JSON-RPC message or a batch. A body of only notifications answers <code class="inline">202</code>. <strong>GET</strong> and <strong>DELETE</strong> answer <code class="inline">405</code> (no server push, no session teardown).</li>
+      <li><code class="inline">initialize</code> mints an <code class="inline">Mcp-Session-Id</code>, sent back in the response header; a client echoes it on later calls. A <code class="inline">notifications/cancelled</code> is scoped to the session that sent it.</li>
+      <li>Versions: <code class="inline">initialize</code> answers the client's <code class="inline">protocolVersion</code> when rupu speaks it (<code class="inline">2024-11-05</code>, <code class="inline">2025-03-26</code>, <code class="inline">2025-06-18</code>, <code class="inline">2025-11-25</code>), otherwise its newest.</li>
+      <li>Methods: <code class="inline">initialize</code>, <code class="inline">ping</code>, <code class="inline">tools/list</code>, <code class="inline">tools/call</code>, <code class="inline">resources/list</code>, <code class="inline">resources/templates/list</code>, <code class="inline">resources/read</code>, <code class="inline">prompts/list</code>, <code class="inline">prompts/get</code>. A tool that fails, refuses its arguments or is unknown comes back as a <code class="inline">tools/call</code> result with <code class="inline">isError: true</code>, so the model sees why.</li>
+    </ul>
+
+    <h2 id="deprecated"><code class="inline">rupu mcp serve</code> is deprecated</h2>
+    <p>
+      <code class="inline">rupu mcp serve</code> used to run a stdio server. It now prints a deprecation notice and runs
+      <code class="inline">rupu cp serve --no-web</code> on <code class="inline">127.0.0.1:7878</code>;
+      <code class="inline">--transport</code> and <code class="inline">--mode</code> are ignored and
+      <code class="inline">--tools</code> is passed on. <strong>stdio is gone.</strong> Point clients at the HTTP URL as
+      above (for a client that only speaks stdio, use <code class="inline">mcp-remote</code>).
+    </p>
+
+    <h2>Troubleshooting</h2>
+    <table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+      <tbody>
+        <tr><td><code>401</code> from <code>/mcp</code></td><td>The server runs with <code>--token</code> and the client sent none</td></tr>
+        <tr><td><code>403</code> from <code>/mcp</code></td><td><code>Origin</code> differs from <code>Host</code>, or a loopback bind got a non-loopback <code>Host</code> (a proxy or tunnel rewriting it)</td></tr>
+        <tr><td><code>405</code> on GET / DELETE</td><td>Expected: <code>/mcp</code> is POST only</td></tr>
+        <tr><td>A fs / shell / findings tool says <code>workspace</code> is required</td><td>Pass a project id or the absolute path of a registered project</td></tr>
+        <tr><td><code>wait</code> returns instantly with <code>run_gate</code></td><td>The gate is still parked; approve it or drop <code>run_gate</code> from <code>watch</code></td></tr>
+        <tr><td><code>wait</code> on a <code>findings</code>, <code>session_turn</code>, <code>agentiflow</code> or <code>agent_run_end</code> condition with a <code>host</code> is refused</td><td><code>host</code> applies only to <code>run_settled</code>, <code>run_gate</code>, <code>run_events</code> and <code>messages</code></td></tr>
+        <tr><td><code>wait</code> with a remote <code>host</code> takes a few seconds even with <code>timeout_ms: 0</code></td><td>It waits up to 5 s for the host's first answer</td></tr>
+        <tr><td>A result has an extra <code>x-rupu-...</code> text line</td><td>A fan-out left hosts out; the note names them</td></tr>
+        <tr><td>A tool errors with "over 16 MiB"</td><td>Fetch the named API path directly with the token</td></tr>
+        <tr><td>Tool is missing from <code>tools/list</code></td><td><code>--tools</code> excludes it, or it is a catalog tool whose service the server lacks (logged at startup with <code>RUST_LOG=info</code>)</td></tr>
+        <tr><td><code>--tools</code> fails at startup with a "did you mean"</td><td>A name matches no tool; use the suggestion</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="tools-inside">Tools inside rupu</h2>
+    <p>
+      The catalog served on <code class="inline">/mcp</code> is the same one rupu's agents use. An agent's frontmatter
+      <code class="inline">tools:</code> is its grant — what its model may call — and each entry is a canonical name
+      (<code class="inline">bash</code>, <code class="inline">findings.report</code>, <code class="inline">scm.prs.get</code>),
+      a legacy alias (<code class="inline">report_finding</code>, <code class="inline">dispatch_agent</code>), a namespace
+      (<code class="inline">scm.*</code>, <code class="inline">board.*</code>), <code class="inline">core.*</code> (the core
+      tools <code class="inline">bash</code>, <code class="inline">read_file</code>, <code class="inline">write_file</code>,
+      <code class="inline">edit_file</code>, <code class="inline">grep</code>, <code class="inline">glob</code>,
+      <code class="inline">ast_grep</code>) or <code class="inline">*</code>. There are no other wildcards. An unknown name
+      fails the agent's load with a did-you-mean; <code class="inline">rupu agent validate</code> checks every file.
+      Omitting <code class="inline">tools:</code> gives the default grant: <code class="inline">core.*</code>,
+      <code class="inline">dispatch</code>, <code class="inline">join</code> and every connector namespace.
     </p>
     <pre class="code"><span class="c"># agent frontmatter</span>
 <span class="k">tools</span>:
   - <span class="s">read_file</span>
   - <span class="s">grep</span>
-  - <span class="s">glob</span></pre>
+  - <span class="s">"scm.*"</span>          <span class="c"># every scm.* tool</span>
+  - <span class="s">issues.get</span>       <span class="c"># one exact tool</span></pre>
     <p>
-      The same <code class="inline">tools:</code> list doubles as the <strong>allowlist for MCP tools</strong>.
-      MCP tool names are dot-namespaced (for example <code class="inline">scm.repos.list</code>), and allowlist
-      entries match by exact name, the wildcard <code class="inline">*</code> (everything), or a
-      trailing-<code class="inline">*</code> prefix. So <code class="inline">scm.*</code> grants the whole SCM
-      namespace while leaving <code class="inline">issues.*</code> out.
-    </p>
-    <pre class="code"><span class="k">tools</span>:
-  - <span class="s">read_file</span>
-  - <span class="s">grep</span>
-  - <span class="s">"scm.*"</span>          <span class="c"># every scm.* MCP tool</span>
-  - <span class="s">issues.get</span>       <span class="c"># one exact MCP tool</span></pre>
-    <div class="callout">
-      <strong>Note.</strong> When an agent declares a <code class="inline">tools:</code> list, rupu registers only
-      the MCP tools that match it. Without the gate the model would see the full catalog advertised, pick a tool
-      it is not permitted to call, get denied, and waste turns on retries.
-    </div>
-
-    <h2>rupu as an MCP server</h2>
-    <p>
-      <code class="inline">rupu mcp serve</code> runs the embedded MCP server for an outside client. v0 ships the
-      <strong>stdio</strong> transport (the default); the client spawns <code class="inline">rupu</code> as a
-      subprocess and talks JSON-RPC over stdin/stdout. (An <code class="inline">http</code> transport is reserved
-      but not wired in v0 — selecting it returns an error.) Internally the very same server is also exposed over
-      an <strong>in-process</strong> transport, which is how rupu's own agent runtime calls the catalog without a
-      serialization round-trip.
-    </p>
-    <p>
-      The catalog it serves is rupu's unified SCM + issue surface — <code class="inline">scm.*</code> repos,
-      branches, files and pull-requests, <code class="inline">issues.*</code>, plus GitHub/GitLab extras (the
-      18 tools below) — and the three <code class="inline">findings.*</code> tools. Each tool's input schema is
-      auto-generated and returned in the MCP <code class="inline">tools/list</code> response. Authentication is
-      shared with the rupu CLI through <code class="inline">~/.rupu/auth.json</code>, so one
-      <code class="inline">rupu auth login</code> unlocks the catalog for both.
-    </p>
-    <pre class="code"><span class="c"># run the server directly (stdio is the default)</span>
-<span class="k">$</span> <span class="v">rupu mcp serve --transport stdio</span></pre>
-    <p>Wiring it into an MCP client — for example Claude Desktop's <code class="inline">claude_desktop_config.json</code>:</p>
-    <pre class="code"><span class="k">{</span>
-  <span class="k">"mcpServers"</span>: {
-    <span class="k">"rupu"</span>: {
-      <span class="k">"command"</span>: <span class="s">"/usr/local/bin/rupu"</span>,
-      <span class="k">"args"</span>: [<span class="s">"mcp"</span>, <span class="s">"serve"</span>, <span class="s">"--transport"</span>, <span class="s">"stdio"</span>]
-    }
-  }
-}</pre>
-    <p>
-      In server mode the permission gate runs with <strong>bypass</strong> mode and an allow-all allowlist: the
-      upstream client is expected to handle write-confirmation prompts itself, which matches the rest of the MCP
-      ecosystem. rupu does not prompt from the server side.
-    </p>
-
-    <h2 id="catalog">The native tool catalog</h2>
-    <p>
-      Every SCM and issue tool takes an optional <code class="inline">platform</code> (or <code class="inline">tracker</code>)
-      argument that falls back to <code class="inline">[scm.default]</code> / <code class="inline">[issues.default]</code>,
-      and an optional <code class="inline">account</code> that picks one of several
-      <a class="link" href="/docs/integrations.html#multi-account">named accounts</a> on that platform.
+      Every tool declares one <strong>effect</strong> — <code class="inline">read</code>, <code class="inline">record</code>
+      (rupu's own bookkeeping: findings, coverage, board posts), <code class="inline">write</code> (the workspace, or
+      running code), <code class="inline">external</code> (acting outside this machine) or <code class="inline">spawn</code>
+      (starting another run) — and the run's permission mode decides each call from the effect alone, never from
+      the tool's name:
     </p>
     <table>
-      <thead><tr><th>Tool</th><th>Kind</th><th>What it does</th></tr></thead>
+      <thead><tr><th>Effect ↓ / Mode →</th><th><code>bypass</code></th><th><code>ask</code> (interactive)</th><th><code>ask</code> (no operator)</th><th><code>readonly</code></th></tr></thead>
       <tbody>
-        <tr><td><code>scm.repos.list</code></td><td>read</td><td>List the authenticated user's repos (across every account of the platform)</td></tr>
-        <tr><td><code>scm.repos.get</code></td><td>read</td><td>Fetch one repo — default branch, clone URLs, visibility</td></tr>
-        <tr><td><code>scm.branches.list</code></td><td>read</td><td>List branches with SHA and protected flag</td></tr>
-        <tr><td><code>scm.branches.create</code></td><td>write</td><td>Create a branch from a SHA</td></tr>
-        <tr><td><code>scm.files.read</code></td><td>read</td><td>Read a file at an optional ref</td></tr>
-        <tr><td><code>scm.prs.list</code></td><td>read</td><td>List PRs / MRs with state, author and limit filters</td></tr>
-        <tr><td><code>scm.prs.get</code></td><td>read</td><td>Fetch one PR / MR — title, body, head and base branches, author</td></tr>
-        <tr><td><code>scm.prs.diff</code></td><td>read</td><td>Unified-diff patch plus file / addition / deletion counts</td></tr>
-        <tr><td><code>scm.prs.comment</code></td><td>write</td><td>Post a top-level comment on a PR / MR</td></tr>
-        <tr><td><code>scm.prs.create</code></td><td>write</td><td>Open a PR / MR (supports <code>draft</code>)</td></tr>
-        <tr><td><code>issues.list</code></td><td>read</td><td>List issues with state, label and author filters</td></tr>
-        <tr><td><code>issues.get</code></td><td>read</td><td>Fetch one issue — title, body, state, labels, author</td></tr>
-        <tr><td><code>issues.comments</code></td><td>read</td><td>Read an issue's comment thread, oldest-first (GitHub only)</td></tr>
-        <tr><td><code>issues.comment</code></td><td>write</td><td>Comment on an issue</td></tr>
-        <tr><td><code>issues.create</code></td><td>write</td><td>Open an issue with title, body and labels</td></tr>
-        <tr><td><code>issues.update_state</code></td><td>write</td><td>Transition an issue to <code>open</code> or <code>closed</code></td></tr>
-        <tr><td><code>github.workflows_dispatch</code></td><td>write</td><td>Trigger a GitHub Actions <code>workflow_dispatch</code></td></tr>
-        <tr><td><code>gitlab.pipeline_trigger</code></td><td>write</td><td>Trigger a GitLab CI pipeline against a ref</td></tr>
-        <tr><td><code>findings.record</code></td><td>write</td><td>Record a finding in the project's findings ledger (a full <code>report</code>, or a summary under the <code>summary</code> profile); under an engagement it takes an optional <code>asset</code>, handled like <code>report_finding</code>&rsquo;s</td></tr>
-        <tr><td><code>findings.query</code></td><td>read</td><td>List the project's findings matching a one-line query, e.g. <code>severity&gt;=high tag:needs-poc</code> (paged, or <code>all: true</code>)</td></tr>
-        <tr><td><code>findings.tag</code></td><td>write</td><td>Add or remove tags on one or more findings</td></tr>
+        <tr><td>read</td><td>allow</td><td>allow</td><td>allow</td><td>allow</td></tr>
+        <tr><td>record</td><td>allow</td><td>allow</td><td>allow</td><td>allow</td></tr>
+        <tr><td>write</td><td>allow</td><td><strong>prompt</strong></td><td>allow, with a notice</td><td><strong>deny</strong></td></tr>
+        <tr><td>external</td><td>allow</td><td><strong>prompt</strong></td><td>allow, with a notice</td><td><strong>deny</strong></td></tr>
+        <tr><td>spawn</td><td>allow; child keeps its own mode</td><td>allow; child capped at <code>ask</code></td><td>allow; child capped at <code>ask</code></td><td>allow; <strong>child capped at <code>readonly</code></strong></td></tr>
       </tbody>
     </table>
     <p>
-      There is no native tool for writing issue labels, and <code class="inline">issues.update_state</code> is
-      open/closed only.
-    </p>
-
-    <h3>Findings tools: agents vs. workflow action steps</h3>
-    <p>
-      The <code class="inline">findings.*</code> tools need run context — which project's ledger to write and
-      which run to attribute — and only a workflow <code class="inline">action:</code> step supplies it. That is
-      what they are for: an <code class="inline">action:</code> step calls exactly one tool and has no agent, so
-      <code class="inline">action: findings.query</code> with <code class="inline">all: true</code> can feed a
-      <code class="inline">for_each</code>, and <code class="inline">action: findings.record</code> can file what a
-      gate or notify hook observed. Called from <code class="inline">rupu mcp serve</code> they are listed but
-      refuse with an error explaining there is no run context, rather than writing a finding into the wrong project.
-    </p>
-    <p>
-      An agent is never offered them, whatever its <code class="inline">tools:</code> list says
-      (<code class="inline">["*"]</code> included): its in-process catalog has no run context, so every call would
-      be refused. Agents use the <code class="inline">report_finding</code>, <code class="inline">query_findings</code>
-      and <code class="inline">tag_findings</code> builtins instead.
-    </p>
-    <p>
-      Agents use the equivalent <strong>built-in</strong> tools instead:
-      <code class="inline">report_finding</code> (injected with a <code class="inline">concerns:</code> block, or granted
-      in <code class="inline">tools:</code>), and <code class="inline">query_findings</code> /
-      <code class="inline">tag_findings</code> (explicit <code class="inline">tools:</code> grant). They share the same
-      query language, report schema and tag rules as the MCP tools. See
-      <a class="link" href="/docs/coverage.html">Coverage</a>.
-    </p>
-    <pre class="code"><span class="c"># agent frontmatter: triage existing findings</span>
-<span class="k">tools</span>:
-  - <span class="s">read_file</span>
-  - <span class="s">query_findings</span>
-  - <span class="s">tag_findings</span></pre>
-
-    <h2>Consuming external MCP servers</h2>
-    <p>
-      On the consuming side, an <code class="inline">McpToolAdapter</code> makes each MCP tool satisfy rupu's
-      native <code class="inline">Tool</code> trait. The adapter carries the tool's name, description and input
-      schema, and forwards every <code class="inline">invoke()</code> to the shared
-      <code class="inline">ToolDispatcher</code>. From the model's point of view there is no difference between a
-      built-in like <code class="inline">grep</code> and an MCP-backed tool like
-      <code class="inline">scm.prs.create</code> — both appear in the same tool list.
-    </p>
-    <p>
-      When a run starts with an SCM registry available, rupu spins up the embedded MCP server over the in-process
-      transport, then walks the tool catalog and inserts an adapter per tool into the agent's registry — skipping
-      any tool the agent's <code class="inline">tools:</code> allowlist does not match. MCP/custom tool calls also
-      emit coverage touch events, so they contribute to coverage just like the self-instrumenting built-ins.
-    </p>
-    <div class="callout">
-      <strong>What's confirmed.</strong> The catalog agents consume is rupu's own embedded SCM + issue surface (the <code class="inline">findings.*</code> entries are left out, as described above),
-      served in-process and gated by the same <code class="inline">tools:</code> allowlist. The adapter itself is
-      generic over any tool the dispatcher exposes; a configuration shape for registering arbitrary third-party
-      MCP servers as an agent's tools is not part of the surface documented here.
-    </div>
-
-    <h2>Permissions</h2>
-    <p>
-      Tool access is gated by two checks, applied in order: the <strong>allowlist</strong> first, then the
-      <strong>mode</strong>. The allowlist is the agent's <code class="inline">tools:</code> list (or
-      <code class="inline">*</code> when none is set), matched by exact name, <code class="inline">*</code>, or
-      trailing-<code class="inline">*</code> prefix. The mode is one of three, supplied at run time:
-    </p>
-    <table>
-      <thead><tr><th>Mode</th><th>Read tools</th><th>Write tools</th></tr></thead>
-      <tbody>
-        <tr><td><code>readonly</code></td><td>allow</td><td>deny</td></tr>
-        <tr><td><code>ask</code></td><td>allow</td><td>prompt before running</td></tr>
-        <tr><td><code>bypass</code></td><td>allow</td><td>allow</td></tr>
-      </tbody>
-    </table>
-    <p>
-      A tool that is not in the allowlist is denied regardless of mode. A tool that passes the allowlist is then
-      mode-checked: <code class="inline">readonly</code> blocks write tools (<code class="inline">bash</code>,
-      <code class="inline">write_file</code>, <code class="inline">edit_file</code>, and any write-kind MCP tool)
-      even when allowlisted; <code class="inline">bypass</code> permits everything. This same model governs both
-      the built-in tools and the MCP catalog — <code class="inline">rupu mcp serve</code> simply runs it pinned to
-      <code class="inline">bypass</code> + allow-all and defers prompting to the upstream client.
+      A tool is offered only where it works — the connector tools need configured SCM accounts, the board and
+      mailbox tools a message space, <code class="inline">coverage.*</code> a <code class="inline">concerns:</code> block —
+      and every run's transcript opens with a <code class="inline">tool_grant</code> event listing exactly the tools
+      the model was offered and why, with every call audited as <code class="inline">tool_audit</code>. The authority
+      tools <code class="inline">board.directive</code> and <code class="inline">board.retract</code> are never granted
+      by <code class="inline">*</code>. The full grammar, the effect table and the alias list are in
+      <a class="link" href="/docs/agents.html">Agents</a>; the launch tools <code class="inline">dispatch</code> /
+      <code class="inline">join</code> / <code class="inline">workflows.generate</code> are described there too.
     </p>
 
     <div class="doc-nav">

@@ -7,6 +7,7 @@
 <meta name="description" content="Autoflows turn a rupu workflow into a self-running loop: a trigger wakes it, it claims an issue, runs the workflow in a durable worktree, and opens a PR — no human kicking it off.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item active" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -115,7 +118,7 @@
         <tr>
           <td><code>cron</code></td>
           <td>The schedule in <code>trigger.cron:</code> (5-field UTC) matches</td>
-          <td>System cron / launchd invokes <code>rupu cron tick</code>. There is no rupu daemon — the OS scheduler drives it.</td>
+          <td>System cron / launchd invokes <code>rupu cron tick</code>, or <code>rupu cp serve</code> runs the same tick as a background loop. No separate daemon is needed.</td>
         </tr>
         <tr>
           <td><code>event</code></td>
@@ -158,7 +161,13 @@
       same workflow without double-firing the same delivery — see <a class="link" href="#idempotency">Idempotency &amp; ownership</a> below.
     </div>
     <p>
-      Webhook secrets are read from environment variables only — never config files, never the keychain. Bind to <code class="inline">127.0.0.1</code>
+      Webhook secrets are read from environment variables only — never config files, never the keychain:
+      <code class="inline">RUPU_GITHUB_WEBHOOK_SECRET</code>, <code class="inline">RUPU_GITLAB_WEBHOOK_TOKEN</code> (GitLab sends a plain
+      shared-secret token, compared in constant time), <code class="inline">RUPU_LINEAR_WEBHOOK_SECRET</code> and
+      <code class="inline">RUPU_JIRA_WEBHOOK_SECRET</code>. Set any combination in one process; the server refuses to start when none is set.
+      Each vendor posts to its own route — <code class="inline">/webhook/github</code>, <code class="inline">/webhook/gitlab</code>,
+      <code class="inline">/webhook/linear</code>, <code class="inline">/webhook/jira</code> (plus <code class="inline">GET /healthz</code>); a route
+      whose secret is unset answers 503, a bad or missing signature 401. Bind to <code class="inline">127.0.0.1</code>
       and front with a TLS-terminating reverse proxy in production; rupu does not terminate TLS itself.
     </p>
     <pre class="code"><span class="c"># split the tiers across different cadences if you like</span>
@@ -272,8 +281,8 @@ rupu autoflow show <span class="v">phase-ready</span>                    <span c
 
   <span class="k">wake_on</span>:                      <span class="c"># event ids that mark a candidate dirty</span>
     - <span class="s">github.issue.labeled</span>
-    - <span class="s">github.pull_request.closed</span>
-    - <span class="s">github.pull_request.reopened</span>
+    - <span class="s">github.pr.closed</span>
+    - <span class="s">github.pr.reopened</span>
 
   <span class="k">reconcile_every</span>: <span class="s">&quot;10m&quot;</span>        <span class="c"># ...and revisit at least this often anyway</span>
 
@@ -339,6 +348,21 @@ rupu autoflow show <span class="v">phase-ready</span>                    <span c
       <code>autoflow:</code> metadata is ignored except for contract validation. Run through <code>rupu autoflow …</code> and the runtime
       activates claim, worktree, outcome, and retry behavior.
     </div>
+
+    <h3 id="messaging">Messaging between steps</h3>
+    <p>
+      Because an autoflow <em>is</em> a workflow, each cycle's run gets a <a class="link" href="/docs/messaging.html">message space</a> like any
+      workflow run: every agent step is offered <code class="inline">board.claim</code>, <code class="inline">board.release</code>,
+      <code class="inline">board.post</code>, <code class="inline">board.read</code> and <code class="inline">msg.send</code> by default, and the
+      operator can message any step with <code class="inline">rupu message send &lt;run-id&gt;</code> while the run is live. The workflow's
+      top-level <code class="inline">messaging:</code> key is the autoflow's opt-out as well: <code class="inline">messaging: false</code> turns the
+      tools off for every step and unit and everything they launch, and <code class="inline">messaging: { tools: [...] }</code> grants only the
+      <code class="inline">board.*</code> / <code class="inline">msg.*</code> tools named.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="s">phase-ready-autoflow</span>
+<span class="k">messaging</span>: <span class="v">false</span>               <span class="c"># no messaging tool for any step, unit or child of this autoflow</span>
+<span class="k">autoflow</span>:
+  <span class="k">enabled</span>: <span class="v">true</span></pre>
 
     <h3 id="selector">Sub-block: <code class="inline">selector:</code></h3>
     <p>
@@ -534,8 +558,8 @@ rupu autoflow show <span class="v">phase-ready</span>                    <span c
     </p>
     <ol>
       <li><strong>Wake.</strong> A cycle starts — <code class="inline">rupu autoflow tick</code> from launchd / a systemd timer / Task Scheduler,
-        or a long-lived <code class="inline">rupu autoflow serve</code> worker. Enabled autoflows are discovered and each one's repo binding is
-        resolved from the repo registry.</li>
+        a long-lived <code class="inline">rupu autoflow serve</code> worker, or <code class="inline">rupu cp serve</code>'s autoflow reconcile
+        loop, which is the same entry point. Enabled autoflows are discovered and each one's repo binding is resolved from the repo registry.</li>
       <li><strong>Select.</strong> Candidates are fetched from the tracker or SCM using the server-side part of
         <code class="inline">selector:</code>, then narrowed locally by the rest — labels, draft/base, and the author gate.</li>
       <li><strong>Resolve precedence.</strong> Every autoflow whose <code class="inline">entity</code> and <code class="inline">selector</code>
@@ -654,7 +678,10 @@ rupu autoflow show <span class="v">phase-ready</span>                    <span c
     <p>
       v1 is idempotent and tick-based — there is no mandatory daemon. An OS scheduler (launchd on macOS, a <code class="inline">systemd --user</code>
       timer on Linux, Task Scheduler on Windows) invokes <code class="inline">rupu autoflow tick</code> periodically; each tick discovers enabled
-      autoflows, reconciles eligible issues, and exits. The <code class="inline">rupu autoflow …</code> family is the operator surface:
+      autoflows, reconciles eligible issues, and exits. A host running <code class="inline">rupu cp serve</code> needs no scheduler at all: its
+      autoflow reconcile loop runs the same tick in-process (<code class="inline">[cp].autoflow_reconcile_enabled</code>,
+      <code class="inline">[cp].autoflow_reconcile_interval_secs</code>, default on / 60&nbsp;s). The <code class="inline">rupu autoflow …</code>
+      family is the operator surface:
     </p>
     <table>
       <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
@@ -686,7 +713,8 @@ rupu autoflow history <span class="s">github:Section9Labs/rupu/issues/42</span>
 <span class="c"># something is stuck — diagnose, then remediate</span>
 rupu autoflow explain <span class="s">github:Section9Labs/rupu/issues/42</span>
 rupu autoflow doctor
-rupu autoflow repair <span class="s">github:Section9Labs/rupu/issues/42</span> <span class="v">--release</span> <span class="v">--requeue</span></pre>
+rupu autoflow repair <span class="s">github:Section9Labs/rupu/issues/42</span> <span class="v">--requeue</span>   <span class="c"># or --release; not both</span>
+rupu autoflow release <span class="s">github:Section9Labs/rupu/issues/42</span>              <span class="c"># drop the claim outright</span></pre>
     <p>
       A repo-local <code class="inline">[autoflow]</code> config section tunes the runtime around the workflow files:
       <code class="inline">checkout</code> and <code class="inline">worktree_root</code> set the workspace fallback,
@@ -699,6 +727,42 @@ rupu autoflow repair <span class="s">github:Section9Labs/rupu/issues/42</span> <
       (<code class="inline">rupu cron list</code> / <code class="inline">rupu cron events</code> inspect what's wired), and <code class="inline">rupu webhook serve</code> feeds the live
       tier. Autoflows consume those events as <em>reconciliation hints</em> via <code class="inline">wake_on:</code> rather than as direct one-shot
       dispatch — they don't get a second polling config or a second cursor store.
+    </p>
+
+    <h2 id="control-plane">In the control plane</h2>
+    <p>
+      The <a class="link" href="/docs/control-plane.html">control plane</a> shows autoflows in two places. <strong>Library → Autoflows</strong>
+      (<code class="inline">/autoflows</code>) lists every workflow with an <code class="inline">autoflow:</code> block, each with an
+      enable/disable toggle that rewrites <code class="inline">autoflow.enabled</code> in the file (a <code class="inline">.bak</code> is kept).
+      <strong>Runs → Autoflows</strong> (<code class="inline">/runs/autoflows</code>) is the autoflow run table, filterable by host, status, time
+      window and customer; it is fed by the cycle ticks (<code class="inline">GET /api/runs/autoflows</code>) and the actionable events — a run
+      launched, a run awaiting a human, a cycle that failed (<code class="inline">GET /api/runs/autoflows/events</code>). Autoflow-driven runs live
+      there only: <strong>Runs → Workflows</strong> lists manually launched workflow runs, with no cron or event wake, so a cycle's run never
+      appears on it. A run's own page shows its autoflow provenance — repo, issue, claim, prior cycles — from
+      <code class="inline">GET /api/runs/:id/autoflow</code>. Runs that the autoflow engine launches enter the run store, so they stream on the
+      live event firehose like any orchestrator run.
+    </p>
+    <p>
+      The claim actions are the same ones the CLI has, served from the same library on the control plane's own host (a remote
+      <code class="inline">host</code> is a 501) and answering with the JSON the matching command prints under <code class="inline">--format json</code>:
+    </p>
+    <table>
+      <thead><tr><th>Endpoint</th><th>CLI equivalent</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/autoflows/claims</code></td><td><code>rupu autoflow claims</code></td><td>Issue claims held by the entity engine.</td></tr>
+        <tr><td><code>POST /api/autoflows/claims/release</code></td><td><code>rupu autoflow release</code></td><td>Body <code>{issue_ref}</code>. Drops the claim.</td></tr>
+        <tr><td><code>POST /api/autoflows/claims/requeue</code></td><td><code>rupu autoflow requeue</code></td><td>Body <code>{issue_ref, not_before?}</code>. Queues a manual wake for a claimed issue; 404 without a claim.</td></tr>
+        <tr><td><code>POST /api/autoflows/claims/repair</code></td><td><code>rupu autoflow repair</code></td><td>Body <code>{issue_ref, release?, requeue?, dry_run?}</code>: drop the claim's invalid queued wakes, rebuild its missing worktree, then release it or queue a repair wake. <strong><code>dry_run</code> defaults to <code>true</code></strong> and only lists what it would do; <code>release</code> with <code>requeue</code> is a 400.</td></tr>
+        <tr><td><code>GET /api/autoflows/explain?issue_ref=…</code></td><td><code>rupu autoflow explain</code></td><td>One issue's state: claim, last run, queued wakes, recent cycle events. The full <code>&lt;tracker&gt;:&lt;project&gt;/issues/&lt;n&gt;</code> form is required.</td></tr>
+        <tr><td><code>GET /api/autoflows/doctor</code> · <code>GET /api/autoflows/wakes</code></td><td><code>rupu autoflow doctor</code> · <code>wakes</code></td><td>Consistency problems across claims, wakes and runs; queued wakes and the ten most recently processed.</td></tr>
+        <tr><td><code>POST /api/autoflows/:name/run</code></td><td><code>rupu autoflow run</code></td><td>Body <code>{issue, repo?, mode?}</code>. Starts one cycle detached (needs <code>rupu cp serve</code>); 409 when another cycle holds the issue's claim.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Over <code class="inline">rupu cp serve</code>'s <a class="link" href="/docs/mcp.html">MCP</a> endpoint the same routes are operator tools
+      — <code class="inline">autoflows.*</code>, <code class="inline">claims.list</code> / <code class="inline">claims.release</code> /
+      <code class="inline">claims.requeue</code> / <code class="inline">claims.repair</code>, and <code class="inline">autoflow_runs.*</code> for the
+      run table. Issue refs are always the full form; a bare <code class="inline">42</code> or <code class="inline">#42</code> is refused.
     </p>
 
     <!-- prev / next footer nav -->

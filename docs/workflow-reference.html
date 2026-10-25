@@ -7,6 +7,7 @@
 <meta name="description" content="The complete rupu workflow authoring reference: every top-level key, every step kind (linear, for_each, parallel, panel, branch, action, approval gate), every field, the connector action catalog, the template vocabulary, and the parse-time validation rules.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -90,6 +93,7 @@
         <tr><td><code>autoflow</code></td><td>object</td><td>no</td><td>none</td><td>Autonomous-ownership metadata consumed by <code class="inline">rupu autoflow</code>. Fields in <a class="link" href="#autoflow">the autoflow block</a>; behaviour on <a class="link" href="/docs/autoflows.html">Autoflows</a>.</td></tr>
         <tr><td><code>notifyIssue</code></td><td>bool</td><td>no</td><td><code class="inline">false</code></td><td>When true <em>and</em> the run target resolves to an issue, rupu auto-comments on the issue at run start and at terminal state. Note the camelCase spelling &mdash; it is the literal YAML key.</td></tr>
         <tr><td><code>concerns</code></td><td>list</td><td>no</td><td>none</td><td>Coverage catalog for the whole run. When present it overrides each step agent's own <code class="inline">concerns:</code> so every step shares one ledger. See <a class="link" href="#concerns">the concerns block</a>.</td></tr>
+        <tr><td><code>messaging</code></td><td>bool or <code>{ tools: [...] }</code></td><td>no</td><td>on</td><td>The messaging tools every agent step and unit gets. Absent or <code class="inline">true</code>: <code class="inline">board.claim</code> / <code class="inline">release</code> / <code class="inline">post</code> / <code class="inline">read</code> and <code class="inline">msg.send</code>. <code class="inline">false</code>: off for every step and unit and everything they launch. <code class="inline">{ tools: [...] }</code>: only the <code class="inline">board.*</code> / <code class="inline">msg.*</code> tools named. See <a class="link" href="#messaging">the messaging key</a>.</td></tr>
         <tr><td><code>loops</code></td><td>map&lt;string, LoopDef&gt;</td><td>no</td><td><code class="inline">{}</code></td><td>Named, bounded loops over a subgraph of existing steps. See <a class="link" href="#graph">Graph orchestration</a>.</td></tr>
         <tr><td><code>max_concurrency</code></td><td>integer</td><td>no</td><td>unbounded</td><td>Cap on how many nodes a graph workflow runs at once, across the whole graph. Must be &#8805; 1. Ignored by a plain chain workflow.</td></tr>
       </tbody>
@@ -190,6 +194,42 @@
       agentiflow&rsquo;s target instead.) See <a class="link" href="/docs/coverage.html#workflow-concerns">Coverage</a>.
     </p>
 
+    <h3 id="messaging">The <code class="inline">messaging:</code> key</h3>
+    <p>
+      Every workflow run has one <a class="link" href="/docs/messaging.html">message space</a>, and every agent step
+      and unit joins it as it starts. Messaging is on by default: each step and unit is offered
+      <code class="inline">board.claim</code>, <code class="inline">board.release</code>,
+      <code class="inline">board.post</code>, <code class="inline">board.read</code> and
+      <code class="inline">msg.send</code>, recorded in its <code class="inline">tool_grant</code> as
+      <code class="inline">ambient:messaging_default</code>. The top-level <code class="inline">messaging:</code> key
+      changes that for the whole workflow:
+    </p>
+    <table>
+      <thead><tr><th>Value</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>absent, or <code>true</code></td><td>The default set above. <code class="inline">true</code> is the default written down.</td></tr>
+        <tr><td><code>false</code></td><td>No messaging tool for any agent step or unit, nor for anything they launch &mdash; a child inherits the off switch. The steps are still in the space, receive-only: the operator&rsquo;s messages reach them.</td></tr>
+        <tr><td><code>{ tools: [...] }</code></td><td>Only the tools named, recorded as <code class="inline">ambient:workflow_messaging</code>. Only <code class="inline">board.*</code> and <code class="inline">msg.*</code> tools are accepted; any other name is a parse error.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="k">name</span>: <span class="v">quiet-review</span>
+<span class="k">messaging</span>: <span class="v">false</span>         <span class="c"># no messaging tool for any step or unit, or anything they launch</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review</span>
+    <span class="k">agent</span>: <span class="v">reviewer</span>
+    <span class="k">prompt</span>: <span class="s">Review crates/rupu-cp.</span></pre>
+    <p>
+      A placed unit (<code class="inline">host:</code> / <code class="inline">distribute:</code>) runs on another
+      machine with a space of its own there, and the key reaches it: <code class="inline">false</code> is launched as
+      <code class="inline">rupu run --no-messaging</code>, and <code class="inline">true</code> or
+      <code class="inline">{ tools: [...] }</code> as one <code class="inline">rupu run --messaging-tool</code> per
+      tool. A host whose rupu doesn&rsquo;t advertise the capability (<code class="inline">agent.no_messaging</code> /
+      <code class="inline">agent.messaging_tools</code>) is refused the unit rather than run it with messaging on.
+      An agent file&rsquo;s own <code class="inline">messaging: false</code> turns it off for that agent wherever it
+      runs, and off wins over everything else. An autoflow is a workflow with an
+      <code class="inline">autoflow:</code> block, so the same key is its opt-out.
+    </p>
+
     <h3 id="autoflow">The <code class="inline">autoflow:</code> block</h3>
     <p>
       Optional metadata that lets <code class="inline">rupu autoflow</code> run the workflow on its own: which issues or
@@ -203,8 +243,8 @@
       <tbody>
         <tr><td><code>enabled</code></td><td>bool</td><td><code class="inline">false</code></td><td>Marks the workflow as autonomously runnable. Everything else in the block is inert until this is <code class="inline">true</code>.</td></tr>
         <tr><td><code>entity</code></td><td><code>issue</code> | <code>pull_request</code></td><td><code class="inline">issue</code></td><td>The kind of item this autoflow owns. <code class="inline">pull_request</code> unlocks the PR-only selector fields.</td></tr>
-        <tr><td><code>source</code></td><td>string</td><td>the repo binding</td><td>Explicit discovery source when the work lives outside the repo, e.g. <code class="inline">github:acme/widgets</code>.</td></tr>
-        <tr><td><code>priority</code></td><td>integer</td><td><code class="inline">0</code></td><td>When several autoflows select the same item, the highest priority wins the claim; ties go to the workflow name that sorts first. Negative values are allowed.</td></tr>
+        <tr><td><code>source</code></td><td>string</td><td>none</td><td>Free-form tracker-native source tag, e.g. <code class="inline">linear:&lt;team-id&gt;</code> or <code class="inline">jira:&lt;host&gt;/&lt;project&gt;</code>. Says which bound tracker or repo the autoflow belongs to when more than one is configured; informational, not a filter.</td></tr>
+        <tr><td><code>priority</code></td><td>integer</td><td><code class="inline">0</code></td><td>When several autoflows select the same item, the highest priority wins the claim; ties go to the workflow name.</td></tr>
         <tr><td><code>selector</code></td><td>object</td><td>empty (matches every item)</td><td>Candidate filter. See <a class="link" href="#autoflow-selector">the selector table</a> below.</td></tr>
         <tr><td><code>wake_on</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td>Event ids that mark a candidate dirty and due for reconciliation. Same vocabulary and <code class="inline">*</code> glob matching as <a class="link" href="/docs/triggers.html">triggers</a>.</td></tr>
         <tr><td><code>reconcile_every</code></td><td>duration</td><td>unset</td><td>Maximum time between reconciliations of an already-claimed item.</td></tr>
@@ -230,8 +270,8 @@
         <tr><td><code>labels_all</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td><strong>Every</strong> listed label must be present. Sent to the connector as the server-side narrowing filter.</td></tr>
         <tr id="labels-any"><td><code>labels_any</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code> (no constraint)</td><td><strong>At least one</strong> listed label must be present. An empty list imposes nothing. Applied locally after the fetch, because the issue connectors only filter conjunctively.</td></tr>
         <tr id="labels-none"><td><code>labels_none</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td><strong>None</strong> of the listed labels may be present &mdash; the usual way to make an item drop out of the loop once it has been handled. Applied locally.</td></tr>
-        <tr><td><code>limit</code></td><td>integer</td><td>connector default</td><td>Cap on how many candidates one discovery query returns.</td></tr>
-        <tr><td><code>draft</code></td><td><code>include</code> | <code>exclude</code> | <code>only</code></td><td>unset (both)</td><td><strong>Pull requests only</strong> &mdash; a parse error on <code class="inline">entity: issue</code>.</td></tr>
+        <tr><td><code>limit</code></td><td>integer</td><td>none</td><td>Candidate cap per reconciliation cycle.</td></tr>
+        <tr><td><code>draft</code></td><td><code>include</code> | <code>exclude</code> | <code>only</code></td><td>unset (behaves like <code class="inline">include</code>)</td><td><strong>Pull requests only</strong> &mdash; a parse error on <code class="inline">entity: issue</code>.</td></tr>
         <tr><td><code>base</code></td><td>string</td><td>unset (any base)</td><td><strong>Pull requests only</strong>: restrict to PRs targeting this base branch. A parse error on <code class="inline">entity: issue</code>.</td></tr>
         <tr><td><code>authors</code></td><td>array&lt;string&gt;</td><td><code class="inline">[]</code></td><td>Explicit author-login allowlist. A listed login is always allowed.</td></tr>
         <tr><td><code>authors_from</code></td><td><code>collaborators</code> | <code>org_members</code></td><td>unset</td><td>Broader author scope, resolved by the SCM connector at tick time.</td></tr>
@@ -364,7 +404,7 @@
         <tr><td><code>parallel</code></td><td><code>parallel</code></td><td>yes</td><td>Distinct specialists concurrently, each with its own prompt.</td></tr>
         <tr><td><code>panel</code></td><td><code>panel</code></td><td>yes</td><td>Reviewer agents emitting structured findings, with an optional fix loop.</td></tr>
         <tr><td><code>branch</code></td><td><code>branch</code></td><td>no</td><td>Evaluates a condition and skips the steps on the arm it did not take.</td></tr>
-        <tr><td><code>action</code></td><td><code>action</code> (+ <code>with</code>)</td><td>no</td><td>A deterministic connector call through the MCP tool catalog. No tokens spent.</td></tr>
+        <tr><td><code>action</code></td><td><code>action</code> (+ <code>with</code>)</td><td>no</td><td>One connector or findings tool call through the tool catalog. No model turn, no tokens spent.</td></tr>
         <tr><td><code>run</code></td><td><code>run</code> (<code>cmd</code> + <code>args</code>)</td><td>no</td><td>Executes a declared command as an argv vector and binds its stdout. No tokens spent. Opt-in per workspace; composes with <code class="inline">for_each:</code>.</td></tr>
         <tr><td>approval gate</td><td><code>approval</code> alone</td><td>no</td><td>Pauses the run for a human decision, with notify and reject-cleanup hooks.</td></tr>
       </tbody>
@@ -402,9 +442,12 @@
 
     <h3><code class="inline">for_each:</code> &mdash; data fan-out</h3>
     <p>
-      One agent, one prompt, run once per item of a rendered list. The list source can be a JSON/YAML array or a
-      newline-delimited block; if the rendered value starts with <code class="inline">[</code> it is parsed as an
-      array, otherwise each non-empty line becomes one item.
+      One agent, one prompt, run once per item of a rendered list. If the rendered value starts with
+      <code class="inline">[</code> it is parsed as a JSON array &mdash; and if it doesn&rsquo;t parse, the step fails
+      with the parse error before any unit runs; otherwise each non-empty line becomes one item. To fan out over a
+      list of objects from another step, render it with <code class="inline">| tojson</code>, e.g.
+      <code class="inline">for_each: "&#123;&#123; (steps.tagged.output | fromjson).rows | tojson &#125;&#125;"</code>
+      after an <code class="inline">action: findings.query</code> step with <code class="inline">all: true</code>.
     </p>
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
@@ -465,7 +508,7 @@
       <tbody>
         <tr><td><code>panel.panelists</code></td><td>array&lt;string&gt;</td><td>yes</td><td>Agent names. Must contain at least one.</td></tr>
         <tr><td><code>panel.subject</code></td><td>string</td><td>yes</td><td>Template rendered once; the thing under review.</td></tr>
-        <tr><td><code>panel.prompt</code></td><td>string</td><td>no</td><td>Optional per-panelist prompt template. Omit it and the rendered subject is sent verbatim as the user message, letting each panelist's own system prompt carry the review instructions.</td></tr>
+        <tr><td><code>panel.prompt</code></td><td>string</td><td>no</td><td>Optional per-panelist prompt template; the current subject is injected into it as <code class="inline">&#123;&#123; inputs.subject &#125;&#125;</code>. Omit it and the rendered subject is sent verbatim as the user message, letting each panelist's own system prompt carry the review instructions.</td></tr>
         <tr><td><code>panel.max_parallel</code></td><td>integer</td><td>no</td><td>Concurrent panelist cap. Absent means 1.</td></tr>
         <tr><td><code>panel.gate</code></td><td>object</td><td>no</td><td>Turns the panel into a review/fix loop.</td></tr>
         <tr><td><code>panel.gate.until_no_findings_at_severity_or_above</code></td><td><code>low</code>|<code>medium</code>|<code>high</code>|<code>critical</code></td><td>yes (in gate)</td><td>Loop while the maximum finding severity is at or above this threshold.</td></tr>
@@ -530,38 +573,86 @@
       <span class="k">then</span>: [<span class="v">open_pr</span>]              <span class="c"># clean review — ship it</span>
       <span class="k">else</span>: [<span class="v">file_issue</span>, <span class="v">escalate</span>]  <span class="c"># complete set of ids on this arm</span></pre>
 
-    <h3><code class="inline">action:</code> &mdash; deterministic connector call</h3>
+    <h3 id="step-kinds-action"><code class="inline">action:</code> &mdash; one tool call, no agent</h3>
     <p>
-      An action step calls one SCM / issue-tracker / CI tool directly through the same in-process MCP tool catalog
-      agents use. <strong>No agent runs, no tokens are spent, and the result is deterministic.</strong> Use it
-      whenever the work is "make this one API call" rather than "reason about something".
+      An action step calls one catalog tool directly &mdash; the same tool an agent or the control plane&rsquo;s
+      <code class="inline">/mcp</code> endpoint would call &mdash; under the run&rsquo;s permission mode.
+      <strong>No agent runs, no model turn happens, no tokens are spent.</strong> Use it whenever the work is
+      "make this one call" rather than "reason about something".
     </p>
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Required</th><th>Meaning</th></tr></thead>
       <tbody>
-        <tr><td><code>action</code></td><td>string</td><td>yes</td><td>A tool name from the catalog, e.g. <code class="inline">scm.prs.create</code>. Must be non-empty and must exist.</td></tr>
-        <tr><td><code>with</code></td><td>mapping</td><td>no</td><td>Tool parameters. Keys are validated against the tool's schema at parse time; values are minijinja templates rendered at execution time.</td></tr>
+        <tr><td><code>action</code></td><td>string</td><td>yes</td><td>A tool an action step may call: a connector tool (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>, <code class="inline">github.*</code>, <code class="inline">gitlab.*</code>) or a findings tool (<code class="inline">findings.record</code> &mdash; the <code class="inline">findings.report</code> tool&rsquo;s action name &mdash; <code class="inline">findings.verify</code>, <code class="inline">findings.query</code>, <code class="inline">findings.tag</code>). A legacy alias works too. <code class="inline">GET /api/tools</code> marks them <code class="inline">action_eligible</code>.</td></tr>
+        <tr><td><code>with</code></td><td>mapping</td><td>no</td><td>Parameters passed to the tool call. Keys are validated against the tool&rsquo;s JSON Schema at parse time; string values may be minijinja templates, rendered at execution time.</td></tr>
       </tbody>
     </table>
-    <p><strong>Rules.</strong></p>
+    <p><strong>Rules, all enforced at parse time.</strong></p>
     <ul>
-      <li>Mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">for_each:</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, and <code class="inline">approval:</code>.</li>
-      <li><code class="inline">with:</code> must be a mapping. An unknown parameter key, or a missing <strong>required</strong> parameter, is a parse error &mdash; validated against the static catalog, so linting a workflow needs no credentials.</li>
-      <li>Parameter <em>values</em> are not checked at parse time (they may be templates); they are re-validated after rendering, immediately before dispatch.</li>
-      <li><code class="inline">when:</code> and <code class="inline">continue_on_error:</code> behave exactly as on any other step. A template-render failure in <code class="inline">with:</code> always aborts, even under <code class="inline">continue_on_error</code>, because that is an authoring error rather than a runtime one. There is no built-in retry.</li>
-      <li>The executed call is recorded in the run's audit trail as an action envelope, unified with the agent action protocol.</li>
+      <li><code class="inline">action:</code> must name a real tool in the catalog. An unknown name is a parse error.</li>
+      <li>The tool must be one an action step may call: not a core fs/shell tool, not one that starts another run, and needing only the services an action step provides (the SCM registry and the findings ledger). Anything else &mdash; <code class="inline">bash</code>, <code class="inline">dispatch</code>, <code class="inline">coverage.mark</code>, <code class="inline">assets.mark</code>, <code class="inline">board.post</code>, &hellip; &mdash; is a parse error.</li>
+      <li><code class="inline">with:</code> must be a mapping. An unknown key, or a missing <strong>required</strong> key, is a parse error before the run ever starts.</li>
+      <li>Mutually exclusive with <code class="inline">agent</code>/<code class="inline">prompt</code>, <code class="inline">for_each:</code>, <code class="inline">parallel:</code>, <code class="inline">panel:</code>, and <code class="inline">branch:</code>.</li>
+      <li>An action step must not carry a <strong>non-empty</strong> <code class="inline">actions:</code> list. <code class="inline">actions:</code> narrows an <em>agent&rsquo;s</em> connector grant; an action step&rsquo;s call is already explicit, so there is nothing to narrow. An empty or absent <code class="inline">actions:</code> is legal, if redundant.</li>
+      <li><code class="inline">findings_profile</code> is accepted only on <code class="inline">action: findings.record</code>; see <a class="link" href="#findings-profile">Findings profile</a>.</li>
     </ul>
-    <p><strong>Published output.</strong> The connector's JSON response, bound to <code class="inline">steps.&lt;id&gt;.output</code>.</p>
-    <pre class="code">  - <span class="k">id</span>: <span class="v">open_pr</span>
+    <p><strong>Typed values.</strong> A <code class="inline">with:</code> value is coerced against the tool&rsquo;s declared schema type:</p>
+    <ul>
+      <li>a plain literal against an <code class="inline">integer</code> / <code class="inline">number</code> / <code class="inline">boolean</code> field with stray quotes (<code class="inline">number: "7"</code>) is rejected at <strong>parse</strong> time &mdash; almost always a typo;</li>
+      <li>a <strong>whole-leaf</strong> template (the entire string is one <code class="inline">&#123;&#123; &hellip; &#125;&#125;</code> expression) is rendered, then parsed against the declared type; a render that doesn&rsquo;t fit is a runtime error;</li>
+      <li>a <strong>partial</strong> template mixed with other text (<code class="inline">"issue-&#123;&#123; n &#125;&#125;"</code>) against a numeric field is a runtime error rather than a guess &mdash; use a whole-leaf template (<code class="inline">"&#123;&#123; n &#125;&#125;"</code>) for a typed parameter.</li>
+    </ul>
+    <p>
+      <strong>Published output.</strong> <code class="inline">steps.&lt;id&gt;.output</code> is the tool&rsquo;s return
+      value serialized as a JSON <em>string</em>, and <code class="inline">steps.&lt;id&gt;.success</code> whether the
+      call succeeded. Because <code class="inline">output</code> is a string, pull fields out of it with the
+      <code class="inline">fromjson</code> filter &mdash; <code class="inline">&#123;&#123; (steps.fetch.output | fromjson).title &#125;&#125;</code>,
+      not <code class="inline">&#123;&#123; steps.fetch.output.title &#125;&#125;</code>. The call is recorded in the
+      run&rsquo;s transcript as an <code class="inline">action_emitted</code> line followed by its
+      <code class="inline">tool_audit</code>.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">fetch</span>
+    <span class="k">action</span>: <span class="v">issues.get</span>
+    <span class="k">with</span>: { <span class="k">project</span>: <span class="s">"acme/widget"</span>, <span class="k">number</span>: <span class="v">41</span> }
+
+  - <span class="k">id</span>: <span class="v">triage</span>
+    <span class="k">agent</span>: <span class="v">triager</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Issue title: &#123;&#123; (steps.fetch.output | fromjson).title &#125;&#125;</span>
+      <span class="s">Labels: &#123;&#123; (steps.fetch.output | fromjson)['labels'] | join(', ') &#125;&#125;</span>
+
+  - <span class="k">id</span>: <span class="v">open_pr</span>
     <span class="k">action</span>: <span class="v">scm.prs.create</span>
     <span class="k">with</span>:
       <span class="k">owner</span>: <span class="s">Section9Labs</span>
       <span class="k">repo</span>: <span class="s">rupu</span>
       <span class="k">title</span>: <span class="s">"fix: &#123;&#123; inputs.title &#125;&#125;"</span>
-      <span class="k">body</span>: <span class="s">"&#123;&#123; steps.implement.output &#125;&#125;"</span>
+      <span class="k">body</span>: <span class="s">"&#123;&#123; steps.triage.output &#125;&#125;"</span>
       <span class="k">head</span>: <span class="s">"rupu/issue-&#123;&#123; issue.number &#125;&#125;"</span>
       <span class="k">base</span>: <span class="s">main</span>
       <span class="k">draft</span>: <span class="v">false</span></pre>
+    <p>
+      The findings tools work the same way: <code class="inline">findings.query</code> with
+      <code class="inline">all: true</code> returns every match unpaged, which a <code class="inline">for_each</code>
+      takes as its rows (each <code class="inline">item</code> is a slim row with <code class="inline">id</code>,
+      <code class="inline">title</code>, <code class="inline">severity</code>, <code class="inline">scope</code>,
+      <code class="inline">location</code>, <code class="inline">concern_id</code>, <code class="inline">tags</code>,
+      <code class="inline">declared_at</code>, <code class="inline">run_id</code>), and
+      <code class="inline">findings.tag</code> adds or removes tags on one or many findings.
+    </p>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">tagged</span>
+    <span class="k">action</span>: <span class="v">findings.query</span>
+    <span class="k">with</span>: { <span class="k">q</span>: <span class="s">"tag:needs-poc severity&gt;=high"</span>, <span class="k">all</span>: <span class="v">true</span> }
+  - <span class="k">id</span>: <span class="v">poc</span>
+    <span class="k">agent</span>: <span class="v">poc-writer</span>
+    <span class="k">for_each</span>: <span class="s">"&#123;&#123; (steps.tagged.output | fromjson).rows | tojson &#125;&#125;"</span>
+    <span class="k">max_parallel</span>: <span class="v">4</span>
+    <span class="k">prompt</span>: <span class="s">|</span>
+      <span class="s">Write a proof of concept for finding &#123;&#123; item.id &#125;&#125;: &#123;&#123; item.title &#125;&#125;</span>
+      <span class="s">(&#123;&#123; item.location &#125;&#125;). When it works, tag it `has-poc` with findings.tag.</span>
+  - <span class="k">id</span>: <span class="v">mark</span>
+    <span class="k">action</span>: <span class="v">findings.tag</span>
+    <span class="k">with</span>: { <span class="k">finding_ids</span>: [<span class="s">"fnd_01J…"</span>], <span class="k">add</span>: [<span class="s">"needs-poc"</span>] }</pre>
 
     <h3><code class="inline">run:</code> &mdash; deterministic command</h3>
     <p>
@@ -710,13 +801,13 @@
     <table>
       <thead><tr><th>Key</th><th>Type</th><th>Gate node</th><th>Inline option</th><th>Meaning</th></tr></thead>
       <tbody>
-        <tr><td><code>required</code></td><td>bool</td><td>ignored</td><td>yes</td><td>On the inline option, <code class="inline">true</code> is what makes the step pause. A gate node always pauses, so the field is redundant there.</td></tr>
-        <tr><td><code>prompt</code></td><td>string</td><td>optional</td><td>optional</td><td>What the operator sees. Rendered with the same context as a step prompt. Falls back to a generated "Approve gate <code class="inline">&lt;id&gt;</code>?" line.</td></tr>
+        <tr><td><code>required</code></td><td>bool</td><td>yes</td><td>yes</td><td><code class="inline">true</code> is what makes the step pause. Every documented gate node sets it too.</td></tr>
+        <tr><td><code>prompt</code></td><td>string</td><td>optional</td><td>optional</td><td>What the operator sees. Rendered with the same context as a step prompt; without it rupu generates a line naming the step.</td></tr>
         <tr><td><code>timeout_seconds</code></td><td>integer</td><td>optional</td><td>optional</td><td>How long the gate may sit unanswered before its timeout policy applies.</td></tr>
-        <tr><td><code>auto_approve</code></td><td>string</td><td>optional</td><td><strong>rejected</strong></td><td>Minijinja expression evaluated when the gate is reached. Truthy resolves the gate as approved (<code class="inline">via: auto</code>) without ever pausing.</td></tr>
+        <tr><td><code>auto_approve</code></td><td>string</td><td>optional</td><td><strong>rejected</strong></td><td>Minijinja expression evaluated when the gate is reached. Truthy resolves the gate as approved (<code class="inline">via: auto</code>) without ever pausing; the <code class="inline">notify</code> hooks do <strong>not</strong> fire on auto-approve.</td></tr>
         <tr><td><code>on_timeout</code></td><td><code>approve</code>|<code>reject</code>|<code>fail</code></td><td>optional</td><td><strong>rejected</strong></td><td>What a timed-out gate resolves to. Absent means <code class="inline">fail</code>. <strong>Requires <code class="inline">timeout_seconds</code>.</strong></td></tr>
-        <tr><td><code>notify</code></td><td>array&lt;NotifyAction&gt;</td><td>optional</td><td><strong>rejected</strong></td><td>Connector calls fired best-effort when the gate parks. Failures are logged and never block the pause.</td></tr>
-        <tr><td><code>on_reject</code></td><td>array&lt;Step&gt;</td><td>optional</td><td><strong>rejected</strong></td><td>Inline cleanup steps that run after a reject decision, before the run ends <code class="inline">Rejected</code>.</td></tr>
+        <tr><td><code>notify</code></td><td>array&lt;action hook&gt;</td><td>optional</td><td><strong>rejected</strong></td><td><code class="inline">action:</code> hooks fired best-effort just before the gate parks. A failure is logged and never blocks the pause.</td></tr>
+        <tr><td><code>on_reject</code></td><td>array&lt;Step&gt;</td><td>optional</td><td><strong>rejected</strong></td><td>A cleanup chain run when the gate is rejected &mdash; by an operator, or by <code class="inline">on_timeout: reject</code> &mdash; before the run ends <code class="inline">Rejected</code>.</td></tr>
       </tbody>
     </table>
     <p>
@@ -744,11 +835,12 @@
     <p>
       <strong>Published output.</strong> A gate node writes a JSON decision record to
       <code class="inline">steps.&lt;id&gt;.output</code> &mdash;
-      <code class="inline">{ "decision", "via", "reason", "decided_at" }</code> &mdash; where
+      <code class="inline">{ "decision", "via", "approver", "reason", "decided_at" }</code> &mdash; where
       <code class="inline">decision</code> is <code class="inline">approved</code> or
       <code class="inline">rejected</code> and <code class="inline">via</code> is
-      <code class="inline">human</code> or <code class="inline">auto</code>. The convenience shortcut
-      <code class="inline">steps.&lt;id&gt;.decision</code> exposes the decision string directly.
+      <code class="inline">human</code>, <code class="inline">auto</code> or <code class="inline">timeout</code>.
+      <code class="inline">steps.&lt;id&gt;.decision</code> is the decision string, already parsed &mdash; no
+      <code class="inline">fromjson</code> needed.
     </p>
     <p>
       <strong>Several gates at once.</strong> In a graph workflow more than one gate can park in the same wave.
@@ -764,11 +856,17 @@
       <strong>Timeouts need <code class="inline">rupu cp serve</code>.</strong>
       <code class="inline">timeout_seconds</code> / <code class="inline">on_timeout</code> are acted on by the control
       plane's background gate sweep (<code class="inline">[cp].gate_sweep_enabled</code>, default on, every
-      <code class="inline">[cp].gate_sweep_interval_secs</code> = 60). Without it, an expired gate simply stays parked
-      until someone decides it.
+      <code class="inline">[cp].gate_sweep_interval_secs</code> = 60). Without it, an <code class="inline">on_timeout: approve</code>
+      or <code class="inline">reject</code> gate simply stays parked until <code class="inline">rupu workflow approve</code>
+      or <code class="inline">reject</code> decides it (reject runs the <code class="inline">on_reject</code> chain),
+      and an <code class="inline">on_reject</code> chain triggered from the control plane&rsquo;s web UI or
+      <code class="inline">rupu workflow cancel</code> is recorded as pending and executed by the sweep, so it too
+      waits for <code class="inline">cp serve</code>. <code class="inline">rupu workflow runs</code> deliberately
+      resolves no gate and runs no cleanup chain &mdash; a read command has no external side effects.
     </p>
     <pre class="code">  - <span class="k">id</span>: <span class="v">merge_gate</span>
     <span class="k">approval</span>:
+      <span class="k">required</span>: <span class="v">true</span>
       <span class="k">prompt</span>: <span class="s">|</span>
         <span class="s">&#123;&#123; steps.panel_review.findings | length &#125;&#125; findings,</span>
         <span class="s">max severity &#123;&#123; steps.panel_review.max_severity &#125;&#125;. Approve to open the PR.</span>
@@ -845,7 +943,9 @@
         <tr><td><code>id</code></td><td>string</td><td>all</td><td>Required. Must be unique within the workflow. Referenced as <code class="inline">steps.&lt;id&gt;</code> in templates &mdash; so use identifier-safe characters (letters, digits, underscore); a hyphen truncates the reference.</td></tr>
         <tr><td><code>when</code></td><td>string</td><td>all except <code>branch</code></td><td>Minijinja expression reduced to truthy/falsy; falsy skips the step and sets <code class="inline">steps.&lt;id&gt;.skipped</code>. Evaluated <em>before</em> approval. Rejected on a <code class="inline">branch:</code> step and on <code class="inline">on_reject</code> cleanup steps.</td></tr>
         <tr><td><code>continue_on_error</code></td><td>bool</td><td>all</td><td>Tolerate this step's failure and keep going. Inherits <code class="inline">defaults.continue_on_error</code> when unset. On fan-out shapes it applies <em>per unit</em> &mdash; a failed item is recorded with <code class="inline">success = false</code> and the rest still dispatch.</td></tr>
-        <tr><td><code>actions</code></td><td>array&lt;string&gt;</td><td>agent steps</td><td>Narrows the agent&rsquo;s <em>connector</em> tools for this step to the ones listed; built-ins are untouched. Each entry must be an MCP catalog tool name. <code class="inline">[]</code> (or omitting it) leaves the agent&rsquo;s grant as is. Must be empty on an <code class="inline">action:</code> step and on a <code class="inline">host:</code>/<code class="inline">distribute:</code> step. See <a class="link" href="#step-actions">Step actions</a>.</td></tr>
+        <tr><td><code>actions</code></td><td>array&lt;string&gt;</td><td>agent steps</td><td>Narrows the agent&rsquo;s <em>connector</em> tools (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>, <code class="inline">github.*</code>, <code class="inline">gitlab.*</code>) for this step to the ones listed; every other tool is untouched. Entries use the agent <code class="inline">tools:</code> grammar &mdash; an exact connector tool name, a namespace (<code class="inline">issues.*</code>) or <code class="inline">*</code>. <code class="inline">[]</code> (or omitting it) leaves the agent&rsquo;s grant as is. Must be empty on an <code class="inline">action:</code> step and on a <code class="inline">host:</code>/<code class="inline">distribute:</code> step. See <a class="link" href="#step-actions">Step actions</a>.</td></tr>
+        <tr><td><code>skills</code></td><td>array&lt;string&gt;</td><td>agent steps</td><td>Skills every agent this step launches may load, on top of its own. Same grammar as an agent&rsquo;s <code class="inline">skills:</code>. See <a class="link" href="#step-skills">Step skills</a>.</td></tr>
+        <tr><td><code>preload_skills</code></td><td>array&lt;string&gt;</td><td>agent steps</td><td>Skills whose bodies go into every launched agent&rsquo;s system prompt. Same rules as <code class="inline">skills</code>.</td></tr>
         <tr><td><code>max_parallel</code></td><td>integer</td><td><code>for_each</code>, <code>parallel</code>, <code>panel</code></td><td>Concurrency cap; must be &#8805; 1. Absent means serial in declared order. Ignored on non-fan-out shapes. On <code class="inline">panel</code> it is set inside the <code class="inline">panel:</code> block.</td></tr>
         <tr><td><code>host</code></td><td>string</td><td>linear only</td><td>Run this step's agent on a named fleet host. Rejected on <code class="inline">for_each</code>/<code class="inline">parallel</code>/<code class="inline">panel</code>/<code class="inline">branch</code>/<code class="inline">action</code>/gate nodes, alongside <code class="inline">distribute:</code>, and when empty.</td></tr>
         <tr><td><code>distribute</code></td><td>object</td><td><code>for_each</code> only</td><td><code class="inline">{ hosts: [...] }</code>, spread round-robin. Rejected without <code class="inline">for_each:</code>, rejected outright on a <code class="inline">run:</code> step (which executes on the coordinator), and <code class="inline">hosts</code> must be non-empty.</td></tr>
@@ -862,9 +962,14 @@
     <p>
       An agent&rsquo;s <code class="inline">tools:</code> says what it may ever call. A step&rsquo;s
       <code class="inline">actions:</code> narrows that, for this step only, to a subset of the <strong>connector</strong>
-      tools &mdash; the MCP catalog (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>,
-      <code class="inline">findings.*</code>, <code class="inline">github.workflows_dispatch</code>,
-      <code class="inline">gitlab.pipeline_trigger</code>; the full list is <a class="link" href="#the-action-catalog">the action catalog</a>).
+      tools &mdash; <code class="inline">scm.*</code>, <code class="inline">issues.*</code>,
+      <code class="inline">github.*</code> and <code class="inline">gitlab.*</code> (the list is in
+      <a class="link" href="#the-action-catalog">the action catalog</a>). Every other tool &mdash;
+      <code class="inline">bash</code>, <code class="inline">read_file</code>, the findings and coverage tools,
+      <code class="inline">dispatch</code>, &hellip; &mdash; is governed only by the agent&rsquo;s own
+      <code class="inline">tools:</code> and the run mode. Entries use the same grammar as
+      <code class="inline">tools:</code>: an exact connector tool name, a namespace (<code class="inline">issues.*</code>)
+      or <code class="inline">*</code>.
     </p>
     <pre class="code"><span class="k">steps</span>:
   - <span class="k">id</span>: <span class="v">triage</span>
@@ -877,8 +982,9 @@
       <tbody>
         <tr><td>Empty means unchanged</td><td><code>actions: []</code>, or no key, leaves the agent&rsquo;s grant exactly as declared. Existing workflows keep working.</td></tr>
         <tr><td>Connector tools only</td><td>Built-ins (<code>bash</code>, <code>read_file</code>, <code>ast_grep</code>, &hellip;) are never removed, whatever the list says.</td></tr>
-        <tr><td>No escalation</td><td>The step&rsquo;s connector tools are the agent&rsquo;s grant <em>intersected</em> with <code>actions:</code>. Wildcards in <code>tools:</code> (<code>scm.*</code>, <code>*</code>) are expanded first; an agent with no <code>tools:</code> counts as granted everything. Listing a tool the agent isn&rsquo;t granted doesn&rsquo;t grant it &mdash; rupu logs a warning, since it&rsquo;s probably an authoring mistake.</td></tr>
-        <tr><td>Checked at load</td><td>Every entry must name a catalog tool; an unknown name is a parse error. A non-empty list is rejected on an <code>action:</code> step (its tool is already explicit) and on a <code>host:</code>/<code>distribute:</code> step, where the narrowing couldn&rsquo;t reach the remote agent.</td></tr>
+        <tr><td>No escalation</td><td>The step&rsquo;s connector tools are the agent&rsquo;s grant <em>intersected</em> with <code>actions:</code>. Listing a tool the agent isn&rsquo;t granted doesn&rsquo;t grant it &mdash; rupu logs a warning, since it&rsquo;s probably an authoring mistake. What was narrowed away is recorded in the step transcript&rsquo;s <code>tool_grant</code> event (<code>narrowed</code>).</td></tr>
+        <tr><td>Reaches children</td><td>The narrowing reaches every child the step&rsquo;s agent starts with <code>dispatch</code>, in its process or its own: a child can&rsquo;t call a connector tool the step couldn&rsquo;t.</td></tr>
+        <tr><td>Checked at load</td><td>An unknown entry is a parse error with a did-you-mean, and so is an entry that names no connector tool (<code>bash</code>, <code>findings.*</code>), since it would have no effect. A non-empty list is rejected on an <code>action:</code> step (its tool is already explicit) and on a <code>host:</code>/<code>distribute:</code> step, where the narrowing couldn&rsquo;t reach the remote agent.</td></tr>
       </tbody>
     </table>
     <p>
@@ -898,10 +1004,84 @@
     <pre class="code">{<span class="s">"type"</span>:<span class="s">"tool_audit"</span>,<span class="s">"data"</span>:{<span class="s">"tool"</span>:<span class="s">"scm.prs.create"</span>,<span class="s">"declared"</span>:<span class="v">false</span>,<span class="s">"granted"</span>:<span class="v">true</span>,<span class="s">"blocked"</span>:<span class="v">true</span>,<span class="s">"restricted"</span>:<span class="v">true</span>}}</pre>
     <p>
       That line reads: the agent is allowed to open PRs in general, this step didn&rsquo;t list it, and the call was
-      blocked. The live run view flags blocked calls, and the control plane&rsquo;s transcript view badges each
-      audited call. The full event schema is in <a class="link" href="/docs/transcripts.html#tool-audit">Transcripts</a>.
+      blocked. Current lines also carry <code class="inline">reason</code> (why the tool was in the grant) and
+      <code class="inline">decision</code> (<code class="inline">allowed</code>, <code class="inline">denied:readonly</code>,
+      <code class="inline">denied:tool</code>, <code class="inline">not_granted</code>, &hellip;). The live run view flags
+      blocked calls, and the control plane&rsquo;s transcript view badges each audited call. The full event schema is
+      in <a class="link" href="/docs/transcripts.html#tool-audit">Transcripts</a>.
     </p>
-    <div class="callout"><strong>Sub-agents aren&rsquo;t covered.</strong> A sub-agent the step starts with <code class="inline">dispatch_agent</code> runs under its own grant: <code class="inline">actions:</code> doesn&rsquo;t narrow it, and its connector calls aren&rsquo;t in this step&rsquo;s trail. rupu logs a warning on every dispatch and leaves a note saying so in the sub-agent&rsquo;s own transcript.</div>
+
+    <h3 id="launching-children">Launching children from a step</h3>
+    <p>
+      A step&rsquo;s agent starts other runs with the launch tools <code class="inline">dispatch</code>,
+      <code class="inline">join</code> and <code class="inline">workflows.generate</code> &mdash; the same catalog tools
+      every agent run has (see <a class="link" href="/docs/agents.html">Agents</a>). <code class="inline">dispatch</code>
+      takes a <code class="inline">kind</code> of <code class="inline">subagent</code> (a task in the step&rsquo;s own
+      process), <code class="inline">agent</code> (its own <code class="inline">rupu run</code>) or
+      <code class="inline">workflow</code> (its own <code class="inline">rupu workflow run --plain</code>), returns at
+      once unless <code class="inline">wait: true</code>, and <code class="inline">join</code> collects the results.
+      The older names &mdash; <code class="inline">dispatch_agent</code>, <code class="inline">dispatch_agents_parallel</code>,
+      <code class="inline">run_workflow</code>, <code class="inline">generate_workflow</code> &mdash; are aliases of these
+      and keep their old output shapes; the model only ever sees the canonical names. What an agent may launch is its
+      <code class="inline">dispatchableAgents:</code> / <code class="inline">dispatchableWorkflows:</code> lists, and a
+      workflow child is checked before it starts: it parses, has no approval gate and no
+      <code class="inline">host:</code> / <code class="inline">distribute:</code> step, and runs only agents the caller
+      may dispatch.
+    </p>
+    <p>
+      Inside a workflow the step&rsquo;s settings follow the child selectively: its <code class="inline">actions:</code>
+      narrowing does (above), while <code class="inline">findings_profile</code> and the step&rsquo;s skills do not
+      &mdash; a child resolves both from its own agent file (a workflow child from its own defaults). A child shares
+      the run&rsquo;s message space, and a <code class="inline">messaging: false</code> reaches it.
+    </p>
+
+    <h3 id="step-skills">Step skills</h3>
+    <p>
+      <code class="inline">skills:</code> and <code class="inline">preload_skills:</code> give
+      <a class="link" href="/docs/skills.html">skills</a> to the agents a step launches, on top of each agent&rsquo;s
+      own. The entries use the same grammar as an agent&rsquo;s <code class="inline">skills:</code>, and they only add
+      &mdash; they never remove a skill the agent declares.
+    </p>
+    <pre class="code"><span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="v">review</span>
+    <span class="k">agent</span>: <span class="v">reviewer</span>
+    <span class="k">prompt</span>: <span class="s">Review the PR.</span>
+    <span class="k">skills</span>: [<span class="v">pdf</span>, <span class="s">"project:*"</span>]      <span class="c"># the model may load these</span>
+    <span class="k">preload_skills</span>: [<span class="v">house-style</span>]   <span class="c"># always in the system prompt</span></pre>
+    <ul>
+      <li>They reach every agent the step launches: its own agent, each <code class="inline">for_each</code> unit, the members of a <code class="inline">parallel:</code> block, and a panel&rsquo;s panelists and its gate&rsquo;s <code class="inline">fix_with</code> fixer. A sub-step has no <code class="inline">skills:</code> of its own &mdash; it takes its parent step&rsquo;s.</li>
+      <li>Allowed only on a step that runs an agent. A gate, <code class="inline">action:</code>, <code class="inline">run:</code>, <code class="inline">branch:</code>, <code class="inline">split:</code> or <code class="inline">join:</code> step that names them fails to parse.</li>
+      <li>Parsing checks each entry&rsquo;s syntax only. Whether the skill is installed is checked when the step launches, so a missing skill fails that step before its agent runs, the way a missing agent does. The run&rsquo;s <code class="inline">skill_index</code> records step skills with reason <code class="inline">launch</code>.</li>
+      <li>A placed step (<code class="inline">host:</code> or <code class="inline">distribute:</code>) ships its skills with the unit; see <a class="link" href="#remote-placement">Remote placement</a>.</li>
+      <li>A child the agent starts with <code class="inline">dispatch</code> gets its own agent&rsquo;s skills, not the step&rsquo;s.</li>
+    </ul>
+
+    <h3 id="permission-modes">Permission modes in a workflow</h3>
+    <p>
+      <code class="inline">rupu workflow run</code> takes <code class="inline">--mode ask | bypass | readonly</code>.
+      <strong><code class="inline">ask</code> and <code class="inline">bypass</code> behave identically for workflow
+      agent steps</strong>, and <code class="inline">ask</code> is the default when <code class="inline">--mode</code> is
+      omitted &mdash; so a run without an explicit mode grants its steps full tool access. A genuinely prompting
+      <code class="inline">ask</code> would block on stdin with no operator at the tool layer, so instead each step&rsquo;s
+      transcript records a <code class="inline">permission_mode_degraded</code> notice the first time
+      <code class="inline">ask</code> lets a write through, and <code class="inline">rupu workflow run</code> prints a
+      warning when no mode was given.
+    </p>
+    <table>
+      <thead><tr><th>Mode</th><th>Workflow agent steps</th><th>Action steps</th></tr></thead>
+      <tbody>
+        <tr><td><code>bypass</code></td><td>all tools allowed</td><td>all catalog tools allowed</td></tr>
+        <tr><td><code>ask</code></td><td><strong>same as <code class="inline">bypass</code></strong> &mdash; no prompt is possible</td><td>same as <code class="inline">bypass</code></td></tr>
+        <tr><td><code>readonly</code></td><td><code class="inline">write</code> and <code class="inline">external</code> tools denied (<code class="inline">bash</code>, <code class="inline">write_file</code>, <code class="inline">edit_file</code>, <code class="inline">scm.prs.create</code>, &hellip;); sub-agents run readonly</td><td><code class="inline">external</code> tools refused</td></tr>
+      </tbody>
+    </table>
+    <p>
+      If you want a workflow restricted, pass <code class="inline">--mode readonly</code> explicitly &mdash;
+      <code class="inline">ask</code> will not do it. For human-in-the-loop control over <em>what a workflow does</em>,
+      use a gate node rather than the permission mode: a gate pauses the run at a point you choose, where an operator
+      can actually answer. A placed unit runs under the same mode (see
+      <a class="link" href="#remote-placement">Remote placement</a>).
+    </p>
 
     <h3 id="findings-profile">Findings profile</h3>
     <p>
@@ -921,9 +1101,53 @@
     <span class="k">findings_profile</span>: <span class="v">summary</span>     <span class="c"># ...except this cheap first pass</span></pre>
     <ul>
       <li><code class="inline">parallel:</code> sub-steps inherit their parent's profile and can't set their own.</li>
-      <li>An <code class="inline">action: findings.record</code> step checks its <code class="inline">with:</code> keys against the profile at parse time: <code class="inline">full</code> needs <code class="inline">scope</code> and <code class="inline">report</code>; <code class="inline">summary</code> needs <code class="inline">scope</code>, <code class="inline">summary</code>, <code class="inline">severity</code> and <code class="inline">rationale</code>.</li>
-      <li>Remote steps launch each unit with the resolved profile. A host that can't honour it refuses the launch &mdash; the unit never runs under a different profile.</li>
+      <li>An <code class="inline">action: findings.record</code> step resolves its profile as the step&rsquo;s own <code class="inline">findings_profile</code> &rarr; <code class="inline">defaults.findings_profile</code> &rarr; <code class="inline">full</code> (there is no agent frontmatter to consult), and checks its <code class="inline">with:</code> keys against it at parse time: <code class="inline">full</code> needs <code class="inline">scope</code> and <code class="inline">report</code>; <code class="inline">summary</code> needs <code class="inline">scope</code>, <code class="inline">summary</code>, <code class="inline">severity</code> and <code class="inline">rationale</code> (optional <code class="inline">code_excerpt</code> / <code class="inline">references</code>; an <code class="inline">evidence</code> object, the agent tool&rsquo;s form, works in place of the three). Only key presence is checked, so a value may be a template. A gate&rsquo;s <code class="inline">notify:</code> hooks have no step of their own and use <code class="inline">defaults.findings_profile</code>, else <code class="inline">full</code>.</li>
+      <li>Children started with <code class="inline">dispatch</code> resolve only from their own agent file (a workflow child from its own defaults); the dispatching step&rsquo;s value does not reach them.</li>
+      <li>Remote steps follow the same order: the coordinator launches each unit with <code class="inline">rupu run --findings-profile</code> from the step&rsquo;s value, else <code class="inline">defaults.findings_profile</code>; when neither is set the host resolves the agent&rsquo;s <code class="inline">findingsProfile</code> from its own copy of the agent file, then <code class="inline">full</code>. A host that can't honour the profile refuses the launch &mdash; the unit never runs under a different profile.</li>
+      <li>The built-in default is <code class="inline">full</code>, so an older <code class="inline">action: findings.record</code> step that sends <code class="inline">summary</code> / <code class="inline">severity</code> / <code class="inline">rationale</code> fails to parse until it sets <code class="inline">findings_profile: summary</code> (or the workflow sets <code class="inline">defaults.findings_profile: summary</code>).</li>
     </ul>
+
+    <h2 id="remote-placement">Remote placement</h2>
+    <p>
+      By default every step&rsquo;s agent runs locally, in the same process as the rest of the workflow.
+      <code class="inline">host:</code> and <code class="inline">distribute:</code> place a step&rsquo;s work on a
+      different <a class="link" href="/docs/multi-host.html">host</a> in your fleet instead. A placed unit runs as
+      <code class="inline">rupu run &lt;agent&gt;</code> on its host, and its output feeds downstream steps exactly as a
+      local step&rsquo;s would.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Applies to</th><th>Meaning &amp; rule</th></tr></thead>
+      <tbody>
+        <tr><td><code>host</code></td><td>linear step only</td><td>Run this one step on the named host. Must be a non-empty string; rejected on <code class="inline">for_each</code>/<code class="inline">parallel</code>/<code class="inline">panel</code>/<code class="inline">branch</code>/<code class="inline">action</code>/gate nodes and alongside <code class="inline">distribute:</code>.</td></tr>
+        <tr><td><code>distribute</code></td><td><code>for_each</code> only</td><td><code class="inline">{ hosts: [...] }</code> &mdash; the items are spread round-robin across the listed hosts. <code class="inline">hosts</code> must be non-empty; rejected outright on a <code class="inline">run:</code> step.</td></tr>
+        <tr><td><code>workspace</code></td><td>remote steps</td><td><code class="inline">sync</code> ships the coordinator&rsquo;s workspace to the host and brings file changes back. Omitted, or <code class="inline">none</code>, keeps the step self-contained: it sees only its rendered prompt and prior steps&rsquo; string outputs, no files. <code class="inline">sync</code> on a purely local step is a parse error; <code class="inline">defaults.workspace</code> is the fallback for every remote step without its own.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">  - <span class="k">id</span>: <span class="v">edit</span>
+    <span class="k">agent</span>: <span class="v">editor</span>
+    <span class="k">for_each</span>: <span class="s">"x\ny\nz"</span>
+    <span class="k">prompt</span>: <span class="s">"edit &#123;&#123; item &#125;&#125;.txt"</span>
+    <span class="k">max_parallel</span>: <span class="v">3</span>
+    <span class="k">workspace</span>: <span class="v">sync</span>
+    <span class="k">distribute</span>:
+      <span class="k">hosts</span>: [<span class="v">w1</span>, <span class="v">w2</span>]</pre>
+    <p><strong>What travels with the unit.</strong> The coordinator launches each unit (and a fan-out unit&rsquo;s retry on its fallback host) with everything the step resolved:</p>
+    <ul>
+      <li><strong>Permission mode</strong> &mdash; <code class="inline">rupu run --mode &lt;mode&gt;</code>, which outranks the agent&rsquo;s <code class="inline">permissionMode</code> and the host&rsquo;s <code class="inline">permission_mode</code> config. <code class="inline">readonly</code> and <code class="inline">bypass</code> travel as they are; <code class="inline">ask</code>, the default, travels as <code class="inline">bypass</code> (a detached <code class="inline">rupu run --mode ask</code> would refuse to start). <code class="inline">--mode readonly</code> is how you keep a placed unit from writing.</li>
+      <li><strong>Findings profile</strong> &mdash; as <code class="inline">--findings-profile</code>; see <a class="link" href="#findings-profile">Findings profile</a>. <strong>Engagement profile</strong> ids travel as <code class="inline">--engagement-profile</code>; a host that doesn&rsquo;t advertise <code class="inline">agent.engagement_profile</code> is refused the launch, and the host resolves the ids against its own profiles.</li>
+      <li><strong>Skills</strong> &mdash; the coordinator resolves the unit&rsquo;s skills the way a local run does (the <code class="inline">skills:</code> / <code class="inline">preloadSkills:</code> of its own copy of the agent plus the step&rsquo;s <code class="inline">skills:</code> / <code class="inline">preload_skills:</code>; <code class="inline">*</code> means the coordinator&rsquo;s global layer), packs each as a tar named by its content hash, asks the host which hashes it lacks and sends only those. The host verifies every archive before keeping it (no absolute or <code class="inline">..</code> paths, no symlink leaving the skill, the tree must hash to its name) and runs the unit with exactly those copies, so it needn&rsquo;t have them installed; a shipped skill replaces the host&rsquo;s installed one of the same layer and name. A skill tree is at most 32 MiB and a unit&rsquo;s bundle 128 MiB &mdash; the coordinator refuses a unit over either limit before dispatch. A step skill not installed on the coordinator fails the unit before it is dispatched. A host that doesn&rsquo;t advertise <code class="inline">agent.skill_bundle</code> is sent the unit by name and runs it with its own installed copies, and the run gets a warning naming the host. Only the unit&rsquo;s own skills ship: children it launches on the host resolve from the host&rsquo;s installed layers. See <a class="link" href="/docs/skills.html">Skills</a>.</li>
+      <li><strong>Messaging</strong> &mdash; the workflow&rsquo;s <code class="inline">messaging:</code> switch, as <code class="inline">--no-messaging</code> or one <code class="inline">--messaging-tool</code> per tool; a host that doesn&rsquo;t advertise <code class="inline">agent.no_messaging</code> / <code class="inline">agent.messaging_tools</code> is refused the unit. See <a class="link" href="#messaging">the messaging key</a>.</li>
+      <li><strong>Not <code class="inline">actions:</code></strong> &mdash; a non-empty <code class="inline">actions:</code> on a <code class="inline">host:</code>/<code class="inline">distribute:</code> step is rejected at parse time: the tool roster never reaches the remote dispatch payload, so a narrowed list there would be a silent no-op. An empty or absent <code class="inline">actions:</code> stays legal.</li>
+    </ul>
+    <p>
+      A unit&rsquo;s findings and coverage reach the coordinator through the run&rsquo;s coverage stream; the
+      <code class="inline">workspace: sync</code> delta still carries <code class="inline">.rupu/coverage/</code>, which the
+      coordinator drops once the unit&rsquo;s complete stream merged and applies otherwise. A stream that can&rsquo;t be
+      delivered or merged, or that may be incomplete, shows a <code class="inline">StepWarning</code> on the step; the
+      unit is not failed. Every placed-unit error and warning is prefixed <code class="inline">host &lt;id&gt;:</code>.
+      On <code class="inline">rupu workflow resume</code> a placed step or unit is restarted from its prompt, not
+      continued from its transcript.
+    </p>
 
     <h2 id="graph">Graph orchestration</h2>
     <p>
@@ -974,9 +1198,12 @@
     <h2 id="the-action-catalog">The action catalog</h2>
     <p>
       These are the tools an <code class="inline">action:</code> step (or a gate's
-      <code class="inline">notify:</code>/<code class="inline">on_reject:</code> entry) may name. It is the same
-      catalog the embedded <a class="link" href="/docs/mcp.html">MCP server</a> exposes to agents &mdash; one
-      catalog, one permission model.
+      <code class="inline">notify:</code>/<code class="inline">on_reject:</code> entry) may name: the connector tools,
+      which a step&rsquo;s <code class="inline">actions:</code> can also narrow, and the findings tools, which it can&rsquo;t.
+      It is the same catalog the <a class="link" href="/docs/mcp.html">MCP endpoint</a> and agents use &mdash; one
+      catalog, one permission model. Every SCM tool takes an optional <code class="inline">platform</code> key and
+      every issue tool an optional <code class="inline">tracker</code> key; omit them and rupu falls back to
+      <code class="inline">[scm.default]</code> / <code class="inline">[issues.default]</code> from your config.
     </p>
     <table>
       <thead><tr><th>Tool</th><th>Class</th><th>Required <code>with:</code> keys</th><th>What it does</th></tr></thead>
@@ -999,16 +1226,16 @@
         <tr><td><code>issues.update_state</code></td><td>write</td><td><code>project</code>, <code>number</code>, <code>state</code></td><td>Transition an issue to <code class="inline">open</code> or <code class="inline">closed</code>.</td></tr>
         <tr><td><code>github.workflows_dispatch</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>workflow</code>, <code>ref</code></td><td>Trigger a GitHub Actions run. The workflow file must declare <code class="inline">on: workflow_dispatch:</code>. Optional <code class="inline">inputs</code>.</td></tr>
         <tr><td><code>gitlab.pipeline_trigger</code></td><td>write</td><td><code>owner</code>, <code>repo</code>, <code>ref</code></td><td>Trigger a GitLab CI pipeline against a branch or tag. Optional <code class="inline">variables</code>.</td></tr>
-        <tr><td><code>findings.record</code></td><td>write</td><td><code>scope</code> (+ per profile)</td><td>Record a finding in the project's ledger. Under <code class="inline">full</code> send a <code class="inline">report</code>; under <code class="inline">summary</code> send <code class="inline">summary</code>, <code class="inline">severity</code>, <code class="inline">rationale</code>. See <a class="link" href="#findings-profile">Findings profile</a>.</td></tr>
-        <tr><td><code>findings.query</code></td><td>read</td><td>&mdash;</td><td>The project's findings matching a one-line query <code class="inline">q</code> (e.g. <code class="inline">severity&gt;=high tag:needs-poc</code>). <code class="inline">all: true</code> returns every match unpaged &mdash; made for a <code class="inline">for_each</code> over the rows.</td></tr>
-        <tr><td><code>findings.tag</code></td><td>write</td><td><code>finding_ids</code></td><td>Add or remove tags (<code class="inline">add</code>, <code class="inline">remove</code>) on one or more of the project's findings.</td></tr>
+        <tr><td><code>findings.record</code></td><td>record</td><td><code>scope</code> (+ per profile)</td><td>Record a finding in the project's ledger (the <code class="inline">findings.report</code> tool&rsquo;s action name). Under <code class="inline">full</code> send a <code class="inline">report</code>; under <code class="inline">summary</code> send <code class="inline">summary</code>, <code class="inline">severity</code>, <code class="inline">rationale</code> (or an <code class="inline">evidence</code> object). Takes an optional <code class="inline">tags</code> array. See <a class="link" href="#findings-profile">Findings profile</a>.</td></tr>
+        <tr><td><code>findings.verify</code></td><td>record</td><td>see the tool&rsquo;s schema</td><td>Set an existing finding&rsquo;s verification status (<code class="inline">confirmed</code>, <code class="inline">disputed</code>, <code class="inline">inconclusive</code>) &mdash; what a verification run records, never the reporting agent. Its parameters are in <code class="inline">GET /api/tools</code>.</td></tr>
+        <tr><td><code>findings.query</code></td><td>read</td><td><code>q</code></td><td>The project's findings matching a one-line query (e.g. <code class="inline">severity&gt;=high tag:needs-poc</code>): one page of slim rows (<code class="inline">limit</code> defaults to 50, at most 500; <code class="inline">cursor</code> for the next page) plus <code class="inline">next_cursor</code>, <code class="inline">total</code> and <code class="inline">tags_in_use</code>. <code class="inline">all: true</code> returns every match unpaged &mdash; made for a <code class="inline">for_each</code> over the rows.</td></tr>
+        <tr><td><code>findings.tag</code></td><td>record</td><td><code>finding_ids</code></td><td>Add or remove tags (<code class="inline">add</code>, <code class="inline">remove</code>) on one or many of the project's findings; returns each finding's tags before and after. Allowed in <code class="inline">readonly</code> mode: it annotates the ledger and never touches the workspace&rsquo;s files.</td></tr>
       </tbody>
     </table>
-    <p>Three things to know about <code class="inline">with:</code>:</p>
+    <p>Two things to know about <code class="inline">with:</code>:</p>
     <ul>
-      <li><strong>Parse-time validation.</strong> Keys are checked against the tool's schema when the workflow loads. An unknown key or a missing required key is a load error, not a runtime surprise &mdash; and the check needs no credentials.</li>
-      <li><strong>Platform defaults.</strong> Every SCM tool takes an optional <code class="inline">platform</code> key and every issue tool an optional <code class="inline">tracker</code> key. Omit them and rupu falls back to <code class="inline">[scm.default]</code> / <code class="inline">[issues.default]</code> from your config, exactly as the MCP tools do.</li>
-      <li><strong>Permission mode.</strong> Action steps run under the same mode as the rest of the run. In <code class="inline">readonly</code> mode a write-class action fails with an explicit permission error before the connector is ever called. <code class="inline">ask</code> mode does not prompt per action step &mdash; the workflow author declared the call deliberately.</li>
+      <li><strong>Parse-time validation.</strong> Keys are checked against the tool's JSON Schema when the workflow loads. An unknown key or a missing required key is a load error, not a runtime surprise. Typed values follow the rules under <a class="link" href="#step-kinds-action">the action step</a>.</li>
+      <li><strong>Permission mode.</strong> Action steps run under the same mode as the rest of the run (<a class="link" href="#permission-modes">Permission modes</a>). In <code class="inline">readonly</code> mode an <code class="inline">external</code> tool &mdash; one that acts outside this machine, such as <code class="inline">scm.prs.create</code>, <code class="inline">issues.comment</code> or <code class="inline">github.workflows_dispatch</code> &mdash; is refused. <code class="inline">ask</code> behaves as <code class="inline">bypass</code>: nothing prompts per action step.</li>
     </ul>
     <div class="callout">
       <strong>Prefer an action step over a prompt.</strong> "Comment on the issue" through an agent costs a model
@@ -1031,6 +1258,7 @@
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.output &#125;&#125;</code></td><td>An earlier step's final output string (JSON array for fan-out steps; the decision JSON for a gate; <code class="inline">then</code>/<code class="inline">else</code> for a branch).</td></tr>
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.success &#125;&#125;</code></td><td>Whether that step completed successfully. For fan-out, true only if every unit succeeded.</td></tr>
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.skipped &#125;&#125;</code></td><td>Whether that step was skipped by <code class="inline">when:</code> or by a branch arm.</td></tr>
+        <tr><td><code>&#123;&#123; steps.&lt;id&gt;.error &#125;&#125;</code></td><td>Why a tolerated step failed, as the step recorded it (for an agent step, the outcome's title and hint). Empty on success.</td></tr>
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.results &#125;&#125;</code></td><td>Per-item (<code class="inline">for_each</code>) or per-sub-step (<code class="inline">parallel</code>) output list, in declared order.</td></tr>
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.sub_results.&lt;sub_id&gt;.output &#125;&#125;</code></td><td>A named <code class="inline">parallel:</code> sub-step output. Also <code class="inline">.success</code>.</td></tr>
         <tr><td><code>&#123;&#123; steps.&lt;id&gt;.findings &#125;&#125;</code></td><td>Aggregated panel findings; each entry has <code class="inline">source</code>, <code class="inline">severity</code>, <code class="inline">title</code>, <code class="inline">body</code>.</td></tr>
@@ -1041,8 +1269,10 @@
         <tr><td><code>&#123;&#123; item &#125;&#125;</code></td><td>The current item inside a <code class="inline">for_each:</code> step.</td></tr>
         <tr><td><code>&#123;&#123; loop.index &#125;&#125;</code></td><td>1-based position. Also <code class="inline">loop.index0</code>, <code class="inline">loop.length</code>, <code class="inline">loop.first</code>, <code class="inline">loop.last</code>.</td></tr>
         <tr><td><code>&#123;&#123; issue.number &#125;&#125;</code></td><td>Issue-target context. Also <code class="inline">issue.title</code>, <code class="inline">issue.body</code>, <code class="inline">issue.labels</code>, <code class="inline">issue.author</code>, <code class="inline">issue.state</code>, <code class="inline">issue.r.project</code>.</td></tr>
-        <tr><td><code>&#123;&#123; event.* &#125;&#125;</code></td><td>The payload of the event that triggered the run, for <code class="inline">on: event</code> workflows.</td></tr>
-        <tr><td><code>read_file('&lt;path&gt;')</code></td><td>The contents of a file a prior step wrote, resolved against the run's working directory. Fails loudly when missing.</td></tr>
+        <tr><td><code>&#123;&#123; event.* &#125;&#125;</code></td><td>The event that triggered the run, for <code class="inline">on: event</code> workflows. <code class="inline">event.id</code>, <code class="inline">event.vendor</code> and <code class="inline">event.repo.full_name</code> are always present; the vendor-native object is one level down under <code class="inline">event.payload.*</code> (<code class="inline">event.payload.pull_request.merged</code>). A top-level <code class="inline">event.pull_request.*</code> does not exist and renders empty &mdash; a <code class="inline">when:</code> built on it is silently, permanently falsy.</td></tr>
+        <tr><td><code>&#123;&#123; loops.&lt;name&gt;.iteration &#125;&#125;</code> &#183; <code>.converged</code></td><td>A <code class="inline">loops:</code> entry's progress: to its own members mid-iteration, to its <code class="inline">until</code>, and to every step downstream once it finishes.</td></tr>
+        <tr><td><code>read_file('&lt;path&gt;')</code></td><td>The contents of a file a prior step wrote. A relative path resolves against the run's workspace &mdash; the directory its agents and <code class="inline">run:</code> steps work in (for a run target, the clone), not where <code class="inline">rupu</code> was started &mdash; so a resumed run reads the same file. Fails loudly when missing.</td></tr>
+        <tr><td><code>| fromjson</code></td><td>The parsed JSON value &mdash; the inverse of <code class="inline">| tojson</code>, and what makes an <code class="inline">action:</code> step's string output indexable: <code class="inline">(steps.fetch.output | fromjson).title</code>. Values come back typed, so <code class="inline">(steps.fetch.output | fromjson).comments &gt; 5</code> works. Fails the run on invalid JSON; it never silently yields an empty value.</td></tr>
         <tr><td><code>&#123;&#37; for x in … &#37;&#125;</code> &#183; <code>&#123;&#37; if … &#37;&#125;</code></td><td>Standard minijinja control blocks; useful for folding <code class="inline">results</code> or <code class="inline">findings</code> into one prompt.</td></tr>
         <tr><td><code>| length</code> &#183; <code>| join(', ')</code> &#183; <code>| upper</code> &#183; <code>| default('&#8230;')</code> &#183; <code>| tojson</code></td><td>Common minijinja filters. <code class="inline">| length</code> on <code class="inline">findings</code> and <code class="inline">| tojson</code> for embedding structured data are the two you will reach for most.</td></tr>
       </tbody>
@@ -1109,7 +1339,14 @@
       <li><code class="inline">on_timeout</code> requires <code class="inline">timeout_seconds</code>.</li>
       <li><code class="inline">auto_approve</code>, <code class="inline">on_timeout</code>, <code class="inline">notify</code>, and <code class="inline">on_reject</code> are rejected on the legacy inline approval option &mdash; drop the <code class="inline">agent</code>/<code class="inline">prompt</code> to make it a gate node.</li>
       <li><code class="inline">on_reject</code> entries must be plain agent or action steps &mdash; no nested gate, fan-out, panel, or branch &mdash; and may not set <code class="inline">host:</code> or <code class="inline">when:</code>.</li>
-      <li><code class="inline">action:</code> must name a tool that exists in the catalog; <code class="inline">with:</code> must be a mapping whose keys are all schema properties, with every required property present. Gate <code class="inline">notify</code> entries are validated by the same rules.</li>
+      <li><code class="inline">action:</code> must name a tool that exists in the catalog and is action-eligible (a connector or findings tool &mdash; not a core tool, not one that starts a run); <code class="inline">with:</code> must be a mapping whose keys are all schema properties, with every required property present, and a quoted literal against a typed field is rejected. Gate <code class="inline">notify</code> entries are validated by the same rules.</li>
+      <li>A non-empty <code class="inline">actions:</code> is rejected on an <code class="inline">action:</code> step and on a <code class="inline">host:</code>/<code class="inline">distribute:</code> step; an <code class="inline">actions:</code> entry must name a connector tool (an unknown name, or <code class="inline">bash</code> / <code class="inline">findings.*</code>, is a parse error).</li>
+    </ul>
+    <p><strong>Skills and messaging</strong></p>
+    <ul>
+      <li><code class="inline">skills:</code> / <code class="inline">preload_skills:</code> are accepted only on a step that runs an agent; each entry must be well-formed (the agent <code class="inline">skills:</code> grammar). Whether a skill is installed is checked at launch, not at parse.</li>
+      <li>A sub-step of a <code class="inline">parallel:</code> block accepts no <code class="inline">skills:</code> of its own.</li>
+      <li><code class="inline">messaging: { tools: [...] }</code> may name only <code class="inline">board.*</code> / <code class="inline">msg.*</code> tools.</li>
     </ul>
     <p><strong>Graph and findings profile</strong></p>
     <ul>
@@ -1154,6 +1391,7 @@
   - <span class="k">id</span>: <span class="v">investigate</span>
     <span class="k">agent</span>: <span class="v">fix-bug</span>
     <span class="k">actions</span>: <span class="v">[]</span>
+    <span class="k">skills</span>: [<span class="s">"project:*"</span>]       <span class="c"># the project's skills, on top of the agent's own</span>
     <span class="k">prompt</span>: <span class="s">|</span>
       <span class="s">Summarize what this change does and what could break:</span>
       <span class="s">&#123;&#123; inputs.diff &#125;&#125;</span>
@@ -1175,6 +1413,7 @@
   <span class="c">#    A clean panel auto-approves; otherwise the run parks and pings the issue.</span>
   - <span class="k">id</span>: <span class="v">merge_gate</span>
     <span class="k">approval</span>:
+      <span class="k">required</span>: <span class="v">true</span>
       <span class="k">prompt</span>: <span class="s">|</span>
         <span class="s">&#123;&#123; steps.panel_review.findings | length &#125;&#125; findings</span>
         <span class="s">(max severity: &#123;&#123; steps.panel_review.max_severity &#125;&#125;). Ship it?</span>

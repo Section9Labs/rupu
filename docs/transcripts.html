@@ -7,6 +7,7 @@
 <meta name="description" content="The rupu transcript JSONL schema: file locations, schema versions, every event type and its fields, outcomes and recovery, the tool_audit trail, forward compatibility, the rupu transcript commands and replay.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
 </head>
 <body>
 <div class="docs-shell">
@@ -27,6 +28,8 @@
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
     <a class="item" href="/docs/profiles.html">Engagement profiles</a>
     <div class="grp">Platform</div>
     <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
@@ -69,8 +72,9 @@
     </table>
     <ul>
       <li><strong>The file name is the run id.</strong> <code class="inline">run_</code> plus a 26-character ULID, so names sort by start time. Only <code class="inline">run_start</code> and <code class="inline">run_complete</code> repeat the id inside the file.</li>
-      <li><strong>A workflow writes one transcript per agent run</strong>, in the same directory: each linear step, each <code class="inline">for_each</code> / <code class="inline">parallel</code> / <code class="inline">panel</code> unit, and each sub-agent started with <code class="inline">dispatch_agent</code>. The workflow run&rsquo;s own records (<code class="inline">run.json</code>, <code class="inline">step_results.jsonl</code>, <code class="inline">events.jsonl</code>) live elsewhere and point at each step&rsquo;s transcript path.</li>
-      <li><strong>Not every <code class="inline">.jsonl</code> in the directory is an agent transcript.</strong> <code class="inline">run:</code> step and <code class="inline">action:</code> step logs and per-run netflow ledgers use the same naming with their own shapes. An agent transcript always starts with <code class="inline">run_start</code>; a file with no <code class="inline">run_start</code> anywhere is one of the others, and rupu&rsquo;s readers skip it.</li>
+      <li><strong>Every agent run writes one</strong>: a standalone <code class="inline">rupu run</code>, each workflow step and fan-out unit, each child started with <code class="inline">dispatch</code>, and each session turn. A workflow run&rsquo;s own records (<code class="inline">run.json</code>, <code class="inline">step_results.jsonl</code>, <code class="inline">events.jsonl</code>) live in the run store and point at each step&rsquo;s transcript path.</li>
+      <li><strong>Not every <code class="inline">.jsonl</code> in the directory is an agent transcript.</strong> <code class="inline">run:</code> step and <code class="inline">action:</code> step logs and per-run netflow ledgers use the same naming with their own shapes. An agent transcript&rsquo;s <code class="inline">run_start</code> is written before the agent loop starts, so it survives every tolerated damage mode; a file with no <code class="inline">run_start</code> anywhere is one of the others, and rupu&rsquo;s readers skip it.</li>
+      <li><code class="inline">rupu transcript list</code> reads only the <code class="inline">run_start</code> event of each file for metadata, which is what lets it sort thousands of transcripts cheaply; it then reads just the <code class="inline">--limit</code> most recent end to end (<code class="inline">run_complete</code> at the tail carries the status and token totals).</li>
     </ul>
 
     <h2 id="format">File format</h2>
@@ -78,7 +82,7 @@
     <pre class="code">{<span class="s">"type"</span>: <span class="s">"&lt;event&gt;"</span>, <span class="s">"data"</span>: { <span class="c">&hellip;</span> }}</pre>
     <ul>
       <li><code class="inline">type</code> is the event name in <code class="inline">snake_case</code>; so are all field names.</li>
-      <li><strong>Optional fields are omitted, not <code class="inline">null</code></strong>, when they have no value, and boolean flags that default to <code class="inline">false</code> are usually omitted when false. Treat a missing key as its default.</li>
+      <li><strong>Optional fields are omitted, not <code class="inline">null</code></strong>, when they have no value, and boolean flags that default to <code class="inline">false</code> are omitted when false. The one exception is <code class="inline">run_start.customer</code>, where <code class="inline">null</code> is meaningful. Treat a missing key as its default.</li>
       <li>Files are only ever appended to. Several writers (the agent loop, the <code class="inline">tool_audit</code> hook, the netflow sink) append to one file, each line whole.</li>
     </ul>
 
@@ -88,14 +92,14 @@
       <thead><tr><th>Version</th><th>What it records</th></tr></thead>
       <tbody>
         <tr><td>1 (no key)</td><td>The conversation as text. Reasoning, if any, is a plain <code>thinking</code> string on <code>assistant_message</code>, with no provider payload.</td></tr>
-        <tr><td>2</td><td>Enough to rebuild the exact conversation sent to the provider: the effective <code>system_prompt</code> on <code>run_start</code>, the <code>user_message</code>, each reasoning block as a <code>thinking</code> event with the provider&rsquo;s byte-exact <code>raw</code> block, any <code>seed</code> the run started from, and every <code>compaction</code>.</td></tr>
+        <tr><td>2</td><td>Enough to rebuild the exact conversation sent to the provider: the effective <code>system_prompt</code> on <code>run_start</code>, the <code>user_message</code>, each reasoning block as a <code>thinking</code> event with the provider&rsquo;s byte-exact <code>raw</code> block, the <code>seed</code> the run started from, every <code>compaction</code>, and <code>assistant_block</code> for reply blocks with no event of their own.</td></tr>
       </tbody>
     </table>
-    <p>Fields and events have been added within version 2 since it shipped (outcomes, recovery, customer, codenames, cache-write tokens). A reader should accept a missing optional key and an unknown event.</p>
+    <p>Fields and events have been added within version 2 since it shipped: <code class="inline">outcome</code>, <code class="inline">recovery</code>, <code class="inline">assistant_block</code>, <code class="inline">customer</code>, <code class="inline">codename</code>, <code class="inline">cache_write_tokens</code>, <code class="inline">purpose</code>, <code class="inline">skill_index</code>, <code class="inline">skill_load</code>, <code class="inline">launch_skills</code>, <code class="inline">launch_preload_skills</code>, <code class="inline">launch_args</code>, <code class="inline">message</code> and <code class="inline">injected</code>. A reader should accept a missing optional key and an unknown event type.</p>
 
     <h3 id="reading">Reading rules</h3>
     <ul>
-      <li><strong>No <code class="inline">run_complete</code></strong> means the run was killed or crashed (or is still going). Treat it as <code class="inline">aborted</code>, the status <code class="inline">rupu transcript list</code> gives it. Everything before the end is still valid.</li>
+      <li><strong>No <code class="inline">run_complete</code></strong> means the run was killed or crashed (or is still going). Treat it as <code class="inline">aborted</code>, the status <code class="inline">rupu transcript list</code> gives it. Everything before the end is still valid, and often diagnostic.</li>
       <li><strong>A truncated last line</strong> is a write cut off by a crash. Skip it.</li>
       <li><strong>Empty lines</strong>: skip them.</li>
       <li><strong>A malformed line mid-file</strong> is an error for that line only; keep reading the rest.</li>
@@ -105,19 +109,25 @@
     <h2 id="order">Event order</h2>
     <p>Within one file:</p>
     <pre class="code">run_start
-seed?                     <span class="c"># a run seeded from earlier history (continue, session, resume)</span>
+notice?                     <span class="c"># model_limits</span>
+tool_grant                  <span class="c"># the tools offered, and why</span>
+notice*                     <span class="c"># tool_unavailable, one per named tool the run can't serve</span>
+skill_index?                <span class="c"># the skills bound, when the run has any</span>
+(skill_load | notice)*      <span class="c"># preload, continuation and operator loads; skill_not_indexed, skill_missing</span>
+seed?                       <span class="c"># a run seeded from earlier history</span>
 user_message?
 ( turn_start
-    usage                 <span class="c"># one per provider call; a compaction call adds one with purpose</span>
-    outcome?              <span class="c"># a non-normal reply, ahead of the turn's content</span>
+    ( message* injected )*  <span class="c"># what the collectors delivered before this turn's model call</span>
+    usage+                  <span class="c"># one per provider call; a compaction call adds one with purpose</span>
+    outcome?                <span class="c"># a non-normal reply, ahead of the turn's content</span>
     ( thinking_delta* thinking | assistant_delta* assistant_message | assistant_block )*
-    ( tool_call  tool_result  file_edit?  command_run?  action_emitted?  tool_audit? )*
+    ( tool_call  tool_result  ( skill_load notice* )?  file_edit?  command_run?  ( message | notice )?  tool_audit )*
   turn_end
-  recovery*               <span class="c"># steps taken for the turn's outcome</span>
-  notice* compaction? )*
-net_flow*                 <span class="c"># interleaved anywhere, as connections close</span>
+  recovery*
+  ( skill_load | notice )*  compaction? )*
+net_flow*                   <span class="c"># interleaved anywhere, as connections close</span>
 run_complete</pre>
-    <p>Reasoning, text, tool calls and other blocks appear in the order the model produced them. A <code class="inline">notice</code> can appear wherever the runtime intervened; a fallback hop writes a <code class="inline">model_limits</code> notice just before its <code class="inline">fell_back</code> recovery. A note sent back to the model mid-run (for example after an interruption) is a <code class="inline">user_message</code>.</p>
+    <p>Reasoning, text, tool calls and other blocks appear in the order the model produced them. An <code class="inline">outcome</code> follows the turn&rsquo;s <code class="inline">usage</code> and precedes its content; its <code class="inline">recovery</code> events follow it, usually after <code class="inline">turn_end</code>. A <code class="inline">notice</code> can appear wherever the runtime intervened; a hop to a fallback model writes a <code class="inline">model_limits</code> notice just before its <code class="inline">fell_back</code> recovery, and a note sent back to the model is a <code class="inline">user_message</code>. A successful <code class="inline">skills.load</code> writes its <code class="inline">skill_load</code> right after the call&rsquo;s <code class="inline">tool_result</code>, then any <code class="inline">skill_changed</code> or <code class="inline">skill_tools_missing</code> notice. Skills put back after a compaction are <code class="inline">skill_load</code> lines with <code class="inline">via: reattach</code>, alongside any <code class="inline">skill_changed</code>, <code class="inline">skill_missing</code> or <code class="inline">skill_reattach_truncated</code> notice. A session&rsquo;s compact pseudo-turn (the compaction a running session&rsquo;s worker does on request) writes the same lines after its compaction <code class="inline">usage</code>; it has no <code class="inline">compaction</code> event.</p>
 
     <h2 id="events">Event reference</h2>
     <p>Fields marked <em>opt</em> are omitted when empty.</p>
@@ -130,16 +140,19 @@ run_complete</pre>
         <tr><td><code>run_id</code></td><td>string</td><td>Same as the file name without <code>.jsonl</code>.</td></tr>
         <tr><td><code>workspace_id</code></td><td>string</td><td>The workspace (project) record, <code>ws_&hellip;</code>.</td></tr>
         <tr><td><code>agent</code></td><td>string</td><td>Agent name from its frontmatter.</td></tr>
-        <tr><td><code>provider</code> / <code>model</code></td><td>string</td><td>What the run was configured to use. A fallback hop shows up later, not here.</td></tr>
+        <tr><td><code>provider</code> / <code>model</code></td><td>string</td><td>What the run was configured to use. A fallback hop appears later as a <code>notice</code> and a <code>recovery</code>, not here.</td></tr>
         <tr><td><code>started_at</code></td><td>RFC 3339</td><td>Start time, UTC.</td></tr>
-        <tr><td><code>mode</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code></td><td>The permission mode.</td></tr>
+        <tr><td><code>mode</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code></td><td>The permission mode: prompt before write/bash tool calls; execute all tools without prompting; deny write/bash and allow read/grep/glob only.</td></tr>
         <tr><td><code>schema</code></td><td>integer, opt</td><td><code>2</code> today; absent on version 1.</td></tr>
-        <tr><td><code>system_prompt</code></td><td>string, opt</td><td>The system prompt actually sent, after rupu appended its own sections (coverage catalog, run target).</td></tr>
-        <tr><td><code>codename</code></td><td>string, opt</td><td>The run&rsquo;s human codename, e.g. <code>amber-delta/kestrel#2</code>.</td></tr>
+        <tr><td><code>system_prompt</code></td><td>string, opt</td><td>The system prompt actually sent, after rupu appended its own sections (coverage catalog, run target, finding guidance).</td></tr>
+        <tr><td><code>codename</code></td><td>string, opt</td><td>The agent instance&rsquo;s human codename, e.g. <code>amber-lantern/heron</code> or <code>cobalt-harbor/heron#412</code>; absent on transcripts that predate codenames.</td></tr>
         <tr><td><code>customer</code></td><td>string | null, opt</td><td>The <a class="link" href="/docs/customers.html">customer</a> slug. <code>null</code> means recorded as no customer; no key means the transcript predates customers.</td></tr>
+        <tr><td><code>launch_skills</code></td><td>string[], opt</td><td>The skill entries the launch granted on top of the agent&rsquo;s (a workflow step&rsquo;s <code>skills:</code>, <code>rupu run --skill</code>), as written: <code>*</code> stays <code>*</code>. Absent when the launch named none, and on transcripts that predate the field. <code>rupu run --continue</code> of a transcript without <code>launch_args</code> passes them again.</td></tr>
+        <tr><td><code>launch_preload_skills</code></td><td>string[], opt</td><td>The launch&rsquo;s <code>preload_skills:</code> / <code>--preload-skill</code> entries, likewise.</td></tr>
+        <tr><td><code>launch_args</code></td><td>string[], opt</td><td>A <code>rupu run</code>&rsquo;s own arguments, the tokens after <code>run</code>, with the run&rsquo;s effective values: no prompt, no <code>--continue</code>, and for a continued run the merged command. <code>rupu run --continue</code> restores them, so a continue keeps every original flag and a flag given on it replaces only its own setting. Absent for other runs and on transcripts that predate the field.</td></tr>
       </tbody>
     </table>
-    <pre class="code">{<span class="s">"type"</span>:<span class="s">"run_start"</span>,<span class="s">"data"</span>:{<span class="s">"run_id"</span>:<span class="s">"run_01JB7Q2M4X8T6V0K3N5R9C1D2E"</span>,<span class="s">"workspace_id"</span>:<span class="s">"ws_01JB7PZ0A1B2C3D4E5F6G7H8J9"</span>,<span class="s">"agent"</span>:<span class="s">"code-reviewer"</span>,<span class="s">"provider"</span>:<span class="s">"anthropic"</span>,<span class="s">"model"</span>:<span class="s">"claude-sonnet-4-6"</span>,<span class="s">"started_at"</span>:<span class="s">"2026-10-07T09:14:03Z"</span>,<span class="s">"mode"</span>:<span class="s">"readonly"</span>,<span class="s">"schema"</span>:<span class="v">2</span>,<span class="s">"codename"</span>:<span class="s">"amber-delta/kestrel"</span>}}</pre>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"run_start"</span>,<span class="s">"data"</span>:{<span class="s">"run_id"</span>:<span class="s">"run_01JB7Q2M4X8T6V0K3N5R9C1D2E"</span>,<span class="s">"workspace_id"</span>:<span class="s">"ws_01JB7PZ0A1B2C3D4E5F6G7H8J9"</span>,<span class="s">"agent"</span>:<span class="s">"code-reviewer"</span>,<span class="s">"provider"</span>:<span class="s">"anthropic"</span>,<span class="s">"model"</span>:<span class="s">"claude-sonnet-4-6"</span>,<span class="s">"started_at"</span>:<span class="s">"2026-10-07T09:14:03Z"</span>,<span class="s">"mode"</span>:<span class="s">"readonly"</span>,<span class="s">"schema"</span>:<span class="v">2</span>,<span class="s">"codename"</span>:<span class="s">"amber-delta/kestrel"</span>,<span class="s">"customer"</span>:<span class="v">null</span>}}</pre>
 
     <h3 id="run-complete">run_complete</h3>
     <p>The last line of a run that ended. Its absence means the run never finished.</p>
@@ -147,11 +160,11 @@ run_complete</pre>
       <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>run_id</code></td><td>string</td><td>Same as <code>run_start</code>.</td></tr>
-        <tr><td><code>status</code></td><td><code>ok</code> | <code>error</code> | <code>aborted</code></td><td>How it ended.</td></tr>
+        <tr><td><code>status</code></td><td><code>ok</code> | <code>error</code> | <code>aborted</code></td><td>Completed normally; ended with a provider or internal error; killed or crashed before <code>run_complete</code>.</td></tr>
         <tr><td><code>total_tokens</code></td><td>integer</td><td>Tokens across all turns.</td></tr>
         <tr><td><code>duration_ms</code></td><td>integer</td><td>Wall-clock duration.</td></tr>
         <tr><td><code>error</code></td><td>string, opt</td><td>The error, when <code>status</code> is <code>error</code>.</td></tr>
-        <tr><td><code>outcome</code></td><td>OutcomeRecord, opt</td><td>The <a class="link" href="#outcome">outcome</a> the run failed on, when it failed because recovery ran out.</td></tr>
+        <tr><td><code>outcome</code></td><td>OutcomeRecord, opt</td><td>The <a class="link" href="#outcome">outcome</a> the run failed on, when it ended because the recovery ladder ran out; or, on an <code>aborted</code> run stopped by SIGTERM, the stop: class <code>stopped_by_signal</code> (warning). A workflow <code>run.json</code>&rsquo;s <code>cause</code> carries the same record when its run failed while its process was stopped by a signal, or <code>runner_died</code> when the reaper finalized a run whose runner had died. A run whose cause is one of these did not fail on its own: whoever continues its parent continues it.</td></tr>
       </tbody>
     </table>
 
@@ -160,8 +173,8 @@ run_complete</pre>
       <thead><tr><th>Event</th><th>Fields</th></tr></thead>
       <tbody>
         <tr><td><code>turn_start</code></td><td><code>turn_idx</code> &mdash; zero-based turn counter.</td></tr>
-        <tr><td><code>turn_end</code></td><td><code>turn_idx</code>; opt <code>tokens_in</code>, <code>tokens_out</code>; opt <code>stop_reason</code> (the provider&rsquo;s own stop value, e.g. <code>end_turn</code>); opt <code>response_id</code>; opt <code>stop</code>, a StopRecord: <code>reason</code> (normalized: <code>end_turn</code>, <code>max_tokens</code>, <code>refusal</code>, <code>pause_turn</code>, &hellip;), <code>wire</code> (provider name, raw value, extras), opt <code>refusal</code>, opt <code>served_by</code> (the model that answered when a server-side fallback served the turn); opt <code>discarded: true</code> when the turn&rsquo;s content was thrown away (a refused, blocked or retried reply) &mdash; it was never sent back to the model.</td></tr>
-        <tr><td><code>usage</code></td><td>One per provider call: <code>provider</code>, <code>model</code> (requested), opt <code>served_model</code> (if the provider served another), <code>input_tokens</code>, <code>output_tokens</code> (billable, reasoning included), <code>cached_tokens</code> (cache reads, part of <code>input_tokens</code>), opt <code>cache_write_tokens</code> (Anthropic only), opt <code>purpose: "compaction"</code> for the context-compaction summarizer &mdash; real spend, but not an agent turn.</td></tr>
+        <tr><td><code>turn_end</code></td><td><code>turn_idx</code>; opt <code>tokens_in</code>, <code>tokens_out</code>; opt <code>stop_reason</code> (the provider&rsquo;s own wire stop value, e.g. <code>end_turn</code>, <code>max_output_tokens</code>); opt <code>response_id</code>; opt <code>stop</code>, a StopRecord: <code>reason</code> (normalized: <code>end_turn</code>, <code>max_tokens</code>, <code>refusal</code>, <code>pause_turn</code>, &hellip;), <code>wire</code> (provider name, raw value, extras), opt <code>refusal</code>, opt <code>served_by</code> (the model that answered when a server-side fallback served the turn) &mdash; absent on transcripts written before the response-outcomes work; opt <code>discarded: true</code> when the turn&rsquo;s content was thrown away (a refused, blocked or retried turn) &mdash; replay drops it and it never reached the model again.</td></tr>
+        <tr><td><code>usage</code></td><td>One per provider call, right after the call returns and before the response&rsquo;s content events: <code>provider</code>, <code>model</code> (requested; used for pricing), opt <code>served_model</code> (if the provider served another), <code>input_tokens</code>, <code>output_tokens</code> (billable, reasoning tokens folded in &mdash; there is no separate reasoning-token field), <code>cached_tokens</code> (prompt-cache reads, part of <code>input_tokens</code>, default <code>0</code>), opt <code>cache_write_tokens</code> (prompt-cache writes in <code>input_tokens</code>; Anthropic only, omitted when <code>0</code>), opt <code>purpose: "compaction"</code> for the context-compaction summarizer &mdash; real, billed spend that is not an agent turn (turn counters skip it; token and cost totals include it).</td></tr>
       </tbody>
     </table>
     <pre class="code">{<span class="s">"type"</span>:<span class="s">"usage"</span>,<span class="s">"data"</span>:{<span class="s">"provider"</span>:<span class="s">"anthropic"</span>,<span class="s">"model"</span>:<span class="s">"claude-sonnet-4-6"</span>,<span class="s">"input_tokens"</span>:<span class="v">18240</span>,<span class="s">"output_tokens"</span>:<span class="v">612</span>,<span class="s">"cached_tokens"</span>:<span class="v">16384</span>}}
@@ -171,14 +184,14 @@ run_complete</pre>
     <table>
       <thead><tr><th>Event</th><th>Fields</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td><code>user_message</code></td><td><code>content</code></td><td>The prompt this run added. Absent on a run that only continues a seed.</td></tr>
-        <tr><td><code>assistant_message</code></td><td><code>content</code>; opt <code>thinking</code></td><td>One complete text block. <code>thinking</code> is the version 1 reasoning string.</td></tr>
+        <tr><td><code>user_message</code></td><td><code>content</code></td><td>The user turn this run added. Absent on a run that only continues a <code>seed</code>. A note rupu sends back to the model mid-run (after an interruption, or a recovery note) is also a <code>user_message</code>.</td></tr>
+        <tr><td><code>assistant_message</code></td><td><code>content</code>; opt <code>thinking</code></td><td>One complete text block. <code>thinking</code> is the version 1 reasoning string; version 2 writers record reasoning as separate <code>thinking</code> events.</td></tr>
         <tr><td><code>assistant_delta</code></td><td><code>content</code></td><td>A streamed chunk ahead of its <code>assistant_message</code>. Ignore it unless you&rsquo;re rendering live.</td></tr>
-        <tr><td><code>thinking</code></td><td>opt <code>text</code>, <code>provider</code>, <code>model</code>, <code>raw</code></td><td>One reasoning block, in its real position in the reply. <code>raw</code> is the provider&rsquo;s exact block, signatures included, kept for replay; never display it. No <code>text</code> means the reasoning was redacted.</td></tr>
-        <tr><td><code>thinking_delta</code></td><td><code>content</code></td><td>A streamed reasoning chunk; the <code>thinking</code> event has the whole block.</td></tr>
-        <tr><td><code>assistant_block</code></td><td><code>block</code>; opt <code>abandoned</code></td><td>A reply block with no event of its own: a server-side <code>fallback</code> boundary (<code>from_model</code> &rarr; <code>to_model</code>) or an <code>unknown</code> block with the provider&rsquo;s raw payload. <code>abandoned: true</code> marks a block the API discarded at a mid-reply fallback.</td></tr>
-        <tr><td><code>seed</code></td><td><code>message_count</code>, <code>sha256</code>; opt <code>source_transcript</code> or <code>messages</code></td><td>The history this run started from, stored once: either a reference to the transcript it was rebuilt from, or the messages inline. <code>sha256</code> covers the seed either way, so a reader can verify a reference chain.</td></tr>
-        <tr><td><code>compaction</code></td><td><code>seq</code>, <code>summarized_messages</code>, <code>backup_path</code>, <code>messages</code></td><td>Context compaction rewrote the conversation. <code>messages</code> is the whole conversation afterwards, which the following turns were built from.</td></tr>
+        <tr><td><code>thinking</code></td><td>opt <code>text</code>, <code>provider</code>, <code>model</code>, <code>raw</code></td><td>One reasoning block, in its real position among the turn&rsquo;s other blocks. <code>raw</code> is the provider&rsquo;s byte-exact block, signatures included, kept for replay; never display it. No <code>text</code> means the reasoning was redacted or its display omitted.</td></tr>
+        <tr><td><code>thinking_delta</code></td><td><code>content</code></td><td>A streamed reasoning chunk; the following <code>thinking</code> event has the whole block.</td></tr>
+        <tr><td><code>assistant_block</code></td><td><code>block</code>; opt <code>abandoned</code></td><td>A reply content block with no event of its own, in its position among the turn&rsquo;s other events: <code>{"type":"fallback","from_model":…,"to_model":…}</code> (an Anthropic server-side fallback boundary) or <code>{"type":"unknown","provider":…,"raw":…}</code> (a block rupu does not model, with the provider&rsquo;s raw payload). <code>abandoned: true</code> marks a block the API discarded at a mid-reply server-side fallback: never sent back to the model, skipped by replay.</td></tr>
+        <tr><td><code>seed</code></td><td><code>message_count</code>, <code>sha256</code>; opt <code>source_transcript</code> or <code>messages</code></td><td>The conversation this run started from (a <code>rupu run --continue</code>, a session&rsquo;s earlier turns, a workflow resume), stored once. Exactly one of <code>source_transcript</code> (a transcript whose replay rebuilds exactly this seed; chains can be several deep) and <code>messages</code> (the seed inline, reasoning <code>raw</code> intact) is present. <code>sha256</code> is a hash of the canonical seed JSON, so a reader can verify a reference chain.</td></tr>
+        <tr><td><code>compaction</code></td><td><code>seq</code>, <code>summarized_messages</code>, <code>backup_path</code>, <code>messages</code></td><td>Context compaction rewrote the conversation. <code>messages</code> is the whole conversation afterwards, which the following turns were built from. The summarizer call itself is billed under a <code>usage</code> line with <code>purpose: "compaction"</code>.</td></tr>
       </tbody>
     </table>
 
@@ -186,27 +199,105 @@ run_complete</pre>
     <table>
       <thead><tr><th>Event</th><th>Fields</th><th>Notes</th></tr></thead>
       <tbody>
-        <tr><td><code>tool_call</code></td><td><code>call_id</code>, <code>tool</code>, <code>input</code></td><td>The model asked for a tool. <code>input</code> is the JSON it sent.</td></tr>
-        <tr><td><code>tool_result</code></td><td><code>call_id</code>, <code>output</code>, opt <code>error</code>, <code>duration_ms</code>, opt <code>structured</code></td><td>Pairs with its <code>tool_call</code> by <code>call_id</code>. <code>structured</code> is a machine-readable payload some tools add, e.g. <code>ast_grep</code>&rsquo;s match ranges and metavariable bindings.</td></tr>
-        <tr><td><code>file_edit</code></td><td><code>path</code>, <code>kind</code> (<code>create</code> | <code>modify</code> | <code>delete</code>), <code>diff</code></td><td>Written alongside a <code>write_file</code> / <code>edit_file</code> result, so you can index edits without parsing tool inputs.</td></tr>
+        <tr><td><code>tool_call</code></td><td><code>call_id</code>, <code>tool</code>, <code>input</code></td><td>The model asked for a tool. <code>call_id</code> is provider-assigned; <code>input</code> is the JSON it sent.</td></tr>
+        <tr><td><code>tool_result</code></td><td><code>call_id</code>, <code>output</code>, opt <code>error</code>, <code>duration_ms</code>, opt <code>structured</code></td><td>Pairs with its <code>tool_call</code> by <code>call_id</code>. <code>structured</code> is a machine-readable payload some tools add next to the text, e.g. <code>ast_grep</code>&rsquo;s matches with ranges and metavariable bindings; absent on older transcripts and for tools that add none.</td></tr>
+        <tr><td><code>file_edit</code></td><td><code>path</code>, <code>kind</code> (<code>create</code> | <code>modify</code> | <code>delete</code>), <code>diff</code></td><td>Written alongside a <code>write_file</code> / <code>edit_file</code> result, so you can index edits without parsing tool inputs. <code>path</code> is absolute; <code>diff</code> is unified.</td></tr>
         <tr><td><code>command_run</code></td><td><code>argv</code>, <code>cwd</code>, <code>exit_code</code>, <code>stdout_bytes</code>, <code>stderr_bytes</code></td><td>Written alongside a <code>bash</code> result.</td></tr>
-        <tr><td><code>action_emitted</code></td><td><code>kind</code>, <code>payload</code>, <code>allowed</code>, <code>applied</code>, opt <code>reason</code></td><td>A workflow <code>action:</code> step&rsquo;s connector call: <code>kind</code> is the catalog tool (<code>issues.comment</code>), <code>payload</code> its rendered <code>with:</code>. <code>applied</code> is false only when the call was refused before reaching the connector. Old transcripts may carry free-form verbs here that no longer exist.</td></tr>
-        <tr><td id="tool-audit"><code>tool_audit</code></td><td><code>tool</code>, <code>declared</code>, <code>granted</code>, <code>blocked</code>, <code>restricted</code></td><td>One per connector (MCP catalog) call in a workflow step, by an agent or an <code>action:</code> node; never for built-ins. See below.</td></tr>
+        <tr><td><code>action_emitted</code></td><td><code>kind</code>, <code>payload</code>, <code>allowed</code>, <code>applied</code>, opt <code>reason</code></td><td>A standalone workflow <code>action:</code> step&rsquo;s catalog call: <code>kind</code> is the tool name as the step wrote it (<code>issues.create</code>, <code>scm.prs.comment</code>), <code>payload</code> its rendered <code>with:</code>. <code>applied</code> is <code>true</code> whenever the call reached the connector (whether or not the connector call succeeded) and <code>false</code> only when it was denied before reaching it; <code>allowed</code> is <code>false</code> only when permission was denied; <code>reason</code> explains either. Always followed immediately by a <code>tool_audit</code> for the same call. Old transcripts may carry free-form verbs (<code>log_finding</code>, <code>propose_edit</code>) with <code>applied: false</code> that no current code path can produce.</td></tr>
+        <tr><td id="tool-audit"><code>tool_audit</code></td><td><code>tool</code>, <code>declared</code>, <code>granted</code>, <code>blocked</code>, <code>restricted</code>, opt <code>reason</code>, opt <code>decision</code></td><td>The audit line for one tool call: every call ends in exactly one, whatever the tool (core, coverage/findings, connector, agentiflow) and whatever happened to it. Written by the agent loop right after the call&rsquo;s <code>tool_result</code> (before <code>run_complete</code> when the operator stops the run at the call&rsquo;s prompt), and after an <code>action:</code> node&rsquo;s <code>action_emitted</code>. It is what the control plane&rsquo;s transcript panel renders a badge from (blocked / not granted). See below.</td></tr>
       </tbody>
     </table>
-    <p><code class="inline">tool_audit</code> is the audit trail for a step&rsquo;s <a class="link" href="/docs/workflow-reference.html#step-actions"><code class="inline">actions:</code></a> narrowing:</p>
+    <p><code class="inline">tool_audit</code> fields:</p>
     <table>
-      <thead><tr><th>Field</th><th>True when</th></tr></thead>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
       <tbody>
-        <tr><td><code>restricted</code></td><td>The step declared a non-empty <code>actions:</code> list.</td></tr>
-        <tr><td><code>declared</code></td><td>That list names this tool. Always false on an unrestricted step, which isn&rsquo;t a violation.</td></tr>
-        <tr><td><code>granted</code></td><td>The agent&rsquo;s <code>tools:</code> covers the tool, before narrowing (wildcards expanded). Always true for an <code>action:</code> node.</td></tr>
-        <tr><td><code>blocked</code></td><td>The call was denied: narrowed out of the step, or refused by the permission mode.</td></tr>
+        <tr><td><code>tool</code></td><td>The tool name as the model called it (canonical or a legacy alias, matching its <code>tool_call</code>); for an <code>action:</code> node, the step&rsquo;s tool.</td></tr>
+        <tr><td><code>declared</code></td><td>Whether the step&rsquo;s <code>actions:</code> names <code>tool</code>. <code>false</code> both when <code>actions:</code> is empty or absent (unrestricted &mdash; not a violation) and when it doesn&rsquo;t name this tool; use <code>restricted</code> to tell those apart.</td></tr>
+        <tr><td><code>granted</code></td><td>Whether the run&rsquo;s grant covered <code>tool</code> before any <code>actions:</code> narrowing. Always <code>true</code> for an <code>action:</code> node.</td></tr>
+        <tr><td><code>blocked</code></td><td>Whether the call was denied (<code>decision</code> is not <code>allowed</code>).</td></tr>
+        <tr><td><code>restricted</code></td><td>Whether the step declared a non-empty <code>actions:</code> allowlist at all.</td></tr>
+        <tr><td><code>reason</code> (opt)</td><td>Why the tool was in the grant, as comma-separated reasons (the <code>tool_grant</code> entry&rsquo;s), or <code>action</code> for an <code>action:</code> node. Absent when the grant didn&rsquo;t cover the call, and on older lines.</td></tr>
+        <tr><td><code>decision</code> (opt)</td><td><code>allowed</code>, <code>denied:readonly</code>, <code>denied:operator</code> (answered no at the prompt), <code>denied:operator_stop</code>, <code>denied:tool</code> (the tool&rsquo;s own gate refused), or <code>not_granted</code> (the model named a tool the run doesn&rsquo;t offer). Absent on lines written before every call was audited.</td></tr>
       </tbody>
     </table>
-    <pre class="code"><span class="c"># an action: step that commented on an issue</span>
-{<span class="s">"type"</span>:<span class="s">"action_emitted"</span>,<span class="s">"data"</span>:{<span class="s">"kind"</span>:<span class="s">"issues.comment"</span>,<span class="s">"payload"</span>:{<span class="s">"project"</span>:<span class="s">"acme/widgets"</span>,<span class="s">"number"</span>:<span class="v">88</span>,<span class="s">"body"</span>:<span class="s">"Triage done."</span>},<span class="s">"allowed"</span>:<span class="v">true</span>,<span class="s">"applied"</span>:<span class="v">true</span>}}
-{<span class="s">"type"</span>:<span class="s">"tool_audit"</span>,<span class="s">"data"</span>:{<span class="s">"tool"</span>:<span class="s">"issues.comment"</span>,<span class="s">"declared"</span>:<span class="v">false</span>,<span class="s">"granted"</span>:<span class="v">true</span>,<span class="s">"blocked"</span>:<span class="v">false</span>,<span class="s">"restricted"</span>:<span class="v">false</span>}}</pre>
+    <pre class="code"><span class="c"># a write refused by readonly mode</span>
+{<span class="s">"type"</span>:<span class="s">"tool_audit"</span>,<span class="s">"data"</span>:{<span class="s">"tool"</span>:<span class="s">"write_file"</span>,<span class="s">"declared"</span>:<span class="v">false</span>,<span class="s">"granted"</span>:<span class="v">true</span>,<span class="s">"blocked"</span>:<span class="v">true</span>,<span class="s">"restricted"</span>:<span class="v">false</span>,<span class="s">"reason"</span>:<span class="s">"declared"</span>,<span class="s">"decision"</span>:<span class="s">"denied:readonly"</span>}}
+
+<span class="c"># an action: step that created an issue</span>
+{<span class="s">"type"</span>:<span class="s">"action_emitted"</span>,<span class="s">"data"</span>:{<span class="s">"kind"</span>:<span class="s">"issues.create"</span>,<span class="s">"payload"</span>:{<span class="s">"title"</span>:<span class="s">"null pointer in parser.rs:142"</span>,<span class="s">"body"</span>:<span class="s">"..."</span>},<span class="s">"allowed"</span>:<span class="v">true</span>,<span class="s">"applied"</span>:<span class="v">true</span>}}</pre>
+
+    <h3 id="tool-grant">tool_grant</h3>
+    <p>The tools the run offered its model, and why. Written once, right after <code class="inline">run_start</code> and its <code class="inline">model_limits</code> notice. <code class="inline">entries</code> is exactly the model&rsquo;s tool list.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>entries</code></td><td>array</td><td><code>{tool, reasons}</code> per offered tool: its canonical name and every reason it is there &mdash; <code>declared</code> (named in <code>tools:</code>), <code>declared:&lt;wildcard&gt;</code> (matched <code>*</code>, <code>core.*</code>, <code>scm.*</code>, &hellip;), <code>default</code> (the agent has no <code>tools:</code>), <code>ambient:concerns</code>, <code>ambient:engagement</code>, <code>ambient:messaging_default</code> (the messaging tools every run with a message space gets unless its agent, workflow, agentiflow or parent turns them off), <code>ambient:workflow_messaging</code> (a workflow&rsquo;s <code>messaging: true</code> or <code>{ tools: [...] }</code>), <code>origin:flow_lead</code> / <code>origin:flow_unit</code> (an agentiflow lead&rsquo;s or unit&rsquo;s coordination tools; a lead&rsquo;s include <code>dispatch</code>, <code>join</code> and <code>workflows.generate</code>), <code>implied:dispatch</code> (<code>join</code>, added because <code>dispatch</code> is granted).</td></tr>
+        <tr><td><code>narrowed</code></td><td>array, opt</td><td>Connector tools the step&rsquo;s <code>actions:</code> removed.</td></tr>
+        <tr><td><code>unavailable</code></td><td>array, opt</td><td><code>{tool, missing}</code>: tools named exactly in <code>tools:</code> that this run can&rsquo;t serve, with the services it lacks. Each also gets a <code>tool_unavailable</code> notice.</td></tr>
+        <tr><td><code>skipped</code></td><td>array, opt</td><td><code>{tool, missing}</code>: tools a wildcard or the default grant matched that this run can&rsquo;t serve. Not offered, no notice.</td></tr>
+      </tbody>
+    </table>
+    <p>Services a tool can be missing: <code class="inline">scm</code> (configured connectors), <code class="inline">launcher</code> (<code class="inline">dispatch</code> / <code class="inline">join</code>, every child kind), <code class="inline">findings</code>, <code class="inline">engagement</code>, <code class="inline">coverage</code> (a <code class="inline">concerns:</code> block), <code class="inline">message_bus</code>, <code class="inline">run_status</code>, <code class="inline">catalog</code>, <code class="inline">workflow_generator</code> (<code class="inline">workflows.generate</code>), <code class="inline">netflow</code>.</p>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"tool_grant"</span>,<span class="s">"data"</span>:{<span class="s">"entries"</span>:[{<span class="s">"tool"</span>:<span class="s">"read_file"</span>,<span class="s">"reasons"</span>:[<span class="s">"declared"</span>]},{<span class="s">"tool"</span>:<span class="s">"findings.report"</span>,<span class="s">"reasons"</span>:[<span class="s">"ambient:concerns"</span>]}],<span class="s">"unavailable"</span>:[{<span class="s">"tool"</span>:<span class="s">"board.post"</span>,<span class="s">"missing"</span>:[<span class="s">"message_bus"</span>]}]}}</pre>
+
+    <h3 id="skills">skill_index and skill_load</h3>
+    <p>A run&rsquo;s <a class="link" href="/docs/skills.html">skills</a> leave two kinds of line. <code class="inline">skill_index</code> is the skills the run bound, written once, right after <code class="inline">tool_grant</code> and its notices, and only when the run has a skill: <code class="inline">skills</code> is an array with one row per bound skill.</p>
+    <table>
+      <thead><tr><th>Row field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>The name the skill binds in this run.</td></tr>
+        <tr><td><code>layer</code></td><td><code>global</code> | <code>project</code></td><td>Which skills directory it came from.</td></tr>
+        <tr><td><code>stamp</code></td><td>string</td><td>The skill&rsquo;s stamp at run start: a sha256 over its files&rsquo; paths, sizes, mtimes and modes, no contents. A later load compares against it to notice an edit. In a session turn it is the session&rsquo;s baseline, recorded when <code>rupu session start</code> froze the set (or when <code>session send --skill</code> added the skill), so an edit made since then is noticed in every later turn.</td></tr>
+        <tr><td><code>preload</code></td><td>bool</td><td>The skill&rsquo;s body is in the system prompt.</td></tr>
+        <tr><td><code>indexed</code></td><td>bool</td><td>The skill is listed in the model&rsquo;s skill index. <code>false</code> for a preloaded skill and for one marked <code>disable-model-invocation</code>.</td></tr>
+        <tr><td><code>reason</code></td><td>string</td><td>Why the run has it: <code>agent</code> (the agent&rsquo;s <code>skills:</code> / <code>preloadSkills:</code>), <code>launch</code> (the launch&rsquo;s own: a workflow step&rsquo;s keys or <code>rupu run --skill</code>), <code>session</code> (<code>rupu session start --skill</code> / <code>--preload-skill</code>) or <code>operator</code> (a skill <code>rupu session send --skill</code> invoked in an earlier turn; never indexed). A transcript written before the rename says <code>step</code> for <code>launch</code>; readers take the value as written.</td></tr>
+        <tr><td><code>shipped</code></td><td>bool, opt</td><td>The skill came from the coordinator of a placed unit, not from the host&rsquo;s installed layers. Absent when false.</td></tr>
+      </tbody>
+    </table>
+    <p><code class="inline">skill_load</code> records that a skill&rsquo;s content entered the conversation, for every load, whichever path made it:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>The skill&rsquo;s name in this run.</td></tr>
+        <tr><td><code>layer</code></td><td><code>global</code> | <code>project</code></td><td></td></tr>
+        <tr><td><code>content_hash</code></td><td>string</td><td>sha256 over the skill&rsquo;s files&rsquo; paths, modes and bytes: the version that was loaded. A <code>preload</code> load&rsquo;s is taken when the run resolves its skills, so it is the version of the body in <code>run_start.system_prompt</code>.</td></tr>
+        <tr><td><code>base_dir</code></td><td>string</td><td>The skill&rsquo;s directory, which its relative file references resolve against.</td></tr>
+        <tr><td><code>via</code></td><td>string</td><td><code>model</code> (a <code>skills.load</code> call), <code>preload</code> (at run start), <code>operator</code> (a <code>/name</code> token at the start of the prompt, or <code>rupu session send --skill</code>, put its body in the turn&rsquo;s message; written at run start), <code>reattach</code> (put back after a compaction) or <code>continuation</code> (carried over from the run this one continues).</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"skill_index"</span>,<span class="s">"data"</span>:{<span class="s">"skills"</span>:[{<span class="s">"name"</span>:<span class="s">"pdf"</span>,<span class="s">"layer"</span>:<span class="s">"global"</span>,<span class="s">"stamp"</span>:<span class="s">"9f2c…"</span>,<span class="s">"preload"</span>:<span class="v">false</span>,<span class="s">"indexed"</span>:<span class="v">true</span>,<span class="s">"reason"</span>:<span class="s">"agent"</span>}]}}
+{<span class="s">"type"</span>:<span class="s">"skill_load"</span>,<span class="s">"data"</span>:{<span class="s">"name"</span>:<span class="s">"pdf"</span>,<span class="s">"layer"</span>:<span class="s">"global"</span>,<span class="s">"content_hash"</span>:<span class="s">"4b1e…"</span>,<span class="s">"base_dir"</span>:<span class="s">"/home/me/.rupu/skills/pdf"</span>,<span class="s">"via"</span>:<span class="s">"model"</span>}}</pre>
+
+    <h3 id="messages">message and injected</h3>
+    <p>A run with a <a class="link" href="/docs/messaging.html">message space</a> records what it sent and received. <code class="inline">message</code> is one message, sent or received: <code class="inline">sent</code> is written right after the messaging tool&rsquo;s <code class="inline">tool_result</code>; <code class="inline">received</code> is written when a collector delivers it, right before the model call that sees it, one event per message, ahead of the <code class="inline">injected</code> event that carries it.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>string</td><td>The message&rsquo;s id in the space&rsquo;s <code>log.jsonl</code> (<code>msg_&lt;ULID&gt;</code>).</td></tr>
+        <tr><td><code>direction</code></td><td><code>sent</code> | <code>received</code></td><td></td></tr>
+        <tr><td><code>from</code></td><td>string</td><td>The sender&rsquo;s address (<code>lynx#1</code>, <code>lead</code>, <code>operator</code>).</td></tr>
+        <tr><td><code>from_codename</code></td><td>string, opt</td><td>The sender&rsquo;s full codename.</td></tr>
+        <tr><td><code>to</code></td><td>string, opt</td><td>The address it was sent to, as recorded (<code>role:recon</code>, <code>lynx#2</code>, <code>broadcast</code>); absent for an unaddressed post.</td></tr>
+        <tr><td><code>kind</code></td><td>string</td><td><code>post</code>, <code>direct</code>, <code>broadcast</code>, <code>directive</code>, <code>retract</code> or <code>operator</code>.</td></tr>
+        <tr><td><code>body</code></td><td>string</td><td>The text.</td></tr>
+        <tr><td><code>urgent</code></td><td>bool</td><td>Absent unless true (operator messages).</td></tr>
+        <tr><td><code>via</code></td><td><code>tool</code> | <code>injected</code></td><td>The run called a messaging tool, or a collector delivered it.</td></tr>
+        <tr><td><code>delivery</code></td><td>object, opt</td><td>On <code>sent</code>: <code>{resolved: [address…], undelivered: [{to, reason}…]}</code> as logged.</td></tr>
+      </tbody>
+    </table>
+    <p><code class="inline">injected</code> is context a collector put in front of the model. Every <code class="inline">once</code> injection is written, at the point it joined the conversation, so replay re-inserts it. An <code class="inline">every_turn</code> injection is written only when its content changed since the turn before, so a standing directive is one line, not one per turn.</p>
+    <table>
+      <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>source</code></td><td>string</td><td>Who it is from (<code>mailbox:lynx#1</code>, <code>broadcast:lynx#1</code>, <code>directive:board</code>, <code>operator</code>, <code>roster</code>, <code>children</code>).</td></tr>
+        <tr><td><code>kind</code></td><td>string</td><td><code>message</code>, <code>directive</code>, <code>operator</code>, <code>observation</code> or <code>status</code>. <code>operator</code> is framed as the operator&rsquo;s instruction, everything else as data.</td></tr>
+        <tr><td><code>cadence</code></td><td><code>once</code> | <code>every_turn</code></td><td>Kept in the conversation, or sent with each request and never kept.</td></tr>
+        <tr><td><code>content</code></td><td>string</td><td>The collector&rsquo;s text, before the framing the model sees (an urgent operator message starts <code>URGENT: </code>).</td></tr>
+        <tr><td><code>message_ids</code></td><td>string[]</td><td>The messages it delivers; absent when none.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"message"</span>,<span class="s">"data"</span>:{<span class="s">"id"</span>:<span class="s">"msg_01J…"</span>,<span class="s">"direction"</span>:<span class="s">"sent"</span>,<span class="s">"from"</span>:<span class="s">"lynx#1"</span>,<span class="s">"to"</span>:<span class="s">"role:recon"</span>,<span class="s">"kind"</span>:<span class="s">"direct"</span>,<span class="s">"body"</span>:<span class="s">"port 22 is open"</span>,<span class="s">"via"</span>:<span class="s">"tool"</span>,<span class="s">"delivery"</span>:{<span class="s">"resolved"</span>:[<span class="s">"otter#1"</span>]}}}
+{<span class="s">"type"</span>:<span class="s">"injected"</span>,<span class="s">"data"</span>:{<span class="s">"source"</span>:<span class="s">"mailbox:otter#1"</span>,<span class="s">"kind"</span>:<span class="s">"message"</span>,<span class="s">"cadence"</span>:<span class="s">"once"</span>,<span class="s">"content"</span>:<span class="s">"from lynx#1 at 2026-10-13T…: port 22 is open"</span>,<span class="s">"message_ids"</span>:[<span class="s">"msg_01J…"</span>]}}</pre>
 
     <h3 id="outcome">outcome and recovery</h3>
     <p>When a reply isn&rsquo;t a normal one, or the provider returns an error, rupu classifies it and records what it did about it. The classes and the recovery ladder are explained in <a class="link" href="/docs/reliability.html">Recovery &amp; reliability</a>.</p>
@@ -215,56 +306,72 @@ run_complete</pre>
       <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>id</code></td><td>string</td><td>Unique in the run (<code>oc_1</code>, <code>oc_2</code>, &hellip;). Recovery events point back to it.</td></tr>
-        <tr><td><code>class</code></td><td>string</td><td><code>pause_turn</code>, <code>max_tokens</code>, <code>context_window_exceeded</code>, <code>refusal</code>, <code>safety</code>, <code>malformed_tool_call</code>, <code>incomplete</code>, <code>empty_reply</code>, <code>unrecognized_stop</code>, <code>unreported_stop</code> or <code>provider_error</code>. A string, so a class added later still parses.</td></tr>
+        <tr><td><code>class</code></td><td>string</td><td><code>pause_turn</code>, <code>max_tokens</code>, <code>context_window_exceeded</code>, <code>refusal</code>, <code>safety</code>, <code>malformed_tool_call</code>, <code>incomplete</code>, <code>empty_reply</code>, <code>unrecognized_stop</code>, <code>unreported_stop</code> or <code>provider_error</code>. A string, so a class a newer writer adds still parses.</td></tr>
         <tr><td><code>severity</code></td><td><code>info</code> | <code>warning</code> | <code>error</code></td><td></td></tr>
         <tr><td><code>title</code></td><td>string</td><td>One line, e.g. <code>refused · cyber</code>.</td></tr>
-        <tr><td><code>detail</code></td><td>string, opt</td><td>Longer text: the refusal&rsquo;s explanation, the cut-off tool call, the provider&rsquo;s error message.</td></tr>
+        <tr><td><code>detail</code></td><td>string, opt</td><td>Longer text: a refusal explanation, the tool call that was cut off, the provider&rsquo;s error message.</td></tr>
         <tr><td><code>error_class</code></td><td>string, opt</td><td>For <code>provider_error</code>: <code>rate_limited</code>, <code>overloaded</code>, <code>server</code>, <code>timeout</code>, <code>context_overflow</code>, <code>quota</code>, <code>not_found</code>, <code>policy</code>, <code>auth</code>, <code>permission</code>, <code>invalid_request</code>, <code>too_large</code> or <code>unrecognized</code>.</td></tr>
-        <tr><td><code>wire</code></td><td>object, opt</td><td>The provider&rsquo;s own stop value or error body, verbatim.</td></tr>
+        <tr><td><code>wire</code></td><td>object, opt</td><td>The provider&rsquo;s own stop value or error body, kept verbatim.</td></tr>
       </tbody>
     </table>
-    <p><code class="inline">recovery</code> is one step taken for an outcome:</p>
+    <p><code class="inline">recovery</code> is one recovery action taken for an outcome, written after its <code class="inline">outcome</code>:</p>
     <table>
       <thead><tr><th>Field</th><th>Type</th><th>Meaning</th></tr></thead>
       <tbody>
         <tr><td><code>outcome_id</code></td><td>string</td><td>The outcome it answers.</td></tr>
         <tr><td><code>rung</code></td><td>integer</td><td><code>0</code> in place, <code>1</code> fallback on the same provider, <code>2</code> fallback on another provider, <code>3</code> nothing left: the run fails.</td></tr>
-        <tr><td><code>action</code></td><td>string</td><td><code>continued</code>, <code>retried</code>, <code>compacted</code>, <code>fell_back</code>, <code>served_by_fallback</code>, <code>skipped</code> or <code>failed</code> (<code>asked</code> and <code>parked</code> are reserved). Treat an action you don&rsquo;t know as <code>other</code>.</td></tr>
-        <tr><td><code>attempt</code> / <code>budget</code></td><td>integer, opt</td><td>Which rung-0 attempt this is, out of how many.</td></tr>
+        <tr><td><code>action</code></td><td>string</td><td><code>continued</code>, <code>retried</code>, <code>compacted</code>, <code>fell_back</code>, <code>served_by_fallback</code>, <code>skipped</code>, <code>asked</code>, <code>parked</code> or <code>failed</code>. <code>asked</code> and <code>parked</code> are reserved for operator-decided recovery and are not written yet. Treat an action you don&rsquo;t know as <code>other</code>.</td></tr>
+        <tr><td><code>attempt</code> / <code>budget</code></td><td>integer, opt</td><td>Which rung-0 attempt this is, against the rung-0 budget for this outcome&rsquo;s turn.</td></tr>
         <tr><td><code>provider</code> / <code>model</code></td><td>string, opt</td><td>The fallback, for <code>fell_back</code>, <code>served_by_fallback</code> and <code>skipped</code>.</td></tr>
         <tr><td><code>reason</code></td><td>string, opt</td><td>Why: the hint on <code>failed</code>, the build error on <code>skipped</code>.</td></tr>
-        <tr><td><code>merge_into_previous</code></td><td>bool, opt</td><td>The next turn&rsquo;s reply continues the previous assistant message (a <code>pause_turn</code>).</td></tr>
-        <tr><td><code>continues_output</code></td><td>bool, opt</td><td>The next turn&rsquo;s text continues this turn&rsquo;s answer (after truncation), so the final answer joins across the boundary.</td></tr>
+        <tr><td><code>merge_into_previous</code></td><td>bool, opt</td><td>The next turn&rsquo;s assistant content joins the previous assistant message (a <code>pause_turn</code> continuation).</td></tr>
+        <tr><td><code>continues_output</code></td><td>bool, opt</td><td>The next turn&rsquo;s text continues this turn&rsquo;s answer (a truncation continuation), so the final answer joins across the boundary.</td></tr>
       </tbody>
     </table>
-    <pre class="code">{<span class="s">"type"</span>:<span class="s">"outcome"</span>,<span class="s">"data"</span>:{<span class="s">"turn_idx"</span>:<span class="v">4</span>,<span class="s">"outcome"</span>:{<span class="s">"id"</span>:<span class="s">"oc_1"</span>,<span class="s">"class"</span>:<span class="s">"provider_error"</span>,<span class="s">"severity"</span>:<span class="s">"warning"</span>,<span class="s">"title"</span>:<span class="s">"overloaded"</span>,<span class="s">"error_class"</span>:<span class="s">"overloaded"</span>}}}
-{<span class="s">"type"</span>:<span class="s">"recovery"</span>,<span class="s">"data"</span>:{<span class="s">"outcome_id"</span>:<span class="s">"oc_1"</span>,<span class="s">"rung"</span>:<span class="v">0</span>,<span class="s">"action"</span>:<span class="s">"retried"</span>,<span class="s">"attempt"</span>:<span class="v">1</span>,<span class="s">"budget"</span>:<span class="v">3</span>}}</pre>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"outcome"</span>,<span class="s">"data"</span>:{<span class="s">"turn_idx"</span>:<span class="v">5</span>,<span class="s">"outcome"</span>:{<span class="s">"id"</span>:<span class="s">"oc_2"</span>,<span class="s">"class"</span>:<span class="s">"refusal"</span>,<span class="s">"severity"</span>:<span class="s">"error"</span>,<span class="s">"title"</span>:<span class="s">"refused · cyber"</span>,<span class="s">"wire"</span>:{<span class="s">"provider"</span>:<span class="s">"anthropic"</span>,<span class="s">"value"</span>:<span class="s">"refusal"</span>}}}}
+{<span class="s">"type"</span>:<span class="s">"recovery"</span>,<span class="s">"data"</span>:{<span class="s">"outcome_id"</span>:<span class="s">"oc_2"</span>,<span class="s">"rung"</span>:<span class="v">1</span>,<span class="s">"action"</span>:<span class="s">"fell_back"</span>,<span class="s">"provider"</span>:<span class="s">"anthropic"</span>,<span class="s">"model"</span>:<span class="s">"claude-opus-5"</span>}}</pre>
 
     <h3 id="notice">notice</h3>
-    <p>A runtime intervention worth showing that isn&rsquo;t part of the conversation: <code class="inline">kind</code> and a human-readable <code class="inline">message</code>. Kinds written today: <code class="inline">model_limits</code> (the run&rsquo;s context and output limits and where each came from), <code class="inline">model_limits_clamped</code>, <code class="inline">context_trim</code>, <code class="inline">provider_retry</code> and <code class="inline">server_side_fallback_disabled</code>. Expect new kinds; render unknown ones by their <code class="inline">message</code>.</p>
+    <p>A runtime intervention worth showing that isn&rsquo;t part of the conversation: a <code class="inline">kind</code> and a human-readable <code class="inline">message</code>. Expect new kinds; render an unknown one by its <code class="inline">message</code>.</p>
+    <table>
+      <thead><tr><th>Kind</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>model_limits</code></td><td>The run&rsquo;s input and output limits and where each came from, written at start and on a fallback hop.</td></tr>
+        <tr><td><code>model_limits_clamped</code>, <code>context_trim</code>, <code>provider_retry</code>, <code>server_side_fallback_disabled</code></td><td>Context and provider interventions; see <a class="link" href="/docs/reliability.html">Recovery &amp; reliability</a>.</td></tr>
+        <tr><td><code>permission_mode_degraded</code></td><td>Ask mode with no operator to ask.</td></tr>
+        <tr><td><code>tool_unavailable</code></td><td>A tool named in <code>tools:</code> that this run can&rsquo;t serve; one per tool, right after <code>tool_grant</code>.</td></tr>
+        <tr><td><code>skill_not_indexed</code></td><td>A granted skill marked <code>disable-model-invocation</code> that isn&rsquo;t preloaded, so the model can&rsquo;t load it.</td></tr>
+        <tr><td><code>skill_changed</code></td><td>A skill loaded at a newer version than the run&rsquo;s <code>skill_index</code> recorded.</td></tr>
+        <tr><td><code>skill_missing</code></td><td>A loaded skill no longer installed when it was due to be re-attached, or, at a session turn&rsquo;s start, a skill the session froze that can&rsquo;t be given now.</td></tr>
+        <tr><td><code>skill_tools_missing</code></td><td>A loaded skill&rsquo;s <code>allowed-tools</code> names tools the run wasn&rsquo;t granted.</td></tr>
+        <tr><td><code>skill_reattach_truncated</code></td><td>Loaded skills that didn&rsquo;t fit under the re-attach cap after a compaction.</td></tr>
+        <tr><td><code>messaging_full</code></td><td>The run&rsquo;s message log reached <code>[messaging].log_max_mb</code>, so a send failed; written after that call&rsquo;s <code>tool_result</code>.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code">{<span class="s">"type"</span>:<span class="s">"notice"</span>,<span class="s">"data"</span>:{<span class="s">"kind"</span>:<span class="s">"provider_retry"</span>,<span class="s">"message"</span>:<span class="s">"overloaded; retrying in 2s (attempt 1/3)"</span>}}</pre>
 
     <h3 id="net-flow">net_flow</h3>
-    <p>One outbound network connection the run made: <code class="inline">{"flow": &lt;FlowRecord&gt;}</code>, with the host, port, scheme, method and path, status and outcome, bytes in and out, timing, and a <code class="inline">fidelity</code> that says how much of it rupu actually observed (rupu&rsquo;s own HTTP calls are seen in full; connections a <code class="inline">bash</code> command opens are seen from the OS socket table). The record is described on the <a class="link" href="/docs/netflow.html">Netflow</a> page.</p>
+    <p>One outbound network connection the run made: <code class="inline">{"flow": &lt;FlowRecord&gt;}</code>, with the host, port, scheme, method and query-stripped path, status and outcome, bytes, timing, and a <code class="inline">fidelity</code> that says how much of it was observed. Written as flows are recorded, so these lines can appear anywhere in the file. The record is described on the <a class="link" href="/docs/netflow.html">Netflow</a> page.</p>
 
     <h3 id="gate-requested">gate_requested</h3>
-    <p>Defined (<code class="inline">gate_id</code>, <code class="inline">prompt</code>, opt <code class="inline">decision</code>, opt <code class="inline">decided_by</code>) but not written by current rupu: workflow approval gates are recorded on the workflow run, not in agent transcripts.</p>
+    <p>Defined (<code class="inline">gate_id</code>, <code class="inline">prompt</code>, opt <code class="inline">decision</code> &mdash; <code class="inline">approved</code> or <code class="inline">rejected</code> &mdash;, opt <code class="inline">decided_by</code>) but not written by current rupu: workflow approval gates are recorded on the workflow run (<code class="inline">run.json</code>, <code class="inline">events.jsonl</code>), not in agent transcripts. Readers still parse and render it so older or hand-made files display.</p>
 
     <h2 id="unknown-events">Unknown events</h2>
-    <p>A line whose <code class="inline">type</code> a reader doesn&rsquo;t know is <strong>not</strong> corruption. rupu reads it as an unknown event that keeps the raw <code class="inline">type</code> and <code class="inline">data</code>, and writes it back unchanged, so a transcript from a newer rupu survives being read and copied by an older one. <code class="inline">rupu transcript show</code> prints it as <code class="inline">unrecognized event · &lt;type&gt;</code> and the control plane shows an &ldquo;unrecognized event&rdquo; block. Your own reader should do the same: skip or pass through, never fail.</p>
+    <p>A line whose <code class="inline">type</code> a reader doesn&rsquo;t know is <strong>not</strong> corruption. rupu reads it as an unknown event that keeps the raw <code class="inline">type</code> and <code class="inline">data</code>, and writes it back unchanged, so a transcript from a newer rupu survives being read and copied by an older one. rupu itself never writes an unknown event. <code class="inline">rupu transcript show</code> prints it as <code class="inline">unrecognized event · &lt;type&gt;</code> and the control plane shows an &ldquo;unrecognized event&rdquo; block. Your own reader should do the same: skip or pass through, never fail.</p>
     <p>What <em>is</em> corruption: a line that isn&rsquo;t a JSON object, has no <code class="inline">type</code>, or has a <code class="inline">type</code> that isn&rsquo;t a string.</p>
 
     <h2 id="cli">Working with transcripts</h2>
     <table>
       <thead><tr><th>Command</th><th>What it does</th></tr></thead>
       <tbody>
-        <tr><td><code>rupu transcript list</code></td><td>Project and global transcripts, newest first, with status and tokens. <code>--limit N</code> (default 50), <code>--archived</code> or <code>--all</code>. Supports <code>--format json|csv</code>.</td></tr>
-        <tr><td><code>rupu transcript show &lt;run&gt;</code></td><td>Render one transcript. <code>&lt;run&gt;</code> is a run id, a unique prefix of one, or a codename. <code>--view focused|compact|full</code> picks the density; <code>--no-pager</code>, <code>--no-color</code>.</td></tr>
-        <tr><td><code>rupu transcript archive &lt;run&gt;</code></td><td>Move a standalone run&rsquo;s transcript into <code>archive/</code>.</td></tr>
-        <tr><td><code>rupu transcript delete &lt;run&gt; --force</code></td><td>Delete a standalone transcript permanently.</td></tr>
-        <tr><td><code>rupu transcript prune --older-than 30d</code></td><td>Delete archived transcripts older than the cutoff; <code>--dry-run</code> previews.</td></tr>
+        <tr><td><code>rupu transcript list</code></td><td>Project and global transcripts, newest first, with status and tokens. <code>--limit N</code> (default 50; every row beyond it costs a full read of its transcript), <code>--archived</code> or <code>--all</code>.</td></tr>
+        <tr><td><code>rupu transcript show &lt;run&gt;</code></td><td>Render one transcript. <code>&lt;run&gt;</code> is a run id, a unique prefix of one, or a codename. <code>--view focused|compact|full</code> picks the density; <code>--pager</code> / <code>--no-pager</code>, <code>--no-color</code>.</td></tr>
+        <tr><td><code>rupu transcript archive &lt;run&gt;</code></td><td>Move a standalone run&rsquo;s transcript and its metadata into <code>archive/</code>. <code>--ignore-liveness</code> skips the still-running check.</td></tr>
+        <tr><td><code>rupu transcript delete &lt;run&gt; --force</code></td><td>Delete a standalone transcript permanently (<code>--force</code> is required; <code>--ignore-liveness</code> is separate and also required for one that still looks live).</td></tr>
+        <tr><td><code>rupu transcript prune --older-than 30d</code></td><td>Delete archived standalone transcripts older than the cutoff (<code>30d</code>, <code>12h</code>, <code>1w</code>); <code>--dry-run</code> previews.</td></tr>
       </tbody>
     </table>
-    <p>For your own tooling, <code class="inline">--format jsonl</code> on <code class="inline">show</code> prints the parsed events one per line in the schema above, and <code class="inline">--format json</code> wraps them in one object (<code class="inline">{"kind": "transcript_show", "version": 1, "item": {"run_id", "path", "events"}}</code>). Or read the file directly:</p>
+    <p>For your own tooling, the global <code class="inline">--format jsonl</code> on <code class="inline">show</code> prints the parsed events one per line in the schema above, and <code class="inline">--format json</code> wraps them in one <code class="inline">transcript_show</code> envelope. Or read the file directly:</p>
     <pre class="code"><span class="c"># every bash command a run executed, with its exit code</span>
 jq -c <span class="s">'select(.type=="command_run") | [.data.exit_code, (.data.argv|join(" "))]'</span> \
   .rupu/transcripts/run_01JB7Q2M4X8T6V0K3N5R9C1D2E.jsonl
@@ -274,18 +381,19 @@ jq -s <span class="s">'map(select(.type=="usage").data) | group_by(.model)
        | map({model: .[0].model, input: (map(.input_tokens)|add), output: (map(.output_tokens)|add)})'</span> \
   .rupu/transcripts/run_01JB7Q2M4X8T6V0K3N5R9C1D2E.jsonl
 
-<span class="c"># connector calls a narrowed step blocked</span>
-jq -c <span class="s">'select(.type=="tool_audit" and .data.blocked)'</span> .rupu/transcripts/*.jsonl</pre>
+<span class="c"># tool calls that were denied or not granted, with the decision</span>
+jq -c <span class="s">'select(.type=="tool_audit" and .data.blocked) | [.data.tool, .data.decision]'</span> .rupu/transcripts/*.jsonl</pre>
 
     <h2 id="replay">Replay</h2>
-    <p>A version 2 transcript is enough to <strong>rebuild the exact conversation</strong> the provider saw, and rupu does exactly that when it continues a run: <code class="inline">rupu run --continue &lt;run-id&gt;</code>, <code class="inline">rupu workflow resume</code> picking up an interrupted step, and a session&rsquo;s next turn. The rules, if you want to rebuild one yourself:</p>
+    <p>A version 2 transcript is enough to <strong>rebuild the exact conversation</strong> the provider saw, and rupu does exactly that when it continues a run: <code class="inline">rupu run --continue &lt;run-id&gt;</code>, <code class="inline">rupu workflow resume</code> continuing an interrupted step, and a session&rsquo;s next turn. The rules, if you want to rebuild one yourself:</p>
     <ul>
-      <li>Start from the <code class="inline">seed</code>, if any. A <code class="inline">source_transcript</code> seed means &ldquo;rebuild that transcript first&rdquo;; the chain can be several deep, and its <code class="inline">sha256</code> must match what you rebuilt.</li>
-      <li>Add the <code class="inline">user_message</code>. Per turn, fold <code class="inline">thinking</code> (its <code class="inline">raw</code> block), <code class="inline">assistant_message</code>, <code class="inline">tool_call</code> and <code class="inline">assistant_block</code> events, in file order, into one assistant message, skipping <code class="inline">abandoned</code> blocks; then the turn&rsquo;s <code class="inline">tool_result</code>s become the next user message.</li>
+      <li>Start from the <code class="inline">seed</code>, if any. A <code class="inline">source_transcript</code> seed means &ldquo;rebuild that transcript first&rdquo;; its <code class="inline">sha256</code> must match what was rebuilt.</li>
+      <li>Add the <code class="inline">user_message</code>. Per turn, fold <code class="inline">thinking</code> (its <code class="inline">raw</code> block), <code class="inline">assistant_message</code>, <code class="inline">tool_call</code> and <code class="inline">assistant_block</code> events, in file order, into one assistant message, skipping <code class="inline">abandoned</code> blocks; the turn&rsquo;s <code class="inline">tool_result</code>s become the next user message.</li>
       <li>Drop a turn with no <code class="inline">turn_end</code> (it was in flight) and a turn whose <code class="inline">turn_end</code> is <code class="inline">discarded</code>. A <code class="inline">recovery</code> with <code class="inline">merge_into_previous</code> joins the next turn&rsquo;s reply onto the previous assistant message.</li>
+      <li>An <code class="inline">injected</code> event with <code class="inline">cadence: once</code> adds its <code class="inline">content</code>, framed as the runner framed it, as a user message at its position. An <code class="inline">every_turn</code> one was sent with that turn&rsquo;s request only, so it adds nothing.</li>
       <li>A <code class="inline">compaction</code> replaces everything so far with its <code class="inline">messages</code>.</li>
     </ul>
-    <p>A version 1 transcript rebuilds without reasoning blocks, since it never kept the provider&rsquo;s payload. Deltas, <code class="inline">usage</code>, <code class="inline">notice</code>, <code class="inline">outcome</code>, <code class="inline">tool_audit</code>, <code class="inline">net_flow</code> and unknown events don&rsquo;t affect the conversation.</p>
+    <p>A version 1 transcript rebuilds without reasoning blocks, since it never kept the provider&rsquo;s payload. Deltas, <code class="inline">usage</code>, <code class="inline">notice</code>, <code class="inline">outcome</code>, <code class="inline">tool_grant</code>, <code class="inline">tool_audit</code>, <code class="inline">skill_index</code>, <code class="inline">skill_load</code>, <code class="inline">message</code>, <code class="inline">net_flow</code> and unknown events don&rsquo;t affect the conversation. The skills a run loaded are folded from its <code class="inline">skill_load</code> events separately, so a continued run knows what to re-attach.</p>
 
     <div class="doc-nav">
       <a href="/docs/api.html">&#8592; HTTP API</a>
