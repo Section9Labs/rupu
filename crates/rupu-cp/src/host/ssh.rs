@@ -1860,9 +1860,7 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
 /// transport failed ([`is_ssh_transport_failure`]) — the remote command
 /// never ran, the host is `Unreachable` (a 502, shown offline). Anything
 /// else is the remote rupu's own failure, in its own words: `Remote(0,
-/// stderr)` (`RemoteOutput` carries no exit code). Before this, every
-/// nonzero exit was `Unreachable`, and each reader that wrapped it as
-/// `Unsupported` turned a dead host into "upgrade rupu there" (a 501).
+/// stderr)` (`RemoteOutput` carries no exit code).
 fn nonzero_exit(stderr: String) -> HostConnectorError {
     if is_ssh_transport_failure(&stderr) {
         HostConnectorError::Unreachable(stderr)
