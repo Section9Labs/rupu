@@ -1,7 +1,18 @@
 use crate::state::AppState;
-use axum::{http::HeaderName, middleware::from_fn_with_state, routing::get, Router};
+use axum::{
+    extract::Request,
+    http::{HeaderName, StatusCode},
+    middleware::{from_fn, from_fn_with_state, Next},
+    response::Response,
+    routing::get,
+    Router,
+};
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    classify::ServerErrorsFailureClass,
+    trace::{OnFailure, TraceLayer},
+};
+use tracing::Level;
 
 /// Liveness probe. The body stays the bare `ok` every existing consumer
 /// compares against; the serving PID and crate version ride along as
@@ -159,6 +170,140 @@ pub fn router_with(state: AppState, token: Option<String>, opts: RouterOpts) -> 
     app.layer(axum::middleware::from_fn(
         crate::path_guard::reject_unsafe_segments,
     ))
-    .layer(TraceLayer::new_for_http())
+    .layer(TraceLayer::new_for_http().on_failure(BodyFailures))
+    .layer(from_fn(log_failed_responses))
     .with_state(state)
+}
+
+/// Logs every failed (5xx) response with its method, uri and latency as
+/// fields of the line itself, so the route and `?host=` are named under any
+/// log filter — tower-http's request span is DEBUG, which both `cp serve`'s
+/// `info` and the default `warn` filter drop, and its default failure line
+/// then carried only the status.
+async fn log_failed_responses(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let started = std::time::Instant::now();
+    let res = next.run(req).await;
+    let status = res.status();
+    if status.is_server_error() {
+        let latency_ms = started.elapsed().as_millis();
+        match failure_level(status) {
+            Level::WARN => {
+                tracing::warn!(%method, %uri, %status, latency_ms, "response failed")
+            }
+            _ => tracing::error!(%method, %uri, %status, latency_ms, "response failed"),
+        }
+    }
+    res
+}
+
+/// The level a failed response is logged at. A 501 or a 502 is this
+/// server's honest answer that the call can't be served from here — a
+/// remote host that is down or too old, an adapter only `rupu cp serve`
+/// installs (`docs/cp-api.md`'s status table) — a state the caller is told
+/// and the web shows as offline or unavailable, not this server's fault: a
+/// warning, beside the handler's own. Every other failure is this server's,
+/// and stays an error.
+fn failure_level(status: StatusCode) -> Level {
+    if status == StatusCode::NOT_IMPLEMENTED || status == StatusCode::BAD_GATEWAY {
+        Level::WARN
+    } else {
+        Level::ERROR
+    }
+}
+
+/// tower-http's failure callback, kept for a response whose BODY failed
+/// after its status went out (a stream or download whose source errored),
+/// which [`log_failed_responses`] cannot see. A failed status is that
+/// middleware's line, and is skipped here.
+#[derive(Clone, Copy)]
+struct BodyFailures;
+
+impl OnFailure<ServerErrorsFailureClass> for BodyFailures {
+    fn on_failure(
+        &mut self,
+        class: ServerErrorsFailureClass,
+        latency: std::time::Duration,
+        _span: &tracing::Span,
+    ) {
+        if let ServerErrorsFailureClass::Error(error) = class {
+            let latency_ms = latency.as_millis();
+            tracing::error!(error, latency_ms, "response body failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Captured {
+            self.clone()
+        }
+    }
+
+    /// Under the default `warn` filter a failed response still names its
+    /// method and route; a 502 is a warning, a 500 an error, a 200 nothing.
+    #[tokio::test]
+    async fn a_failed_response_names_its_route_under_the_default_filter() {
+        use axum::body::Body;
+        use tower::ServiceExt as _;
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("warn"))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Captured(Arc::clone(&buf))),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let app = Router::new()
+            .route("/api/down", get(|| async { StatusCode::BAD_GATEWAY }))
+            .route(
+                "/api/broken",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route("/api/fine", get(|| async { StatusCode::OK }))
+            .layer(TraceLayer::new_for_http().on_failure(BodyFailures))
+            .layer(from_fn(log_failed_responses));
+        for path in ["/api/down?host=h1", "/api/fine", "/api/broken"] {
+            let req = Request::get(path).body(Body::empty()).unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+        let log = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert!(
+            lines[0].contains(" WARN ")
+                && lines[0].contains(
+                    "response failed method=GET uri=/api/down?host=h1 status=502 Bad Gateway"
+                ),
+            "{log}"
+        );
+        assert!(
+            lines[1].contains("ERROR")
+                && lines[1].contains(
+                    "response failed method=GET uri=/api/broken status=500 Internal Server Error"
+                ),
+            "{log}"
+        );
+    }
 }
