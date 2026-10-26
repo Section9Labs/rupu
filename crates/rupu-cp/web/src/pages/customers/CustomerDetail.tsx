@@ -49,7 +49,7 @@ import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { Segmented } from '../../components/ui/Segmented';
-import { Spinner } from '../../components/ui/Spinner';
+import { ListSkeleton } from '../../components/lists/ListSkeleton';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
@@ -203,9 +203,7 @@ export default function CustomerDetail() {
         {loadError ? (
           <ErrorBanner>{loadError}</ErrorBanner>
         ) : (
-          <div className="py-16 flex items-center justify-center">
-            <Spinner label="Loading customer…" />
-          </div>
+          <ListSkeleton label="Loading customer…" />
         )}
       </div>
     );
@@ -892,16 +890,8 @@ function RecentRuns({ slug, limit, title }: { slug: string; limit: number; title
         <span className="text-note text-ink-mute">on this control plane</span>
       </div>
       {error && <ErrorBanner>{error}</ErrorBanner>}
-      {runs === null && !error && (
-        <div className="py-8 flex items-center justify-center">
-          <Spinner label="Loading runs…" />
-        </div>
-      )}
-      {runs !== null && runs.length === 0 && (
-        <div className="rounded-xl border border-dashed border-border bg-panel/50 py-8 flex items-center justify-center">
-          <p className="text-xs text-ink-mute">No runs yet</p>
-        </div>
-      )}
+      {runs === null && !error && <ListSkeleton label="Loading runs…" rows={4} />}
+      {runs !== null && runs.length === 0 && <EmptyState title="No runs yet" />}
       {runs !== null && runs.length > 0 && (
         <ListCard>
           {runs.map((r) => (
