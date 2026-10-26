@@ -12,9 +12,11 @@ import { Link } from 'react-router-dom';
 import { api, type WorkerView } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import { Chip } from '../components/ui/Chip';
+import { PageHeader } from '../components/ui/PageHeader';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { cn } from '../lib/cn';
 import { relativeTime } from '../lib/time';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
@@ -53,21 +55,18 @@ export default function Workers() {
 
   return (
     <div className="p-8">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold text-ink">Workers</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Local execution identities registered with this control plane.
-        </p>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Workers"
+        subtitle="Local execution identities registered with this control plane."
+      />
 
       <Explainer />
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
       {workers === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading workers…" />
-        </div>
+        <ListSkeleton label="Loading workers…" />
       ) : workers.length === 0 ? (
         <EmptyState
           title="No workers registered"
@@ -235,7 +234,7 @@ function Capabilities({ worker }: { worker: WorkerView }) {
         </Chip>
       ))}
       {scmHosts.map((h) => (
-        <Chip key={`s-${h}`} className="bg-violet-50 text-violet-700 ring-violet-200">
+        <Chip key={`s-${h}`} className="bg-brand-50 text-brand-700 ring-brand-100">
           {h}
         </Chip>
       ))}
@@ -245,19 +244,6 @@ function Capabilities({ worker }: { worker: WorkerView }) {
         </Chip>
       ))}
     </div>
-  );
-}
-
-function Chip({ children, className }: { children: React.ReactNode; className?: string }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded px-1.5 py-0.5 text-note font-medium ring-1',
-        className,
-      )}
-    >
-      {children}
-    </span>
   );
 }
 
