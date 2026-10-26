@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Recovery &amp; reliability</title>
+<meta name="description" content="How rupu keeps long agent runs alive: typed response outcomes, a recovery ladder with model fallbacks, continuing interrupted runs and workflows, and model-limits discovery.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item active" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Recovery &amp; reliability</h1>
+    <p class="intro">Long agent runs meet refusals, cut-off replies, rate limits, crashed terminals and killed processes. rupu classifies every reply into a typed outcome, works down a fixed recovery ladder before it gives up, and picks interrupted work up where it stopped instead of starting it over.</p>
+
+    <h2>Response outcomes</h2>
+    <p>A model's reply does not always give the agent what it needs: it can be cut off at the output limit, refused, blocked by a safety filter, empty, or stopped on a tool call that cannot be parsed. The provider can also fail the request outright. rupu classifies <strong>every</strong> reply and every provider error. A normal reply (an <code class="inline">end_turn</code>, <code class="inline">tool_use</code> or <code class="inline">stop_sequence</code> stop with usable text or a tool call) has no outcome; anything else gets a typed class with a <strong>severity</strong>:</p>
+
+    <table>
+      <thead><tr><th>Class</th><th>Severity</th><th>What happened</th></tr></thead>
+      <tbody>
+        <tr><td><code>pause_turn</code></td><td>info</td><td>The provider paused a server-side tool loop and expects the conversation to be sent back to continue.</td></tr>
+        <tr><td><code>max_tokens</code></td><td>error</td><td>The reply hit the output limit. When it cut a tool call off mid-arguments, the outcome says which tool.</td></tr>
+        <tr><td><code>context_window_exceeded</code></td><td>error</td><td>The reply stopped because the context window is full.</td></tr>
+        <tr><td><code>refusal</code></td><td>error</td><td>The model refused. The title carries the provider's category when it gave one (<code>refused · cyber</code>).</td></tr>
+        <tr><td><code>safety</code></td><td>error</td><td>A safety filter blocked the reply.</td></tr>
+        <tr><td><code>malformed_tool_call</code></td><td>error</td><td>The model called a tool with arguments that could not be used.</td></tr>
+        <tr><td><code>incomplete</code></td><td>error</td><td>The provider reported the reply as incomplete. Also what a reply that is still paused after every continuation becomes (see the ladder notes).</td></tr>
+        <tr><td><code>empty_reply</code></td><td>error</td><td>A normal stop with no text and no tool call.</td></tr>
+        <tr><td><code>unrecognized_stop</code></td><td>warning</td><td>The provider sent a stop reason rupu does not know. The raw value is kept.</td></tr>
+        <tr><td><code>unreported_stop</code></td><td>warning</td><td>The provider reported no stop reason at all.</td></tr>
+        <tr><td><code>provider_error</code></td><td>error</td><td>The request failed. The <code>error_class</code> field carries the normalized class: <code>rate_limited</code>, <code>overloaded</code>, <code>server</code>, <code>timeout</code>, <code>context_overflow</code>, <code>quota</code>, <code>not_found</code>, <code>policy</code>, <code>auth</code>, <code>permission</code>, <code>invalid_request</code>, <code>too_large</code> or <code>unrecognized</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <p>Severity decides what the run does next. A <strong>warning</strong> outcome never fails a run on its own: the reply is kept, the outcome is recorded so the odd stop is visible, and the run carries on. The one <strong>info</strong> outcome, <code class="inline">pause_turn</code>, is handled in place. An <strong>error</strong> outcome enters the ladder.</p>
+    <p>Each outcome is one <code class="inline">outcome</code> line in the transcript, written ahead of the turn's content, and every recovery step taken for it is one <code class="inline">recovery</code> line pointing back at it by id (<code class="inline">oc_1</code>, <code class="inline">oc_2</code>, &hellip; are run-local), so a transcript reads as a timeline. The final <code class="inline">run_complete</code> line of a run that failed on an outcome carries that outcome too. The field-level reference is on the <a class="link" href="/docs/transcripts.html#outcome">Transcript schema</a> page.</p>
+    <p>The transcript viewers (<code class="inline">rupu transcript show</code>, <code class="inline">rupu session</code>, <code class="inline">rupu watch</code>), the live run view, the workflow printer and <code class="inline">rupu autoflow serve</code> print each event as one line, with a glyph for the outcome severity (<code class="inline">✗</code> error, <code class="inline">!</code> warning, <code class="inline">●</code> info) and a <code class="inline">↺</code> for a recovery:</p>
+    <pre class="code"><span class="c">✗</span> outcome   truncated · output limit
+<span class="c">↺</span> recovery  rung 0 · continued 1/3
+<span class="c">✗</span> outcome   refused · cyber
+<span class="c">↺</span> recovery  rung 1 · fell back to anthropic/claude-opus-5</pre>
+    <p>The control plane's transcript view shows an outcome as a block with a severity-colored edge, its title and its detail, and a recovery as a one-line timeline entry. Beyond the transcript, a failed workflow step, fan-out unit or run records the outcome that caused it (its <code class="inline">cause</code>) on the run record, so a failure is stored as &ldquo;refused · cyber&rdquo; and not only as an error string. The control plane does not display <code class="inline">cause</code> yet.</p>
+
+    <h2>The recovery ladder</h2>
+    <p>When an error outcome occurs, rupu works down four rungs and stops at the first one that gets the run moving again:</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 150" role="img" aria-label="The recovery ladder: retry in place, same-provider fallback, other-provider fallback, fail with a hint">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+        <rect class="d-box-accent" x="10" y="46" width="140" height="58" rx="10"></rect>
+        <text class="d-label" x="80" y="70" text-anchor="middle">rung 0</text>
+        <text class="d-sub" x="80" y="88" text-anchor="middle">retry in place</text>
+        <line class="d-edge" x1="150" y1="75" x2="180" y2="75" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="180" y="46" width="140" height="58" rx="10"></rect>
+        <text class="d-label" x="250" y="70" text-anchor="middle">rung 1</text>
+        <text class="d-sub" x="250" y="88" text-anchor="middle">same-provider model</text>
+        <line class="d-edge" x1="320" y1="75" x2="350" y2="75" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="350" y="46" width="140" height="58" rx="10"></rect>
+        <text class="d-label" x="420" y="70" text-anchor="middle">rung 2</text>
+        <text class="d-sub" x="420" y="88" text-anchor="middle">other-provider model</text>
+        <line class="d-edge" x1="490" y1="75" x2="520" y2="75" marker-end="url(#ar)"></line>
+        <rect class="d-box" x="520" y="46" width="150" height="58" rx="10"></rect>
+        <text class="d-label" x="595" y="70" text-anchor="middle">rung 3</text>
+        <text class="d-sub" x="595" y="88" text-anchor="middle">fail with a hint</text>
+        <text class="d-sub" x="340" y="134" text-anchor="middle">stops at the first rung that gets the run moving · at most 20 recovery actions per run</text>
+      </svg>
+      <figcaption>Each outcome class decides which rungs it may use.</figcaption>
+    </figure>
+
+    <p>What each outcome does on rung 0, which later rungs it may use, and what happens to the partial reply:</p>
+    <table>
+      <thead><tr><th>Outcome</th><th>Rung 0 (in place)</th><th>Rung-0 budget</th><th>Rung 1</th><th>Rung 2</th><th>The partial reply</th></tr></thead>
+      <tbody>
+        <tr><td><code>pause_turn</code></td><td>Send the paused conversation back and join the continuation to it</td><td>5</td><td>no</td><td>no</td><td>kept</td></tr>
+        <tr><td><code>max_tokens</code></td><td>Tell the model to continue exactly where it stopped</td><td>3</td><td>yes</td><td>yes</td><td>kept</td></tr>
+        <tr><td><code>max_tokens</code> that cut a tool call off</td><td>Compact the history, then retry at the model's full output cap. Applies only when the cap had been lowered to make input and output fit; otherwise rung 0 is skipped</td><td>1</td><td>yes</td><td>yes</td><td>discarded</td></tr>
+        <tr><td><code>context_window_exceeded</code></td><td>Compact the history, then continue</td><td>3</td><td>yes</td><td>yes</td><td>kept</td></tr>
+        <tr><td><code>refusal</code>, <code>safety</code></td><td>none</td><td>0</td><td>yes</td><td>yes</td><td>discarded</td></tr>
+        <tr><td><code>malformed_tool_call</code></td><td>Tell the model what was wrong with the call and ask for it again</td><td>2</td><td>yes</td><td>yes</td><td>kept</td></tr>
+        <tr><td><code>empty_reply</code></td><td>Tell the model its reply was empty and ask it to continue</td><td>1</td><td>yes</td><td>yes</td><td>none to keep</td></tr>
+        <tr><td><code>incomplete</code></td><td>Retry the turn</td><td>1</td><td>yes</td><td>yes</td><td>discarded</td></tr>
+        <tr><td><code>unrecognized_stop</code>, <code>unreported_stop</code></td><td>none; a warning, so the run carries on</td><td>0</td><td>no</td><td>no</td><td>kept</td></tr>
+        <tr><td><code>provider_error</code>: <code>rate_limited</code>, <code>overloaded</code>, <code>server</code>, <code>timeout</code>, <code>context_overflow</code></td><td>The existing retry, backoff and overflow compaction run first; the ladder adds a hop only after they give up</td><td>n/a</td><td>no</td><td>yes</td><td>n/a</td></tr>
+        <tr><td><code>provider_error</code>: <code>quota</code></td><td>none</td><td>0</td><td>no</td><td>yes</td><td>n/a</td></tr>
+        <tr><td><code>provider_error</code>: <code>not_found</code>, <code>policy</code></td><td>none</td><td>0</td><td>yes</td><td>yes</td><td>n/a</td></tr>
+        <tr><td><code>provider_error</code>: <code>auth</code>, <code>permission</code>, <code>invalid_request</code>, <code>too_large</code>, <code>unrecognized</code></td><td>none; retrying elsewhere would not help</td><td>0</td><td>no</td><td>no</td><td>n/a</td></tr>
+      </tbody>
+    </table>
+
+    <ul>
+      <li><strong>A rung-0 budget is per logical turn.</strong> A turn that is continued three times and then moves on through tool calls starts the next turn with fresh budgets.</li>
+      <li><strong>Still paused after five continuations</strong> reclassifies the reply as <code class="inline">incomplete</code> (titled <code class="inline">incomplete reply · still paused after 5 continuations</code>). It skips the rung-0 retry and goes straight to the fallback hops, and the paused partial reply is kept, not discarded. With no fallback left, the run fails.</li>
+      <li><strong>A discarded partial reply</strong> is written to the transcript but left out of the conversation: it is not sent back to the model, and a later <code class="inline">rupu run --continue</code> does not replay it.</li>
+      <li><strong>One ceiling of 20 recovery actions per run.</strong> Rung 0 and every hop count against it. At the ceiling the run goes straight to rung 3.</li>
+      <li>A fallback that cannot be built (its provider is not configured, say) is recorded as <code class="inline">skipped</code> with the reason, counts as an action, and the next fallback is tried.</li>
+      <li><strong>Hops are sticky.</strong> Once the run has moved to a fallback, later turns stay on it. When the conversation ends on an assistant message, the fallback model is told that a previous attempt stopped and why, and is asked to check the state and continue.</li>
+      <li>Rungs 1 and 2 need a fallback chain and a way to build a provider for it. A run with no chain still gets rung 0 and then rung 3.</li>
+    </ul>
+
+    <h2>Configuring fallbacks</h2>
+    <p>A fallback chain is an ordered list of models. Each entry names a <code class="inline">model</code> and, optionally, a <code class="inline">provider</code>. Declare it on an agent:</p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="v">dependency-auditor</span>
+<span class="k">provider</span>: <span class="v">anthropic</span>
+<span class="k">model</span>: <span class="v">claude-opus-5</span>
+<span class="k">fallbacks</span>:
+  - <span class="k">model</span>: <span class="v">claude-sonnet-5-5</span>          <span class="c"># same provider as the run → rung 1</span>
+  - <span class="k">provider</span>: <span class="v">openai-codex</span>            <span class="c"># another provider → rung 2</span>
+    <span class="k">model</span>: <span class="v">gpt-5.6-cyber</span>
+<span class="c">---</span></pre>
+    <p>&hellip;or once, for every agent that declares none, in <code class="inline">config.toml</code>:</p>
+    <pre class="code"><span class="v">[recovery]</span>
+<span class="k">fallbacks</span> = [
+  { <span class="k">model</span> = <span class="s">"claude-sonnet-5-5"</span> },
+  { <span class="k">provider</span> = <span class="s">"openai-codex"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
+]
+<span class="k">server_side_fallback</span> = <span class="v">true</span></pre>
+    <ul>
+      <li><strong>Precedence.</strong> An agent's <code class="inline">fallbacks:</code> wins over <code class="inline">[recovery].fallbacks</code> (default <code class="inline">[]</code>). They are not merged: when the agent declares a chain, the config table is not consulted for that agent, and <code class="inline">fallbacks: []</code> is an empty chain. No chain in either place means rungs 1 and 2 are unavailable. Both forms reject unknown keys, so a typo in an entry is a load error and not a silent no-op. A rupu release that predates <code class="inline">fallbacks:</code> refuses to load an agent file that sets it, so upgrade remote hosts before adding it.</li>
+      <li><strong>Which rung an entry belongs to.</strong> An entry without a <code class="inline">provider</code> means the provider the run started on, even if the run has since moved to another provider; it is a rung-1 candidate, and so is an entry naming that provider. Every other entry is rung 2. Within a rung the chain's order decides. The model the run started on and any entry already tried are never offered again. The split matters because an outcome decides which rungs it may use: a <code class="inline">rate_limited</code> error skips the same-provider models (the provider is the problem) and goes to rung 2; a <code class="inline">refusal</code> may use both.</li>
+      <li><strong>What a hop uses.</strong> A hop is built through the same credential resolver, <code class="inline">[providers.&lt;name&gt;]</code> table and network logging as the run's own provider, so a same-provider hop differs only in model. The agent's <code class="inline">anthropicOauthPrefix</code> and <code class="inline">anthropicPromptCache</code> settings carry over to every hop (providers they do not apply to ignore them), and so does <code class="inline">effort</code>. The agent's <code class="inline">auth:</code> mode applies only to a hop on the provider the run started on. A hop does not inherit the agent's <code class="inline">maxTokens</code> or <code class="inline">contextWindowTokens</code>: its limits come from <code class="inline">[[providers.X.models]]</code> and the provider's model list. A hop to a different model does not send <code class="inline">contextWindow</code>, <code class="inline">anthropicSpeed</code>, <code class="inline">anthropicTaskBudget</code> or <code class="inline">anthropicContextManagement</code> either; a hop that keeps the original model's name on another provider keeps them.</li>
+    </ul>
+    <div class="callout"><strong>Data handling.</strong> A rung-2 hop sends the whole conversation &mdash; including file contents and tool output the agent has read &mdash; to a different company's API under that provider's terms. Put a provider in a chain only when the data in the run is allowed to go there; if it is not, leave it out of <code class="inline">fallbacks:</code>.</div>
+
+    <h3>Anthropic server-side fallback</h3>
+    <p>Anthropic can fall back to another model on its own side when the model you asked for refuses. rupu opts in for you, which saves a round trip and keeps the reply in one request.</p>
+    <ul>
+      <li><strong>Models:</strong> <code class="inline">claude-fable-5</code>, <code class="inline">claude-fable-5-1</code>, <code class="inline">claude-opus-5</code>, <code class="inline">claude-opus-5-5</code> and <code class="inline">claude-sonnet-5-5</code>. A <code class="inline">[1m]</code> suffix on the model id is ignored when matching. The list is exact; a newer model is added deliberately.</li>
+      <li><strong>Auth:</strong> API-key auth only. A run on Anthropic SSO (OAuth) never sends the opt-in.</li>
+      <li><strong>On the wire:</strong> the request carries the <code class="inline">server-side-fallback-2026-07-01</code> beta and <code class="inline">"fallbacks": "default"</code>.</li>
+      <li><strong>In the transcript:</strong> when the fallback answers, the turn proceeds normally. The refusal is recorded as an <code class="inline">outcome</code> titled <code class="inline">refused · served by &lt;model&gt;</code>, followed by a <code class="inline">recovery</code> with action <code class="inline">served_by_fallback</code> on rung 1. The reply's <code class="inline">fallback</code> boundary is written in place as an <code class="inline">assistant_block</code> event, and replay puts it back where it was, since Anthropic requires it echoed in that position on the next request.</li>
+      <li><strong>Declined mid-output:</strong> when the requested model stops part way through its reply, the API passes only the partial's text on to the fallback model. Tool calls and reasoning from before the boundary are abandoned: rupu never runs those tool calls and leaves them out of the conversation. They are still written to the transcript, as <code class="inline">assistant_block</code> events marked <code class="inline">abandoned</code>.</li>
+    </ul>
+    <p>Turn it off with <code class="inline">[recovery].server_side_fallback = false</code> (default <code class="inline">true</code>); the setting applies to the run's own provider and to any Anthropic hop. If the API refuses the opt-in (a 400 that names <code class="inline">fallbacks</code>, which an account or gateway that does not accept the beta returns), rupu stops sending it, retries the request once, and writes a notice of kind <code class="inline">server_side_fallback_disabled</code> (&ldquo;server-side fallback refused by the API — disabled for this run&rdquo;). The run is not affected otherwise; set the key to <code class="inline">false</code> for that account to avoid the refused request on every run.</p>
+
+    <h3>When nothing is left</h3>
+    <p>When the ladder runs out, the run ends with status <code class="inline">error</code>. The failure message is the outcome's title followed by a hint; for a provider error it is instead the provider's own error text (<code class="inline">provider: &lt;error&gt;</code>) followed by the hint. The hint depends on where the run was started:</p>
+    <pre class="code"><span class="c"># rupu run &lt;agent&gt; (a dispatched sub-agent's own transcript and run record get the same hint)</span>
+refused · cyber; no recovery left — continue with a prompt on the same model: rupu run dependency-auditor --continue &lt;run id&gt; "&lt;instruction&gt;", or with another model: rupu run dependency-auditor --continue &lt;run id&gt; --model &lt;model&gt; [--provider &lt;provider&gt;]
+
+<span class="c"># a workflow step</span>
+no recovery left — add fallbacks: to the agent or [recovery].fallbacks to try other models
+
+<span class="c"># a session turn (the conversation is kept, so the next message continues it)</span>
+no recovery left — send another message to continue, or start a new session on another model</pre>
+    <p>A failed run's final output is empty: its last text is an interim message or a cut-off reply, not an answer. A workflow step tolerated by <code class="inline">continue_on_error:</code> publishes <code class="inline">steps.&lt;id&gt;.output</code> as <code class="inline">""</code> and the reason as <code class="inline">steps.&lt;id&gt;.error</code>; a failed dispatched sub-agent returns <code class="inline">"ok": false</code>, <code class="inline">"output": ""</code> and the reason as <code class="inline">"error"</code> to the agent that dispatched it. That reason leaves out the <code class="inline">rupu run … --continue</code> hint, which the dispatching agent cannot act on. How to continue a failed run is under <a class="link" href="#continue-failed">Continue a failed run on another model</a> below.</p>
+
+    <h2>Context overflow</h2>
+    <p>rupu compacts proactively — summarizing older turns once the conversation reaches <code class="inline">compactAtPercent</code> (default 80) of the model's input limit, with room left for a full-length reply. When a provider still rejects a request as too long, rupu reads the real maximum out of the error text (Anthropic, OpenAI, Copilot, vLLM and Gemini formats are each recognized), lowers the run's input limit to it, writes a <code class="inline">model_limits_clamped</code> notice, compacts with a summary and retries. Deleting the oldest exchanges is the last resort.</p>
+    <ul>
+      <li>An Anthropic error saying input <em>plus</em> <code class="inline">max_tokens</code> exceeds the window is treated as an output-reservation problem: the turn is retried once with a smaller <code class="inline">max_tokens</code> before anything is compacted.</li>
+      <li>An Anthropic 429 refusing a 1M-context request on an account without extra-usage billing is not retried with the beta: rupu drops to the standard 200K window for the rest of that client's life, says so, and retries once.</li>
+      <li>An observed limit is never written to the shared model cache — it reflects the account, not the model.</li>
+    </ul>
+
+    <h2>Recover on interrupt</h2>
+    <p>A closed terminal, a killed process, a crash or a reboot should not throw away an hour of agent work. rupu keeps enough on disk to continue interrupted work rather than restart it.</p>
+
+    <h3>Continue an agent run</h3>
+    <pre class="code"><span class="k">rupu run</span> &lt;agent&gt; <span class="k">--continue</span> &lt;agent_run_id&gt;</pre>
+    <p>rupu rebuilds the conversation from the run's transcript, drops the turn that was in flight when it stopped, and tells the agent it was interrupted (work from that turn may be partially applied, so the agent re-checks before going on). The new run's transcript links back to the old one rather than copying it. If the run had actually finished, its recorded answer is printed <strong>without calling the model</strong>. A sub-agent's <code class="inline">sub_…</code> id works too: rupu finds its transcript under the run that dispatched it. The continued run also takes on the children the interrupted one launched, under the same handles: finished ones as they ended, the rest continued.</p>
+    <ul>
+      <li><strong>The command is restored.</strong> Every flag the run was launched with (mode, model, provider, findings profile, engagement, skills and the rest) and its repo target come back, recorded as <code class="inline">launch_args</code> on the transcript's <code class="inline">run_start</code>. A flag given on the continue replaces only its own setting; a repeatable flag (<code class="inline">--skill</code>, <code class="inline">--engagement-profile</code>) replaces its whole list.</li>
+      <li>A repo target reuses the checkout the original run cloned when it is still there (<code class="inline">--tmp</code> clones afresh). Run the command from the same directory as the original run.</li>
+      <li>The new run needs its own run id: a <code class="inline">--run-id</code> that already has a transcript is refused rather than overwritten.</li>
+      <li>With no prompt, a run that <strong>failed</strong> is not continued: a run that failed on a provider-side outcome is continued only with <code class="inline">--model</code> or <code class="inline">--provider</code> (below), and any other failed run only with a prompt. A run whose last turn ends on a tool call with no result cannot be continued at all.</li>
+    </ul>
+
+    <h3 id="continue-prompt">Continue with a prompt</h3>
+    <p>A continue can be told something new. A positional that parses as a run target is still the target; anything else is the prompt, and <code class="inline">--prompt</code> is the explicit form:</p>
+    <pre class="code"><span class="k">rupu run</span> &lt;agent&gt; <span class="k">--continue</span> &lt;agent_run_id&gt; <span class="s">"now write the fix"</span>
+<span class="k">rupu run</span> &lt;agent&gt; <span class="k">--continue</span> &lt;agent_run_id&gt; <span class="k">--prompt</span> <span class="s">"now write the fix"</span></pre>
+    <p>A prompt is new input, so every ended run can take one:</p>
+    <table>
+      <thead><tr><th>The run</th><th>It is sent</th></tr></thead>
+      <tbody>
+        <tr><td>interrupted</td><td>the interruption note, then the prompt, in the conversation's trailing user turn</td></tr>
+        <tr><td>finished</td><td>the prompt, as a new user turn after its answer (a real model call)</td></tr>
+        <tr><td>failed on a provider-side outcome</td><td>the &ldquo;earlier attempt stopped&rdquo; note, then the prompt, on its own model (or <code>--model</code>)</td></tr>
+        <tr><td>failed for another reason (max turns, say)</td><td>the prompt alone, on its own model</td></tr>
+      </tbody>
+    </table>
+    <p>The prompt is never part of the restored command: <code class="inline">launch_args</code> records no prompt, and the new run's <code class="inline">launch_args</code> are the merged command, still without it. The prompt lives in the new run's transcript as a <code class="inline">user_message</code>, and so in the conversation a later <code class="inline">--continue</code> of that run rebuilds — continuing it again never re-sends the prompt. With no prompt (or a blank one), nothing changes.</p>
+
+    <h3 id="continue-failed">Continue a failed run on another model</h3>
+    <pre class="code"><span class="k">rupu run</span> &lt;agent&gt; <span class="k">--continue</span> &lt;agent_run_id&gt; <span class="k">--model</span> &lt;model&gt; [<span class="k">--provider</span> &lt;provider&gt;]</pre>
+    <p>A run that failed on an outcome &mdash; a refusal, a reply that kept getting cut off &mdash; has an intact conversation, so it can be picked up on a different model. The rebuilt conversation leaves out any discarded partial reply. The new model is told that the earlier attempt stopped, why, and which model it is continuing on.</p>
+    <ul>
+      <li>It applies only to a run that ended in failure <strong>with</strong> an outcome recorded. A run that failed for another reason (max turns, say) cannot be continued this way; give it a prompt instead.</li>
+      <li>Only a <code class="inline">--model</code> or <code class="inline">--provider</code> given on the continue counts: the ones a bare <code class="inline">--continue</code> restores from the original command do not, so a bare <code class="inline">--continue</code> still refuses a failed run.</li>
+      <li><code class="inline">--model</code> and <code class="inline">--provider</code> override the agent's own <code class="inline">model:</code> and <code class="inline">provider:</code> for any <code class="inline">rupu run</code>, not only a continuation.</li>
+      <li>They also drop the agent's settings that were chosen for its own model. A different <code class="inline">--model</code> drops <code class="inline">maxTokens</code>, <code class="inline">contextWindowTokens</code>, <code class="inline">compactAtPercent</code>, <code class="inline">contextWindow</code>, <code class="inline">anthropicSpeed</code>, <code class="inline">anthropicTaskBudget</code> and <code class="inline">anthropicContextManagement</code>; a different <code class="inline">--provider</code> drops the agent's <code class="inline">auth:</code> mode. The new model's limits are discovered instead.</li>
+    </ul>
+
+    <h3>Resume a workflow</h3>
+    <p><code class="inline">rupu workflow resume &lt;run-id&gt;</code> (also <code class="inline">rupu run resume</code>) takes a failed, cancelled, rejected or paused run back and re-runs only what did not finish. Steps with a recorded result are skipped, and <code class="inline">for_each</code> units that already succeeded are replayed from their checkpoints. For each linear step and each <code class="inline">for_each</code> unit without a recorded result, resume reads the latest agent attempt's transcript and picks one of three plans:</p>
+    <table>
+      <thead><tr><th>The attempt's transcript</th><th>Plan</th><th>What runs</th></tr></thead>
+      <tbody>
+        <tr><td>Stopped mid-run (killed, crashed, paused)</td><td><strong>continued</strong></td><td>A new agent run seeded from the transcript (replayed, with a continuation note) carries on from where it stopped.</td></tr>
+        <tr><td>Had in fact finished — only its result was lost</td><td><strong>recovered</strong></td><td>Its final answer is the step's or unit's result; no agent runs and no model call is made.</td></tr>
+        <tr><td>Ended in failure, or missing / unreadable</td><td><strong>restarted</strong></td><td>A fresh agent run from the rendered prompt.</td></tr>
+      </tbody>
+    </table>
+    <p>Resume prints one line per step it planned something for (e.g. <code class="inline">each: 1 continued · 1 recovered · 1 restarted</code>) before dispatching; the live view marks a continued or recovered step or unit with <code class="inline">↩ continued</code> / <code class="inline">↩ recovered</code> (a restarted one looks like any fresh start), and the run's <code class="inline">events.jsonl</code> records each as an <code class="inline">attempt_resumed</code> event naming the interrupted agent run it picked up. Every agent attempt is recorded in a per-run <code class="inline">attempts.jsonl</code> ledger as it starts; a run interrupted before the ledger existed is covered by deriving the same attempts from its <code class="inline">events.jsonl</code>.</p>
+    <pre class="code"><span class="k">rupu workflow resume</span> run_01EXAMPLE                         <span class="c"># continue interrupted work (the default)</span>
+<span class="k">rupu workflow resume</span> run_01EXAMPLE <span class="k">--restart-interrupted</span>   <span class="c"># start every interrupted step and for_each unit over from its prompt</span>
+<span class="k">rupu workflow resume</span> run_01EXAMPLE <span class="k">--mode</span> readonly <span class="k">--plain</span>  <span class="c"># override the permission mode; plain line printer instead of the live graph view</span></pre>
+    <p>A run left <code class="inline">Running</code> by a runner that has since died (<code class="inline">SIGKILL</code>, an out-of-memory kill, a reboot) is marked <code class="inline">Failed</code> first &mdash; the same transition <code class="inline">rupu cp serve</code>'s sweep makes &mdash; so the CLI alone can recover it. A run whose recorded runner is still alive is refused.</p>
+    <div class="callout"><strong>What still restarts.</strong> <code class="inline">parallel:</code> sub-steps and <code class="inline">panel:</code> members, steps that are members of a <code class="inline">loops:</code> subgraph, and a step or unit placed on a remote host (<code class="inline">host:</code> / <code class="inline">distribute:</code>) are started over from their prompt rather than continued: a remote transcript cannot be continued from the coordinator.</div>
+
+    <h3>From the control plane</h3>
+    <p>The control plane records a control action and lets <code class="inline">rupu cp serve</code> carry it out, so a <code class="inline">200</code> or <code class="inline">202</code> means <em>recorded</em>; the run's own status is what confirms it. See <a class="link" href="/docs/control-plane.html">Control plane</a> and the <a class="link" href="/docs/api.html">HTTP API</a>.</p>
+    <ul>
+      <li><strong>Resume</strong> (<code class="inline">POST /api/runs/:id/resume</code>, a paused run) sets a marker; the resume worker inside <code class="inline">cp serve</code> (polling every 4 s) spawns a detached <code class="inline">rupu workflow resume --if-unfinished</code>, which refuses a run that finished in the meantime rather than retry it. Work the dead runner left mid-flight is continued from its transcript, as above. Resuming a run that isn't <code class="inline">paused</code> is a 409.</li>
+      <li><strong>Retry</strong> (<code class="inline">POST /api/runs/:id/retry</code>, a failed, rejected or cancelled run) records the retry, then spawns a detached <code class="inline">rupu workflow resume &lt;id&gt;</code> — plus <code class="inline">--restart-interrupted</code> when the body sets <code class="inline">restart_interrupted</code> — in the body's <code class="inline">mode</code>, else the run's own launch mode. A run left <code class="inline">Running</code> by a dead runner is marked <code class="inline">Failed</code> first and retried. A standalone agent run is a 409 here: continue it instead. Local only.</li>
+      <li><strong>Continue</strong> (<code class="inline">POST /api/runs/agents/:id/continue</code>, a standalone <code class="inline">run_…</code> or a sub-agent's <code class="inline">sub_…</code>) spawns a detached <code class="inline">rupu run &lt;agent&gt; --continue &lt;id&gt;</code> under a new run id, in the directory the run was launched from. Its optional body &mdash; <code class="inline">prompt</code>, <code class="inline">model</code>, <code class="inline">provider</code>, <code class="inline">mode</code>, <code class="inline">findings_profile</code>, <code class="inline">engagement_profiles</code>, <code class="inline">skills</code>, <code class="inline">preload_skills</code>, <code class="inline">messaging</code> &mdash; follows the CLI's rules: every original flag is restored and each field given replaces its own; with a <code class="inline">prompt</code> any ended run carries on, without one a failed run is continued only with <code class="inline">model</code> or <code class="inline">provider</code>, and a finished run answers with its recorded answer. 409 while the run is still running. Local only.</li>
+    </ul>
+
+    <h2>Model limits discovery</h2>
+    <p>Every run needs its model's real <strong>input limit</strong> (for proactive compaction) and <strong>output cap</strong> (the per-request <code class="inline">max_tokens</code>). Per field, rupu takes the first of:</p>
+    <ol>
+      <li>the agent's <code class="inline">contextWindowTokens</code> / <code class="inline">maxTokens</code> frontmatter;</li>
+      <li>a <code class="inline">[[providers.&lt;name&gt;.models]]</code> entry in config;</li>
+      <li>the provider's live model list, from the cache;</li>
+      <li>unknown — and the run says so.</li>
+    </ol>
+    <p>A value of <code class="inline">0</code> counts as unset at every level. Each run writes a <code class="inline">model_limits</code> notice to its transcript with the values and where each came from. With an unknown input limit, compaction is off; with an unknown output cap, Anthropic requests carry <code class="inline">8192</code> and other providers get no cap (the model's own maximum).</p>
+    <p>Live lists are cached per provider (or per named account) at <code class="inline">~/.rupu/cache/models/&lt;provider&gt;.json</code> for one hour. A run refreshes a stale or missing entry itself, bounded at 10 seconds; a failed refresh is remembered for 5 minutes so a provider outage doesn't cost every launch the timeout. Providers that expose no listing — a Gemini CLI / Code Assist login, for one — leave limits unknown unless you declare them.</p>
+    <pre class="code"><span class="k">rupu models list</span>                              <span class="c"># CONTEXT, OUTPUT, SOURCE and FETCHED per model</span>
+<span class="k">rupu models list</span> <span class="k">--provider</span> anthropic-work     <span class="c"># a named account works too</span>
+<span class="k">rupu models refresh</span>                           <span class="c"># re-fetch every live list; non-zero exit if none refreshed</span>
+<span class="k">rupu models refresh</span> <span class="k">--provider</span> openai</pre>
+    <p>In the control plane, <strong>Settings → Models</strong> shows the same catalog with per-provider <strong>Refetch</strong> buttons. See <a class="link" href="/docs/providers.html">Providers &amp; Auth</a> for where each provider's limits come from.</p>
+
+    <div class="doc-nav">
+      <a href="/docs/providers.html">&#8592; Providers &amp; Auth</a>
+      <a href="/docs/integrations.html">Integrations &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

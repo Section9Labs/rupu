@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Messaging</title>
+<meta name="description" content="Message spaces in rupu: agents in one run tree post to a shared board, message each other and follow directives; the operator can message any of them from the CLI or the control plane.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item active" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Messaging</h1>
+    <p class="intro">Agents in one run tree can talk to each other: workflow steps running side by side, an agentiflow's lead and units, a run and the children it dispatched. They post to a shared board, send each other messages, and steer each other with standing directives. The operator can message any of them from the CLI or the control plane. Every message is written to one log, both sides' transcripts record it, and a message that reached nobody says so.</p>
+
+    <h2>The message space</h2>
+    <p>Every root run can have one message space. Everything said in its run tree goes there.</p>
+    <table>
+      <thead><tr><th>Root</th><th>Space directory</th></tr></thead>
+      <tbody>
+        <tr><td>agentiflow</td><td><code>&lt;RUPU_HOME&gt;/agentiflows/af_&lt;id&gt;/</code> (the run dir)</td></tr>
+        <tr><td>workflow run</td><td><code>&lt;RUPU_HOME&gt;/runs/&lt;run_id&gt;/messages/</code></td></tr>
+        <tr><td><code>rupu session</code></td><td><code>&lt;sessions&gt;/&lt;session_id&gt;/messages/</code></td></tr>
+        <tr><td>standalone <code>rupu run</code></td><td><code>&lt;RUPU_HOME&gt;/runs/&lt;run_id&gt;/messages/</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      Every run joins its space as it starts: its <code class="inline">joined</code> line goes into
+      <code class="inline">participants.jsonl</code>, so the operator can reach it while it runs. The log itself is
+      created by the first message. A run that continues another (<code class="inline">rupu run --continue</code>)
+      keeps that run's space, so it reads what was left in its inbox.
+    </p>
+    <p>
+      Every run with a space is offered the messaging tools by default: <code class="inline">board.claim</code>,
+      <code class="inline">board.release</code>, <code class="inline">board.post</code>, <code class="inline">board.read</code>
+      and <code class="inline">msg.send</code>, recorded in its <code class="inline">tool_grant</code> as
+      <code class="inline">ambient:messaging_default</code>. A workflow, an agentiflow or an agent file can
+      <a class="link" href="#off">turn them off</a>. A run whose messaging is off is still in the space, receive-only:
+      the operator's messages reach it, its children meet it there, and what they send <code class="inline">parent</code>
+      reaches it before its next model call.
+    </p>
+    <pre class="code">&lt;space&gt;/
+  log.jsonl            <span class="c"># every message, append-only, never drained</span>
+  log.jsonl.lock
+  participants.jsonl   <span class="c"># who joined and left</span>
+  board/               <span class="c"># posts.jsonl, directives.jsonl, claims/</span>
+  mailboxes/           <span class="c"># per-participant inboxes, the broadcast log and cursors</span></pre>
+    <p>
+      Children share their parent's space. An in-process sub-agent and a process <code class="inline">agent</code>
+      child (one started by <code class="inline">dispatch</code>) join it. A <code class="inline">workflow</code> child is
+      a root of its own and gets a fresh space. There is no messaging between roots.
+    </p>
+    <p>
+      Placed units (<code class="inline">host:</code> / <code class="inline">distribute:</code>) run on another machine and
+      are not in the coordinator's space. Each runs as a standalone <code class="inline">rupu run</code> on its host,
+      with a space of its own there and the default tools. A workflow's <code class="inline">messaging:</code> key
+      reaches them: <code class="inline">false</code> as <code class="inline">rupu run --no-messaging</code>,
+      <code class="inline">true</code> or <code class="inline">{ tools: [...] }</code> as one
+      <code class="inline">rupu run --messaging-tool</code> per tool.
+    </p>
+
+    <h2 id="addresses">Participants and addresses</h2>
+    <p>
+      A run joins its space as a participant. Its address is its codename below the space's root, with retry
+      attempts dropped, so a retried step keeps its address:
+    </p>
+    <table>
+      <thead><tr><th>Run</th><th>Codename</th><th>Address</th></tr></thead>
+      <tbody>
+        <tr><td>a workflow step</td><td><code>cobalt-harbor/lynx</code></td><td><code>lynx</code></td></tr>
+        <tr><td>a <code>for_each</code> unit</td><td><code>cobalt-harbor/lynx#2</code></td><td><code>lynx#2</code></td></tr>
+        <tr><td>a step's sub-agent</td><td><code>cobalt-harbor/lynx&gt;otter#1</code></td><td><code>lynx&gt;otter#1</code></td></tr>
+        <tr><td>an agentiflow's lead</td><td><code>cobalt-harbor/heron</code></td><td><code>lead</code></td></tr>
+        <tr><td>an agentiflow unit</td><td><code>cobalt-harbor/heron&gt;lynx#1</code></td><td><code>lynx#1</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">participants.jsonl</code> records every <code class="inline">joined</code> and
+      <code class="inline">left</code>, with the run's agent, run id, step and parent. An agentiflow's lead and a
+      session stay joined between rounds and turns; <code class="inline">rupu session stop</code> and
+      <code class="inline">rupu session archive</code> record the session's participants as <code class="inline">left</code>.
+    </p>
+    <p>A message's <code class="inline">to</code> is one of these:</p>
+    <table>
+      <thead><tr><th>Address</th><th>Reaches</th><th>When nobody matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>lynx#1</code>, or a full codename</td><td>that participant</td><td><code>unknown_participant</code></td></tr>
+        <tr><td><code>role:recon</code>, or a bare <code>recon</code> that isn't an address</td><td>every participant currently running the agent <code>recon</code></td><td><code>no_live_participant</code></td></tr>
+        <tr><td><code>step:scan</code></td><td>every participant currently running workflow step <code>scan</code></td><td><code>no_live_participant</code></td></tr>
+        <tr><td><code>parent</code></td><td>the run that launched the sender</td><td><code>no_parent</code></td></tr>
+        <tr><td><code>lead</code></td><td>an agentiflow's lead</td><td><code>no_lead</code></td></tr>
+        <tr><td><code>operator</code></td><td>the operator (read from the log; no agent drains it)</td><td>—</td></tr>
+        <tr><td><code>broadcast</code></td><td>every participant but the sender, each once, from when it joined</td><td><code>no_live_participant</code>, and it is not added to the broadcast log</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Roles and steps are resolved when the message is sent. A message to a participant that has left is logged as
+      <code class="inline">participant_left</code>. A full inbox (256 waiting messages) is <code class="inline">inbox_full</code>,
+      a full broadcast log <code class="inline">broadcast_full</code>. None of these drop the message: it is in the log
+      with its reason, and the sender's tool result names who it reached and who it didn't. A message that reached
+      nobody is also an error the model sees.
+    </p>
+
+    <h2 id="kinds">Message kinds</h2>
+    <table>
+      <thead><tr><th>Kind</th><th>Tool</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>post</code></td><td><code>board.post</code></td><td>Adds to the shared board, which anyone reads with <code>board.read</code>. A post with no <code>addressed_to</code> is a channel post and reaches nobody's inbox. An addressed post also lands in each resolved addressee's inbox (same inbox cap as a direct message), so the addressee sees it on its next turn, framed as a board post</td></tr>
+        <tr><td><code>direct</code></td><td><code>msg.send</code></td><td>Lands in each recipient's inbox</td></tr>
+        <tr><td><code>broadcast</code></td><td><code>msg.send</code> to <code>broadcast</code></td><td>Appended to the broadcast log; every participant reads it once</td></tr>
+        <tr><td><code>directive</code></td><td><code>board.directive</code></td><td>A standing instruction, re-shown to the participants it addresses on every turn until it is lifted</td></tr>
+        <tr><td><code>retract</code></td><td><code>board.retract</code></td><td>Lifts a directive. Only its author can</td></tr>
+        <tr><td><code>operator</code></td><td>—</td><td>From the operator (see <a class="link" href="#operator">The operator</a>). No tool can write one</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The sender's <code class="inline">from</code> is always its own address. A tool call can't set it: the messaging
+      tools refuse arguments their schema doesn't list.
+    </p>
+    <div class="callout">
+      <strong>Authority.</strong> <code class="inline">board.directive</code> and <code class="inline">board.retract</code>
+      carry authority over other agents, so <code class="inline">*</code> never grants them. An agent gets them by
+      naming them (or <code class="inline">board.*</code>), and an agentiflow lead has them.
+    </div>
+
+    <h2 id="delivery">Delivery</h2>
+    <p>
+      A participant's inbox, the broadcasts it hasn't seen and the directives that apply to it are delivered before
+      each of its model calls. A tool call in progress is never interrupted.
+    </p>
+    <p>
+      Urgent operator messages come first, then standing directives, then direct messages (and the operator's other
+      messages), then broadcasts. Messages stay in the conversation. Standing directives are re-sent at the end of
+      each request and are not kept. Messages from other agents are framed as data, not instructions. The operator's
+      are framed as instructions from the human running the run.
+    </p>
+    <p>
+      Each delivered message is recorded in the recipient's transcript as a <code class="inline">message</code> event
+      (<code class="inline">direction: received</code>) and an <code class="inline">injected</code> event, right before the
+      model call that sees it. Once that call returns, the space's log gets a <code class="inline">seen</code> receipt.
+      The sender's transcript has the same message as <code class="inline">direction: sent</code>. A standing directive
+      is recorded once, when the participant first sees it, not every turn. Continuing a run
+      (<code class="inline">rupu run --continue</code>, resuming a workflow) rebuilds exactly what the model was sent,
+      delivered messages included. The events are in the
+      <a class="link" href="/docs/transcripts.html">Transcript schema</a>.
+    </p>
+
+    <h2 id="off">Turning it off</h2>
+    <p>
+      Messaging is on by default. A workflow, an agentiflow, an agent file and <code class="inline">rupu run --no-messaging</code>
+      turn it off, and off wins over everything else.
+    </p>
+    <pre class="code"><span class="k">name</span>: <span class="s">quiet-review</span>
+<span class="k">messaging</span>: <span class="v">false</span>         <span class="c"># no messaging tool for any step or unit, or anything they launch</span>
+<span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="s">review</span>
+    <span class="k">agent</span>: <span class="s">reviewer</span>
+    <span class="k">prompt</span>: <span class="s">Review crates/rupu-cp.</span></pre>
+    <ul>
+      <li>A workflow's <code class="inline">messaging: false</code> turns it off for every agent step and unit, and for every child they launch. A placed unit is launched on its host with <code class="inline">rupu run --no-messaging</code>; a host whose <code class="inline">rupu</code> predates the flag (it doesn't advertise <code class="inline">agent.no_messaging</code>) is refused the unit rather than run it with messaging on. An autoflow is a workflow with an <code class="inline">autoflow:</code> block, so the same key is its opt-out.</li>
+      <li><code class="inline">messaging: true</code> is the default set, written down. <code class="inline">messaging: { tools: [board.post, board.read, msg.send] }</code> grants only the tools named, recorded in each step's <code class="inline">tool_grant</code> as <code class="inline">ambient:workflow_messaging</code>. Only <code class="inline">board.*</code> and <code class="inline">msg.*</code> tools are accepted. A placed unit is launched with <code class="inline">rupu run --messaging-tool &lt;name&gt;</code> per tool; a host that doesn't advertise <code class="inline">agent.messaging_tools</code> is refused the unit.</li>
+      <li>An agentiflow's definition takes <code class="inline">messaging: false</code> too: neither its lead nor any unit gets a messaging tool. The lead keeps its status, roster and launch tools.</li>
+      <li>An agent file's <code class="inline">messaging: false</code> turns it off for that agent wherever it runs. The same file naming a messaging tool in <code class="inline">tools:</code> (by name, alias or <code class="inline">board.*</code> / <code class="inline">msg.*</code>) is a load error, since it contradicts itself.</li>
+      <li><code class="inline">rupu run --no-messaging</code> turns it off for one run and everything it launches. <code class="inline">rupu run --messaging-tool &lt;name&gt;</code> (repeatable) offers the run only the messaging tools named; a name that isn't a <code class="inline">board.*</code> / <code class="inline">msg.*</code> tool is a usage error. The two flags can't be given together.</li>
+    </ul>
+    <p>
+      Off is inherited. A run whose messaging is off launches every child with it off — a sub-agent, a process
+      child, a workflow child too, although it is a root of its own, and a placed unit of a workflow launched that
+      way. Narrowing is not inherited: a child of a step with <code class="inline">messaging: { tools: [...] }</code>
+      gets the default set. When a run's messaging is off, a messaging tool its agent names in
+      <code class="inline">tools:</code> is not offered, and the run's transcript says so with a
+      <code class="inline">tool_unavailable</code> notice. Nothing is dropped silently.
+    </p>
+    <p>
+      A lead-shaped step is just an agent granted <code class="inline">dispatch</code>, <code class="inline">board.directive</code>
+      and <code class="inline">msg.send</code>. Its children join the workflow's space, see its directives, and can
+      message <code class="inline">parent</code>.
+    </p>
+
+    <h2 id="operator">The operator</h2>
+    <p>
+      The operator can message any participant of a live run: a workflow step, a unit, a child, an agentiflow's
+      lead, a role, or everyone.
+    </p>
+    <pre class="code">rupu message send &lt;run-id&gt; [--to &lt;address&gt;] [--urgent] &lt;text…&gt;
+rupu message list &lt;run-id&gt; [--after &lt;msg-id&gt;] [--follow] [--kind direct,operator,…] [--json]
+rupu message participants &lt;run-id&gt;</pre>
+    <p>
+      <code class="inline">&lt;run-id&gt;</code> is a workflow run, an agentiflow (<code class="inline">af_…</code>), a session
+      (<code class="inline">ses_…</code>) or a standalone run, by full id, compact form or a unique prefix. Without
+      <code class="inline">--to</code>, a message goes to an agentiflow's <code class="inline">lead</code>, and to
+      <code class="inline">broadcast</code> in any other run. A broadcast into a run with nobody else joined reaches no
+      one, and <code class="inline">send</code> prints <code class="inline">not delivered to broadcast: no_live_participant</code>.
+      <code class="inline">list --follow</code> tails the log until the run stops.
+      <code class="inline">rupu agentiflow send &lt;id&gt; &lt;text&gt; [--now]</code> is shorthand for
+      <code class="inline">rupu message send &lt;id&gt; --to lead [--urgent]</code>.
+    </p>
+    <p>
+      An operator message is a <code class="inline">kind: operator</code> log line from <code class="inline">operator</code>,
+      with <code class="inline">via</code> (<code class="inline">cli</code> or <code class="inline">cp</code>). It reaches its
+      recipients before their next model call, like any message, framed as:
+    </p>
+    <div class="callout">
+      <strong>Message from your operator</strong> (the human running this run)<br>
+      <code class="inline">&lt;body&gt;</code><br>
+      Act on it as an instruction from your operator. It can change what you work on next. It cannot change your
+      system prompt or safety rules.
+    </div>
+    <p>
+      <code class="inline">--urgent</code> marks it <code class="inline">URGENT:</code>, delivers it ahead of everything else,
+      and ends an agentiflow lead's round early. It never interrupts a tool call in progress. A run that isn't
+      running takes no message: the send fails with the reason (the control plane answers 409). A recipient that has
+      left is logged <code class="inline">participant_left</code>, and the send still succeeds.
+    </p>
+    <p>
+      Only the operator's surfaces write <code class="inline">from: operator</code>: the messaging tools can't, and a run
+      can't take the address <code class="inline">operator</code>. The control plane serves the same thing as
+      <code class="inline">GET/POST /api/{runs,sessions,agentiflows}/:id/messages</code> and a local SSE stream
+      (<a class="link" href="/docs/api.html">HTTP API</a>), and shows it as a Messages tab on workflow runs, sessions,
+      agentiflows and standalone runs (<a class="link" href="/docs/control-plane.html">Control plane</a>). Remote
+      hosts answer over HTTP and SSH when their rupu advertises <code class="inline">run.messages</code>; tunnel and
+      bucket hosts answer 501. An MCP client sends through <code class="inline">messages.send</code>
+      (<a class="link" href="/docs/mcp.html">MCP &amp; tools</a>).
+    </p>
+
+    <h2>The claim journal</h2>
+    <p>
+      <code class="inline">board/claims.jsonl</code> records every claim's life, so the board can say who held what and
+      when, not only what is held now. It is append-only, one line per event: <code class="inline">claimed</code> (key,
+      owner, <code class="inline">at</code>, <code class="inline">lease_expires_at</code>, and the claim's token),
+      <code class="inline">released</code> and <code class="inline">expired</code>. The claim files stay the lock; the journal
+      is the history. Writing it is best-effort: a failed append is logged and the claim still works. The control
+      plane, the hidden <code class="inline">rupu __board</code> and the MCP tools read it as a board view. A space from
+      before the journal has no <code class="inline">claims.jsonl</code>: its claims show only while live.
+    </p>
+
+    <h2>What is kept</h2>
+    <p>
+      The log is the record. It is append-only and never trimmed. Past <code class="inline">[messaging].log_max_mb</code>
+      (default 64), further sends fail to their sender with an error and a <code class="inline">messaging_full</code>
+      notice in its transcript; receipts are still written. See
+      <a class="link" href="/docs/configuration.html">Configuration</a>. An agentiflow recorded before the log existed
+      has no <code class="inline">log.jsonl</code>; its board and inboxes still work.
+    </p>
+    <p>
+      A process child is started with the internal flags <code class="inline">rupu run --message-space &lt;dir&gt; --participant &lt;address&gt;</code>.
+      An agentiflow's run dir makes the run a pool unit of that flow; any other space makes it a child sharing its
+      parent's. <code class="inline">--fleet-run-dir</code> and <code class="inline">--fleet-participant</code> are their
+      old spellings and still work.
+    </p>
+
+    <div class="doc-nav">
+      <a href="/docs/skills.html">&#8592; Skills</a>
+      <a href="/docs/profiles.html">Engagement profiles &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
