@@ -43,6 +43,64 @@ impl Board {
             .join(format!("{}.reaplock", claim_stem(key)))
     }
 
+    /// Re-open only this participant's unexpired claims after its session
+    /// turn/restart. Tokens stay unchanged; a stale guard can never release
+    /// another participant's replacement claim. The session owns a worker
+    /// lease while these guards are in use.
+    pub(crate) fn restore_claims(&self, owner: &str) -> Result<Vec<(String, ClaimGuard)>, FleetError> {
+        let entries = match std::fs::read_dir(self.claims_dir()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(FleetError::Io {
+                    action: "read session claims".into(),
+                    source,
+                })
+            }
+        };
+        let mut claims = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| FleetError::Io {
+                action: "read session claim".into(),
+                source,
+            })?;
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(record) = read_claim(&entry.path())? else {
+                continue;
+            };
+            let Some(key) = record.key else {
+                continue;
+            };
+            let path = self.claim_path(&key);
+            if path != entry.path() {
+                continue;
+            }
+            let lock_path = self.reap_lock_path(&key);
+            let _lock = crate::bus::lock_exclusive(&lock_path)?;
+            let Some(record) = read_claim(&path)? else {
+                continue;
+            };
+            if record.owner != owner || is_expired(&record) {
+                continue;
+            }
+            claims.push((
+                key.clone(),
+                ClaimGuard {
+                    keep_on_drop: true,
+                    path,
+                    board_root: self.root.clone(),
+                    key,
+                    owner: owner.into(),
+                    lock_path,
+                    token: record.token,
+                },
+            ));
+        }
+        Ok(claims)
+    }
+
     /// Atomically claim a work unit. Returns `Granted` with an RAII guard, or
     /// `Denied` with the current holder. A claim whose lease has expired is
     /// reaped and re-granted. Mirrors `AutoflowClaimStore::try_acquire_active_lock`.
@@ -70,6 +128,7 @@ impl Board {
                     lease_expires_at: rec.lease_expires_at,
                 });
                 return Ok(ClaimOutcome::Granted(ClaimGuard {
+                    keep_on_drop: false,
                     path,
                     board_root: self.root.clone(),
                     key: key.to_string(),

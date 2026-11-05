@@ -329,7 +329,7 @@ struct SessionTurnRequest {
 impl SessionTurnRequest {
     /// The newest request version this rupu runs. A request is queued at
     /// [`Self::written_version`].
-    const VERSION: u32 = 3;
+    const VERSION: u32 = 4;
 
     /// 2 for a request that invokes skills, which a worker that predates
     /// them would run without; else 1, so such a worker still runs it.
@@ -7902,6 +7902,10 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         std::process::id(),
         rupu_launch::proc::own_start_stamp(),
     )?;
+    let orchestration_dir = session_dir(&global, scope, &session.session_id);
+    let orchestration =
+        rupu_runtime::session_orchestration::SessionOrchestration::read(&orchestration_dir)?;
+
     // Freeze settings before this turn performs any external work.
     let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
         &global,
@@ -8203,6 +8207,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             hooks: Default::default(),
             pause: Some(cancellation.token.clone()),
             services: rupu_runtime::assembly::LaunchServices {
+                session_orchestration: orchestration.enabled,
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
@@ -8262,7 +8267,13 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 }
             }
             None => match assembler.assemble(launch).await {
-                Ok(run) => run.run().await,
+                Ok(run) => {
+                    if orchestration.enabled {
+                        rupu_launch::session::run(run, &orchestration_dir, &session.session_id).await
+                    } else {
+                        run.run().await
+                    }
+                }
                 Err(e) => rupu_agent::RunExit {
                     result: Err(e.into_run_error()),
                     final_limits: session
@@ -8681,13 +8692,20 @@ fn enqueue_session_turn_request(
     let path = session_turn_request_path(global, scope, session_id, &request.request_id);
     let tmp = path.with_extension("tmp");
     let request = SessionTurnRequest {
-        version: if rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+        version: if rupu_runtime::session_orchestration::SessionOrchestration::read(&session_dir(
             global, scope, session_id,
         ))?
         .revision
             > 0
         {
             SessionTurnRequest::VERSION
+        } else if rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+            global, scope, session_id,
+        ))?
+        .revision
+            > 0
+        {
+            3
         } else {
             request.written_version()
         },
@@ -12123,6 +12141,8 @@ mod tests {
             })
             .collect()
     }
+
+    include!("session_orchestration_tests.rs");
 
     #[tokio::test]
     async fn session_settings_reach_the_turn_without_rewriting_defaults_or_limits() {

@@ -1,3 +1,6 @@
+#[path = "session_orchestration.rs"]
+mod orchestration;
+
 use crate::api::host_fanout::{fan_out_sessions, sort_values_newest_first};
 use crate::{
     error::{ApiError, ApiResult},
@@ -15,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
+        .merge(orchestration::routes())
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route(

@@ -282,6 +282,19 @@ pub struct AdmittedRun {
 }
 
 impl AdmittedRun {
+    /// Startup services inspect the admitted run before the provider loop.
+    /// Identity stays immutable after admission.
+    pub fn options(&self) -> &AgentRunOpts {
+        &self.opts
+    }
+
+    /// Install a lifecycle wrapper after acquiring the parent's admission
+    /// slot. Restored in-process children can then borrow that slot, even
+    /// at a concurrency ceiling of one. The run's identity is unchanged.
+    pub fn replace_launcher(&mut self, launcher: Arc<dyn rupu_tools::Launcher>) {
+        self.opts.tool_context.services.launcher = Some(launcher);
+    }
+
     /// The slot it holds — how long it waited for it. `None` for an origin
     /// that skips admission.
     pub fn permit(&self) -> Option<&crate::admission::JobPermit> {
@@ -556,7 +569,11 @@ impl RunAssembler {
 
     /// Build the run `spec` describes.
     pub async fn assemble(&self, mut spec: LaunchSpec) -> Result<AssembledRun, AssembleError> {
-        let d = defaults_for(&spec.origin);
+        let mut d = defaults_for(&spec.origin);
+        if matches!(spec.origin, Origin::SessionTurn { .. }) && spec.services.session_orchestration
+        {
+            d.origin_grant = Some(crate::session_orchestration::grant());
+        }
         let cfg = &self.ctx.config;
         let messaging = MessagingGrant::resolve(&spec, d.origin_grant.as_ref());
         if let MessagingGrant::Off(why) = &messaging {

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 /// the file still holds THIS grant's token.
 #[derive(Debug)]
 pub struct ClaimGuard {
+    pub(crate) keep_on_drop: bool,
     pub(crate) path: PathBuf,
     /// The board root and the raw key/owner, for the claim journal's `released`.
     pub(crate) board_root: PathBuf,
@@ -19,6 +20,9 @@ pub struct ClaimGuard {
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
+        if self.keep_on_drop {
+            return;
+        }
         // Compare-and-delete under the per-key reap lock: remove the file only
         // if it still holds OUR grant's token. A successor's re-grant has a
         // different token, so a stale guard can never delete a live claim.

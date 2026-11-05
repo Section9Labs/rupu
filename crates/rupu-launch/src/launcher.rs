@@ -944,6 +944,8 @@ impl RunLauncher {
                     .children_dir
                     .as_deref()
                     .is_some_and(|d| is_generated_file(d, file));
+                let inside =
+                    inside || crate::session::generated_by_session(self.global(), id, file);
                 if !inside {
                     return Err(LaunchError::new(
                         "workflow_not_dispatchable",
@@ -2263,21 +2265,47 @@ impl Launcher for RunLauncher {
             if !claimed {
                 continue;
             }
-            let taken = match end {
-                end if end.status == ChildState::Interrupted => {
-                    self.continue_child(&started, end.at, &from).await
+            // A session may narrow its dispatch allowlists between turns.
+            // Observe completed results, but re-vet every request that would
+            // execute again under the current catalog and connector grant.
+            let session_refusal = if to.identity.surface == rupu_tools::Surface::Session {
+                let restarts = end.status == ChildState::Interrupted
+                    || (end.status == ChildState::Failed
+                        && self.stopped_from_outside(&started).await);
+                if restarts {
+                    crate::session::check_continuation(self, &started, to)
+                        .await
+                        .err()
+                } else {
+                    None
                 }
-                // Recorded failed before its parent recorded the stop that
-                // ended it too (a reboot signals every process at once),
-                // even if the parent collected that end before it stopped.
-                end if end.status == ChildState::Failed
-                    && self.stopped_from_outside(&started).await =>
-                {
-                    self.continue_child(&started, end.at, &from).await
-                }
-                end => {
-                    self.restore(&started, end, joined, &from);
-                    true
+            } else {
+                None
+            };
+            let taken = if let Some(refusal) = session_refusal {
+                self.restore_failed(
+                    &started,
+                    format!("session dispatch allowlist or current launch policy no longer permits this child: {refusal}"),
+                    &from,
+                )
+                .await
+            } else {
+                match end {
+                    end if end.status == ChildState::Interrupted => {
+                        self.continue_child(&started, end.at, &from).await
+                    }
+                    // Recorded failed before its parent recorded the stop that
+                    // ended it too (a reboot signals every process at once),
+                    // even if the parent collected that end before it stopped.
+                    end if end.status == ChildState::Failed
+                        && self.stopped_from_outside(&started).await =>
+                    {
+                        self.continue_child(&started, end.at, &from).await
+                    }
+                    end => {
+                        self.restore(&started, end, joined, &from);
+                        true
+                    }
                 }
             };
             if taken {
