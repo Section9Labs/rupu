@@ -349,7 +349,7 @@ struct SessionTurnRequest {
 impl SessionTurnRequest {
     /// The newest request version this rupu runs. A request is queued at
     /// [`Self::written_version`].
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 
     /// 2 for a request that invokes skills, which a worker that predates
     /// them would run without; else 1, so such a worker still runs it.
@@ -1276,7 +1276,11 @@ fn build_session_usage_timeline(
             )
         })
         .collect();
-    Ok(rupu_orchestrator::usage_summary::transcripts_usage(&labeled).points.clone())
+    Ok(
+        rupu_orchestrator::usage_summary::transcripts_usage(&labeled)
+            .points
+            .clone(),
+    )
 }
 
 #[derive(Serialize)]
@@ -2658,7 +2662,13 @@ impl SessionInteractiveState {
                     retained_session_event_line_raw(
                         crate::output::palette::Status::Active,
                         "message",
-                        &rupu_transcript::messages::message_line(*direction, kind, from, to.as_deref(), body),
+                        &rupu_transcript::messages::message_line(
+                            *direction,
+                            kind,
+                            from,
+                            to.as_deref(),
+                            body,
+                        ),
                     ),
                 );
             }
@@ -6911,6 +6921,16 @@ async fn compact_recorded(
     let read_bytes = fs::read(&record_path)
         .with_context(|| format!("read session record {}", record_path.display()))?;
     let mut session = parse_session_record(&read_bytes)?;
+    let mut effective_agent = session_agent_spec(&global, &session)?;
+    let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+        &global, scope, session_id,
+    ))?;
+    settings.validate()?;
+    let changed_model = settings.apply(&mut effective_agent);
+    anyhow::ensure!(
+        !changed_model || window_override.is_some(),
+        "model override requires an explicit context window for compaction; pass --window <tokens>"
+    );
 
     if session.status == SessionStatus::Running {
         anyhow::bail!(
@@ -6919,8 +6939,7 @@ async fn compact_recorded(
         );
     }
 
-    let compact_threshold = session
-        .compaction_threshold(window_override)
+    let compact_threshold = settings_compaction_threshold(&session, changed_model, window_override)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "session {} has no known input limit: its model limits are unknown \
@@ -6996,11 +7015,14 @@ async fn compact_recorded(
     let resolver = crate::accounts::resolver_for(&cfg);
 
     let provider_config = provider_factory::ProviderConfig::for_agent(
-        &session.provider_name,
+        effective_agent
+            .provider
+            .as_deref()
+            .unwrap_or(&session.provider_name),
         &cfg.providers,
         provider_factory::AgentProviderSettings {
-            oauth_prefix: session.anthropic_oauth_prefix,
-            prompt_cache: session.anthropic_prompt_cache,
+            oauth_prefix: effective_agent.anthropic_oauth_prefix,
+            prompt_cache: effective_agent.anthropic_prompt_cache,
         },
         Some(cfg.recovery.server_side_fallback),
     );
@@ -7009,9 +7031,12 @@ async fn compact_recorded(
     // transcript, and isn't a step of any run in progress. This traffic
     // is deliberately not attributed to a ledger.
     let (_resolved_auth, mut provider) = provider_factory::build_for_provider_with_config(
-        &session.provider_name,
-        &session.model,
-        session.auth_mode,
+        effective_agent
+            .provider
+            .as_deref()
+            .unwrap_or(&session.provider_name),
+        effective_agent.model.as_deref().unwrap_or(&session.model),
+        effective_agent.auth,
         &resolver,
         &provider_config,
         Arc::new(rupu_netflow::NullSink),
@@ -7021,7 +7046,7 @@ async fn compact_recorded(
     match rupu_agent::compact_messages(
         &session.message_history,
         provider.as_mut(),
-        &session.model,
+        effective_agent.model.as_deref().unwrap_or(&session.model),
         compact_threshold,
         last_input_tokens,
     )
@@ -7030,8 +7055,11 @@ async fn compact_recorded(
         Ok(Some(outcome)) => {
             record_offline_compaction_usage(
                 latest_transcript.as_deref(),
-                &session.provider_name,
-                &session.model,
+                effective_agent
+                    .provider
+                    .as_deref()
+                    .unwrap_or(&session.provider_name),
+                effective_agent.model.as_deref().unwrap_or(&session.model),
                 &outcome.usage,
             );
             let summarized = outcome.summarized_messages;
@@ -7085,13 +7113,36 @@ async fn compact_recorded(
             if let rupu_agent::CompactionError::Rejected { usage, .. } = &e {
                 record_offline_compaction_usage(
                     latest_transcript.as_deref(),
-                    &session.provider_name,
-                    &session.model,
+                    effective_agent
+                        .provider
+                        .as_deref()
+                        .unwrap_or(&session.provider_name),
+                    effective_agent.model.as_deref().unwrap_or(&session.model),
                     usage,
                 );
             }
             anyhow::bail!("compaction failed: {e}");
         }
+    }
+}
+
+/// An explicit window for a changed model cannot reuse the original model's
+/// output headroom or learned compaction percentage. Keep its limits untouched
+/// in the record so resetting the overrides restores the original behavior.
+fn settings_compaction_threshold(
+    session: &SessionRecord,
+    changed_model: bool,
+    window_override: Option<u32>,
+) -> Option<u64> {
+    if changed_model {
+        rupu_providers::model_limits::ModelLimits::from_pins(
+            window_override,
+            None,
+            session.compact_at_percent,
+        )
+        .compact_threshold()
+    } else {
+        session.compaction_threshold(window_override)
     }
 }
 
@@ -7480,6 +7531,15 @@ async fn run_compact_request(
     request: &SessionTurnRequest,
 ) -> anyhow::Result<()> {
     let (mut session, _scope) = read_session(global, session_id)?;
+    let mut effective_agent = session_agent_spec(global, &session)?;
+    let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+        global, scope, session_id,
+    ))?;
+    settings.validate()?;
+    anyhow::ensure!(
+        !settings.apply(&mut effective_agent),
+        "compact a model-overridden session with `session compact --window <tokens>`"
+    );
 
     // Load config for the same reason the turn path does: a compaction call is
     // a real provider call and must honor `[providers.<name>]` tuning
@@ -8026,6 +8086,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_active_scope(scope, "session _run-turn")?;
+    // Freeze settings before this turn performs any external work.
+    let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+        &global,
+        scope,
+        &session.session_id,
+    ))?;
+    settings.validate()?;
+
     let cfg_paths = paths::config_paths(
         &global,
         session.project_root.as_deref(),
@@ -8112,7 +8180,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 ))),
             },
         ));
-        let agent = session_agent_spec(&global, &session)?;
+        let mut agent = session_agent_spec(&global, &session)?;
+        let model_overridden = settings.apply(&mut agent);
         // The session's frozen skills as installed now, joined by the skills
         // the operator invoked in this turn (spec 2026-10-12 §5.2); one that
         // can't be given is reported and the turn runs without it. The skills
@@ -8172,7 +8241,11 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // first-turn failure (timeout, network blip), not an answer: the
         // assembler resolves again, a cache read unless stale.
         let overrides = rupu_runtime::assembly::Overrides {
-            limits: session.model_limits.clone(),
+            limits: if model_overridden {
+                None
+            } else {
+                session.model_limits.clone()
+            },
             skill_section: Some(session.skill_prompt.clone().unwrap_or_default()),
             ..Default::default()
         };
@@ -8221,8 +8294,8 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         let mode =
             PermissionMode::parse(&session.permission_mode).unwrap_or(PermissionMode::Readonly);
         let live_usage_state = Arc::new(Mutex::new(SessionLiveUsageWriterState::new(
-            &session.provider_name,
-            &session.model,
+            agent.provider.as_deref().unwrap_or(&session.provider_name),
+            agent.model.as_deref().unwrap_or(&session.model),
         )));
         let live_usage_global = global.clone();
         let live_usage_session_id = args.session_id.clone();
@@ -8408,10 +8481,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
         // On success AND failure: the limits carry to every later turn
         // without refetching. The note stays with this turn's notice: it
         // describes this resolution, not the limits.
-        session.model_limits = Some(rupu_providers::model_limits::ModelLimits {
-            note: None,
-            ..final_limits
-        });
+        if !model_overridden {
+            session.model_limits = Some(rupu_providers::model_limits::ModelLimits {
+                note: None,
+                ..final_limits
+            });
+        }
 
         let mut run_status = Some(RunStatus::Error);
         let mut duration_ms = 0;
@@ -8790,7 +8865,16 @@ fn enqueue_session_turn_request(
     let path = session_turn_request_path(global, scope, session_id, &request.request_id);
     let tmp = path.with_extension("tmp");
     let request = SessionTurnRequest {
-        version: request.written_version(),
+        version: if rupu_runtime::session_settings::SessionSettings::read(&session_dir(
+            global, scope, session_id,
+        ))?
+        .revision
+            > 0
+        {
+            SessionTurnRequest::VERSION
+        } else {
+            request.written_version()
+        },
         ..request
     };
     fs::write(&tmp, serde_json::to_vec_pretty(&request)?)?;
@@ -12217,6 +12301,178 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn session_settings_reach_the_turn_without_rewriting_defaults_or_limits() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, mut record) = idle_dense_session(&tmp, "ses_settings_turn");
+        record.message_history.clear();
+        record.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
+            123_456, 7_890,
+        ));
+        write_session(&global, SessionScope::Active, &record).unwrap();
+        rupu_runtime::session_settings::SessionSettings {
+            provider: Some("openai".into()),
+            model: Some("session-override-model".into()),
+            tools: Some(vec!["agents.list".into()]),
+            ..Default::default()
+        }
+        .save(&session_dir(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ))
+        .unwrap();
+        let request_id = "req_settings";
+        enqueue_session_turn_request(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+            SessionTurnRequest {
+                version: 1,
+                request_id: request_id.into(),
+                run_id: "run_settings".into(),
+                prompt: "go".into(),
+                transcript_path: record.transcripts_dir.join("run_settings.jsonl"),
+                enqueued_at: Utc::now(),
+                compact: false,
+                operator_skills: Vec::new(),
+            },
+        )
+        .unwrap();
+        let queued: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(session_turn_request_path(
+                &global,
+                SessionScope::Active,
+                &record.session_id,
+                request_id,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            queued["version"], 3,
+            "older workers must refuse configured turns"
+        );
+        with_mock_home(
+            &global,
+            r#"[{ "AssistantText": { "text": "configured", "stop": "end_turn" } }]"#,
+            run_turn(RunTurnArgs {
+                session_id: record.session_id.clone(),
+                run_id: "run_settings".into(),
+                prompt: "go".into(),
+                operator_skills: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let events: Vec<_> = JsonlReader::iter(record.transcripts_dir.join("run_settings.jsonl"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(events.iter().any(|e| matches!(e, TranscriptEvent::RunStart { provider, model, .. } if model == "session-override-model" && provider == "openai")));
+        let grants = events
+            .iter()
+            .find_map(|event| match event {
+                TranscriptEvent::ToolGrant { entries, .. } => Some(entries),
+                _ => None,
+            })
+            .expect("effective tool grant recorded");
+        assert!(grants.iter().any(|entry| entry.tool == "agents.list"));
+        assert!(!grants.iter().any(|entry| entry.tool == "read_file"));
+        let after = read_session(&global, &record.session_id).unwrap().0;
+        assert_eq!(after.model, record.model);
+        assert_eq!(after.provider_name, record.provider_name);
+        assert_eq!(after.model_limits.unwrap().input.tokens, Some(123_456));
+        assert!(!after.message_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_settings_compaction_uses_explicit_window_and_selected_provider() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, mut record) = idle_dense_session(&tmp, "ses_settings_compact");
+        record.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
+            200_000, 900,
+        ));
+        let last = record.transcripts_dir.join("run_previous.jsonl");
+        fs::write(&last, b"").unwrap();
+        record.last_transcript_path = Some(last.clone());
+        write_session(&global, SessionScope::Active, &record).unwrap();
+        rupu_runtime::session_settings::SessionSettings {
+            provider: Some("openai".into()),
+            model: Some("compact-override-model".into()),
+            ..Default::default()
+        }
+        .save(&session_dir(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            settings_compaction_threshold(&record, false, Some(1000)),
+            Some(100)
+        );
+        assert_eq!(
+            settings_compaction_threshold(&record, true, Some(1000)),
+            Some(800)
+        );
+        assert_eq!(settings_compaction_threshold(&record, true, None), None);
+        let before = fs::read(session_record_path(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ))
+        .unwrap();
+        let error = compact_recorded(&global, SessionScope::Active, &record.session_id, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit context window"));
+        let request = SessionTurnRequest {
+            version: 3,
+            request_id: "req_compact_settings".into(),
+            run_id: "run_compact_settings".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact_settings.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+            operator_skills: Vec::new(),
+        };
+        let error =
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("--window"));
+        assert_eq!(
+            fs::read(session_record_path(
+                &global,
+                SessionScope::Active,
+                &record.session_id
+            ))
+            .unwrap(),
+            before
+        );
+        assert!(!request.transcript_path.exists());
+
+        with_mock_home(
+            &global,
+            SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            compaction_usage(&last),
+            vec![(500, 10, "openai".into(), "compact-override-model".into())]
+        );
+        let after = read_session(&global, &record.session_id).unwrap().0;
+        assert!(after.message_history.len() < record.message_history.len());
+        assert_eq!(after.model, record.model);
+        assert_eq!(after.model_limits.unwrap().output.tokens, Some(900));
     }
 
     /// An idle session under `<tmp>/global` with a dense history that

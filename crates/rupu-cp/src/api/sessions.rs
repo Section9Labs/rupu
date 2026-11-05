@@ -22,6 +22,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/sessions/:id/runs", get(get_session_runs))
         .route("/api/sessions/:id/send", post(send_session))
+        .route(
+            "/api/sessions/:id/settings",
+            get(get_settings).put(put_settings),
+        )
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/restore", post(restore_session))
         .route("/api/sessions/:id/stop", post(stop_session))
@@ -1303,7 +1307,9 @@ async fn archive_session(
         conn.archive_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
@@ -1322,7 +1328,9 @@ async fn restore_session(
         conn.restore_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
 }
@@ -1340,7 +1348,9 @@ async fn delete_session(
         conn.delete_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
@@ -2154,7 +2164,10 @@ pub(crate) mod tests {
         .0;
 
         assert_eq!(absent, serde_json::json!({ "ok": true, "id": "s1" }));
-        assert_eq!(explicit_local, serde_json::json!({ "ok": true, "id": "s1" }));
+        assert_eq!(
+            explicit_local,
+            serde_json::json!({ "ok": true, "id": "s1" })
+        );
     }
 
     #[tokio::test]
@@ -2615,5 +2628,153 @@ pub(crate) mod tests {
         .expect("a malformed until must degrade, never error")
         .rows;
         assert_eq!(rows.len(), 1);
+    }
+}
+
+/// Settings are local to the session and take effect when the next turn starts.
+/// Existing turns keep their provider and grant; the agent definition is unchanged.
+async fn get_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SendQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || settings_response(&s, &id, q.host.as_deref(), None))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+async fn put_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SendQuery>,
+    Json(settings): Json<rupu_runtime::session_settings::SessionSettings>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || {
+        settings_response(&s, &id, q.host.as_deref(), Some(settings))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+fn settings_response(
+    s: &AppState,
+    id: &str,
+    host: Option<&str>,
+    update: Option<rupu_runtime::session_settings::SessionSettings>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(id)?;
+    if host.is_some_and(|h| h != "local") {
+        return Err(ApiError::not_available(
+            "session settings require a direct connection to the owning host",
+        ));
+    }
+    if update.is_some() {
+        crate::api::config::require_writable_to(s, "changing session settings")?;
+    }
+    let dto = active_session(s, id, "settings")?;
+    let dir = s.global_dir.join("sessions").join(id);
+    let settings = if let Some(settings) = update {
+        settings
+            .validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        settings
+            .save(&dir)
+            .map_err(|e| ApiError::conflict(e.to_string()))?
+    } else {
+        rupu_runtime::session_settings::SessionSettings::read(&dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("session.json")).map_err(|e| ApiError::internal(e.to_string()))?,
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "session_id": id, "host_id": "local", "settings": settings,
+        "defaults": { "provider": dto.provider_name, "model": dto.model, "tools": record["agent_tools"] },
+        "applies": "next_turn", "permission_mode": record["permission_mode"],
+        "tools": crate::api::tools::catalog(),
+        "history": "The conversation is retained. The selected provider receives Rupu's normalized message history on the next turn. Provider-specific options and learned model limits are re-resolved when the model changes."
+    })))
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    struct SettingsLauncher;
+    #[async_trait::async_trait]
+    impl crate::launcher::RunLauncher for SettingsLauncher {
+        async fn launch(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, crate::launcher::LaunchError> {
+            unreachable!("settings updates do not launch runs")
+        }
+    }
+    #[test]
+    fn settings_preserve_history_reject_wrong_host_and_detect_stale_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions/ses_settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = serde_json::json!({"session_id":"ses_settings","provider_name":"anthropic","model":"original","status":"idle","agent_tools":["read_file"],"message_history":[{"private":"retained"}]});
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(dir.join("session.json"), &bytes).unwrap();
+        let state = AppState::new(tmp.path().to_owned(), Default::default());
+        let first = settings_response(&state, "ses_settings", Some("local"), None)
+            .unwrap()
+            .0;
+        assert_eq!(first["settings"]["revision"], 0);
+        assert!(first.get("message_history").is_none());
+        let edit = rupu_runtime::session_settings::SessionSettings {
+            model: Some("next".into()),
+            tools: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(
+            settings_response(&state, "ses_settings", Some("local"), Some(edit.clone())).is_err()
+        );
+        assert!(!dir.join("settings.json").exists());
+        let state = state.with_launcher(Some(std::sync::Arc::new(SettingsLauncher)));
+        let saved = settings_response(&state, "ses_settings", Some("local"), Some(edit.clone()))
+            .unwrap()
+            .0;
+        assert_eq!(saved["settings"]["model"], "next");
+        assert_eq!(saved["defaults"]["model"], "original");
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("local"), Some(edit))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("remote"), None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            settings_response(&state, "../ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let invalid = rupu_runtime::session_settings::SessionSettings {
+            revision: 1,
+            tools: Some(vec!["unknown_tool".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, Some(invalid))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), bytes);
+        let archived = tmp.path().join("sessions-archive");
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::rename(&dir, archived.join("ses_settings")).unwrap();
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
     }
 }
