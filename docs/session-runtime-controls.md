@@ -12,11 +12,11 @@ Writes require a writable `rupu cp serve` deployment, matching the existing life
 
 ## Worker semantics
 
-The worker reads a settings snapshot at the start of each turn, overlays a temporary AgentSpec, and uses the existing RunAssembler. The actual provider/model and effective grants retain the normal transcript provenance. No agent definition or original session defaults are rewritten. Provider-specific authentication/options are cleared on provider changes. Model changes invalidate inherited limits, effort and context pins; override limits never replace the default model's cached limits. Explicit overrides disable the agent/config fallback chain.
+The worker reads a settings snapshot at the start of each turn, overlays a temporary AgentSpec, and uses the existing RunAssembler. The actual provider/model and effective grants retain the normal transcript provenance. No agent definition or original session defaults are rewritten. Provider-specific authentication/options are cleared on provider changes. Model changes invalidate inherited limits, effort and context pins; override limits never replace the default model's cached limits. Explicit model/provider selections disable the agent/config fallback chain, including selecting the original model explicitly. Tools-only edits preserve that chain.
 
 Queued messages use request version 3 after settings have been written. Old workers reject that version rather than ignoring it; normal stale-binary detection restarts workers on enqueue. Deploy the new control plane and worker together. Saving settings alone does not replace an already running turn's provider.
 
-Manual compaction after a model change requires an explicit window and uses the configured provider/model. Worker compact pseudo-turns without that contract refuse. Automatic per-turn compaction continues through the normal assembler.
+Manual compaction after a model change requires an explicit window and uses the configured provider/model. Its threshold uses that window and the agent's compaction percentage, without the original model's cached output headroom or learned limits. Worker compact pseudo-turns without that contract refuse. Automatic per-turn compaction continues through the normal assembler.
 
 ## Validation and limits
 
@@ -27,9 +27,13 @@ This branch adds local session configuration. It does not add remote proxy confi
 ## Verification receipt
 
 - `cargo check -p rupu-runtime -p rupu-cp -p rupu-cli --no-default-features` passed.
-- Runtime settings tests: 3 passed (revision/atomic replacement, validation, isolated AgentSpec overrides).
-- API settings test: passed (history preservation, identity/path checks, stale writes, read-only refusal).
-- Mock worker test: passed; verifies actual model/provider, effective tool grant, preserved defaults/history/limits. The final test also checks request version 3 for configured turns.
+- Runtime settings tests: 4 passed (revision/atomic replacement, validation, isolated AgentSpec overrides, and explicit original-model selection disabling fallback while tools-only edits preserve it). The new fallback regression failed before the fix.
+- API settings test: passed (history preservation, host/path checks, stale-write conflicts, invalid grants, read-only refusal, and archived-session refusal).
+- Mock worker/compaction tests: 2 passed; verify actual model/provider, effective tool grant, preserved defaults/history/limits, request version 3 for configured turns, explicit compaction windows without stale output headroom, and refusal of compaction paths that lack a window after a model change.
 - Existing compaction-to-next-turn history regression: passed.
 - Strict Clippy is not clean on this checkout/toolchain. The dependency-inclusive invocation stops on existing `async_trait`/`double_must_use` diagnostics in `rupu-netflow`. `--no-deps` reaches `rupu-cp` but stops on 88 existing macro-generated `double_must_use` diagnostics and one existing `result_large_err` in `api/findings.rs:890`. Those files were not changed by this work.
 - Default PDF-feature builds and real provider authentication/switching have not been exercised. The test provider is mocked; no installed CLI or live session was modified.
+
+## Integration
+
+The command-parity and orchestration branches started from foundation commit `1624fe99`. Integrate the final `codex/session-runtime-controls` branch before either dependent branch; those branches must include the review follow-up for fallback and compaction correctness. The `GET`/`PUT /api/sessions/:id/settings?host=local` request and response contract is unchanged by that follow-up. Native callers do not need a schema change.

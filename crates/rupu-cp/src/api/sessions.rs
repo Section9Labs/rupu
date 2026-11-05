@@ -2737,9 +2737,44 @@ mod settings_tests {
             .0;
         assert_eq!(saved["settings"]["model"], "next");
         assert_eq!(saved["defaults"]["model"], "original");
-        assert!(settings_response(&state, "ses_settings", Some("local"), Some(edit)).is_err());
-        assert!(settings_response(&state, "ses_settings", Some("remote"), None).is_err());
-        assert!(settings_response(&state, "../ses_settings", None, None).is_err());
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("local"), Some(edit))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("remote"), None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            settings_response(&state, "../ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let invalid = rupu_runtime::session_settings::SessionSettings {
+            revision: 1,
+            tools: Some(vec!["unknown_tool".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, Some(invalid))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
         assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), bytes);
+        let archived = tmp.path().join("sessions-archive");
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::rename(&dir, archived.join("ses_settings")).unwrap();
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
     }
 }

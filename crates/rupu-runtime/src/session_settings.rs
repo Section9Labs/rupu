@@ -118,7 +118,10 @@ impl SessionSettings {
             agent.context_window_tokens = None;
             agent.effort = None;
             agent.context_window = None;
+        }
+        if self.provider.is_some() || self.model.is_some() {
             // An override must not quietly fall back to the definition's model.
+            // Pinning the original model is still an explicit selection.
             agent.fallbacks = Some(Vec::new());
         }
         provider_changed || model_changed
@@ -173,6 +176,32 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+    #[test]
+    fn explicit_original_model_disables_fallbacks_but_tools_only_preserves_them() {
+        let original = rupu_agent::AgentSpec::parse(
+            "---\nname: reviewer\nprovider: anthropic\nmodel: original\nmaxTokens: 2048\nfallbacks:\n  - model: fallback\n---\nReview carefully.",
+        )
+        .unwrap();
+        let mut effective = original.clone();
+        let settings = SessionSettings {
+            model: original.model.clone(),
+            ..Default::default()
+        };
+        assert!(
+            !settings.apply(&mut effective),
+            "the model identity is unchanged"
+        );
+        assert_eq!(effective.fallbacks, Some(Vec::new()));
+        assert_eq!(effective.max_tokens, original.max_tokens);
+
+        let mut tools_only = original.clone();
+        assert!(!SessionSettings {
+            tools: Some(vec![]),
+            ..Default::default()
+        }
+        .apply(&mut tools_only));
+        assert_eq!(tools_only.fallbacks, original.fallbacks);
     }
     #[test]
     fn override_changes_only_the_turn_agent_and_clears_incompatible_pins() {

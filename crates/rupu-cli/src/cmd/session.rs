@@ -6939,8 +6939,7 @@ async fn compact_recorded(
         );
     }
 
-    let compact_threshold = session
-        .compaction_threshold(window_override)
+    let compact_threshold = settings_compaction_threshold(&session, changed_model, window_override)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "session {} has no known input limit: its model limits are unknown \
@@ -7124,6 +7123,26 @@ async fn compact_recorded(
             }
             anyhow::bail!("compaction failed: {e}");
         }
+    }
+}
+
+/// An explicit window for a changed model cannot reuse the original model's
+/// output headroom or learned compaction percentage. Keep its limits untouched
+/// in the record so resetting the overrides restores the original behavior.
+fn settings_compaction_threshold(
+    session: &SessionRecord,
+    changed_model: bool,
+    window_override: Option<u32>,
+) -> Option<u64> {
+    if changed_model {
+        rupu_providers::model_limits::ModelLimits::from_pins(
+            window_override,
+            None,
+            session.compact_at_percent,
+        )
+        .compact_threshold()
+    } else {
+        session.compaction_threshold(window_override)
     }
 }
 
@@ -12368,6 +12387,92 @@ mod tests {
         assert_eq!(after.provider_name, record.provider_name);
         assert_eq!(after.model_limits.unwrap().input.tokens, Some(123_456));
         assert!(!after.message_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_settings_compaction_uses_explicit_window_and_selected_provider() {
+        let _guard = crate::test_support::ENV_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (global, mut record) = idle_dense_session(&tmp, "ses_settings_compact");
+        record.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
+            200_000, 900,
+        ));
+        let last = record.transcripts_dir.join("run_previous.jsonl");
+        fs::write(&last, b"").unwrap();
+        record.last_transcript_path = Some(last.clone());
+        write_session(&global, SessionScope::Active, &record).unwrap();
+        rupu_runtime::session_settings::SessionSettings {
+            provider: Some("openai".into()),
+            model: Some("compact-override-model".into()),
+            ..Default::default()
+        }
+        .save(&session_dir(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            settings_compaction_threshold(&record, false, Some(1000)),
+            Some(100)
+        );
+        assert_eq!(
+            settings_compaction_threshold(&record, true, Some(1000)),
+            Some(800)
+        );
+        assert_eq!(settings_compaction_threshold(&record, true, None), None);
+        let before = fs::read(session_record_path(
+            &global,
+            SessionScope::Active,
+            &record.session_id,
+        ))
+        .unwrap();
+        let error = compact_recorded(&global, SessionScope::Active, &record.session_id, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("explicit context window"));
+        let request = SessionTurnRequest {
+            version: 3,
+            request_id: "req_compact_settings".into(),
+            run_id: "run_compact_settings".into(),
+            prompt: "[compact]".into(),
+            transcript_path: record.transcripts_dir.join("run_compact_settings.jsonl"),
+            enqueued_at: Utc::now(),
+            compact: true,
+            operator_skills: Vec::new(),
+        };
+        let error =
+            run_compact_request(&global, SessionScope::Active, &record.session_id, &request)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("--window"));
+        assert_eq!(
+            fs::read(session_record_path(
+                &global,
+                SessionScope::Active,
+                &record.session_id
+            ))
+            .unwrap(),
+            before
+        );
+        assert!(!request.transcript_path.exists());
+
+        with_mock_home(
+            &global,
+            SUMMARY_SCRIPT,
+            compact(&record.session_id, Some(1000), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            compaction_usage(&last),
+            vec![(500, 10, "openai".into(), "compact-override-model".into())]
+        );
+        let after = read_session(&global, &record.session_id).unwrap().0;
+        assert!(after.message_history.len() < record.message_history.len());
+        assert_eq!(after.model, record.model);
+        assert_eq!(after.model_limits.unwrap().output.tokens, Some(900));
     }
 
     /// An idle session under `<tmp>/global` with a dense history that
