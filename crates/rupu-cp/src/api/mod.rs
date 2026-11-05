@@ -41,6 +41,7 @@ pub mod run_streams;
 pub mod runs;
 pub mod scm;
 pub mod sessions;
+pub mod session_commands;
 pub mod skills;
 pub mod source;
 pub mod tools;

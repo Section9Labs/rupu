@@ -43,6 +43,9 @@ use rupu_providers::types::{Message, StreamEvent};
 use rupu_runtime::argv::{RunArgv, SessionWorker};
 use rupu_runtime::provider_factory;
 use rupu_runtime::services::session_compaction as compaction;
+use rupu_runtime::session_commands::{
+    parse_attach_command, AttachCommand, RoutedAttachCommand, SLASH_COMMANDS,
+};
 use rupu_runtime::sessions::{
     archived_sessions_dir, delete_session_owned_artifacts, load_sessions_in_scope,
     parse_session_record, session_dir, session_record_path, sessions_dir, SessionPruneReport,
@@ -291,29 +294,6 @@ impl SessionStatusUi for SessionStatus {
 enum AttachExit {
     Detach,
     Quit,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AttachCommand {
-    Help,
-    Status,
-    Detach,
-    Quit,
-    Cancel,
-    Compact,
-    Stop,
-    History,
-    Transcript,
-    Runs,
-    Coverage,
-    Routed(RoutedAttachCommand),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RoutedAttachCommand {
-    root: String,
-    args: Vec<String>,
-    display: String,
 }
 
 enum SessionInput {
@@ -1098,7 +1078,10 @@ async fn list(
             }
             let (session, status) = match stored {
                 StoredSession::Current(mut session) => {
-                    if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+                    if scope == SessionScope::Active
+                        && reconcile_stale_session(&mut session)
+                        && std::env::var_os("RUPU_SESSION_READ_ONLY").is_none()
+                    {
                         write_session(&global, scope, &session)?;
                     }
                     let status = session.status.as_str().to_string();
@@ -1187,7 +1170,10 @@ async fn show(
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, session_id)?;
-    if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
+    if scope == SessionScope::Active
+        && reconcile_stale_session(&mut session)
+        && std::env::var_os("RUPU_SESSION_READ_ONLY").is_none()
+    {
         write_session(&global, scope, &session)?;
     }
     let pwd = std::env::current_dir()?;
@@ -4781,7 +4767,11 @@ fn resolve_inline_session_aliases(
                 && (argv.get(2).is_none()
                     || argv.get(2).is_some_and(|value| value == "current")) =>
         {
-            argv.insert(2, session.session_id.clone());
+            if argv.get(2).is_some() {
+                argv[2] = session.session_id.clone();
+            } else {
+                argv.push(session.session_id.clone());
+            }
         }
         "transcript" if argv.get(1).is_some_and(|value| value == "show") => {
             if let Some(run_id) = inline_session_run_alias(session, state, argv.get(2)) {
@@ -5965,85 +5955,6 @@ fn handle_session_input(
     Ok(AttachControl::Continue)
 }
 
-struct SlashCommand {
-    name: &'static str,
-    description: &'static str,
-    routed: bool,
-}
-
-const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "cancel",
-        description: "cancel the active run",
-        routed: false,
-    },
-    SlashCommand {
-        name: "compact",
-        description: "summarize older context now (frees the window)",
-        routed: false,
-    },
-    SlashCommand {
-        name: "coverage",
-        description: "show coverage audit for this session's target",
-        routed: false,
-    },
-    SlashCommand {
-        name: "detach",
-        description: "leave the live view (keep session running)",
-        routed: false,
-    },
-    SlashCommand {
-        name: "help",
-        description: "show available commands",
-        routed: false,
-    },
-    SlashCommand {
-        name: "history",
-        description: "replay prompt history",
-        routed: false,
-    },
-    SlashCommand {
-        name: "issues",
-        description: "(routed) issues show / list",
-        routed: true,
-    },
-    SlashCommand {
-        name: "quit",
-        description: "quit and stop the session",
-        routed: false,
-    },
-    SlashCommand {
-        name: "runs",
-        description: "list runs in this session",
-        routed: false,
-    },
-    SlashCommand {
-        name: "session",
-        description: "(routed) session show / list",
-        routed: true,
-    },
-    SlashCommand {
-        name: "status",
-        description: "session status detail",
-        routed: false,
-    },
-    SlashCommand {
-        name: "stop",
-        description: "stop the worker",
-        routed: false,
-    },
-    SlashCommand {
-        name: "transcript",
-        description: "show the current transcript",
-        routed: false,
-    },
-    SlashCommand {
-        name: "workflow",
-        description: "(routed) workflow show / list / show-run",
-        routed: true,
-    },
-];
-
 const SLASH_COMPLETION_VISIBLE_ROWS: usize = 8;
 
 fn slash_completion_candidates(query: &str) -> Vec<usize> {
@@ -6153,97 +6064,6 @@ fn slash_completion_accept(state: &mut SessionInteractiveState) {
         state.input_buffer.push(' ');
     }
     state.completion = None;
-}
-
-fn parse_attach_command(input: &str) -> Option<AttachCommand> {
-    let command = input.strip_prefix('/')?.trim();
-    match command {
-        "help" | "h" | "?" => Some(AttachCommand::Help),
-        "status" => Some(AttachCommand::Status),
-        "detach" => Some(AttachCommand::Detach),
-        "quit" | "exit" => Some(AttachCommand::Quit),
-        "cancel" => Some(AttachCommand::Cancel),
-        "compact" => Some(AttachCommand::Compact),
-        "stop" => Some(AttachCommand::Stop),
-        "history" => Some(AttachCommand::History),
-        "transcript" => Some(AttachCommand::Transcript),
-        "runs" => Some(AttachCommand::Runs),
-        "coverage" => Some(AttachCommand::Coverage),
-        _ => parse_routed_attach_command(command).map(AttachCommand::Routed),
-    }
-}
-
-fn parse_routed_attach_command(command: &str) -> Option<RoutedAttachCommand> {
-    let argv = tokenize_attach_command(command)?;
-    let (root, args) = argv.split_first()?;
-    if !matches!(
-        root.as_str(),
-        "workflow" | "session" | "transcript" | "issues"
-    ) {
-        return None;
-    }
-    if !inline_command_is_allowed(root, args) {
-        return None;
-    }
-    Some(RoutedAttachCommand {
-        root: root.clone(),
-        args: args.to_vec(),
-        display: command.to_string(),
-    })
-}
-
-fn tokenize_attach_command(command: &str) -> Option<Vec<String>> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut quote = None;
-    while let Some(ch) = chars.next() {
-        match (quote, ch) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            (Some(_), c) => current.push(c),
-            (None, '"' | '\'') => quote = Some(ch),
-            (None, '\\') => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-            }
-            (None, c) if c.is_whitespace() => {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-            }
-            (None, c) => current.push(c),
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
-fn inline_command_is_allowed(root: &str, args: &[String]) -> bool {
-    let Some(subcommand) = args.first().map(|value| value.as_str()) else {
-        return false;
-    };
-    match root {
-        "session" => matches!(subcommand, "show" | "list"),
-        "transcript" => matches!(subcommand, "show" | "list"),
-        "workflow" => matches!(subcommand, "show" | "show-run" | "runs" | "list"),
-        "issues" => matches!(subcommand, "show" | "list"),
-        _ => false,
-    }
 }
 
 fn execute_attach_command(
@@ -7317,42 +7137,16 @@ fn cancel_active_turn(
 }
 
 fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Result<Option<String>> {
-    let (mut session, scope) = read_session(global, session_id)?;
+    let (session, scope) = read_session(global, session_id)?;
     ensure_active_scope(scope, "session cancel")?;
-    if reconcile_stale_session(&mut session) {
-        write_session(global, scope, &session)?;
-    }
-    let Some(run_id) = session.active_run_id.clone() else {
+    let Some(run_id) = session.active_run_id else {
         return Ok(None);
     };
-    if let Some(pid) = session
-        .active_pid
-        .or(session.worker_pid)
-        .filter(|pid| pid_is_running(*pid))
-    {
-        let _ = terminate_pid(pid);
-    }
-    session.status = SessionStatus::Idle;
-    session.updated_at = Utc::now();
-    session.last_error = Some("turn cancelled by operator".into());
-    session.last_run_id = Some(run_id.clone());
-    session.last_transcript_path = session.active_transcript_path.clone();
-    session.active_run_id = None;
-    session.active_transcript_path = None;
-    session.active_pid = None;
-    session.worker_pid = None;
-    if let Some(run) = session.runs.iter_mut().find(|run| run.run_id == run_id) {
-        run.completed_at = Some(Utc::now());
-        run.status = Some(RunStatus::Aborted);
-        run.error = Some("turn cancelled by operator".into());
-    }
-    write_session(global, scope, &session)?;
-    clear_session_live_usage(global, scope, session_id)?;
-    if session_has_pending_turn_requests(global, scope, session_id)? {
-        let (mut refreshed, scope) = read_session(global, session_id)?;
-        refreshed.status = SessionStatus::Idle;
-        let _ = ensure_session_worker(global, &mut refreshed, scope)?;
-    }
+    rupu_runtime::session_cancel::request(
+        &session_dir(global, scope, session_id),
+        &run_id,
+        rupu_launch::proc::process_alive,
+    )?;
     Ok(Some(run_id))
 }
 
@@ -7530,6 +7324,12 @@ async fn run_compact_request(
     session_id: &str,
     request: &SessionTurnRequest,
 ) -> anyhow::Result<()> {
+    let cancellation = rupu_runtime::session_cancel::TurnCancellation::start(
+        &session_dir(global, scope, session_id),
+        &request.run_id,
+        std::process::id(),
+        rupu_launch::proc::own_start_stamp(),
+    )?;
     let (mut session, _scope) = read_session(global, session_id)?;
     let mut effective_agent = session_agent_spec(global, &session)?;
     let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
@@ -7727,15 +7527,25 @@ async fn run_compact_request(
         // The summary, with the session's loaded skills put back; a re-attach
         // that can't read the skills fails the request like a failed summary,
         // leaving the history as it was.
-        let compacted = match rupu_agent::compact_messages(
-            &session.message_history,
-            provider.as_mut(),
-            &session.model,
-            compact_threshold,
-            last_input_tokens,
-        )
-        .await
-        {
+        let summary = tokio::select! {
+            biased;
+            _ = cancellation.token.cancelled() => {
+                writer.write(&TranscriptEvent::RunComplete {
+                    run_id: request.run_id.clone(), status: RunStatus::Aborted,
+                    total_tokens: 0, duration_ms: (Utc::now() - started_at).num_milliseconds().max(0) as u64,
+                    error: Some("turn cancelled by operator".into()), outcome: None,
+                })?;
+                writer.flush()?;
+                finalize_compact_run(global, scope, session_id, &mut session, request,
+                    &started_at, RunStatus::Aborted, Some("turn cancelled by operator".into()))?;
+                return Ok(());
+            }
+            result = rupu_agent::compact_messages(
+                &session.message_history, provider.as_mut(), &session.model,
+                compact_threshold, last_input_tokens,
+            ) => result,
+        };
+        let compacted = match summary {
             Ok(Some(outcome)) => {
                 // The summariser call is billed: record it in this pseudo-run's
                 // own transcript (as a `purpose: compaction` usage, never a turn).
@@ -7893,7 +7703,7 @@ fn finalize_compact_run(
     // history just persisted above.
     s.history_source_transcript = session.history_source_transcript.clone();
     s.customer = session.customer.clone();
-    s.status = if status == RunStatus::Ok {
+    s.status = if matches!(status, RunStatus::Ok | RunStatus::Aborted) {
         SessionStatus::Idle
     } else {
         SessionStatus::Failed
@@ -8086,6 +7896,12 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_active_scope(scope, "session _run-turn")?;
+    let cancellation = rupu_runtime::session_cancel::TurnCancellation::start(
+        &session_dir(&global, scope, &args.session_id),
+        &args.run_id,
+        std::process::id(),
+        rupu_launch::proc::own_start_stamp(),
+    )?;
     // Freeze settings before this turn performs any external work.
     let settings = rupu_runtime::session_settings::SessionSettings::read(&session_dir(
         &global,
@@ -8385,7 +8201,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
                 on_stream_event: Some(on_stream_event),
             },
             hooks: Default::default(),
-            pause: None,
+            pause: Some(cancellation.token.clone()),
             services: rupu_runtime::assembly::LaunchServices {
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
@@ -8524,7 +8340,7 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
 
         match outcome {
             Ok(result) => {
-                session.status = if result.status == RunStatus::Ok {
+                session.status = if result.status == RunStatus::Ok || result.paused {
                     SessionStatus::Idle
                 } else {
                     SessionStatus::Failed
@@ -9039,6 +8855,7 @@ fn clear_session_turn_queue(
     Ok(())
 }
 
+#[cfg(test)]
 fn session_has_pending_turn_requests(
     global: &Path,
     scope: SessionScope,
@@ -9286,6 +9103,10 @@ fn move_if_exists(from: &Path, to: &Path) -> anyhow::Result<()> {
 // live here — see `terminate_pid`'s doc comment, and
 // `terminate_pid_refuses_to_signal_this_process` for the regression test).
 use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
+
+#[cfg(test)]
+#[path = "session_command_tests.rs"]
+mod session_command_tests;
 
 #[cfg(test)]
 #[path = "session_skills_tests.rs"]
@@ -12478,7 +12299,7 @@ mod tests {
     /// An idle session under `<tmp>/global` with a dense history that
     /// reliably exceeds a tiny compaction window (the recipe of
     /// `compact_clears_history_source_transcript_and_next_turn_seeds_inline`).
-    fn idle_dense_session(tmp: &tempfile::TempDir, session_id: &str) -> (PathBuf, SessionRecord) {
+    pub(super) fn idle_dense_session(tmp: &tempfile::TempDir, session_id: &str) -> (PathBuf, SessionRecord) {
         let global = tmp.path().join("global");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create workspace dir");

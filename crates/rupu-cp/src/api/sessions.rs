@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(super::session_commands::routes())
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route(
@@ -711,7 +712,7 @@ impl SessionsQuery {
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct SessionHostQuery {
     #[serde(default)]
-    host: Option<String>,
+    pub(crate) host: Option<String>,
 }
 
 /// `GET /api/sessions[?host=<id>][&customer=<slug>|none][&q=…]`
@@ -1364,7 +1365,7 @@ async fn delete_session(
 /// The local session `id` a stop or compact acts on, read from its active
 /// directory: 404 when there is none, 409 when it is archived (the CLI
 /// refuses both commands on an archived session).
-fn active_session(s: &AppState, id: &str, command: &str) -> ApiResult<SessionDto> {
+pub(crate) fn active_session(s: &AppState, id: &str, command: &str) -> ApiResult<SessionDto> {
     let active = s.global_dir.join("sessions").join(id);
     if let Some(dto) = load_session_file(&active)? {
         return Ok(dto);
@@ -1396,7 +1397,7 @@ async fn refuse_while_compacting(s: &AppState, id: &str) -> ApiResult<()> {
 /// `POST /api/sessions/:id/stop`: `rupu session stop <id>` — ends the
 /// session's worker and its running turn, and marks the session stopped.
 /// Answers `{ok, id}` once the session record says stopped.
-async fn stop_session(
+pub(crate) async fn stop_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<SessionHostQuery>,
@@ -1427,7 +1428,7 @@ pub(crate) struct CompactBody {
 /// log}` once it has started; `GET /api/sessions/:id` shows `compacting`
 /// and, when it ends, `last_compaction`. 409 while a turn or another
 /// compaction is running.
-async fn compact_session(
+pub(crate) async fn compact_session(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<SessionHostQuery>,

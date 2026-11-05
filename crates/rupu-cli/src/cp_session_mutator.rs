@@ -69,6 +69,19 @@ pub(crate) fn classify_failure(action: SessionAction, stderr: &str) -> SessionMu
 
 #[async_trait::async_trait]
 impl SessionMutator for SubprocessSessionMutator {
+    fn supports_commands(&self) -> bool {
+        true
+    }
+    async fn command(
+        &self,
+        global: &Path,
+        id: &str,
+        command: rupu_runtime::session_commands::AttachCommand,
+    ) -> Result<rupu_cp::session_commands::CommandOutput, rupu_cp::session_commands::CommandError>
+    {
+        crate::cp_session_commands::execute(&self.exe, global, id, command).await
+    }
+
     async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError> {
         let argv = build_argv(id, action);
         let out = tokio::process::Command::new(&self.exe)

@@ -30,6 +30,7 @@ pub mod query;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;
+pub mod session_commands;
 pub mod session_sender;
 pub mod session_starter;
 pub mod skill_installer;
