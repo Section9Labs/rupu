@@ -8,3 +8,5 @@ mod subagent;
 mod support;
 mod w7;
 mod workflow_step;
+
+mod session;

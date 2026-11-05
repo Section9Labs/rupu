@@ -98,6 +98,8 @@ pub struct Overrides {
 /// Services the site provides (they belong to the root run, not this one).
 #[derive(Default)]
 pub struct LaunchServices {
+    /// Frozen session configuration; only meaningful for SessionTurn.
+    pub session_orchestration: bool,
     /// The launcher behind `dispatch` / `join` (`rupu_launch::RunLauncher`),
     /// offered when the origin's defaults allow it.
     pub launcher: Option<Arc<dyn Launcher>>,
