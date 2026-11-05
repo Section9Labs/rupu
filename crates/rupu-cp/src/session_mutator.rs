@@ -40,6 +40,20 @@ pub enum SessionMutateError {
 
 #[async_trait]
 pub trait SessionMutator: Send + Sync {
+    fn supports_commands(&self) -> bool {
+        false
+    }
+    async fn command(
+        &self,
+        _global: &std::path::Path,
+        _id: &str,
+        _command: rupu_runtime::session_commands::AttachCommand,
+    ) -> Result<crate::session_commands::CommandOutput, crate::session_commands::CommandError> {
+        Err(crate::session_commands::CommandError::Failed(
+            "session command adapter unavailable".into(),
+        ))
+    }
+
     async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError>;
 
     /// Start `rupu session compact <id> [--window <window>] --compaction-id

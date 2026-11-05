@@ -985,3 +985,30 @@ async fn session_send_refuses_an_unknown_skill_before_enqueue() {
         .failure()
         .stderr(predicate::str::contains("<PROMPT>"));
 }
+
+#[tokio::test]
+async fn session_command_reads_do_not_reconcile_records() {
+    let _env = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    write_session(&home, "ses_inspect", "running", Some(4_000_000), false);
+    let path = home.join("sessions/ses_inspect/session.json");
+    let before = std::fs::read(&path).unwrap();
+    for args in [
+        vec!["session", "show", "ses_inspect", "--no-pager"],
+        vec!["session", "list"],
+    ] {
+        rupu(&home, tmp.path())
+            .env("RUPU_SESSION_READ_ONLY", "1")
+            .args(args)
+            .assert()
+            .success();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    rupu(&home, tmp.path())
+        .env_remove("RUPU_SESSION_READ_ONLY")
+        .args(["session", "show", "ses_inspect", "--no-pager"])
+        .assert().success();
+    assert_ne!(std::fs::read(&path).unwrap(), before, "ordinary CLI inspection still reconciles the stale fixture");
+
+}

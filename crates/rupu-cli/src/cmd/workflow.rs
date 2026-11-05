@@ -2609,6 +2609,12 @@ async fn runs(
     // expired runs the next time they look at the list.
     let now = chrono::Utc::now();
     for r in &mut all {
+        // Native session command inspection is read-only even when an overdue
+        // gate would normally be lazily expired by this CLI listing.
+        if std::env::var_os("RUPU_SESSION_READ_ONLY").is_some() {
+            break;
+        }
+
         let on_timeout = gate_on_timeout_for(&store, r);
 
         // ISSUES.md I-25: `rupu workflow runs` is a *listing* command and
