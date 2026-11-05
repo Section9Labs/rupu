@@ -4,6 +4,15 @@ use super::*;
 
 #[tokio::test]
 async fn cooperative_cancel_keeps_worker_and_next_turn_usable() {
+    cancel_then_continue(false).await;
+}
+
+#[tokio::test]
+async fn cooperative_cancel_orchestration_keeps_worker_and_next_turn_usable() {
+    cancel_then_continue(true).await;
+}
+
+async fn cancel_then_continue(orchestration: bool) {
     let _env = crate::test_support::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     let (global, mut record) = idle_dense_session(&tmp, "ses_cancel");
@@ -23,6 +32,14 @@ async fn cooperative_cancel_keeps_worker_and_next_turn_usable() {
     };
     let first = make_request("run_cancel");
     let dir = session_dir(&global, SessionScope::Active, &record.session_id);
+    if orchestration {
+        rupu_runtime::session_orchestration::SessionOrchestration {
+            revision: 0,
+            enabled: true,
+        }
+        .save(&dir)
+        .unwrap();
+    }
     let cancel = async {
         loop {
             if rupu_runtime::session_cancel::available(
@@ -30,7 +47,8 @@ async fn cooperative_cancel_keeps_worker_and_next_turn_usable() {
                 "run_cancel",
                 Some(std::process::id()),
                 rupu_launch::proc::process_alive,
-            ) {
+            ) && (!orchestration || dir.join("orchestration-turns.json").exists())
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -102,6 +120,17 @@ async fn cooperative_cancel_keeps_worker_and_next_turn_usable() {
     assert!(serde_json::to_string(&final_record.message_history)
         .unwrap()
         .contains("next turn works"));
+    if orchestration {
+        let journal: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("orchestration-turns.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            journal["turns"],
+            serde_json::json!(["run_cancel", "run_after"])
+        );
+        assert!(!dir.join("cancel-run_cancel.owner.json").exists());
+        assert!(!dir.join("cancel-run_after.owner.json").exists());
+    }
 }
 
 #[tokio::test]

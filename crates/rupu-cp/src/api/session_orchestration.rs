@@ -225,7 +225,7 @@ mod tests {
     async fn wire_rejects_unknown_fields() {
         use tower::ServiceExt;
         let (_tmp, s) = fixture();
-        let response = routes()
+        let response = crate::api::sessions::routes()
             .with_state(s)
             .oneshot(
                 axum::http::Request::builder()

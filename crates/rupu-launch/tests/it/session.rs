@@ -88,6 +88,15 @@ async fn session_child_result_survives_turn_and_launcher_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_checkpoint_reschedules_pending_work_with_current_permission_ceiling() {
+    checkpoint_then_resume(ParentEnd::Completed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_cancel_checkpoints_children_and_resumes_with_current_permission_ceiling() {
+    checkpoint_then_resume(ParentEnd::Paused).await;
+}
+
+async fn checkpoint_then_resume(end: ParentEnd) {
     let h = home();
     let dir = h.global().join("sessions/ses_test");
     let ctx1 = context(&h, "turn_one", PermissionMode::Bypass);
@@ -107,7 +116,7 @@ async fn session_checkpoint_reschedules_pending_work_with_current_permission_cei
         )
         .await
         .unwrap();
-    l1.finish(&ctx1.identity, ParentEnd::Completed).await;
+    l1.finish(&ctx1.identity, end).await;
     assert_eq!(
         ledger::read(&h.runs().join("turn_one"))[0].state(),
         ChildState::Interrupted
