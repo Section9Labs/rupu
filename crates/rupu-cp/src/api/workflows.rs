@@ -2942,7 +2942,6 @@ mod tests {
                     raw: VALID_YAML.replace("hi", label),
                     scope_kind: Some(ScopeKind::Project),
                     scope_id: Some(id.into()),
-                    ..Default::default()
                 }),
             )
             .await
@@ -2970,7 +2969,6 @@ mod tests {
             Json(WorkflowWriteBody {
                 raw: VALID_YAML.replace("hi", "updated-b"),
                 expected_revision: detail["revision"].as_str().map(str::to_string),
-                ..Default::default()
             }),
         )
         .await
@@ -2992,7 +2990,6 @@ mod tests {
                 raw: VALID_YAML.into(),
                 scope_kind: Some(ScopeKind::Project),
                 scope_id: Some("ws_b".into()),
-                ..Default::default()
             }),
         )
         .await
@@ -3025,14 +3022,13 @@ mod tests {
                 Json(WorkflowWriteBody {
                     raw: VALID_YAML.replace("hi", text),
                     expected_revision: Some(revision(VALID_YAML)),
-                    ..Default::default()
                 }),
             )
         };
         let (a, b) = tokio::join!(save("first"), save("second"));
         assert_ne!(a.is_ok(), b.is_ok());
-        let loser = if a.is_err() {
-            a.unwrap_err()
+        let loser = if let Err(error) = a {
+            error
         } else {
             b.unwrap_err()
         };

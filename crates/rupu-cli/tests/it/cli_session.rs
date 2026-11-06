@@ -11,6 +11,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+const NEWER_SESSION_VERSION: u32 = rupu_runtime::sessions::SessionRecord::VERSION + 1;
 
 #[derive(Serialize)]
 struct TestRun {
@@ -465,7 +466,7 @@ fn make_newer(home: &std::path::Path, root: &str, session_id: &str) -> Vec<u8> {
     let path = home.join(root).join(session_id).join("session.json");
     let mut payload: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    payload["version"] = 4.into();
+    payload["version"] = NEWER_SESSION_VERSION.into();
     payload["from_the_future"] = "kept".into();
     std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap()).unwrap();
     std::fs::read(&path).unwrap()
@@ -515,7 +516,9 @@ async fn session_list_shows_a_newer_record_and_never_writes_it() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("session ses_newer01 was written by a newer rupu (record version 4)"),
+        stderr.contains(&format!(
+            "session ses_newer01 was written by a newer rupu (record version {NEWER_SESSION_VERSION})"
+        )),
         "{stderr}"
     );
     assert_eq!(
@@ -558,9 +561,9 @@ async fn session_prune_skips_a_newer_record() {
         .assert()
         .success()
         .stdout(predicate::str::contains("ses_newer02").not())
-        .stderr(predicate::str::contains(
-            "session ses_newer02 was written by a newer rupu (record version 4)",
-        ));
+        .stderr(predicate::str::contains(format!(
+            "session ses_newer02 was written by a newer rupu (record version {NEWER_SESSION_VERSION})"
+        )));
     assert_eq!(
         std::fs::read(home.join("sessions-archive/ses_newer02/session.json")).unwrap(),
         before

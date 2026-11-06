@@ -10,14 +10,26 @@ The real API-key Anthropic account returned 16 models from a targeted refresh on
 
 ## OpenAI compatibility change
 
-Only default production ChatGPT OAuth clients gain a fallback to `https://api.openai.com/v1/models` when their legacy catalog is empty, malformed, fails, or times out. The fallback uses the same selected access token. It does not switch to an API key, another account, or another credential store. Custom endpoint overrides do not enable this fallback, and no legacy account-ID header is sent to the public route.
+The actual failure was the hardcoded Codex `client_version=0.50.0`. The server filters model availability by minimum client version. A read-only comparison using the same existing Rupu `openai/sso` credential and account header on 2026-11-06 established:
 
-The current public ChatGPT schema uses a `models` array. The parser keeps entries explicitly marked `visibility: "list"`, uses canonical `slug` values, and preserves server ordering. It does not invent model capabilities or limits missing from the response. Existing API-key discovery, including `data` listings and `supported_in_api` filtering, remains intact. The documented public listing has no pagination contract.
+| Catalog request | HTTP status | Returned models | Picker-visible models |
+| --- | --- | --- | --- |
+| Codex backend, version 0.50.0 | 200 | 0 | 0 |
+| Codex backend, version 0.166.0 | 200 | 15 | 13 |
+| Codex backend, version 0.166.0 plus Codex originator | 200 | 15 | 13 |
 
-Primary reference: [OpenAI — Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference). This change is model discovery only; it does not change inference routing or claim successful inference with any listed model.
+The installed Codex CLI reports 0.166.0, and its tagged official source passes its client version to the same backend model-list route. Rupu now uses that verified catalog protocol baseline through one shared URL builder, used by both listing APIs and the API-key metadata attempt. The CP does not need a Codex installation. This is a compatibility pin that must be maintained when the upstream catalog changes; it is not Rupu's package version.
+
+The previous attempt to fall back to public `/v1/models` has been removed. Parent integration demonstrated that the existing Codex OAuth credential lacks the `api.model.read` scope required there. The newer public ChatGPT plan-usage documentation applies to a different credential flow and did not establish compatibility with this stored login.
+
+Discovery preserves the selected token, account, and configured endpoint. OAuth never switches to an API key or another account, and custom endpoint overrides remain isolated. Rich catalog entries with explicit non-list visibility are omitted; older/custom/API-key entries without visibility remain supported. Server ordering, available context metadata, API-key `data` listings, and `supported_in_api` filtering remain intact. Unknown capability metadata is not fabricated.
+
+Primary reference: [Codex 0.166.0 model-list implementation](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/endpoint/models.rs). The parser consumes the returned `models` array; this endpoint has no model-list pagination contract. No inference routing changed, and a listed model does not establish successful inference.
 
 ## Validation
 
-All 30 tests in `openai_codex::fetch_models_tests` pass, including five new regressions for public visibility/order, exact production routing, same-token fallback without a legacy account header, preservation of usable legacy catalogs, and error propagation. Existing API-key fallback and token-refresh persistence tests remain green. Tests use the shared historical target and the current combined tree. The first sandbox run could not bind local HTTP mock listeners; the rerun with local networking allowed passed. `rustfmt` and the scoped `git diff --check` also pass.
+The superseded fallback passed its 30 unit tests but failed live acceptance with a scope error; those tests did not prove the credential-flow assumption. The corrected version-gate implementation has new regressions for current-versus-obsolete requests, preservation of a configured custom endpoint and selected bearer/account header, and visibility filtering across both listing methods. Existing API-key fallback and token-refresh persistence coverage is retained. `rustfmt` and scoped `git diff --check` pass; the corrected provider test filter is pending the shared target becoming available.
 
-A targeted model-only refresh through the updated runtime remains pending parent integration. No completion request, agent job, CP restart, provider reauthentication, or release was performed by this workstream.
+The direct live probe proves the version gate and real account model counts. A targeted refresh through the rebuilt CP and its authoritative cache remains pending parent integration. No completion request, agent job, CP restart, provider reauthentication, or release was performed by this workstream. Probes printed only status/count/schema metadata, not credentials or account IDs.
+
+The final corrected implementation passed all 27 `fetch_models_tests` on the combined tree. The earlier 30-test result covered the removed public fallback and is superseded. No model completion was part of this check.
