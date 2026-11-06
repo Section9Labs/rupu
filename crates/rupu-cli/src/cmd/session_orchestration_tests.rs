@@ -81,7 +81,7 @@ async fn orchestration_is_assembled_in_real_session_turns_and_survives_disable()
         assert!(!grant.iter().any(|g| g.tool == "budget.status"));
         let after = read_session(&global, &record.session_id).unwrap().0;
         assert_eq!(after.status, SessionStatus::Idle, "{:?}", after.last_error);
-        assert!(after.total_turns >= index as u32 + 1);
+        assert!(after.total_turns > index as u32);
         assert_eq!(after.permission_mode, "readonly");
     }
     let journal: serde_json::Value =
