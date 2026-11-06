@@ -78,6 +78,9 @@ import UsageTimeline from '../components/usage/UsageTimeline';
 import { type UsageMetric } from '../components/dashboard/UsageTimelineStacked';
 import ModelBreakdownTable from '../components/dashboard/ModelBreakdownTable';
 import { Spinner } from '../components/ui/Spinner';
+import { Segmented } from '../components/ui/Segmented';
+import { Button } from '../components/ui/Button';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { useScopedList } from '../lib/useScopedList';
 import { ScopeChip } from '../components/customers/ScopeChip';
 import { HostsWithoutCustomerBanner } from '../components/customers/HostsWithoutCustomerBanner';
@@ -332,31 +335,21 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
           )}
           <PivotPicker value={pivot} onChange={(p) => startTransition(() => setPivot(p))} />
           {isCustomWindow && (
-            <button
-              type="button"
+            <Button
+              variant="ring"
               onClick={clearCustomWindow}
-              className="rounded-full border border-border px-2 py-0.5 text-[10px] text-ink-mute hover:bg-surface"
               title="Clear the drag-selected window and return to the active preset"
             >
               custom · ×
-            </button>
+            </Button>
           )}
-          <div className="flex rounded-md border border-border">
-            {RANGES.map((r) => (
-              <button
-                key={r}
-                type="button"
-                onClick={() => handleRangeChange(r)}
-                className={`px-2 py-1 text-xs ${
-                  !isCustomWindow && range === r
-                    ? 'bg-surface text-ink'
-                    : 'text-ink-mute'
-                }`}
-              >
-                {r}
-              </button>
-            ))}
-          </div>
+          <Segmented
+            ariaLabel="Range"
+            size="sm"
+            options={RANGES.map((r) => ({ value: r, label: r }))}
+            value={isCustomWindow ? '' : range}
+            onChange={(v) => handleRangeChange(v as DashboardRange)}
+          />
         </div>
       </header>
 
@@ -429,9 +422,7 @@ export default function Usage({ customer: fixedCustomer }: { customer?: string }
           </section>
         </>
       ) : error ? (
-        <div className="p-6 text-sm text-status-failed">
-          Could not load usage: {error.message}
-        </div>
+        <ErrorBanner>Could not load usage: {error.message}</ErrorBanner>
       ) : (
         <div className="flex items-center justify-center p-6">
           <Spinner size="md" label="Loading…" />
