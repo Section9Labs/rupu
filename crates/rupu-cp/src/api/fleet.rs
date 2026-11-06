@@ -131,7 +131,7 @@ pub(crate) struct FleetInstallBody {
 pub(crate) struct LocalQuery {
     /// Must be this host: the operation is local-only.
     #[serde(default)]
-    host: Option<String>,
+    pub(crate) host: Option<String>,
 }
 
 fn report_json(root: &Path, report: &WriteReport) -> serde_json::Value {

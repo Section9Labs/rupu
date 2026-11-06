@@ -117,6 +117,7 @@
   "projects.get",
   "projects.init",
   "projects.list",
+  "projects.register",
   "projects.runs",
   "projects.sessions",
   "projects.source",

@@ -3,7 +3,7 @@
 //! file list).
 
 use super::{op, OpSpec};
-use crate::api::{code, projects};
+use crate::api::{code, fleet, projects};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -15,6 +15,14 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "List the registered projects with their usage rollup and customer.\n\n`customer` (a slug, or `none`) keeps the projects currently assigned to that customer; a bad slug is `HTTP 400`. Returns a JSON array of rows `{ws_id, name, path, repo_remote, branch, repo_home_url?, created_at, last_run_at, usage, run_count, last_active, customer}`.",
         )
         .query::<projects::ProjectsQuery>(),
+        op(
+            "projects.register",
+            Method::POST,
+            "/api/projects",
+            "Register an existing local project directory without starting work.\n\n`path` must be absolute and name an existing directory. Registration reuses the canonical workspace identity and preserves last-run time. Optional `customer` assigns an existing active customer; omitted or null preserves its current assignment. Returns the normal project row. Remote hosts and read-only deployments are unsupported.",
+        )
+        .query::<fleet::LocalQuery>()
+        .body::<projects::RegisterProjectBody>(),
         op(
             "projects.get",
             Method::GET,
