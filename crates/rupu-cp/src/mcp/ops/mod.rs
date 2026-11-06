@@ -148,6 +148,36 @@ pub fn ops() -> &'static [OpSpec] {
 /// `tests/it/mcp_routes.rs` holds this list and `ops()` in lockstep with the
 /// registered routes.
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
+    (
+        "GET",
+        "/api/sessions/:id/controls",
+        "interactive session command discovery for the attach client",
+    ),
+    (
+        "POST",
+        "/api/sessions/:id/commands",
+        "interactive attach commands; operator tools use sessions.stop and sessions.compact",
+    ),
+    (
+        "GET",
+        "/api/sessions/:id/settings",
+        "session-local model and tool-grant editor for the operator UI",
+    ),
+    (
+        "PUT",
+        "/api/sessions/:id/settings",
+        "operator-only session model and tool-grant configuration",
+    ),
+    (
+        "GET",
+        "/api/sessions/:id/orchestration",
+        "session-local orchestration editor and effective tool inventory for the operator UI",
+    ),
+    (
+        "PUT",
+        "/api/sessions/:id/orchestration",
+        "operator-only session orchestration configuration",
+    ),
     ("GET", "/api/runs/:id/log", "SSE stream"),
     ("GET", "/api/events/stream", "SSE stream"),
     ("GET", "/api/transcript/stream", "SSE stream"),

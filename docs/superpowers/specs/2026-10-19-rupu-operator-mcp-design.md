@@ -153,6 +153,8 @@ The exclusions are:
 | `/healthz`, the SPA fallback | Not operations |
 | `GET /api/fs/browse` | A UI directory picker (agents have their own file tools) |
 
+The native session-client routes added in November are also excluded: `GET /api/sessions/:id/controls`, `POST /api/sessions/:id/commands`, and `GET`/`PUT /api/sessions/:id/settings` and `/api/sessions/:id/orchestration`. They serve the operator's attach/configuration interface. The MCP surface retains its typed session operations; this rollout does not expose a slash-command gateway or model/tool-grant and orchestration configuration writes as model-callable tools.
+
 A new route without a table entry or an exclusion fails the build.
 
 **Tool names (my call).** One tool per operation, grouped by area, mirroring the API. A sample (the full list is generated from the table):

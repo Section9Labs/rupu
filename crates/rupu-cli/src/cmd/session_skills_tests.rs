@@ -1229,8 +1229,9 @@ async fn the_worker_refuses_a_request_a_newer_rupu_queued() {
     let (global, record) = skill_session(&tmp, "ses_newer_req01", &agent(""), &[], &[]).await;
     let id = record.session_id.clone();
     let transcript = record.transcripts_dir.join("run_newer_1.jsonl");
+    let future_version = SessionTurnRequest::VERSION + 1;
     let request = json!({
-        "version": 3,
+        "version": future_version,
         "request_id": "01KTEST",
         "run_id": "run_newer_1",
         "prompt": "hi",
@@ -1240,17 +1241,16 @@ async fn the_worker_refuses_a_request_a_newer_rupu_queued() {
     });
     work_one(&global, &id, request, ACK).await;
 
-    let refusal = "this turn was queued by a newer rupu (turn request version 3); restart the \
-                   session worker: rupu session stop ses_newer_req01";
+    let refusal = format!("this turn was queued by a newer rupu (turn request version {future_version}); restart the session worker: rupu session stop ses_newer_req01");
     let evs: Vec<TranscriptEvent> = JsonlReader::iter(&transcript)
         .unwrap()
         .filter_map(Result::ok)
         .collect();
-    assert_eq!(closing_error(&evs).as_deref(), Some(refusal));
+    assert_eq!(closing_error(&evs).as_deref(), Some(refusal.as_str()));
     assert_eq!(user_message(&evs), "hi");
     let (after, _) = read_session(&global, &id).unwrap();
     assert_eq!(after.status, SessionStatus::Failed);
-    assert_eq!(after.last_error.as_deref(), Some(refusal));
+    assert_eq!(after.last_error.as_deref(), Some(refusal.as_str()));
 }
 
 /// A version-2 request (one that invokes skills) runs on this rupu, with

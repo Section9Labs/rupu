@@ -7888,7 +7888,15 @@ fn session_agent_file(global: &Path, session: &SessionRecord) -> Option<rupu_age
     }
 }
 
-async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
+// Keep the large turn state off the worker/caller stack. In particular, the
+// cancellation path nests this future in join!/timeout on musl test threads.
+fn run_turn(
+    args: RunTurnArgs,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> {
+    Box::pin(run_turn_inner(args))
+}
+
+async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
     // See `run_worker`: `log_level` is the `RUPU_LOG` fallback (I-14).
     let turn_cfg = crate::cmd::update::load_cli_config();
     crate::logging::init_to_file(turn_cfg.log_level.as_deref());
@@ -8269,9 +8277,14 @@ async fn run_turn(args: RunTurnArgs) -> anyhow::Result<()> {
             None => match assembler.assemble(launch).await {
                 Ok(run) => {
                     if orchestration.enabled {
-                        rupu_launch::session::run(run, &orchestration_dir, &session.session_id).await
+                        Box::pin(rupu_launch::session::run(
+                            run,
+                            &orchestration_dir,
+                            &session.session_id,
+                        ))
+                        .await
                     } else {
-                        run.run().await
+                        Box::pin(run.run()).await
                     }
                 }
                 Err(e) => rupu_agent::RunExit {
@@ -12319,7 +12332,10 @@ mod tests {
     /// An idle session under `<tmp>/global` with a dense history that
     /// reliably exceeds a tiny compaction window (the recipe of
     /// `compact_clears_history_source_transcript_and_next_turn_seeds_inline`).
-    pub(super) fn idle_dense_session(tmp: &tempfile::TempDir, session_id: &str) -> (PathBuf, SessionRecord) {
+    pub(super) fn idle_dense_session(
+        tmp: &tempfile::TempDir,
+        session_id: &str,
+    ) -> (PathBuf, SessionRecord) {
         let global = tmp.path().join("global");
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create workspace dir");
