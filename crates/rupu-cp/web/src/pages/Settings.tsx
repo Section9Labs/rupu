@@ -11,6 +11,16 @@
 // `status.token_set: bool` (Bearer token row on the CP-Runtime tab), and it is
 // never editable from this form.
 //
+// Three operator tabs follow the config tabs (operator MCP Plan 3b, UI-5;
+// each its own component, reading and writing through `lib/api3b/admin`):
+//  - Automation: the cron schedules and event triggers, with Dry run and
+//    Tick now (`/api/cron*`).
+//  - Maintenance: each prune kind's dry-run count, then a confirmed Prune
+//    (`/api/maintenance/prune`).
+//  - Accounts: every provider and SCM account's credential state (never a
+//    credential) and the SCM binding rules, with Add rule.
+// The active tab rides `?tab=` so a tab can be linked to.
+//
 // Three more tabs round out the page:
 //  - Raw: the global `config.toml` shown highlighted, read-only, until Edit is
 //    clicked (same single-view + edit-mode pattern as the agent/workflow
@@ -30,8 +40,11 @@
 //    restart to take effect.
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   Activity,
+  Archive,
+  Clock,
   Cpu,
   DollarSign,
   FileCode,
@@ -40,6 +53,7 @@ import {
   Lock as LockIcon,
   Server,
   SlidersHorizontal,
+  UserCheck,
   Workflow,
 } from 'lucide-react';
 import { api, ApiError, type ConfigRuntimeStatus, type ConfigView } from '../lib/api';
@@ -63,18 +77,38 @@ import {
 } from '../components/ConfigEditor';
 import { FieldGroup, toggleInputCls } from '../components/settings/ConfigField';
 import { ModelsTab } from '../components/settings/ModelsTab';
+import { AutomationTab } from '../components/settings/AutomationTab';
+import { MaintenanceTab } from '../components/settings/MaintenanceTab';
+import { AccountsTab } from '../components/settings/AccountsTab';
 
-type SettingsTab =
-  | 'general'
-  | 'providers'
-  | 'models'
-  | 'autoflow'
-  | 'scm'
-  | 'pricing'
-  | 'cp-runtime'
-  | 'raw'
-  | 'policy'
-  | 'runtime-status';
+const SETTINGS_TABS = [
+  'general',
+  'providers',
+  'models',
+  'autoflow',
+  'scm',
+  'pricing',
+  'cp-runtime',
+  'automation',
+  'maintenance',
+  'accounts',
+  'raw',
+  'policy',
+  'runtime-status',
+] as const;
+
+type SettingsTab = (typeof SETTINGS_TABS)[number];
+
+const isSettingsTab = (v: string | null): v is SettingsTab => (SETTINGS_TABS as readonly string[]).includes(v ?? '');
+
+/** The operator tabs: they write through their own endpoints, never the config Save. */
+const OPERATOR_TABS: ReadonlySet<SettingsTab> = new Set(['automation', 'maintenance', 'accounts']);
+
+/** A config value as a string, when it is one. */
+function stringAt(eff: Record<string, unknown>, key: string): string | undefined {
+  const v = getPath(eff, key);
+  return typeof v === 'string' && v.trim() ? v : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Small status-tile primitive shared by the CP-Runtime and Runtime-status
@@ -248,7 +282,20 @@ export default function Settings() {
   const [readOnly, setReadOnly] = useState(false);
   const [lockList, setLockList] = useState<string[]>([]);
   const [lockError, setLockError] = useState<string | null>(null);
-  const [tab, setTab] = useState<SettingsTab>('general');
+  const [params, setParams] = useSearchParams();
+  const tabParam = params.get('tab');
+  const tab: SettingsTab = isSettingsTab(tabParam) ? tabParam : 'general';
+  function setTab(next: SettingsTab) {
+    setParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === 'general') p.delete('tab');
+        else p.set('tab', next);
+        return p;
+      },
+      { replace: true },
+    );
+  }
 
   // ── Raw TOML tab state ──────────────────────────────────────────────────
   // The draft itself lives inside `RawTab` (self-contained edit-mode, like
@@ -454,14 +501,16 @@ export default function Settings() {
         }
         actions={
           <>
-            {dirtyCount > 0 && (
+            {dirtyCount > 0 && !OPERATOR_TABS.has(tab) && (
               <span className="text-note text-ink-dim">
                 {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}
               </span>
             )}
-            <Button variant="solid" onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving}>
-              {saving ? 'Saving…' : 'Save changes'}
-            </Button>
+            {!OPERATOR_TABS.has(tab) && (
+              <Button variant="solid" onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving}>
+                {saving ? 'Saving…' : 'Save changes'}
+              </Button>
+            )}
           </>
         }
       />
@@ -487,7 +536,9 @@ export default function Settings() {
         </div>
       )}
 
-      <div className="-mx-8">
+      {/* Thirteen tabs outgrow a laptop-width page: the strip wraps to a
+          second row rather than hide tabs, and each label stays on one line. */}
+      <div className="-mx-8 [&>div]:flex-wrap [&_button]:whitespace-nowrap">
         <TabBar>
           <TabButton active={tab === 'general'} onClick={() => setTab('general')} icon={SlidersHorizontal} label="General" />
           <TabButton active={tab === 'providers'} onClick={() => setTab('providers')} icon={Cpu} label="Providers" />
@@ -496,6 +547,9 @@ export default function Settings() {
           <TabButton active={tab === 'scm'} onClick={() => setTab('scm')} icon={GitBranch} label="SCM / Issues" />
           <TabButton active={tab === 'pricing'} onClick={() => setTab('pricing')} icon={DollarSign} label="Pricing" />
           <TabButton active={tab === 'cp-runtime'} onClick={() => setTab('cp-runtime')} icon={Server} label="CP-Runtime" />
+          <TabButton active={tab === 'automation'} onClick={() => setTab('automation')} icon={Clock} label="Automation" />
+          <TabButton active={tab === 'maintenance'} onClick={() => setTab('maintenance')} icon={Archive} label="Maintenance" />
+          <TabButton active={tab === 'accounts'} onClick={() => setTab('accounts')} icon={UserCheck} label="Accounts" />
           <div aria-hidden="true" className="mx-1 h-5 w-px shrink-0 bg-border" />
           <TabButton active={tab === 'raw'} onClick={() => setTab('raw')} icon={FileCode} label="Raw" />
           <TabButton active={tab === 'policy'} onClick={() => setTab('policy')} icon={LockIcon} label="Policy" />
@@ -570,6 +624,26 @@ export default function Settings() {
             status={configView.status}
           />
         )}
+        {tab === 'automation' && (
+          <AutomationTab
+            tick={{
+              enabled: getPath(eff, 'cp.cron_tick_enabled') !== false,
+              intervalSecs: (() => {
+                const v = getPath(eff, 'cp.cron_tick_interval_secs');
+                return typeof v === 'number' && v > 0 ? v : 60;
+              })(),
+            }}
+          />
+        )}
+        {tab === 'maintenance' && (
+          <MaintenanceTab
+            retention={{
+              transcripts: stringAt(eff, 'storage.archived_transcript_retention'),
+              sessions: stringAt(eff, 'storage.archived_session_retention'),
+            }}
+          />
+        )}
+        {tab === 'accounts' && <AccountsTab />}
         {tab === 'raw' && (
           <RawTab
             heading={

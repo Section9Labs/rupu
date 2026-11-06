@@ -1,6 +1,7 @@
-//! Port: archive / restore / delete sessions. rupu-cp defines it; rupu-cli's
-//! `cp serve` provides the subprocess adapter that shells `rupu session
-//! archive|restore|delete <id>`. `None` → the endpoints return 501.
+//! Port: archive / restore / delete / stop / compact sessions. rupu-cp
+//! defines it; rupu-cli's `cp serve` provides the subprocess adapter that
+//! shells `rupu session archive|restore|delete|stop <id>` and starts a
+//! detached `rupu session compact <id>`. `None` → the endpoints return 501.
 
 use async_trait::async_trait;
 
@@ -9,6 +10,8 @@ pub enum SessionAction {
     Archive,
     Restore,
     Delete,
+    /// `rupu session stop`: end the session's worker and its running turn.
+    Stop,
 }
 
 impl SessionAction {
@@ -17,6 +20,7 @@ impl SessionAction {
             SessionAction::Archive => "archive",
             SessionAction::Restore => "restore",
             SessionAction::Delete => "delete",
+            SessionAction::Stop => "stop",
         }
     }
 }
@@ -36,7 +40,34 @@ pub enum SessionMutateError {
 
 #[async_trait]
 pub trait SessionMutator: Send + Sync {
+    fn supports_commands(&self) -> bool {
+        false
+    }
+    async fn command(
+        &self,
+        _global: &std::path::Path,
+        _id: &str,
+        _command: rupu_runtime::session_commands::AttachCommand,
+    ) -> Result<crate::session_commands::CommandOutput, crate::session_commands::CommandError> {
+        Err(crate::session_commands::CommandError::Failed(
+            "session command adapter unavailable".into(),
+        ))
+    }
+
     async fn mutate(&self, id: &str, action: SessionAction) -> Result<(), SessionMutateError>;
+
+    /// Start `rupu session compact <id> [--window <window>] --compaction-id
+    /// <compaction_id>` detached, its output to `log`, and return the child's
+    /// pid once it has started: the compaction itself is a model call and
+    /// lands in the session record when it ends. The caller has already
+    /// recorded `compaction_id` (`rupu_runtime::services::session_compaction`).
+    async fn compact(
+        &self,
+        id: &str,
+        compaction_id: &str,
+        window: Option<u32>,
+        log: &std::path::Path,
+    ) -> Result<u32, SessionMutateError>;
 }
 
 #[cfg(test)]
@@ -52,6 +83,15 @@ mod tests {
                 return Err(SessionMutateError::NotFound("x".into()));
             }
             Ok(())
+        }
+        async fn compact(
+            &self,
+            _id: &str,
+            _compaction_id: &str,
+            _window: Option<u32>,
+            _log: &std::path::Path,
+        ) -> Result<u32, SessionMutateError> {
+            Ok(0)
         }
     }
 

@@ -46,7 +46,7 @@ pub use reaper::{
     reap_orphaned_agentiflows_with, HardStopGrace, HardStopOutcome, ReapSummary,
 };
 pub use run::{
-    agentiflow_dir, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
+    agentiflow_dir, decision_excerpt, new_run_id, run_agentiflow, AgentiflowRecord, GoalStatus, LeadInputs,
     RunAgentiflowOpts,
 };
 pub use rupu_launch::proc::{

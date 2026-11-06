@@ -88,5 +88,22 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .query::<messages::HostQuery>()
         .body::<messages::PostBody>(),
+        op(
+            "sessions.stop",
+            Method::POST,
+            "/api/sessions/:id/stop",
+            "Stop a session: end its worker and any running turn, and mark it stopped.\n\n`id` is the session id (local sessions only: a remote `host` is `HTTP 501`). Returns `{ok, id}` once the record says stopped; `HTTP 404` for an unknown session, `HTTP 409` for an archived one. A later `sessions.send` reactivates it.",
+        )
+        .query::<sessions::SessionHostQuery>()
+        .destructive(),
+        op(
+            "sessions.compact",
+            Method::POST,
+            "/api/sessions/:id/compact",
+            "Compact a session's stored conversation now, summarizing its older turns.\n\n`id` is the session id; `window` sizes it against a context window (tokens) other than the session's own. Starts the compaction detached and returns `HTTP 202` `{ok, id, log}`: the history is rewritten when it ends, and a failure is written to `log`. `HTTP 409` while a turn is running or for an archived session.",
+        )
+        .query::<sessions::SessionHostQuery>()
+        .body::<sessions::CompactBody>()
+        .open_world(),
     ]
 }

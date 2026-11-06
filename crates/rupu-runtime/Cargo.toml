@@ -24,6 +24,7 @@ async-trait.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 
 # In-workspace (needed by provider_factory)
 rupu-providers = { path = "../rupu-providers" }
@@ -44,6 +45,7 @@ tokio-util.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }

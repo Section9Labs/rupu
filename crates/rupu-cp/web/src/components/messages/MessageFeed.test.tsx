@@ -23,6 +23,7 @@ function space(over: Partial<MessageSpace> = {}): MessageSpace {
     participants: PARTICIPANTS,
     log: withMessages(EMPTY_LOG, MESSAGES),
     loaded: true,
+    caughtUp: true,
     streaming: true,
     refreshable: false,
     refresh: () => {},

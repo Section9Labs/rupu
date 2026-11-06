@@ -386,6 +386,7 @@ async fn seed_unstarted_run(global: &std::path::Path, run_id: &str) {
         source,
     }
     .record_unstarted(rupu_agent::UnstartedRun {
+        launch_args: &[],
         transcript_path: &transcript,
         run_id,
         workspace_id: "ws_1",

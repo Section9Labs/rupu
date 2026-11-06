@@ -48,9 +48,14 @@ pub enum RunArgv {
     SessionSend(SessionSend),
     /// `rupu session _worker …` — the warm session worker.
     SessionWorker(SessionWorker),
+    /// `rupu session compact …` — summarize a session's older turns now.
+    SessionCompact(SessionCompact),
     /// `rupu agentiflow run --run-id <id> -- <definition>` — the detached
     /// child of `agentiflow run --detach`.
     Agentiflow(AgentiflowRun),
+    /// `rupu autoflow run [--repo] [--mode] -- <name> <target>` — one
+    /// autoflow cycle, detached by the CP (`POST /api/autoflows/:name/run`).
+    AutoflowRun(AutoflowRun),
 }
 
 /// `rupu run <agent> …`.
@@ -85,9 +90,15 @@ pub struct AgentRun {
     /// Join a message space (`--message-space <dir> --participant <id>`):
     /// a child sharing its parent's, an agentiflow's pool unit (spec F1a §7).
     pub message_space: Option<MessageSpace>,
-    /// `--continue <run id>`: continue that interrupted run of the agent
-    /// instead of starting from a prompt.
+    /// `--continue <run id>`: continue that earlier run of the agent instead
+    /// of starting fresh. With `prompt` set too, the prompt (still ONE
+    /// `--prompt=` element) is what the continuation is told next.
     pub continue_from: Option<String>,
+    /// `--model`: the model for this run, over the agent's `model:`.
+    pub model: Option<String>,
+    /// `--provider`: the provider for this run, over the agent's
+    /// `provider:`.
+    pub provider: Option<String>,
     /// A child a parent run launched (W7): its depth, ceiling, caps and
     /// usage root (hidden flags).
     pub launch: Option<LaunchLink>,
@@ -113,6 +124,8 @@ impl AgentRun {
             messaging: LaunchMessaging::Default,
             message_space: None,
             continue_from: None,
+            model: None,
+            provider: None,
             launch: None,
         }
     }
@@ -296,6 +309,9 @@ pub enum WorkflowControl {
         /// `--if-unfinished` (hidden): refuse a run that finished since the
         /// resume was requested.
         if_unfinished: bool,
+        /// `--restart-interrupted`: start every interrupted step and unit
+        /// over from its prompt instead of continuing it.
+        restart_interrupted: bool,
     },
 }
 
@@ -334,11 +350,35 @@ pub struct SessionWorker {
     pub session_id: String,
 }
 
+/// `rupu session compact <session_id> [--window <tokens>] [--compaction-id <id>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionCompact {
+    pub session_id: String,
+    /// `--window`: the context-window size to size the compaction against.
+    pub window: Option<u32>,
+    /// `--compaction-id` (hidden): the compaction the CP recorded before
+    /// starting this one, which it takes over.
+    pub compaction_id: Option<String>,
+}
+
 /// `rupu agentiflow run --run-id <id> -- <definition>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentiflowRun {
     pub definition: String,
     pub run_id: String,
+}
+
+/// `rupu autoflow run [--repo <repo>] [--mode <mode>] -- <name> <target>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoflowRun {
+    /// The autoflow-enabled workflow.
+    pub name: String,
+    /// The issue in full run-target form (`github:owner/repo/issues/42`).
+    pub target: String,
+    /// `--repo`: limit resolution to one bound repo.
+    pub repo: Option<String>,
+    /// `--mode`: `bypass` | `readonly`.
+    pub mode: Option<PermissionMode>,
 }
 
 /// What a peer's `rupu` can take, for [`RunArgv::for_peer`].
@@ -479,6 +519,14 @@ impl RunArgv {
                     LaunchMessaging::Off => a.push("--no-messaging"),
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
+                // One element each, like the prompt: a name starting with
+                // `-` can't be read as a flag.
+                if let Some(m) = &r.model {
+                    a.push(format!("--model={m}"));
+                }
+                if let Some(p) = &r.provider {
+                    a.push(format!("--provider={p}"));
+                }
                 if let Some(m) = &r.message_space {
                     a.push("--message-space");
                     a.push(m.dir.as_os_str());
@@ -544,11 +592,15 @@ impl RunArgv {
                         run_id,
                         mode,
                         if_unfinished,
+                        restart_interrupted,
                     } => {
                         a.push("resume");
                         a.push(run_id);
                         if *if_unfinished {
                             a.push("--if-unfinished");
+                        }
+                        if *restart_interrupted {
+                            a.push("--restart-interrupted");
                         }
                         a.opt_flag_value("--mode", mode.map(PermissionMode::as_str));
                     }
@@ -597,6 +649,17 @@ impl RunArgv {
                 a.push("_worker");
                 a.flag_value("--session-id", &w.session_id);
             }
+            Self::SessionCompact(c) => {
+                a.push("session");
+                a.push("compact");
+                if let Some(w) = c.window {
+                    a.flag_value("--window", &w.to_string());
+                }
+                a.opt_flag_value("--compaction-id", c.compaction_id.as_deref());
+                // `--` keeps an id starting with `-` from being read as a flag.
+                a.push("--");
+                a.push(&c.session_id);
+            }
             Self::Agentiflow(f) => {
                 a.push("agentiflow");
                 a.push("run");
@@ -604,6 +667,16 @@ impl RunArgv {
                 // `--` keeps a definition name from being read as a flag.
                 a.push("--");
                 a.push(&f.definition);
+            }
+            Self::AutoflowRun(r) => {
+                a.push("autoflow");
+                a.push("run");
+                a.opt_flag_value("--repo", r.repo.as_deref());
+                a.opt_flag_value("--mode", r.mode.map(PermissionMode::as_str));
+                // `--` keeps a name or target from being read as a flag.
+                a.push("--");
+                a.push(&r.name);
+                a.push(&r.target);
             }
         }
         a.0
@@ -956,10 +1029,21 @@ mod tests {
             run_id: "run_x".into(),
             mode: None,
             if_unfinished: true,
+            restart_interrupted: false,
         });
         assert_eq!(
             strs(&resume),
             ["workflow", "resume", "run_x", "--if-unfinished"]
+        );
+        let retry = RunArgv::WorkflowControl(WorkflowControl::Resume {
+            run_id: "run_x".into(),
+            mode: None,
+            if_unfinished: false,
+            restart_interrupted: true,
+        });
+        assert_eq!(
+            strs(&retry),
+            ["workflow", "resume", "run_x", "--restart-interrupted"]
         );
         let reject = RunArgv::WorkflowControl(WorkflowControl::Reject {
             run_id: "run_x".into(),

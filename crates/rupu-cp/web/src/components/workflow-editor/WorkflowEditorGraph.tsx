@@ -25,6 +25,7 @@ import {
   type Connection,
   type Edge,
   type EdgeChange,
+  type EdgeTypes,
   type Node,
   type NodeChange,
   type NodeMouseHandler,
@@ -56,12 +57,17 @@ import LoopGroupNode, { type LoopGroupNodeData, loopGroupBox } from './nodes/Loo
 import LoopForm from './LoopForm';
 import { KIND_ACCENT } from './kindVisuals';
 import NodePalette, { NODE_KIND_MIME, NODE_SEED_MIME } from './NodePalette';
+import FlowEdge, { FlowConnectionLine } from './FlowEdge';
+import { useEntranceSlots } from '../../lib/graph/runMotion';
+import { mergeMeasured, type Size } from '../../lib/graph/measured';
+import { useExitGhosts } from './exitGhosts';
 
 import '@xyflow/react/dist/style.css';
 
 // Memoized once at module scope so React Flow doesn't see a fresh object each
 // render (mirrors RunGraph).
 const NODE_TYPES: NodeTypes = { editable: EditableStepNode, loopGroup: LoopGroupNode };
+const EDGE_TYPES: EdgeTypes = { flow: FlowEdge };
 
 // ── Pure mutation helpers (exported for tests) ───────────────────────────────
 
@@ -448,6 +454,11 @@ export function applyInsertOnEdge(
   return { graph: withDerivedEdges(graph.meta, nodes, graph.loops), id };
 }
 
+/** Whether `selected` names exactly `members` (a loop the canvas has picked). */
+function sameMembers(members: readonly string[], selected: ReadonlySet<string>): boolean {
+  return members.length > 0 && members.length === selected.size && members.every((id) => selected.has(id));
+}
+
 /** Narrow an arbitrary dataTransfer string to a StepKind. Exported for tests. */
 export function asStepKind(v: string): StepKind | null {
   return v === 'step' ||
@@ -568,16 +579,27 @@ function WorkflowEditorGraphInner({
     });
   }, [graph.edges]);
 
+  // The node objects are rebuilt from `graph` on every change (each drag
+  // frame included). Hand xyflow back the sizes it measured, or it drops every
+  // node's handles until it re-measures and every edge remounts for a frame;
+  // and mirror which nodes are mid-drag, so a dragged card can lift.
+  const [measured, setMeasured] = useState<ReadonlyMap<string, Size>>(() => new Map());
+  const [draggingIds, setDraggingIds] = useState<ReadonlySet<string>>(() => new Set());
+  const positionsById = useMemo(() => new Map(graph.nodes.map((n) => [n.id, n.position])), [graph.nodes]);
+  const slots = useEntranceSlots(positionsById);
+
   const nodes = useMemo<Node<NodeData>[]>(
     () =>
       graph.nodes.map((node) => ({
         id: node.id,
         type: 'editable',
         position: node.position,
-        data: { node, problems: problemsById[node.id] ?? [] },
+        data: { node, problems: problemsById[node.id] ?? [], slot: slots.get(node.id) ?? 0 },
         selected: node.id === selectedId || selectedIds.has(node.id),
+        ...(draggingIds.has(node.id) ? { dragging: true } : {}),
+        ...(measured.has(node.id) ? { measured: measured.get(node.id) } : {}),
       })),
-    [graph.nodes, problemsById, selectedId, selectedIds],
+    [graph.nodes, problemsById, selectedId, selectedIds, slots, draggingIds, measured],
   );
 
   // Loop group boundary nodes (Phase 3 Task 5) — one synthetic, non-
@@ -594,6 +616,7 @@ function WorkflowEditorGraphInner({
     for (const loop of loops) {
       const box = loopGroupBox(graph.nodes, loop);
       if (!box) continue;
+      const slot = Math.min(...loop.nodes.map((id) => slots.get(id) ?? Infinity));
       out.push({
         id: `loop-group:${loop.name}`,
         type: 'loopGroup',
@@ -608,12 +631,14 @@ function WorkflowEditorGraphInner({
           width: box.width,
           height: box.height,
           problems: problemsById[loopProblemKey(loop.name)] ?? [],
+          selected: loopForm?.editing?.name === loop.name || sameMembers(loop.nodes, selectedIds),
+          slot: Number.isFinite(slot) ? slot : 0,
           onEdit: () => setLoopForm({ editing: loop, memberIds: loop.nodes }),
         },
       });
     }
     return out;
-  }, [loops, graph.nodes, problemsById]);
+  }, [loops, graph.nodes, problemsById, loopForm, selectedIds, slots]);
 
   const flowNodes = useMemo<Node[]>(() => [...loopGroupNodes, ...nodes], [loopGroupNodes, nodes]);
 
@@ -638,6 +663,8 @@ function WorkflowEditorGraphInner({
       const isSelected = selectedEdgeIds.has(e.id);
       const sourceKind = kindById.get(e.source);
       const accentKey = sourceKind ? KIND_ACCENT[sourceKind] : undefined;
+      const targetKind = kindById.get(e.target);
+      const targetKey = targetKind ? KIND_ACCENT[targetKind] : accentKey;
       // Plain (non-branch) edges get a kind-tinted arrowhead, matching the
       // stroke below.
       const markerColor = branchColor ?? colors.alpha(accentKey ?? 'inkMute', 0.55);
@@ -645,7 +672,7 @@ function WorkflowEditorGraphInner({
         id: e.id,
         source: e.source,
         target: e.target,
-        type: 'smoothstep',
+        type: 'flow',
         markerEnd: { type: MarkerType.ArrowClosed, color: markerColor },
       };
       // Anchor the edge at the branch node's matching arm handle.
@@ -660,9 +687,10 @@ function WorkflowEditorGraphInner({
       // Only set `selected` when true, so an unselected edge's emitted shape
       // stays as small as possible.
       if (isSelected) edge.selected = true;
-      // xyflow's built-in dashed flow animation, on every edge (branch arm or
-      // plain).
+      // Every edge flows (branch arm or plain): FlowEdge's travelling light,
+      // which replaces xyflow's built-in dashes (styles/graph-motion.css).
       edge.animated = true;
+      const slot = slots.get(e.source) ?? 0;
       if (e.label !== undefined) edge.label = e.label;
       if (branchColor !== undefined) {
         // Branch (true/false) arm — colored stroke, a touch bolder (mirrors
@@ -671,6 +699,7 @@ function WorkflowEditorGraphInner({
         // default `.selected` CSS treatment, so the selected emphasis is
         // earned here rather than through the stylesheet.
         edge.style = { stroke: branchColor, strokeWidth: isSelected ? 3.5 : 2.5 };
+        edge.data = { from: branchColor, to: branchColor, slot };
         edge.labelStyle = { fill: branchColor, fontWeight: 600 };
         // Semantic label chip: ✓ then / ✕ else, filled with a soft tint of
         // the arm's own accent (status.done / status.failed).
@@ -686,9 +715,16 @@ function WorkflowEditorGraphInner({
         // accent (mockup's `.edge`, upgraded from a flat muted stroke so
         // every edge — not just branch arms — reads as meaningful); bolder,
         // full-strength when selected.
+        const a = isSelected ? 0.9 : 0.55;
         edge.style = {
-          stroke: colors.alpha(accentKey ?? 'inkMute', isSelected ? 0.9 : 0.55),
+          stroke: colors.alpha(accentKey ?? 'inkMute', a),
           strokeWidth: isSelected ? 3 : 2,
+        };
+        // The line runs from the source's kind color into the target's.
+        edge.data = {
+          from: colors.alpha(accentKey ?? 'inkMute', a),
+          to: colors.alpha(targetKey ?? 'inkMute', a),
+          slot,
         };
         if (e.label !== undefined) {
           // Non-branch edges that carry a label (none produced by
@@ -702,13 +738,38 @@ function WorkflowEditorGraphInner({
       }
       return edge;
     });
-  }, [graph.edges, kindById, colors, selectedEdgeIds]);
+  }, [graph.edges, kindById, colors, selectedEdgeIds, slots]);
+
+  // A delete still reaches `onChange` at once; what leaves the canvas fades
+  // out from a copy of its last frame (exitGhosts.tsx).
+  const { layer: exitLayer, ghost } = useExitGhosts();
 
   // Move (drag) + delete (Backspace/Delete) both arrive as node changes.
   const onNodesChange = useCallback(
     (changes: NodeChange<Node>[]) => {
+      setMeasured((prev) => mergeMeasured(prev, changes));
+      const drags = changes.filter(
+        (c): c is Extract<NodeChange<Node>, { type: 'position' }> => c.type === 'position' && c.dragging !== undefined,
+      );
+      if (drags.length > 0) {
+        setDraggingIds((prev) => {
+          let next: Set<string> | undefined;
+          for (const c of drags) {
+            if (prev.has(c.id) === c.dragging) continue;
+            next ??= new Set(prev);
+            if (c.dragging) next.add(c.id);
+            else next.delete(c.id);
+          }
+          return next ?? prev;
+        });
+      }
       const removed = changes.flatMap((c) => (c.type === 'remove' ? [c.id] : []));
       if (removed.length > 0) {
+        const gone = new Set(removed);
+        ghost(
+          removed,
+          edges.filter((e) => gone.has(e.source) || gone.has(e.target)).map((e) => e.id),
+        );
         let g = graph;
         for (const id of removed) g = applyDelete(g, id);
         onChange(g);
@@ -734,7 +795,7 @@ function WorkflowEditorGraphInner({
         }),
       });
     },
-    [graph, nodes, onChange, selectedId, onSelect, selectedIds],
+    [graph, nodes, edges, ghost, onChange, selectedId, onSelect, selectedIds],
   );
 
   // Select (click) + remove (Backspace/Delete on a selected edge) both arrive
@@ -764,7 +825,11 @@ function WorkflowEditorGraphInner({
 
       const removed = new Set(changes.flatMap((c) => (c.type === 'remove' ? [c.id] : [])));
       if (removed.size > 0) {
-        onChange(applyRemoveEdges(graph, removed));
+        const next = applyRemoveEdges(graph, removed);
+        // A chain edge derives from step order and survives its remove.
+        const kept = new Set(next.edges.map((e) => e.id));
+        ghost([], [...removed].filter((id) => !kept.has(id)));
+        onChange(next);
         setSelectedEdgeIds((prev) => {
           if (![...removed].some((id) => prev.has(id))) return prev;
           const next = new Set(prev);
@@ -773,7 +838,7 @@ function WorkflowEditorGraphInner({
         });
       }
     },
-    [graph, onChange],
+    [graph, ghost, onChange],
   );
 
   const onConnect = useCallback(
@@ -968,12 +1033,12 @@ function WorkflowEditorGraphInner({
 
       {/* toolbar — Re-layout / + next / find. The "Add" palette is now the
           graphical NodePalette dock (bottom-left). */}
-      <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 rounded-lg border border-border bg-panel/95 px-2 py-1.5 shadow-card">
+      <div className="wfx-toolbar absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5 px-1.5 py-1.5">
         <button
           type="button"
           disabled={paused}
           onClick={relayout}
-          className="rounded-md border border-border bg-panel px-2 py-1 text-note font-medium text-ink-dim hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+          className="wfx-tbtn"
         >
           Re-layout
         </button>
@@ -982,7 +1047,8 @@ function WorkflowEditorGraphInner({
           disabled={paused || !selectedId}
           onClick={addConnectedNext}
           title={selectedId ? `Add a step connected from ${selectedId}` : 'Select a node first'}
-          className="rounded-md border border-info/30 bg-info-bg px-2 py-1 text-note font-medium text-info hover:bg-info-bg disabled:cursor-not-allowed disabled:opacity-50"
+          className="wfx-tbtn"
+          data-tone="info"
         >
           ⊕ next
         </button>
@@ -997,13 +1063,13 @@ function WorkflowEditorGraphInner({
                 ? `Group ${selectedIdsArr.length} steps into a loop`
                 : 'Select 2+ steps (none already in another loop)'
           }
-          className="rounded-md border border-border bg-panel px-2 py-1 text-note font-medium text-ink-dim hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+          className="wfx-tbtn"
         >
           {exactLoopMatch
             ? `⟳ Edit loop ${exactLoopMatch.name}`
             : `⟳ Group into loop${selectedIdsArr.length >= 2 ? ` (${selectedIdsArr.length})` : ''}`}
         </button>
-        <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+        <span className="wfx-tsep" aria-hidden />
         <div className="relative">
           <input
             type="search"
@@ -1013,16 +1079,16 @@ function WorkflowEditorGraphInner({
             onKeyDown={onFindKeyDown}
             placeholder="Find step…"
             aria-label="Find step by id"
-            className="w-28 rounded-md border border-border bg-panel px-2 py-1 text-note text-ink placeholder:text-ink-mute focus:outline-none focus:ring-1 focus:ring-brand-100 disabled:cursor-not-allowed disabled:opacity-50"
+            className="wfx-tfind"
           />
           {matches.length > 0 && (
-            <ul className="absolute left-0 top-full z-20 mt-1 max-h-40 w-40 overflow-auto rounded-md border border-border bg-panel py-1 shadow-card">
+            <ul className="wfx-tmenu absolute left-0 top-full z-20 mt-1.5 max-h-40 w-44 overflow-auto py-1">
               {matches.slice(0, 8).map((n) => (
                 <li key={n.id}>
                   <button
                     type="button"
                     onClick={() => locate(n.id)}
-                    className="block w-full truncate px-2 py-1 text-left text-note text-ink hover:bg-surface-hover"
+                    className="wfx-tmenu-item"
                   >
                     {n.id}
                   </button>
@@ -1066,6 +1132,8 @@ function WorkflowEditorGraphInner({
         nodes={flowNodes}
         edges={edges}
         nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
+        connectionLineComponent={FlowConnectionLine}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -1086,12 +1154,13 @@ function WorkflowEditorGraphInner({
         <MiniMap
           pannable
           zoomable
-          className="!border-border !bg-panel"
-          maskColor={colors.alpha('ink', 0.08)}
-          nodeColor={colors.inkMute}
-          nodeStrokeColor={colors.border}
+          style={{ width: 150, height: 96 }}
+          maskColor={colors.alpha('bg', 0.55)}
+          nodeColor={(n) => (n.type === 'editable' ? colors.alpha(KIND_ACCENT[(n.data as NodeData).node.data.kind], 0.8) : 'transparent')}
+          nodeBorderRadius={4}
         />
         <Controls className="!border-border !bg-panel !shadow-card" showInteractive={false} />
+        {exitLayer}
       </ReactFlow>
       </div>
     </div>

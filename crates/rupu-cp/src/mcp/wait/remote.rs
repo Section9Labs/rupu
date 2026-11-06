@@ -297,7 +297,8 @@ impl Remote {
                     }
                 }
                 Kind::Gate => {
-                    if !r.gates.iter().any(|s| s.source == c.source) {
+                    let seen = r.gates.iter().any(|s| s.source == c.source);
+                    if !seen {
                         r.gates.push(GateSrc {
                             host,
                             run: c.target.clone(),

@@ -747,26 +747,13 @@ fn run_audit_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>)
 
 // ── gap ───────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
-struct GapRow {
-    concern_id: String,
-    file: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CoverageGapsReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<GapRow>,
-}
-
 struct GapOutput {
-    report: CoverageGapsReport,
+    report: rupu_coverage::CoverageGaps,
 }
 
 impl CollectionOutput for GapOutput {
-    type JsonReport = CoverageGapsReport;
-    type CsvRow = GapRow;
+    type JsonReport = rupu_coverage::CoverageGaps;
+    type CsvRow = rupu_coverage::GapRow;
 
     fn command_name(&self) -> &'static str {
         "coverage gap"
@@ -804,22 +791,8 @@ impl CollectionOutput for GapOutput {
 
 fn run_gap_in(workspace: &Path, target_id: &str, format: Option<OutputFormat>) -> Result<()> {
     let paths = rupu_coverage::CoveragePaths::new(workspace, target_id);
-    let audit_report = rupu_coverage::run_audit(&paths)?;
-    let mut rows = Vec::new();
-    for c in &audit_report.concerns {
-        for f in &c.gap_files {
-            rows.push(GapRow {
-                concern_id: c.concern_id.clone(),
-                file: f.clone(),
-            });
-        }
-    }
     let output = GapOutput {
-        report: CoverageGapsReport {
-            kind: "coverage_gaps",
-            version: 1,
-            rows,
-        },
+        report: rupu_coverage::run_audit(&paths)?.gaps(),
     };
     report::emit_collection(format, &output)
 }

@@ -104,6 +104,7 @@ pub struct Bus {
     /// agentiflow lead's rounds and a session's turns stay joined between
     /// runs.
     leave_on_exit: bool,
+    persistent_claims: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) fail_after_log: std::sync::atomic::AtomicBool,
 }
@@ -122,9 +123,31 @@ impl Bus {
             space: space.to_path_buf(),
             member: RwLock::new(None),
             leave_on_exit: true,
+            persistent_claims: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_after_log: Default::default(),
         }
+    }
+
+    /// Preserve session claims until explicit release or their original TTL.
+    /// Call only while holding the session worker lease, before tool execution.
+    pub fn persist_claims(&self) -> Result<(), FleetError> {
+        let mut held = self.claims.lock();
+        if self
+            .persistent_claims
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        for (key, mut guard) in self.board.restore_claims(&self.participant)? {
+            if let std::collections::hash_map::Entry::Vacant(entry) = held.entry(key) {
+                guard.keep_on_drop = false;
+                entry.insert(guard);
+            }
+        }
+        self.persistent_claims
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn with_caps(mut self, caps: BusCaps) -> Self {
@@ -683,7 +706,7 @@ fn append<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), FleetError>
 }
 
 /// An exclusive `flock` on `path`, held while the returned file lives.
-fn lock_exclusive(path: &Path) -> Result<std::fs::File, FleetError> {
+pub(crate) fn lock_exclusive(path: &Path) -> Result<std::fs::File, FleetError> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -702,6 +725,19 @@ fn lock_exclusive(path: &Path) -> Result<std::fs::File, FleetError> {
                     action: format!("lock {}", path.display()),
                     source: e.into(),
                 })
+            }
+        }
+    }
+}
+
+impl Drop for Bus {
+    fn drop(&mut self) {
+        if self
+            .persistent_claims
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for guard in self.claims.lock().values_mut() {
+                guard.keep_on_drop = true;
             }
         }
     }

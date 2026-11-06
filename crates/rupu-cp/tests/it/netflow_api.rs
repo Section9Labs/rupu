@@ -290,6 +290,7 @@ fn seed_step(run_id: &str, transcript_path: PathBuf) -> StepResultRecord {
         codename: None,
         cause: None,
         error: None,
+        started_at: None,
     }
 }
 

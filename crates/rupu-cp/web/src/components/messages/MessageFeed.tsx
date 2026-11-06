@@ -15,6 +15,7 @@ import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 import { Composer } from './Composer';
 import { FeedView } from './FeedView';
+import { withinSpan } from '../../lib/run/turnWindow';
 
 export interface MessageFeedProps {
   route: MessageRoute;
@@ -26,12 +27,19 @@ export interface MessageFeedProps {
   workflow?: boolean;
   openInTranscript?: (m: SpaceMessage) => (() => void) | null;
   highlightId?: string | null;
+  /** Only messages sent inside this span (ms since the epoch): a window the
+   *  run page selected on its Token flow. */
+  within?: [number, number] | null;
 }
 
-export default function MessageFeed({ route, space, notLiveReason, workflow = false, openInTranscript, highlightId }: MessageFeedProps) {
+export default function MessageFeed({ route, space, notLiveReason, workflow = false, openInTranscript, highlightId, within }: MessageFeedProps) {
   // Local, not `?q=`: the run detail page's Findings tab owns that param.
   const [query, setQuery] = useState('');
   const groups = useMemo(() => recipientGroups(route, space.participants, workflow), [route, space.participants, workflow]);
+  const messages = useMemo(
+    () => (within ? space.log.messages.filter((m) => withinSpan(within, m.ts)) : space.log.messages),
+    [space.log.messages, within],
+  );
 
   if (space.status === 'loading' || (space.status === 'ready' && space.space === 'present' && !space.loaded && space.log.messages.length === 0)) {
     return (
@@ -51,7 +59,7 @@ export default function MessageFeed({ route, space, notLiveReason, workflow = fa
   return (
     <FeedView
       participants={space.participants}
-      messages={space.log.messages}
+      messages={messages}
       legacy={space.legacy}
       query={query}
       onQuery={setQuery}

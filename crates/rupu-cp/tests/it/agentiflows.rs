@@ -640,3 +640,299 @@ async fn detail_asset_scope_resolves_to_the_engagement_coverage_target() {
         "unscoped af must not carry an asset_scope: {d2}"
     );
 }
+
+/// A `started` line in `dir`'s children ledger, as a lead round launches a
+/// child: `round` and, for a workflow child, the file it was dispatched
+/// from (`generated` when `workflows.generate` wrote it).
+fn launched(
+    dir: &Path,
+    handle: &str,
+    kind: rupu_tools::ChildKind,
+    run_id: &str,
+    depth: u32,
+    round: Option<u32>,
+    workflow: Option<(&Path, bool)>,
+) {
+    use rupu_launch::ledger::{LedgerLine, Request, Started};
+    let request = workflow.map(|(file, generated)| {
+        Box::new(Request {
+            mode: rupu_tools::PermissionMode::Bypass,
+            link: None,
+            prompt: None,
+            workflow: Some(file.to_path_buf()),
+            inputs: Default::default(),
+            generated,
+        })
+    });
+    rupu_launch::ledger::append(
+        dir,
+        &LedgerLine::Started(Started {
+            round,
+            request,
+            ..Started::new(handle, kind, "sweep", run_id, 1, depth)
+        }),
+    );
+}
+
+#[tokio::test]
+async fn children_carry_round_generated_and_excerpt() {
+    use rupu_tools::ChildKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let af = "af_01ROUNDGENERATED00000000000";
+    let run = agentiflow_dir(global).join(af);
+    record(af, "2026-10-21T00:00:00Z", "running")
+        .write(&run)
+        .unwrap();
+    let file = run.join("generated").join("auth-sweep-01X.yaml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, "name: auth-sweep\nsteps: []\n").unwrap();
+    // Round 2 dispatched the workflow the lead wrote; it ran a sub-agent.
+    let wf = "run_01ROUNDGENWF000000000000000";
+    let sub = "sub_01ROUNDGENSUB00000000000000";
+    launched(
+        &run,
+        "ch_wf",
+        ChildKind::Workflow,
+        wf,
+        1,
+        Some(2),
+        Some((&file, true)),
+    );
+    let answer = format!("  {}é{}  ", "a".repeat(239), "b".repeat(100));
+    rupu_launch::ledger::append(
+        &run,
+        &rupu_launch::ledger::LedgerLine::Finished(rupu_launch::ledger::Finished {
+            success: Some(true),
+            output: Some(answer),
+            ..rupu_launch::ledger::Finished::new("ch_wf", rupu_tools::ChildState::Done, None)
+        }),
+    );
+    launched(
+        &global.join("runs").join(wf),
+        "ch_sub",
+        ChildKind::Subagent,
+        sub,
+        2,
+        None,
+        None,
+    );
+    let addr = spawn_server(global).await;
+
+    let (status, body) = get(addr, &format!("/api/agentiflows/{af}/children")).await;
+    assert_eq!(status, 200, "{body}");
+    let kids = body["children"].as_array().unwrap();
+    let of = |id: &str| kids.iter().find(|c| c["run_id"] == id).unwrap().clone();
+    let (w, s) = (of(wf), of(sub));
+    assert_eq!((&w["round"], &w["generated"]), (&json!(2), &json!(true)));
+    assert_eq!(
+        w["output_excerpt"],
+        json!(format!("{}é…", "a".repeat(239))),
+        "240 chars, cut on a char boundary"
+    );
+    // The sub-agent sits under the round-2 child: its round is its root's.
+    assert_eq!((&s["round"], &s["generated"]), (&json!(2), &json!(false)));
+    assert!(s.get("output_excerpt").is_none(), "{s}");
+
+    let (_, detail) = get(addr, &format!("/api/agentiflows/{af}")).await;
+    let unit = detail["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["unit_id"] == wf)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (&unit["round"], &unit["generated"]),
+        (&json!(2), &json!(true))
+    );
+}
+
+#[tokio::test]
+async fn children_without_round_infer_nothing() {
+    use rupu_tools::ChildKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let af = "af_01NOROUND000000000000000000";
+    let run = agentiflow_dir(global).join(af);
+    record(af, "2026-10-21T00:00:00Z", "completed")
+        .write(&run)
+        .unwrap();
+    // A ledger from before rounds and `generated` were recorded.
+    let wf = "run_01NOROUNDWF0000000000000000";
+    let named = global.join("workflows").join("sweep.yaml");
+    launched(
+        &run,
+        "ch_wf",
+        ChildKind::Workflow,
+        wf,
+        1,
+        None,
+        Some((&named, false)),
+    );
+    launched(
+        &global.join("runs").join(wf),
+        "ch_sub",
+        ChildKind::Subagent,
+        "sub_01NOROUNDSUB000000000000000",
+        2,
+        None,
+        None,
+    );
+    let addr = spawn_server(global).await;
+
+    let (status, body) = get(addr, &format!("/api/agentiflows/{af}/children")).await;
+    assert_eq!(status, 200, "{body}");
+    let kids = body["children"].as_array().unwrap();
+    assert_eq!(kids.len(), 2, "{body}");
+    for c in kids {
+        assert!(c.get("round").is_none(), "{c}");
+        assert_eq!(c["generated"], json!(false), "{c}");
+    }
+    let (_, detail) = get(addr, &format!("/api/agentiflows/{af}")).await;
+    let unit = &detail["units"][0];
+    assert!(unit.get("round").is_none(), "{unit}");
+    assert_eq!(unit["generated"], json!(false), "{unit}");
+}
+
+#[tokio::test]
+async fn generated_definition_is_served_and_path_checked() {
+    use rupu_tools::ChildKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path();
+    let af = "af_01GENERATEDDEF0000000000000";
+    let run = agentiflow_dir(global).join(af);
+    record(af, "2026-10-21T00:00:00Z", "running")
+        .write(&run)
+        .unwrap();
+    let generated = run.join("generated");
+    std::fs::create_dir_all(&generated).unwrap();
+    let yaml = "name: auth-sweep\nsteps:\n  - id: scan\n    agent: recon\n";
+    let file = generated.join("auth-sweep-01X.yaml");
+    std::fs::write(&file, yaml).unwrap();
+    launched(
+        &run,
+        "ch_gen",
+        ChildKind::Workflow,
+        "run_01GENA",
+        1,
+        Some(1),
+        Some((&file, true)),
+    );
+
+    // Outside `generated/`: a file reached by `..`, and one by a symlink.
+    let outside = global.join("secret.yaml");
+    std::fs::write(&outside, "name: secret\n").unwrap();
+    let dotdot = generated
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("secret.yaml");
+    launched(
+        &run,
+        "ch_dots",
+        ChildKind::Workflow,
+        "run_01GENB",
+        1,
+        Some(1),
+        Some((&dotdot, true)),
+    );
+    let link = generated.join("link.yaml");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    launched(
+        &run,
+        "ch_link",
+        ChildKind::Workflow,
+        "run_01GENC",
+        1,
+        Some(1),
+        Some((&link, true)),
+    );
+    // A directory under `generated/`: no definition, refused like one outside.
+    let dir = generated.join("dir.yaml");
+    std::fs::create_dir_all(&dir).unwrap();
+    launched(
+        &run,
+        "ch_dir",
+        ChildKind::Workflow,
+        "run_01GENF",
+        1,
+        Some(1),
+        Some((&dir, true)),
+    );
+    // A named pool workflow, and an agent child.
+    launched(
+        &run,
+        "ch_named",
+        ChildKind::Workflow,
+        "run_01GEND",
+        1,
+        Some(1),
+        Some((&outside, false)),
+    );
+    launched(
+        &run,
+        "ch_agent",
+        ChildKind::Agent,
+        "run_01GENE",
+        1,
+        Some(1),
+        None,
+    );
+    let addr = spawn_server(global).await;
+
+    let (status, body) = get(addr, &format!("/api/agentiflows/{af}/generated/ch_gen")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "handle": "ch_gen",
+            "name": "sweep",
+            "file_name": "auth-sweep-01X.yaml",
+            "yaml": yaml,
+        })
+    );
+    for handle in ["ch_dots", "ch_link", "ch_dir"] {
+        let (status, body) = get(addr, &format!("/api/agentiflows/{af}/generated/{handle}")).await;
+        assert_eq!(status, 403, "{handle}: {body}");
+    }
+    for handle in ["ch_named", "ch_agent", "ch_nope"] {
+        let (status, body) = get(addr, &format!("/api/agentiflows/{af}/generated/{handle}")).await;
+        assert_eq!(status, 404, "{handle}: {body}");
+    }
+    let (status, _) = get(
+        addr,
+        &format!("/api/agentiflows/{af}/generated/ch_gen?host=peer"),
+    )
+    .await;
+    assert_eq!(status, 501);
+    let (status, _) = get(addr, "/api/agentiflows/af_01NOSUCHFLOW/generated/ch_gen").await;
+    assert_eq!(status, 404);
+
+    // A flow whose `generated/` is itself a symlink to a directory outside
+    // it: what is reached through it is not the flow's.
+    let af2 = "af_01GENERATEDLINK00000000000";
+    let run2 = agentiflow_dir(global).join(af2);
+    record(af2, "2026-10-21T00:00:00Z", "running")
+        .write(&run2)
+        .unwrap();
+    let elsewhere = global.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("planted.yaml"), "name: planted\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, run2.join("generated")).unwrap();
+    launched(
+        &run2,
+        "ch_planted",
+        ChildKind::Workflow,
+        "run_01GENF",
+        1,
+        Some(1),
+        Some((&run2.join("generated").join("planted.yaml"), true)),
+    );
+    let (status, body) = get(
+        addr,
+        &format!("/api/agentiflows/{af2}/generated/ch_planted"),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+}

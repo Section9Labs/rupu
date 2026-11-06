@@ -4128,6 +4128,9 @@ mod tests {
         };
         let run_id = conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "a".into(),
                 prompt: Some("hi".into()),
@@ -4288,6 +4291,9 @@ mod tests {
         };
         let run_id = conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "a".into(),
                 prompt: Some("hi".into()),

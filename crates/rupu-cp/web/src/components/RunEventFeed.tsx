@@ -1,109 +1,115 @@
-// Per-run live event feed — a scrolling vertical timeline of one run's SSE
-// events. Now renders the shared Situation Room `EventCard`s (same visual
-// language as the global /events wall), instead of the old EventTimelineList.
+// The Events tab of a workflow run (and, through `cards`, of an agentiflow):
+// one run's events on the shared event rail (components/events/EventRail) —
+// the same rows, threads and Needs-you deck as Live Events, scoped to the
+// run. Its gates are answered from the deck and the gate row through the run
+// page's own gate control (the graph's), so all three show one decision.
 //
-// The SSE subscription lives ONE level up in RunDetail (shared with RunGraph),
-// so this is a pure render of the accumulated event list plus a connection
-// indicator. Auto-scrolls to newest unless the user has scrolled up. Approval
-// is handled by RunDetail's own gate banner, so await cards here show status
-// only (no inline Approve/Reject) — hence no onApprove/onReject wiring.
+// The SSE subscription lives one level up in RunDetail (shared with RunGraph);
+// this renders the accumulated list.
 
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo } from 'react';
 import { cn } from '../lib/cn';
 import { agentUnitIndex, cardFromEvent, unitKeyIndex, type StreamCard } from '../lib/situationRoom/cards';
-import EventCard from './situationRoom/EventCard';
+import { identityOf } from '../lib/events/identity';
+import EventRail from './events/EventRail';
+import { IDLE_GATE, type EventGate } from './events/GateButtons';
+import type { GateControl } from './graph/GateActions';
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting';
 
-/** A RunEvent paired with a monotonically-increasing sequence id for stable React keys. */
+/** A RunEvent paired with a monotonically-increasing sequence id. */
 export interface SeqEvent {
   seq: number;
   event: import('../lib/api').RunEvent;
 }
 
-/** Numeric `ts` if the event carries one (history rows do; raw SSE frames don't). */
+/** Numeric `ts` if the event carries one (history rows do; a run's own log doesn't). */
 function tsOf(ev: SeqEvent['event']): number {
   const raw = ev as Record<string, unknown>;
   return typeof raw.ts === 'number' ? raw.ts : 0;
 }
+
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected']);
 
 export default function RunEventFeed({
   events,
   cards: externalCards,
   connection,
   crewByRun,
+  gate,
+  status,
 }: {
   /** The run's SSE events; mapped to cards via `cardFromEvent`. */
   events?: SeqEvent[];
   /** Pre-built cards, when the caller's events are not orchestrator `RunEvent`s
-   *  (e.g. the agentiflow Events tab — see `lib/agentiflowEvents`). Takes
+   *  (the agentiflow Events tab — see `lib/agentiflowEvents`). Takes
    *  precedence over `events`. */
   cards?: StreamCard[];
   /** The live-connection indicator; omit it for a non-SSE feed (no badge). */
   connection?: ConnectionState;
   /** run_id → run codename; gives run-level cards (no codename of their own)
-   *  the crew tint stripe. */
+   *  the run's crew tint. */
   crewByRun?: ReadonlyMap<string, string>;
+  /** The run page's gate control: Approve / Reject on gate rows and the deck. */
+  gate?: GateControl;
+  /** The run's status, when the page knows it (`running`, `completed`, …). */
+  status?: string;
 }) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  // Newest-first: follow=true pins to the TOP (new events prepend visually).
-  const [follow, setFollow] = useState(true);
-
-  // Newest-first cards; drop events that carry nothing worth a row (e.g. a
-  // note-less step_working heartbeat → cardFromEvent returns null).
+  // Newest first; keyed by content identity (so a row seen on Live Events is
+  // seen here), with an occurrence suffix for an event the run logged twice.
   const cards = useMemo<StreamCard[]>(() => {
-    if (externalCards) return externalCards;
+    if (externalCards) return [...externalCards].reverse().sort((a, b) => b.ts - a.ts);
     const list = events ?? [];
     const out: StreamCard[] = [];
     const evs = list.map((e) => e.event);
     const ctx = { unitKeys: unitKeyIndex(evs), agentUnits: agentUnitIndex(evs), crewByRun };
-    for (let i = list.length - 1; i >= 0; i--) {
-      const { seq, event } = list[i];
-      const c = cardFromEvent(event, tsOf(event), `run-ev-${seq}`, ctx);
+    const seen = new Map<string, number>();
+    for (const { event } of list) {
+      const id = identityOf(event);
+      const n = seen.get(id) ?? 0;
+      seen.set(id, n + 1);
+      const c = cardFromEvent(event, tsOf(event), n === 0 ? id : `${id}#${n}`, ctx);
       if (c) out.push(c);
     }
-    return out;
+    return out.reverse();
   }, [externalCards, events, crewByRun]);
 
-  const count = externalCards ? externalCards.length : events?.length ?? 0;
+  const count = externalCards ? externalCards.length : (events?.length ?? 0);
+  const ended = status ? TERMINAL.has(status) : false;
+  const live = !ended && (connection === 'live' || status === 'running' || status === 'awaiting_approval');
 
-  useLayoutEffect(() => {
-    if (!follow) return;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = 0;
-  }, [count, follow]);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const onScroll = () => setFollow(el.scrollTop < 48);
-    el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
-  }, []);
+  const eventGate = useMemo<EventGate | undefined>(
+    () =>
+      gate && {
+        state: (c) => (c.stepId ? gate.state(c.stepId) : IDLE_GATE),
+        approve: (c) => c.stepId && gate.approve(c.stepId),
+        reject: (c) => c.stepId && gate.reject(c.stepId),
+      },
+    [gate],
+  );
+  const terminal = useCallback(() => (ended ? status : undefined), [ended, status]);
+  const isRunLive = useCallback(() => live, [live]);
 
   return (
-    <div className="flex flex-col h-full min-h-0">
+    <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center justify-between px-1 pb-2">
         {connection ? <ConnectionBadge state={connection} /> : <span />}
-        <span className="text-note text-ink-mute tabular-nums">
+        <span className="text-note tabular-nums text-ink-mute">
           {count} event{count === 1 ? '' : 's'}
         </span>
       </div>
-
-      <div
-        ref={scrollRef}
-        className="flex-1 min-h-0 overflow-y-auto rounded-xl border border-border bg-panel shadow-card p-3"
-      >
-        {cards.length === 0 ? (
-          <div className="p-8 text-center text-sm text-ink-dim">Waiting for events…</div>
-        ) : (
-          <div className="flex flex-col gap-2.5">
-            {cards.map((card) => (
-              <EventCard key={card.key} card={card} hideRunLink />
-            ))}
-          </div>
-        )}
-      </div>
+      <EventRail
+        className="flex-1 rounded-xl border border-border bg-panel shadow-card"
+        cards={cards}
+        scope="run"
+        width="narrow"
+        gate={eventGate}
+        terminal={terminal}
+        isRunLive={isRunLive}
+        live={live}
+        nowSub={live ? 'run live · streaming' : status ? `run ${status.replace(/_/g, ' ')}` : 'stream idle'}
+        emptyText="Waiting for events…"
+      />
     </div>
   );
 }
@@ -117,7 +123,7 @@ export function ConnectionBadge({ state }: { state: ConnectionState }) {
   const m = map[state];
   return (
     <span className={cn('inline-flex items-center gap-1.5 text-note font-medium', m.text)}>
-      <span className={cn('inline-block w-1.5 h-1.5 rounded-full', m.dot, state !== 'live' && 'animate-pulse')} />
+      <span className={cn('inline-block h-1.5 w-1.5 rounded-full', m.dot, state !== 'live' && 'animate-pulse')} />
       {m.label}
     </span>
   );

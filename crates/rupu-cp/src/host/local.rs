@@ -506,6 +506,19 @@ impl HostConnector for LocalHostConnector {
         .await
     }
 
+    async fn run_board(
+        &self,
+        id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        let global = self.global_dir.clone();
+        let id = id.to_string();
+        blocking_host(move || {
+            crate::api::board::local_run_board(&global, &id)
+                .map_err(|e| messages::connector_error(e, HostConnectorError::Internal))
+        })
+        .await
+    }
+
     async fn stream_run_events(&self, run_id: &str) -> Result<EventByteStream, HostConnectorError> {
         self.stream_run_events_after(run_id, 0).await
     }
@@ -1278,6 +1291,9 @@ mod launch_agent_tests {
         );
         let id = conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: None,
                 mode: None,
@@ -1315,6 +1331,9 @@ mod launch_agent_tests {
             tmp.path().to_path_buf(),
         );
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,
@@ -1357,6 +1376,9 @@ mod launch_agent_tests {
             tmp.path().to_path_buf(),
         );
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,
@@ -1404,6 +1426,9 @@ mod launch_agent_tests {
                 tmp.path().to_path_buf(),
             );
             conn.launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "recon".into(),
                 prompt: None,
                 mode: None,
@@ -1474,6 +1499,9 @@ mod launch_agent_tests {
             }],
         };
         conn.launch_agent(AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: None,
             mode: None,

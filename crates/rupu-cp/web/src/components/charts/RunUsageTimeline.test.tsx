@@ -2,7 +2,7 @@
 import '@testing-library/jest-dom/vitest';
 import { describe, it, expect } from 'vitest';
 import { render } from '@testing-library/react';
-import RunUsageTimeline, { formatTokenTick, toChartPoint } from './RunUsageTimeline';
+import RunUsageTimeline, { formatTokenTick } from './RunUsageTimeline';
 import type { UsageTimelinePoint } from '../../lib/api';
 
 describe('formatTokenTick', () => {
@@ -15,24 +15,6 @@ describe('formatTokenTick', () => {
   it('abbreviates millions and billions', () => {
     expect(formatTokenTick(1_200_000)).toBe('1.2M');
     expect(formatTokenTick(3_000_000_000)).toBe('3B');
-  });
-});
-
-describe('toChartPoint', () => {
-  const p: UsageTimelinePoint = { turn: 1, label: 'step', tokens_in: 800, tokens_out: 120, tokens_cached: 40 };
-  it('keeps all three series positive (axis split, not negation)', () => {
-    const d = toChartPoint(p);
-    expect(d.in).toBe(p.tokens_in);
-    expect(d.out).toBe(p.tokens_out);
-    expect(d.cached).toBe(p.tokens_cached);
-  });
-  it('preserves the original values and metadata', () => {
-    const d = toChartPoint(p);
-    expect(d.tokens_out).toBe(120);
-    expect(d.tokens_in).toBe(800);
-    expect(d.tokens_cached).toBe(40);
-    expect(d.label).toBe('step');
-    expect(d.turn).toBe(1);
   });
 });
 

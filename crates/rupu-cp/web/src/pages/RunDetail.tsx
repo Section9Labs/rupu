@@ -12,12 +12,13 @@
 // getRunUsageTimeline are called with the host parameter. All control/SSE
 // calls also include the host param.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { Archive, FileText, GitBranch, GitFork, ListOrdered, MessagesSquare, Network as NetworkIcon, Pause, ShieldAlert, Trash2 } from 'lucide-react';
 import {
   api,
   ApiError,
+  apiErrorMessage,
   isKnownRunEvent,
   type AutoflowRunContext,
   type RunEvent,
@@ -30,11 +31,15 @@ import { StatusPill } from '../components/StatusPill';
 import { Button } from '../components/ui/Button';
 import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { StatusChip } from '../components/ui/StatusChip';
+import { RetryControl, type RetryChoice } from '../components/runops/RetryControl';
+import { asPermissionMode, isAgentRunRecord, isRetryable, RETRY_STALL_MS, runsApi } from '../lib/api3b/runs';
 import { TabBar, TabButton } from '../components/TabBar';
 
 const BACK = { label: 'Runs', to: '/runs' };
 import { FindingsExplorer } from '../components/findings/FindingsExplorer';
-import RunGraph, { type NodeSelection } from '../components/RunGraph';
+import RunGraph, { type NodeSelection, type RunGraphOverlay } from '../components/RunGraph';
+import type { GateControl } from '../components/graph/GateActions';
 import RunEventFeed, { type ConnectionState, type SeqEvent } from '../components/RunEventFeed';
 import RunWarningsBanner from '../components/RunWarningsBanner';
 import TranscriptPanel from '../components/TranscriptPanel';
@@ -42,10 +47,21 @@ import MessageFeed from '../components/messages/MessageFeed';
 import { MessageLinksContext, type MessageLinks } from '../components/transcript/messageLinks';
 import { msgHash, parseMsgHash } from '../lib/messages';
 import { useTabParam, withTab } from '../lib/tabParam';
-import { useMessageSpace } from '../lib/useMessageSpace';
+import { useMessageSpace, type MessageSpace } from '../lib/useMessageSpace';
+import { useRunLayer } from '../lib/flow/useRunLayer';
+import type { FlowMessage } from '../lib/flow/flowModel';
+import type { RunLayer } from '../lib/flow/runLayer';
+import { boardAt } from '../lib/flow/runLayer';
+import { TimeAxis } from '../components/timeline/TimeAxis';
+import MessageListPanel from '../components/flowmap/MessageListPanel';
+import BoardRail, { boardCounts } from '../components/flowmap/BoardRail';
+import CollapsiblePanel from '../components/flowmap/CollapsiblePanel';
 import type { SpaceParticipant } from '../lib/api';
 import StepTranscriptBrowser from '../components/run/StepTranscriptBrowser';
 import RunUsageTimeline from '../components/charts/RunUsageTimeline';
+import TurnWindowBar from '../components/run/TurnWindowBar';
+import WindowTranscripts from '../components/run/WindowTranscripts';
+import { turnWindow } from '../lib/run/turnWindow';
 import AutoflowPanel from '../components/AutoflowPanel';
 import CyclesTab from '../components/run/CyclesTab';
 import ChildrenPanel from '../components/run/ChildrenPanel';
@@ -80,6 +96,134 @@ type Tab = (typeof RUN_TABS)[number];
  * selection, so this is informational); `null` means "whole run".
  */
 type Selection = { stepId: string; unitIndex?: number } | null;
+
+/** The Messages list and the board under the run graph (its message layer):
+ *  what the replay has revealed; a row picked lights its arc. Memoized: a
+ *  replay frame that reveals nothing new renders nothing here. */
+const RunLayerPanels = memo(function RunLayerPanels({
+  layer,
+  shown,
+  revealed,
+  selected,
+  select,
+  spaces,
+}: {
+  layer: RunLayer;
+  shown: FlowMessage[];
+  revealed: Set<string> | null;
+  selected: string | null;
+  select: (id: string | null) => void;
+  spaces: Map<string, string>;
+}) {
+  const posts = useMemo(
+    () => (revealed ? layer.board.posts.filter((p) => revealed.has(p.id)) : layer.board.posts),
+    [layer, revealed],
+  );
+  const board = useMemo(() => boardAt(layer.board.view, revealed), [layer, revealed]);
+  return (
+    // `items-start`: a folded panel keeps its width, and only its header's height.
+    <div className="grid items-start gap-3 lg:grid-cols-2">
+      <CollapsiblePanel name="run-messages" title="Messages" count={shown.length} label="Run messages" testId="run-layer-messages">
+        <MessageListPanel messages={shown} spaces={spaces} selected={selected} onSelect={select} />
+      </CollapsiblePanel>
+      <CollapsiblePanel name="run-board" title="Board" count={boardCounts(board, posts)} label="Run board" testId="run-layer-board">
+        <BoardRail board={board} posts={posts} onSelect={select} />
+      </CollapsiblePanel>
+    </div>
+  );
+});
+
+/** The run graph with its message layer (a run with a message space): the
+ *  time axis, the graph and the layer's panels. It owns the layer and its
+ *  timeline, so a replay or a scrub (a timeline update per animation frame)
+ *  re-renders only this, never the page around it. */
+const RunGraphChrome = memo(function RunGraphChrome({
+  id,
+  host,
+  model,
+  events,
+  record,
+  space,
+  running,
+  positions,
+  gate,
+  onSelectNode,
+  onExpandFanout,
+  onOpenUnit,
+}: {
+  id: string;
+  host?: string;
+  model: RunGraphModel;
+  events: RunEvent[];
+  record: RunGraphResponse | null;
+  space: MessageSpace;
+  running: boolean;
+  positions: Map<string, Pos>;
+  gate?: GateControl;
+  onSelectNode: (sel: NodeSelection) => void;
+  onExpandFanout: (stepId: string) => void;
+  onOpenUnit: (stepId: string, index: number) => void;
+}) {
+  const runLayer = useRunLayer({ id, host, model, events, record, space, running });
+  // Rebuilt only when what the graph draws changes, not on every render.
+  const caughtUp = space.caughtUp;
+  const layerData = runLayer?.layer;
+  const layerRevealed = runLayer?.revealed ?? null;
+  const layerSelected = runLayer?.selected ?? null;
+  const layerSelect = runLayer?.select;
+  const layerFollow = runLayer?.follow ?? null;
+  const overlay = useMemo<RunGraphOverlay | undefined>(
+    () =>
+      layerData
+        ? {
+            messages: layerData.messages,
+            board: layerData.board.view,
+            writers: layerData.board.writers,
+            revealed: layerRevealed,
+            selected: layerSelected,
+            onSelect: layerSelect,
+            caughtUp,
+            follow: layerFollow,
+          }
+        : undefined,
+    [layerData, layerRevealed, layerSelected, layerSelect, caughtUp, layerFollow],
+  );
+  return (
+    <>
+      {runLayer && (
+        <TimeAxis
+          bands={runLayer.layer.timeline.bands}
+          items={runLayer.layer.timeline.items}
+          bounds={runLayer.bounds}
+          t={runLayer.timeline.t}
+          live={running}
+          onScrub={runLayer.timeline.scrub}
+          onReplay={runLayer.timeline.replay}
+          onRelease={runLayer.timeline.release}
+        />
+      )}
+      <RunGraph
+        model={model}
+        positions={positions}
+        gate={gate}
+        onSelectNode={onSelectNode}
+        onExpandFanout={onExpandFanout}
+        onOpenUnit={onOpenUnit}
+        overlay={overlay}
+      />
+      {runLayer && (
+        <RunLayerPanels
+          layer={runLayer.layer}
+          shown={runLayer.shown}
+          revealed={runLayer.revealed}
+          selected={runLayer.selected}
+          select={runLayer.select}
+          spaces={runLayer.spaces}
+        />
+      )}
+    </>
+  );
+});
 
 /** The step (and fan-out unit) a message-space participant ran as. */
 function selectionOf(model: RunGraphModel, p: SpaceParticipant): Selection {
@@ -166,6 +310,13 @@ function eventStepId(ev: RunEvent): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
+/** The longest the graph waits for the message-space probe before it is
+ *  drawn without the layer (a slow remote host). */
+const SPACE_PROBE_GRACE_MS = 1500;
+
+/** How often a requested retry polls the run record for the resume taking it. */
+const RETRY_POLL_MS = 1500;
+
 export default function RunDetail() {
   const { id = '' } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
@@ -197,11 +348,6 @@ export default function RunDetail() {
   // once the autoflow context arrives.
   const tab: Tab = (tabParam === 'cycles' && !autoflowCtx) || (tabParam === 'children' && remote) ? 'transcript' : tabParam;
 
-  const [messagesOpened, setMessagesOpened] = useState(false);
-  useEffect(() => {
-    if (tab === 'messages') setMessagesOpened(true);
-  }, [tab]);
-
   // Live state, fed by the single SSE subscription below.
   const [events, setEvents] = useState<SeqEvent[]>([]);
   const [connection, setConnection] = useState<ConnectionState>('connecting');
@@ -221,6 +367,10 @@ export default function RunDetail() {
   // a global index across all of the run's steps (see effect below).
   // Only populated for local runs (remote gating skips this fetch).
   const [series, setSeries] = useState<UsageTimelinePoint[]>([]);
+  // Turns selected on the Token flow (point indices): a window the
+  // Transcript, Events, Findings and Messages follow. Null = the whole run.
+  const [turnZoom, setTurnZoom] = useState<[number, number] | null>(null);
+  useEffect(() => setTurnZoom(null), [id]);
 
   // This run's finding count for the tab label, reported by the Findings tab
   // once it has been opened. `null` = not known yet.
@@ -289,6 +439,24 @@ export default function RunDetail() {
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // Retry (failed / rejected / cancelled runs). Pending, not optimistic: after
+  // the 202, `retryRequestedAt` holds until the run record shows the resume
+  // took the run (its marker consumed, or a non-retryable status); then
+  // `retryFollowing` holds while the retried run is live, so the page reads
+  // it afresh when it ends.
+  const [retryPending, setRetryPending] = useState(false);
+  const [retryRequestedAt, setRetryRequestedAt] = useState<number | null>(null);
+  const [retryFollowing, setRetryFollowing] = useState(false);
+  // Bumped to re-read the run's event stream from the start (a retried run
+  // replays its new attempt's events after the old ones, as a page load does).
+  const [streamGen, setStreamGen] = useState(0);
+  // The retried run ended and the graph (and the per-turn series) were read
+  // after it: their usage is the run's, where the live usage poll may hold a
+  // reading from mid-run.
+  const [usageFromGraph, setUsageFromGraph] = useState(false);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [retryStalled, setRetryStalled] = useState(false);
+
   // The ONE selection cursor that the tab panel follows. Null = whole run.
   const [selection, setSelection] = useState<Selection>(null);
   // Guards the one-time default seed so live model rebuilds don't override the
@@ -317,6 +485,12 @@ export default function RunDetail() {
     setResumeError(null);
     setActionPending(false);
     setActionError(null);
+    setRetryPending(false);
+    setRetryRequestedAt(null);
+    setRetryFollowing(false);
+    setUsageFromGraph(false);
+    setRetryError(null);
+    setRetryStalled(false);
     seededSelRef.current = false;
     setFindingsCount(null);
     setChildrenCount(null);
@@ -354,7 +528,7 @@ export default function RunDetail() {
     return () => {
       cancelled = true;
     };
-  }, [id, host]);
+  }, [id, host, streamGen]);
 
   // Autoflow-history context — independent of ?host= (the endpoint is
   // global-history-only today; see api.ts's getRunAutoflow doc comment).
@@ -416,7 +590,7 @@ export default function RunDetail() {
       host ? { host } : undefined,
     );
     return unsubscribe;
-  }, [id, host]);
+  }, [id, host, streamGen]);
 
   // Plain RunEvent[] for the model builder (drop the seq wrapper).
   const rawEvents = useMemo<RunEvent[]>(() => events.map((e) => e.event), [events]);
@@ -562,13 +736,25 @@ export default function RunDetail() {
   const effectiveStatus = liveRunStatus ?? run?.status ?? 'pending';
   const isRunning = effectiveStatus === 'running' || effectiveStatus === 'pending';
 
-  // The run's message space: probed always (the tab shows only when there is
-  // one), read in full once the tab is opened, followed while the run is live
-  // so the tab can count what arrives.
+  // The run's message space: probed always (the tab and the graph's layer
+  // show only when there is one), read in full when there is (the graph's
+  // layer draws every message), followed while the run is live.
   const messages = useMessageSpace(
     { route: 'runs', id, host },
-    { live: isRunning && !!run, load: (isRunning && !!run) || messagesOpened, reading: tab === 'messages' },
+    { live: isRunning && !!run, load: true, reading: tab === 'messages' },
   );
+  // Whether the run has a space decides the graph's height and whether the
+  // time axis sits above it, so the graph waits for the probe's answer (for
+  // at most SPACE_PROBE_GRACE_MS): it is drawn once, at its final place, and
+  // never jumps when the answer lands.
+  const [probeGraceOver, setProbeGraceOver] = useState(false);
+  useEffect(() => {
+    setProbeGraceOver(false);
+    const timer = setTimeout(() => setProbeGraceOver(true), SPACE_PROBE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [id, host]);
+  const spaceKnown =
+    messages.space !== null || messages.status === 'unavailable' || messages.status === 'error' || probeGraceOver;
   const messageLinks = useMemo<MessageLinks>(() => {
     const openAt = (address: string, msgId: string) => {
       const p = messages.participants.find((x) => x.address === address);
@@ -598,8 +784,64 @@ export default function RunDetail() {
   // one-shot usage + the timeline fetch.
   const runKnown = run !== null && run.id === id;
   const { usage: liveUsage } = useRunUsage(id, host, runKnown && isRunning, { runKnown });
+
+  // A requested retry: poll the run record until the resume has taken the run
+  // (its flip to Running consumes the marker the retry recorded), then follow
+  // the retried run until it ends. At each of those two points the page reads
+  // the run afresh (graph + event stream), so nothing from the failed attempt
+  // lingers. A marker that outlives RETRY_STALL_MS is a retry that never
+  // started: say so and offer Retry again.
+  useEffect(() => {
+    if (retryRequestedAt === null && !retryFollowing) return;
+    let cancelled = false;
+    const reread = async () => {
+      const g = await api.getRunGraph(id);
+      if (cancelled) return;
+      setGraph(g);
+      setStreamGen((n) => n + 1);
+    };
+    const tick = async () => {
+      try {
+        const { run: rec } = await api.getRun(id);
+        if (cancelled) return;
+        const live = rec.status === 'running' || rec.status === 'pending';
+        if (retryRequestedAt !== null) {
+          if (!isRetryable(rec.status) || !rec.resume_requested_at) {
+            // Re-read before moving the phase: the phase change re-runs this
+            // effect, whose cleanup would drop a read still in flight.
+            await reread();
+            if (cancelled) return;
+            setRetryRequestedAt(null);
+            setRetryFollowing(live);
+            setUsageFromGraph(!live);
+          } else if (Date.now() - retryRequestedAt > RETRY_STALL_MS) {
+            setRetryRequestedAt(null);
+            setRetryStalled(true);
+          }
+        } else if (!live) {
+          await reread();
+          if (cancelled) return;
+          setRetryFollowing(false);
+          setUsageFromGraph(true);
+        }
+      } catch {
+        // A failed read keeps polling: the request is still recorded.
+      }
+    };
+    const t = window.setInterval(() => void tick(), RETRY_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [retryRequestedAt, retryFollowing, id]);
   // Usage for the header row: live summary, else the graph's one-shot numbers.
-  const displayUsage = liveUsage?.summary ?? graph?.usage;
+  const displayUsage = usageFromGraph ? (graph?.usage ?? liveUsage?.summary) : (liveUsage?.summary ?? graph?.usage);
+  const chartPoints = (usageFromGraph ? null : liveUsage?.points) ?? series;
+  const turnWin = useMemo(
+    () => (turnZoom ? turnWindow(chartPoints, turnZoom[0], turnZoom[1]) : null),
+    [chartPoints, turnZoom],
+  );
+  const windowSpan = turnWin?.span ?? null;
   // Pause is only offered while the run is actively `running` (not merely
   // `pending`, and not `awaiting_approval` — those have their own gate).
   const isPausable = effectiveStatus === 'running';
@@ -704,6 +946,22 @@ export default function RunDetail() {
     }
   }
 
+  async function onRetry(choice: RetryChoice) {
+    if (!run || retryPending) return;
+    setRetryPending(true);
+    setRetryError(null);
+    setRetryStalled(false);
+    setUsageFromGraph(false);
+    try {
+      await runsApi.retryRun(run.id, choice);
+      setRetryRequestedAt(Date.now());
+    } catch (e: unknown) {
+      setRetryError(apiErrorMessage(e));
+    } finally {
+      setRetryPending(false);
+    }
+  }
+
   async function onArchive() {
     if (actionPending) return;
     setActionPending(true);
@@ -750,6 +1008,34 @@ export default function RunDetail() {
     }
   }
 
+  // Approve / Reject on the gate node itself: the same handlers the banners
+  // use, so the node and its banner always agree. One parked gate goes through
+  // the single-gate handlers (the banner it shares state with); several go
+  // through the per-gate ones, keyed by step id. The handlers are read through
+  // a ref so the control (and the graph's nodes) only change with the state.
+  const gateHandlers = useRef({ onApprove, onReject, onApproveGate, onRejectGate });
+  gateHandlers.current = { onApprove, onReject, onApproveGate, onRejectGate };
+  const multiGate = awaitingGates.length > 1;
+  const gateControl = useMemo<GateControl | undefined>(() => {
+    if (!run || cancelled) return undefined;
+    if (multiGate) {
+      return {
+        state: (stepId) => {
+          const gs = multiGateState[stepId] ?? DEFAULT_GATE_UI_STATE;
+          return { pending: gs.pending, decision: gs.decision, error: gs.error };
+        },
+        approve: (stepId) => void gateHandlers.current.onApproveGate(stepId),
+        reject: (stepId) => void gateHandlers.current.onRejectGate(stepId),
+      };
+    }
+    const decision = rejected ? 'rejected' : resumeRequested ? 'approved' : null;
+    return {
+      state: () => ({ pending: gatePending, decision, error: gateError }),
+      approve: () => void gateHandlers.current.onApprove(),
+      reject: () => void gateHandlers.current.onReject(),
+    };
+  }, [run, cancelled, multiGate, multiGateState, rejected, resumeRequested, gatePending, gateError]);
+
   // ---- Selection-driven derivations (safe when model is null) --------------
 
   // The selected node, its fan-out (if any), and its resolved transcript path.
@@ -772,9 +1058,16 @@ export default function RunDetail() {
   // Events filtered to the selected step (run-level events, which carry no
   // step_id, drop out naturally); the whole feed when nothing is selected.
   const feedEvents = useMemo<SeqEvent[]>(() => {
-    if (!selection) return events;
-    return events.filter((e) => eventStepId(e.event) === selection.stepId);
-  }, [events, selection]);
+    const inStep = selection ? events.filter((e) => eventStepId(e.event) === selection.stepId) : events;
+    if (!turnWin) return inStep;
+    // Run events carry no time of their own, so a window keeps the events of
+    // the steps its turns belong to.
+    const steps = new Set(turnWin.labels);
+    return inStep.filter((e) => {
+      const step = eventStepId(e.event);
+      return step !== undefined && step !== null && steps.has(step);
+    });
+  }, [events, selection, turnWin]);
 
   // RunGraph wiring → selection cursor. A normal step's NodeSelection.label is
   // its node id (== step id); for_each expand/open-unit pass the step id (and
@@ -804,8 +1097,8 @@ export default function RunDetail() {
     );
   }
 
-  // Loading: we need both run and model.
-  if (!run || !model) {
+  // Loading: we need both run and model, and to know whether it has a space.
+  if (!run || !model || !spaceKnown) {
     return (
       <div className="p-8">
         <PageHeader back={BACK} title="Run" />
@@ -875,33 +1168,61 @@ export default function RunDetail() {
                   )}
                 </div>
               )}
-              {!isRunning && (
-                <div className="flex flex-col items-end gap-1">
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="secondary"
-                      onClick={() => void onArchive()}
-                      disabled={actionPending}
-                      className="gap-1.5"
-                    >
-                      <Archive size={14} /> Archive
-                    </Button>
-                    <Button
-                      variant="danger-outline"
-                      onClick={() => void onDelete()}
-                      disabled={actionPending}
-                      className="gap-1.5"
-                    >
-                      <Trash2 size={14} /> Delete
-                    </Button>
-                  </div>
-                  {actionError && (
-                    <p role="alert" className="text-ui font-medium text-err">
-                      {actionError}
-                    </p>
-                  )}
-                </div>
+          {!isRunning && (
+            <div className="flex shrink-0 flex-col items-end gap-1">
+              <div className="flex items-center gap-2">
+                {isRetryable(effectiveStatus) &&
+                  !isAgentRunRecord(run.workflow_name) &&
+                  (retryRequestedAt !== null ? (
+                    <StatusChip tone="running" dot className="mr-1">
+                      retry requested
+                    </StatusChip>
+                  ) : (
+                    <RetryControl
+                      workflowName={run.workflow_name}
+                      recordedMode={asPermissionMode(run.permission_mode)}
+                      disabled={remote || retryPending}
+                      disabledReason={
+                        remote ? 'Retrying is local-only: a remote host resumes only paused runs.' : undefined
+                      }
+                      onRetry={(choice) => void onRetry(choice)}
+                    />
+                  ))}
+                <Button
+                  variant="secondary"
+                  onClick={() => void onArchive()}
+                  disabled={actionPending}
+                  className="gap-1.5"
+                >
+                  <Archive size={14} /> Archive
+                </Button>
+                <Button
+                  variant="danger-outline"
+                  onClick={() => void onDelete()}
+                  disabled={actionPending}
+                  className="gap-1.5"
+                >
+                  <Trash2 size={14} /> Delete
+                </Button>
+              </div>
+              {actionError && (
+                <p role="alert" className="text-ui font-medium text-err">
+                  {actionError}
+                </p>
               )}
+              {retryError && (
+                <p role="alert" className="max-w-md text-right text-ui font-medium text-err">
+                  {retryError}
+                </p>
+              )}
+              {retryStalled && (
+                <p role="status" className="max-w-md text-right text-note text-warn">
+                  The retry was recorded but hasn’t started. Its log is <span className="font-mono">retry.log</span> in
+                  the run’s directory.
+                </p>
+              )}
+            </div>
+          )}
             </>
           }
         />
@@ -1271,10 +1592,19 @@ export default function RunDetail() {
         )}
 
         {/* Persistent chrome: the run graph + per-turn usage chart. */}
-        <section className="mt-3" data-testid="run-graph-chrome">
-          <RunGraph
+        <section className="mt-3 space-y-3" data-testid="run-graph-chrome">
+          {/* The graph, its message layer, time axis and panels: one child
+              owns the layer's timeline, so a replay never re-renders the page. */}
+          <RunGraphChrome
+            id={id}
+            host={host}
             model={model!}
+            events={rawEvents}
+            record={graph}
+            space={messages}
+            running={isRunning}
             positions={positions}
+            gate={gateControl}
             onSelectNode={selectFromNode}
             onExpandFanout={selectStep}
             onOpenUnit={selectUnit}
@@ -1283,13 +1613,17 @@ export default function RunDetail() {
 
         {/* Persistent chrome: per-turn usage chart. */}
         <section
-          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-4 py-3"
+          className="mt-3 bg-panel border border-border rounded-xl shadow-card px-5 pb-3 pt-4"
           data-testid="usage-timeline-chrome"
         >
-          <h2 className="text-xs font-semibold text-ink-dim uppercase tracking-wide mb-2">
-            Token usage by turn
-          </h2>
-          <RunUsageTimeline series={liveUsage?.points ?? series} separators />
+          <RunUsageTimeline
+            key={id}
+            series={chartPoints}
+            separators
+            live={isRunning}
+            zoom={turnZoom}
+            onZoomChange={setTurnZoom}
+          />
         </section>
 
         {/* Autoflow panel — only when this run has an autoflow-history trail. */}
@@ -1318,6 +1652,12 @@ export default function RunDetail() {
           )}
         </TabBar>
       </div>
+
+      {turnWin && (
+        <div className="px-8 pt-2">
+          <TurnWindowBar window={turnWin} onClear={() => setTurnZoom(null)} />
+        </div>
+      )}
 
       <div className="px-8 pt-2 text-note text-ink-dim">
         <span data-testid="run-selected-label" className="inline-flex flex-wrap items-center gap-1.5">
@@ -1353,7 +1693,16 @@ export default function RunDetail() {
           <MessageLinksContext.Provider value={messages.space === 'present' ? messageLinks : {}}>
           <SubrunIdentityContext.Provider value={subrunIdentities}>
             <div className="flex h-full min-h-0 flex-col overflow-auto">
-              {selection && selectedFanout ? (
+              {turnWin ? (
+                <WindowTranscripts
+                  window={turnWin}
+                  model={model}
+                  preferred={selectedTranscriptPath}
+                  live={isRunning}
+                  runId={id}
+                  host={host}
+                />
+              ) : selection && selectedFanout ? (
                 <StepTranscriptBrowser
                   stepId={selection.stepId}
                   units={selectedFanout.units}
@@ -1393,18 +1742,26 @@ export default function RunDetail() {
                 return p && model && selectionOf(model, p) ? () => messageLinks.openParticipant?.(m.from, m.id) : null;
               }}
               highlightId={parseMsgHash(hash)}
+              within={windowSpan}
             />
           </div>
         )}
         {tab === 'events' && (
           <div className="h-full min-h-0">
-            <RunEventFeed events={feedEvents} connection={connection} crewByRun={crewByRun} />
+            <RunEventFeed
+              events={feedEvents}
+              connection={connection}
+              crewByRun={crewByRun}
+              gate={gateControl}
+              status={effectiveStatus}
+            />
           </div>
         )}
         {tab === 'findings' && (
           <div className="h-full min-h-0 overflow-auto">
             <FindingsExplorer
               scope={{ runId: id }}
+              within={windowSpan}
               exportTitle="Run findings report"
               onCount={setFindingsCount}
               empty={{

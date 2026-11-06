@@ -1,6 +1,7 @@
 // Per-target coverage detail — a tabbed shell (Overview | Catalog | Audit |
 // Gap). Overview shows findings, files touched, and the assertion grid; the
-// other tabs lazily fetch their own endpoints. Routes: /coverage/:target and
+// other tabs lazily fetch their own endpoints. The header's "Rerun…" replays a
+// recorded run on the target. Routes: /coverage/:target and
 // /coverage/:target/{catalog,audit,gap}. The ?ws_id= scope is preserved across
 // tabs.
 
@@ -13,6 +14,7 @@ import CoverageGapTab from '../components/coverage/CoverageGapTab';
 import CoverageDiffTab from '../components/coverage/CoverageDiffTab';
 import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { CoverageRerunButton } from '../components/coverage/CoverageRerunDialog';
 import { Spinner } from '../components/ui/Spinner';
 import {
   api,
@@ -132,7 +134,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
         back={{ label: 'Coverage', to: '/coverage' }}
         title={<span className="break-all">{detail.target_id}</span>}
         subtitle={`${detail.assertions.length} assertion${detail.assertions.length !== 1 ? 's' : ''} · ${sortedFindings.length} finding${sortedFindings.length !== 1 ? 's' : ''} · ${files.length} file${files.length !== 1 ? 's' : ''} touched`}
-        actions={<CatalogBadge present={detail.has_catalog} />}
+        actions={<><CatalogBadge present={detail.has_catalog} /><CoverageRerunButton target={target} wsId={wsId} /></>}
       />
 
       {/* Tab bar */}

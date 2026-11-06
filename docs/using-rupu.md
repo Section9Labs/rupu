@@ -330,6 +330,7 @@ A single agent run continues the same way:
 ```sh
 rupu run review-diff --continue run_01J...                       # interrupted: pick it up
 rupu run review-diff --continue run_01J... --model <other-model>  # failed on a refusal / cut-off: try another model
+rupu run review-diff --continue run_01J... "now fix the first one"  # any ended run: tell it something new
 ```
 
 Run it from the same directory as the original run. A continue restores every flag

@@ -193,8 +193,8 @@ assert_out "source ships" "crates/rupu-cli/src/main.rs" \
 
 # Markdown under crates/ is compiled in (include_str! of the agent
 # templates), so the .md suffix alone must never mark a path as docs.
-assert_out "markdown compiled into the binary ships" "crates/rupu-cli/templates/agents/fix-bug.md" \
-  sh -c "printf 'crates/rupu-cli/templates/agents/fix-bug.md\n' | '$SHIP'"
+assert_out "markdown compiled into the binary ships" "crates/rupu-templates/templates/agents/fix-bug.md" \
+  sh -c "printf 'crates/rupu-templates/templates/agents/fix-bug.md\n' | '$SHIP'"
 
 # docs/pages is the site GitHub Pages deploys on merge, not something a
 # release publishes; its keyring check runs on the PR that touches it.

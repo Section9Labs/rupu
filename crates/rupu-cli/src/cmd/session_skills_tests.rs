@@ -1385,7 +1385,7 @@ async fn session_compact_reattaches_loaded_skills_once() {
     let (global, record, _) = compactable_session(&tmp, "ses_skills_compact01").await;
     for _ in 0..2 {
         let before = history_len(&global, &record.session_id);
-        with_mock_home(&global, SUMMARY, compact(&record.session_id, None))
+        with_mock_home(&global, SUMMARY, compact(&record.session_id, None, None))
             .await
             .expect("compact completes");
         assert!(
@@ -1454,7 +1454,7 @@ async fn compaction_names_a_loaded_skill_that_was_uninstalled() {
     let (global, record, pdf) = compactable_session(&tmp, "ses_skills_compact03").await;
     fs::remove_dir_all(&pdf).unwrap();
 
-    with_mock_home(&global, SUMMARY, compact(&record.session_id, None))
+    with_mock_home(&global, SUMMARY, compact(&record.session_id, None, None))
         .await
         .expect("compact completes");
     let blocks = reattach_blocks(&global, &record.session_id);

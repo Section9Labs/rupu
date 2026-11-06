@@ -1,0 +1,1610 @@
+/* ──────────────────────────────────────────────────────────────────────────
+ * Workflow-graph look and motion: the run graph (components/RunGraph.tsx,
+ * components/graph/*, `gx-*`), the workflow editor's canvas (`wfx-*`) and the
+ * agentiflow map (components/flowmap/*, `afx-*`, at the end), on the same
+ * tokens and keyframes. "Calm depth": cards are raised panels whose
+ * shadows read as light; status is a capsule whose glyph morphs between
+ * states; only the live frontier moves continuously, and every move says
+ * something about the run:
+ *
+ *  - the graph arrives column by column, left to right, the order it runs:
+ *    each card settles down into place and the edges out of it draw;
+ *  - an edge the run has taken is solid and luminous, an untaken one faint, one
+ *    out of a failed step a dashed red dead end; a glow travels along the edge
+ *    into a running step (amber and slower into a gate that waits on you);
+ *  - a running card floats a little higher on a breathing under-glow and
+ *    carries a progress line along its foot; its capsule's arc spins;
+ *  - a gate that waits on you glows amber, and its Approve breathes;
+ *  - a step that lands plays one cue: a green bloom under the card while the
+ *    arc closes into a ring and grows a check; a failure flashes the card red
+ *    once while its X draws;
+ *  - state changes cross-fade and morph, never swap.
+ *
+ * Arrivals use --ease-out, on-screen movement --ease-in-out (both from the
+ * Chart motion block in styles.css). Colors are theme tokens. Under
+ * prefers-reduced-motion nothing travels, spins, breathes or draws: things
+ * fade, and states hold still.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --rgx-stagger: 70ms;  /* between entrance columns */
+  --rgx-enter: 460ms;   /* a card's settle */
+  --rgx-draw: 420ms;    /* an edge's draw */
+  --gx-spring: cubic-bezier(0.34, 1.2, 0.64, 1);
+  --gx-card: var(--c-panel);
+  --gx-sh: 15 23 42;
+  --gx-shadow-rest: 0 1px 1px rgb(var(--gx-sh) / 0.04), 0 2px 6px -1px rgb(var(--gx-sh) / 0.06),
+    0 10px 20px -8px rgb(var(--gx-sh) / 0.08);
+  --gx-shadow-lift: 0 1px 2px rgb(var(--gx-sh) / 0.05), 0 6px 14px -4px rgb(var(--gx-sh) / 0.1),
+    0 24px 40px -14px rgb(var(--gx-sh) / 0.18);
+  --gx-highlight: inset 0 1px 0 rgb(255 255 255 / 0.9);
+  --gx-glow-rest: 0.5;
+  --gx-sil-shadow: drop-shadow(0 1px 1px rgb(15 23 42 / 0.05)) drop-shadow(0 4px 8px rgb(15 23 42 / 0.07));
+}
+[data-theme='dark'] {
+  --gx-card: var(--c-surface);
+  --gx-sh: 0 0 0;
+  --gx-shadow-rest: 0 1px 1px rgb(var(--gx-sh) / 0.35), 0 4px 10px -2px rgb(var(--gx-sh) / 0.45);
+  --gx-shadow-lift: 0 2px 4px rgb(var(--gx-sh) / 0.45), 0 14px 32px -8px rgb(var(--gx-sh) / 0.7);
+  --gx-highlight: inset 0 1px 0 rgb(255 255 255 / 0.07);
+  --gx-glow-rest: 0.4;
+  --gx-sil-shadow: drop-shadow(0 1px 1px rgb(0 0 0 / 0.4)) drop-shadow(0 4px 10px rgb(0 0 0 / 0.45));
+}
+
+/* Status color, by state, for anything marked .gx-s[data-state]. */
+.gx-s { --gx-c: var(--c-status-pending); }
+.gx-s[data-state='running'] { --gx-c: var(--c-status-running); }
+.gx-s[data-state='done'] { --gx-c: var(--c-status-done); }
+.gx-s[data-state='failed'] { --gx-c: var(--c-status-failed); }
+.gx-s[data-state='awaiting_approval'] { --gx-c: var(--c-status-awaiting); }
+.gx-s[data-state='paused'] { --gx-c: var(--c-status-paused); }
+
+/* ── canvas ── */
+.gx-canvas { background: rgb(var(--c-bg)); }
+:is(.gx-canvas, .wfx-canvas) .react-flow__controls,
+:is(.gx-canvas, .wfx-canvas) .react-flow__minimap {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 9px;
+  overflow: hidden;
+  background: rgb(var(--c-panel));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+}
+:is(.gx-canvas, .wfx-canvas) .react-flow__controls-button {
+  width: 26px;
+  height: 26px;
+  border-bottom: 1px solid rgb(var(--c-border));
+  background: rgb(var(--c-panel));
+  transition: background-color 150ms ease;
+}
+:is(.gx-canvas, .wfx-canvas) .react-flow__controls-button:last-child { border-bottom: 0; }
+:is(.gx-canvas, .wfx-canvas) .react-flow__controls-button svg { fill: rgb(var(--c-ink-dim)); max-width: 11px; max-height: 11px; }
+@media (hover: hover) and (pointer: fine) {
+  :is(.gx-canvas, .wfx-canvas) .react-flow__controls-button:hover { background: rgb(var(--c-surface-hover)); }
+}
+
+/* The run at a glance, over the canvas's top-right corner. */
+.gx-summary {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 13px;
+  background: rgb(var(--c-panel) / 0.9);
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  font-size: 11px;
+  color: rgb(var(--c-ink-dim));
+  pointer-events: none;
+  animation: rgx-fade 300ms ease-out 200ms backwards;
+}
+.gx-summary-item { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.gx-summary-item b { color: rgb(var(--c-ink)); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* ── the card ── */
+.gx-node {
+  position: relative;
+  --k: var(--c-ink-mute);
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+}
+@keyframes rgx-enter {
+  from { opacity: 0; translate: 0 10px; scale: 0.985; }
+}
+.gx-card {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  padding: 11px 13px 10px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 12px;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  overflow: hidden;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+  transition: translate 180ms var(--ease-out), border-color 240ms ease;
+}
+.gx-node[data-state='failed'] > .gx-card { border-color: rgb(var(--c-status-failed) / 0.55); }
+.gx-node[data-state='awaiting_approval'] > .gx-card { border-color: rgb(var(--c-status-awaiting) / 0.5); }
+
+/* Depth: the lift shadow cross-fades in (never a shadow transition). */
+.gx-lift {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: 12px;
+  box-shadow: var(--gx-shadow-lift);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease, translate 180ms var(--ease-out);
+}
+:is(.gx-node[data-state='running'], .gx-node[data-state='awaiting_approval']) > :is(.gx-card, .gx-lift) {
+  translate: 0 -1px;
+}
+:is(.gx-node[data-state='running'], .gx-node[data-state='awaiting_approval']) > .gx-lift { opacity: 1; }
+@media (hover: hover) and (pointer: fine) {
+  .react-flow__node:hover .gx-node > :is(.gx-card, .gx-lift) { translate: 0 -1px; }
+  .react-flow__node:hover .gx-node > .gx-lift { opacity: 1; }
+  .react-flow__node:hover .gx-node > .gx-card { border-color: rgb(var(--c-ink) / 0.14); }
+  .react-flow__node:hover .gx-node[data-state='failed'] > .gx-card { border-color: rgb(var(--c-status-failed) / 0.7); }
+}
+
+/* The under-glow a working card breathes on, and the bloom a landing plays. */
+.gx-glow,
+.gx-bloom {
+  position: absolute;
+  z-index: 0;
+  left: 14%;
+  right: 14%;
+  bottom: -8px;
+  height: 24px;
+  border-radius: 50%;
+  filter: blur(14px);
+  opacity: 0;
+  pointer-events: none;
+}
+.gx-glow { background: rgb(var(--c-status-running)); transition: opacity 400ms ease; }
+.gx-node[data-state='running'] > .gx-glow {
+  opacity: var(--gx-glow-rest);
+  animation: gx-breathe 2.8s var(--ease-in-out) infinite;
+}
+.gx-node[data-state='awaiting_approval'] > .gx-glow {
+  background: rgb(var(--c-status-awaiting));
+  opacity: calc(var(--gx-glow-rest) * 0.75);
+}
+@keyframes gx-breathe {
+  0%, 100% { opacity: var(--gx-glow-rest); scale: 0.96 1; }
+  50% { opacity: calc(var(--gx-glow-rest) + 0.25); scale: 1.05 1; }
+}
+.gx-bloom {
+  left: 6%;
+  right: 6%;
+  bottom: -12px;
+  height: 30px;
+  filter: blur(18px);
+  background: rgb(var(--c-status-done));
+}
+.gx-node[data-cue='done'] > .gx-bloom { animation: gx-bloom 1000ms var(--ease-out); }
+@keyframes gx-bloom {
+  0% { opacity: 0; scale: 0.85; }
+  30% { opacity: 0.8; }
+  100% { opacity: 0; scale: 1.15; }
+}
+.gx-flash {
+  position: absolute;
+  inset: 0;
+  border-radius: 11px;
+  background: rgb(var(--c-status-failed));
+  opacity: 0;
+  pointer-events: none;
+}
+.gx-node[data-cue='failed'] > .gx-card > .gx-flash { animation: gx-flash 440ms var(--ease-out); }
+@keyframes gx-flash {
+  0% { opacity: 0; }
+  15% { opacity: 0.26; }
+  100% { opacity: 0; }
+}
+
+/* Selection: a brand ring with a gap. */
+.gx-sel {
+  position: absolute;
+  inset: -5px;
+  z-index: 3;
+  border: 2px solid rgb(var(--c-brand-500));
+  border-radius: 17px;
+  box-shadow: 0 0 0 4px rgb(var(--c-brand-500) / 0.12);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+.react-flow__node.selected .gx-sel { opacity: 1; }
+/* An end of the selected message: the ring, lighter and without its halo. */
+.gx-node[data-lit] > .gx-sel { opacity: 0.7; box-shadow: none; }
+.react-flow__node.selected .gx-node[data-lit] > .gx-sel { opacity: 1; }
+
+/* Ports: a small ring on each side, in the kind's color. */
+.gx-node .react-flow__handle.gx-port {
+  width: 7px;
+  height: 7px;
+  min-width: 0;
+  min-height: 0;
+  z-index: 4;
+  border: 1.5px solid rgb(var(--k) / 0.55);
+  background: rgb(var(--gx-card));
+}
+
+/* ── anatomy ── */
+.gx-head { display: flex; align-items: center; gap: 7px; height: 20px; min-width: 0; }
+.gx-tile {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: rgb(var(--k) / 0.14);
+  color: rgb(var(--k));
+}
+.gx-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: rgb(var(--c-ink));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gx-count {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: rgb(var(--c-ink-dim));
+}
+.gx-body { margin-top: 9px; min-width: 0; }
+.gx-line {
+  overflow: hidden;
+  font-size: 12px;
+  line-height: 16px;
+  color: rgb(var(--c-ink));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gx-sub {
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 14px;
+  color: rgb(var(--c-ink-dim));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gx-body > .gx-sub { margin-top: 0; }
+.gx-line + .gx-sub { margin-top: 2px; }
+.gx-row { display: flex; align-items: center; gap: 8px; height: 28px; }
+.gx-grow { flex: 1 1 auto; }
+.gx-tag {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: rgb(var(--c-surface));
+  font-size: 10px;
+  font-weight: 600;
+  color: rgb(var(--c-ink-dim));
+}
+.gx-foot {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 9px;
+  font-size: 10px;
+  line-height: 12px;
+  min-width: 0;
+}
+.gx-kind {
+  flex: none;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgb(var(--k));
+}
+.gx-failcount { font-size: 10px; font-weight: 600; color: rgb(var(--c-status-failed)); }
+
+/* Identity: `leaf · agent` 12px, provider/model 11px mono. */
+.gx-ident [data-testid='agent-head'] { font-size: 12px; line-height: 16px; color: rgb(var(--c-ink)); }
+.gx-ident [data-testid='agent-pm'] { margin-top: 2px; font-size: 11px; line-height: 14px; color: rgb(var(--c-ink-dim)); }
+.gx-ident-sm [data-testid='agent-head'] { font-size: 11px; line-height: 14px; color: rgb(var(--c-ink-dim)); }
+.gx-ident-sm [data-testid='agent-pm'] { margin-top: 1px; font-size: 10px; line-height: 13px; color: rgb(var(--c-ink-mute)); }
+
+/* The progress line a working card (or row) carries along its foot. */
+.gx-runline {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 0;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 1px;
+  background: rgb(var(--c-status-running) / 0.16);
+}
+.gx-runline > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 38%;
+  border-radius: 1px;
+  background: linear-gradient(90deg, rgb(var(--c-status-running) / 0), rgb(var(--c-status-running)), rgb(var(--c-status-running) / 0));
+  translate: -100% 0;
+  animation: gx-run 1.6s var(--ease-in-out) infinite;
+}
+@keyframes gx-run {
+  to { translate: 270% 0; }
+}
+
+/* ── status capsule + its morphing glyph ── */
+.gx-cap {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 7px 0 5px;
+  border-radius: 10px;
+  background: rgb(var(--gx-c) / 0.1);
+  box-shadow: inset 0 0 0 1px rgb(var(--gx-c) / 0.22);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: rgb(var(--c-ink) / 0.82);
+  transition: background-color 240ms ease, box-shadow 240ms ease;
+}
+.gx-cap:is([data-state='pending'], [data-state='skipped']) { color: rgb(var(--c-ink-dim)); }
+.gx-cap-sm { height: 18px; }
+/* A calm state's capsule is its glyph alone, in a round chip. */
+.gx-cap-quiet { justify-content: center; width: 20px; padding: 0; }
+.gx-cap-sm.gx-cap-quiet { width: 18px; }
+.gx-word { animation: rgx-fade 220ms ease-out; }
+.gx-glyph { flex: none; width: 12px; height: 12px; overflow: visible; color: rgb(var(--gx-c)); }
+.gx-glyph :is(circle, path) {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+/* The arc spins while running and only pauses otherwise: closed, a ring
+   reads the same at any angle, so landing never snaps the rotation back. */
+.gx-spin {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: gx-spin 1s linear infinite paused;
+}
+.gx-glyph[data-state='running'] .gx-spin { animation-play-state: running; }
+@keyframes gx-spin {
+  to { rotate: 360deg; }
+}
+.gx-g-ring {
+  stroke-dasharray: 34.6px;
+  stroke-dashoffset: 34.6px;
+  transition: stroke-dashoffset 460ms var(--ease-out), opacity 200ms ease;
+}
+.gx-glyph[data-state='running'] .gx-g-ring { stroke-dashoffset: 24px; }
+.gx-glyph:is([data-state='done'], [data-state='failed'], [data-state='awaiting_approval'], [data-state='paused']) .gx-g-ring {
+  stroke-dashoffset: 0;
+}
+.gx-glyph[data-state='skipped'] .gx-g-ring { stroke-dashoffset: 0; opacity: 0.55; }
+.gx-g-dash { stroke-dasharray: 2.3px 2.1px; opacity: 0; transition: opacity 200ms ease; }
+.gx-glyph[data-state='pending'] .gx-g-dash { opacity: 1; }
+.gx-g-check {
+  stroke-dasharray: 9.5px;
+  stroke-dashoffset: 9.5px;
+  opacity: 0;
+  transition: stroke-dashoffset 460ms var(--ease-out) 140ms, opacity 160ms ease 140ms;
+}
+.gx-glyph[data-state='done'] .gx-g-check { stroke-dashoffset: 0; opacity: 1; }
+.gx-g-x1,
+.gx-g-x2 {
+  stroke-dasharray: 7px;
+  stroke-dashoffset: 7px;
+  opacity: 0;
+  transition: stroke-dashoffset 460ms var(--ease-out), opacity 120ms ease;
+}
+.gx-g-x2 { transition-delay: 110ms; }
+.gx-glyph[data-state='failed'] :is(.gx-g-x1, .gx-g-x2) { stroke-dashoffset: 0; opacity: 1; }
+.gx-glyph .gx-g-dot {
+  fill: currentColor;
+  stroke: none;
+  opacity: 0;
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: opacity 200ms ease;
+}
+.gx-glyph[data-state='awaiting_approval'] .gx-g-dot { opacity: 1; animation: gx-pulse 1.7s ease-in-out infinite; }
+@keyframes gx-pulse {
+  0%, 100% { scale: 1; }
+  50% { scale: 1.45; }
+}
+.gx-g-pause,
+.gx-g-skip { opacity: 0; transition: opacity 160ms ease; }
+.gx-glyph[data-state='paused'] .gx-g-pause { opacity: 1; }
+.gx-glyph[data-state='skipped'] .gx-g-skip { opacity: 1; }
+
+/* ── parallel rows ── */
+.gx-subrows { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.gx-subrow {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 6px 6px 8px;
+  border-radius: 8px;
+  background: rgb(var(--c-ink) / 0.035);
+  overflow: hidden;
+  transition: background-color 240ms ease;
+}
+/* A row reserves its identity's two lines (nodeSize), so the card has no gap. */
+.gx-subrow:has(.gx-ident) { min-height: 62px; }
+.gx-subrow[data-state='running'] { background: rgb(var(--c-status-running) / 0.08); }
+.gx-subrow[data-state='failed'] { background: rgb(var(--c-status-failed) / 0.08); }
+.gx-subrow::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 8px;
+  background: rgb(var(--c-status-done) / 0.2);
+  opacity: 0;
+  pointer-events: none;
+}
+.gx-subrow[data-cue='done']::after { animation: gx-row-bloom 800ms var(--ease-out); }
+@keyframes gx-row-bloom {
+  0% { opacity: 0; }
+  25% { opacity: 1; }
+  100% { opacity: 0; }
+}
+.gx-subrow .gx-runline { left: 8px; right: 8px; }
+.gx-subrow-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.gx-subname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgb(var(--c-ink));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gx-subrow .gx-ident { margin-top: 3px; }
+
+/* ── fan-out ── */
+.gx-cells { display: grid; gap: 5px; }
+.gx-cell {
+  display: grid;
+  place-items: center;
+  height: 24px;
+  border: 1px solid rgb(var(--gx-c) / 0.3);
+  border-radius: 6px;
+  background: rgb(var(--gx-c) / 0.1);
+  cursor: pointer;
+  transition: background-color 240ms ease, border-color 240ms ease, scale 140ms var(--ease-out);
+}
+.gx-cell[data-state='pending'] { border-style: dashed; border-color: rgb(var(--gx-c) / 0.5); background: transparent; }
+.gx-cell[data-cue='done'] { animation: gx-pop 380ms var(--gx-spring); }
+@keyframes gx-pop {
+  40% { scale: 1.1; }
+}
+@media (hover: hover) and (pointer: fine) {
+  .gx-cell:hover { scale: 1.06; }
+}
+.gx-cell:active { scale: 0.96; }
+/* A unit's grid cell: its button, and its message-arc ends beside it (an
+ * invisible point at the cell's centre). */
+.gx-cell-slot { position: relative; display: grid; }
+.gx-cell-slot > .react-flow__handle.gx-unit-port {
+  top: 50%; left: 50%; width: 1px; height: 1px; min-width: 0; min-height: 0;
+  border: 0; background: none; opacity: 0; pointer-events: none; transform: none;
+}
+.gx-role { display: inline-flex; align-items: center; gap: 4px; min-width: 0; font-size: 10px; color: rgb(var(--c-ink-dim)); }
+.gx-big { display: flex; align-items: baseline; gap: 6px; }
+.gx-big-n { font-size: 24px; font-weight: 650; line-height: 1; letter-spacing: -0.02em; color: rgb(var(--c-ink)); }
+.gx-pct { margin-left: auto; font-size: 13px; font-weight: 650; color: rgb(var(--k)); }
+.gx-bar {
+  position: relative;
+  height: 6px;
+  margin-top: 9px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgb(var(--c-surface));
+}
+.gx-bar-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgb(var(--c-status-running)), rgb(var(--c-status-done)));
+  transform-origin: left;
+  transition: scale 600ms var(--ease-out);
+}
+.gx-bar[data-live]::after {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+  translate: -100% 0;
+  animation: gx-run 1.8s var(--ease-in-out) infinite;
+}
+.gx-stats { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; font-size: 11px; color: rgb(var(--c-ink-dim)); }
+.gx-stats b { font-weight: 600; color: rgb(var(--c-ink)); }
+.gx-mini { display: grid; grid-template-columns: repeat(20, 8px); gap: 2px; margin-top: 10px; }
+.gx-mini-cell {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: rgb(var(--gx-c) / 0.85);
+  transition: background-color 300ms ease;
+}
+.gx-mini-cell[data-state='pending'] { background: rgb(var(--gx-c) / 0.3); }
+.gx-mini-cell[data-state='running'] { animation: gx-cell-work 1.8s ease-in-out infinite; }
+@keyframes gx-cell-work {
+  50% { opacity: 0.4; }
+}
+.gx-link {
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: rgb(var(--k));
+  text-align: left;
+}
+@media (hover: hover) and (pointer: fine) {
+  .gx-link:hover { text-decoration: underline; }
+}
+
+/* ── panel ── */
+.gx-chip {
+  display: flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 7px;
+  background: rgb(var(--c-status-awaiting) / 0.1);
+  box-shadow: inset 0 0 0 1px rgb(var(--c-status-awaiting) / 0.28);
+  font-size: 11px;
+  font-weight: 500;
+  color: rgb(var(--c-ink) / 0.82);
+}
+.gx-prows { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.gx-prow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 40px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgb(var(--c-ink) / 0.035);
+  text-align: left;
+  transition: background-color 200ms ease;
+}
+.gx-prow[data-cue='done'] { animation: gx-pop 380ms var(--gx-spring); }
+@media (hover: hover) and (pointer: fine) {
+  .gx-prow:hover { background: rgb(var(--c-ink) / 0.07); }
+}
+.gx-loop { display: inline-block; color: rgb(var(--c-status-awaiting)); animation: gx-spin 2.4s linear infinite; }
+
+/* ── gate actions ── */
+.gx-approve {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 13px 0 10px;
+  border-radius: 14px;
+  background: rgb(var(--c-status-awaiting));
+  box-shadow: 0 1px 2px rgb(var(--gx-sh) / 0.14), inset 0 1px 0 rgb(255 255 255 / 0.35);
+  font-size: 12px;
+  font-weight: 600;
+  color: rgb(15 23 42);
+  animation: gx-invite 2.6s var(--ease-in-out) infinite;
+  transition: scale 120ms var(--ease-out), opacity 160ms ease;
+}
+.gx-approve::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  z-index: -1;
+  border-radius: 17px;
+  background: rgb(var(--c-status-awaiting) / 0.4);
+  filter: blur(6px);
+  animation: gx-invite-glow 2.6s var(--ease-in-out) infinite;
+}
+@keyframes gx-invite {
+  50% { scale: 1.03; }
+}
+@keyframes gx-invite-glow {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.85; }
+}
+.gx-approve:active:not(:disabled) { scale: 0.97; animation: none; }
+.gx-approve:disabled { opacity: 0.6; animation: none; }
+.gx-approve:disabled::before { animation: none; opacity: 0; }
+.gx-btn {
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background-color 150ms ease, scale 120ms var(--ease-out);
+}
+.gx-btn:active:not(:disabled) { scale: 0.97; }
+.gx-btn:disabled { opacity: 0.6; }
+.gx-btn-quiet { color: rgb(var(--c-ink-dim)); }
+.gx-btn-danger { background: rgb(var(--c-status-failed)); color: rgb(255 255 255); }
+@media (hover: hover) and (pointer: fine) {
+  .gx-btn-quiet:hover:not(:disabled) { background: rgb(var(--c-surface-hover)); color: rgb(var(--c-ink)); }
+}
+.gx-error {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10px;
+  color: rgb(var(--c-status-failed));
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gx-gate-done { animation: rgx-fade 240ms ease-out; }
+.gx-swap { animation: rgx-fade 260ms ease-out; }
+
+/* ── edges ── */
+.gx-edge path { fill: none; stroke-linecap: round; }
+.gx-e-base {
+  stroke-width: 2;
+  stroke-dasharray: 1 1;
+  opacity: 0.26;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 260ms);
+  transition: opacity 320ms ease;
+}
+.gx-edge:is([data-tone='lit'], [data-tone='live'], [data-tone='await']) .gx-e-base { opacity: 1; }
+.gx-edge[data-tone='dead'] .gx-e-base { opacity: 0; }
+.gx-e-halo { stroke-width: 6; filter: blur(3px); opacity: 0; transition: opacity 320ms ease; }
+.gx-edge[data-tone='lit'] .gx-e-halo { opacity: 0.22; }
+.gx-edge:is([data-tone='live'], [data-tone='await']) .gx-e-halo { opacity: 0.32; }
+.gx-e-dead {
+  stroke: rgb(var(--c-status-failed));
+  stroke-width: 1.5;
+  stroke-dasharray: 3 6;
+  opacity: 0;
+  transition: opacity 320ms ease;
+}
+.gx-edge[data-tone='dead'] .gx-e-dead { opacity: 0.5; }
+@keyframes rgx-draw {
+  from { stroke-dashoffset: 1; }
+}
+/* The travelling glow: a blurred comet with a bright core. */
+.gx-e-comet,
+.gx-e-core {
+  --gx-light-at: calc(var(--i, 0) * var(--rgx-stagger) + 260ms + var(--rgx-draw));
+  animation:
+    gx-travel 2.4s var(--ease-in-out) var(--gx-light-at) infinite,
+    rgx-fade 300ms ease-out var(--gx-light-at) backwards;
+}
+.gx-e-comet { stroke-width: 5; stroke-dasharray: 0.2 1.2; filter: blur(3px); opacity: 0.6; }
+.gx-e-core { stroke-width: 2.5; stroke-dasharray: 0.1 1.1; }
+.gx-edge[data-tone='await'] :is(.gx-e-comet, .gx-e-core) { animation-duration: 3.4s, 300ms; }
+@keyframes gx-travel {
+  from { stroke-dashoffset: 0.2; }
+  to { stroke-dashoffset: -1; }
+}
+@keyframes rgx-travel {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+@keyframes rgx-fade {
+  from { opacity: 0; }
+}
+/* ── workflow editor: cards ── */
+/* Cards arrive like the run graph's (a node dropped from the palette arrives
+   the same way, at once). Hover lifts a card's shadow; grabbing it lifts the
+   card itself; selecting fades its accent glow in. */
+.wfx-node {
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+  transition: scale 180ms var(--ease-out);
+}
+/* The silhouette takes the run graph's card: its surface, a resting shadow
+   that follows the shape, and a brand selection ring (the shape's own stroke
+   turns the kind's color). */
+.wfx-sil { filter: var(--gx-sil-shadow); }
+.wfx-sil-shape { fill: rgb(var(--gx-card)); transition: stroke 220ms ease; }
+.wfx-sil-glow {
+  stroke: rgb(var(--c-brand-500));
+  opacity: 0;
+  transition: opacity 200ms var(--ease-out);
+}
+.wfx-sil-glow[data-on] { opacity: 0.22; }
+.wfx-sil-lift {
+  fill: rgb(var(--gx-sh) / 0.35);
+  filter: blur(9px);
+  translate: 0 4px;
+  opacity: 0;
+  transition: opacity 200ms var(--ease-out), translate 200ms var(--ease-out);
+}
+/* Type: the run graph's — a sans name, the kind as a tinted label. */
+.wfx-node .wfx-kindpill {
+  gap: 4px;
+  height: 16px;
+  padding: 0 6px 0 5px;
+  border-radius: 5px;
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+}
+.wfx-node .wfx-nid {
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.wfx-node .wfx-agent { color: rgb(var(--c-ink-dim)); }
+/* Insets sit on the card's surface in both themes (the card is --c-surface in
+   dark, so a surface-colored row would vanish). */
+.wfx-node :is(.wfx-subrow, .wfx-expr) {
+  border-color: rgb(var(--c-ink) / 0.07);
+  background: rgb(var(--c-ink) / 0.035);
+}
+@media (hover: hover) and (pointer: fine) {
+  .react-flow__node:hover .wfx-sil-lift { opacity: 0.45; }
+}
+.react-flow__node.dragging .wfx-node { scale: 1.025; cursor: grabbing; }
+.react-flow__node.dragging .wfx-sil-lift { opacity: 0.9; translate: 0 10px; }
+
+/* Handles grow when their card is hovered, and the one a connection would
+   land on rings green. */
+.wfx-canvas .react-flow__handle {
+  transition: scale 160ms var(--ease-out), box-shadow 160ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-canvas .react-flow__node:hover .react-flow__handle {
+    scale: 1.45;
+    box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.18);
+  }
+}
+.wfx-canvas .react-flow__handle.connectingto.valid {
+  scale: 1.7;
+  box-shadow: 0 0 0 4px rgb(var(--c-status-done) / 0.3);
+}
+.wfx-canvas .react-flow__handle.connectingto:not(.valid) {
+  box-shadow: 0 0 0 4px rgb(var(--c-status-failed) / 0.25);
+}
+
+/* ── workflow editor: edges ── */
+/* An edge draws from its source to its target when it appears (so a new
+   connection reads as made), and a soft light travels toward the step it
+   feeds — brighter and quicker on the selected edge. These replace xyflow's
+   dashes on its `animated` edges. */
+.react-flow__edge.react-flow__edge-flow path.wfx-e-base {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 0;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+  transition: stroke-width 160ms var(--ease-out);
+}
+.react-flow__edge.react-flow__edge-flow path.wfx-e-halo {
+  fill: none;
+  stroke-width: 6;
+  filter: blur(3px);
+  opacity: 0.16;
+  pointer-events: none;
+  animation: rgx-fade 400ms ease-out backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger) + 160ms);
+  transition: opacity 200ms ease;
+}
+.react-flow__edge.react-flow__edge-flow.selected path.wfx-e-halo { opacity: 0.32; }
+.react-flow__edge.react-flow__edge-flow path.wfx-e-light {
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 0.08 1.1;
+  pointer-events: none;
+  opacity: 0.55;
+  animation: gx-travel 3.2s var(--ease-in-out) infinite;
+  /* staggered phases, so the edges don't pulse in lockstep */
+  animation-delay: calc(var(--i, 0) * -0.53s);
+  transition: opacity 200ms ease;
+}
+.react-flow__edge.react-flow__edge-flow.selected path.wfx-e-light {
+  opacity: 1;
+  animation-duration: 1.8s;
+}
+
+/* The line a connection draws while dragged. */
+.wfx-cline-path {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  transition: stroke 150ms ease;
+}
+.wfx-cline-dot,
+.wfx-cline-halo { transition: fill 150ms ease; }
+.wfx-cline-halo {
+  opacity: 0.22;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: wfx-halo 1.2s ease-in-out infinite;
+}
+@keyframes wfx-halo {
+  0%, 100% { scale: 0.8; opacity: 0.3; }
+  50% { scale: 1.15; opacity: 0.12; }
+}
+
+/* ── workflow editor: palette ── */
+/* Palette cards are small editions of the canvas cards: the same surface,
+   resting shadow and highlight; hover lifts one (its lift shadow fades in),
+   pressing gives way. */
+.wfx-pcard {
+  position: relative;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  transition:
+    border-color 0.15s ease,
+    translate 160ms var(--ease-out),
+    scale 120ms var(--ease-out);
+}
+.wfx-pcard::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: var(--gx-shadow-lift);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-pcard:not(:disabled):hover { translate: 0 -1px; }
+  .wfx-pcard:not(:disabled):hover::after { opacity: 1; }
+}
+.wfx-pcard:not(:disabled):active { scale: 0.97; translate: none; }
+
+
+/* ── workflow editor: leaving ── */
+/* A deleted card or edge fades out from a copy of its last frame
+   (workflow-editor/exitGhosts.tsx); a card also settles back a little, the
+   reverse of its arrival. The copy plays nothing of its own. The curve is the
+   symmetric one: --ease-out's front-loaded drop would leave a 160ms exit
+   unseen after its first frames. */
+.wfx-ghosts { position: absolute; left: 0; top: 0; pointer-events: none; }
+.wfx-ghost-edges {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+}
+.wfx-ghost {
+  pointer-events: none !important;
+  animation: wfx-exit-fade 160ms var(--ease-in-out) forwards;
+}
+/* (xyflow pins a node's origin to its corner; settle toward the middle) */
+.wfx-ghosts .wfx-ghost-node { transform-origin: center; animation-name: wfx-exit; }
+.wfx-ghost, .wfx-ghost * { transition: none !important; }
+.wfx-ghost * { animation: none !important; }
+@keyframes wfx-exit {
+  to { opacity: 0; scale: 0.94; }
+}
+@keyframes wfx-exit-fade {
+  to { opacity: 0; }
+}
+
+/* ── workflow editor: loop groups ── */
+/* A loop is a faint tray its member cards sit in, arriving with the first of
+   them; its name rides a raised chip astride the top edge, which lifts on
+   hover and gives way when pressed, and the tray firms up while you point at
+   it. A loop the selection picks out (or whose form is open) takes the brand
+   ring a selected card wears; one with problems turns red. */
+.wfx-loop {
+  position: relative;
+  border-radius: 18px;
+  border: 1.5px dashed rgb(var(--c-brand-500) / 0.38);
+  background: rgb(var(--c-brand-500) / 0.03);
+  box-shadow: inset 0 1px 3px rgb(var(--gx-sh) / 0.05);
+  pointer-events: none;
+  animation: rgx-fade 420ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+  transition: border-color 200ms ease, background-color 200ms ease;
+}
+.wfx-loop::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border-radius: 22px;
+  border: 3px solid rgb(var(--c-brand-500) / 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms var(--ease-out);
+}
+.wfx-loop[data-selected] {
+  border-color: rgb(var(--c-brand-500) / 0.7);
+  background: rgb(var(--c-brand-500) / 0.05);
+}
+.wfx-loop[data-selected]::after { opacity: 1; }
+.wfx-loop[data-error] {
+  border-color: rgb(var(--c-status-failed) / 0.6);
+  background: rgb(var(--c-status-failed) / 0.04);
+}
+.wfx-loop[data-error]::after { border-color: rgb(var(--c-status-failed) / 0.16); }
+
+.wfx-loop-label,
+.wfx-loop-run {
+  position: absolute;
+  top: -11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px 0 8px;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--c-brand-500) / 0.3);
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.wfx-loop-label {
+  left: 12px;
+  max-width: calc(100% - 2rem);
+  overflow: hidden;
+  color: rgb(var(--c-brand-500));
+  cursor: pointer;
+  pointer-events: auto;
+  transition:
+    border-color 150ms ease,
+    translate 160ms var(--ease-out),
+    scale 120ms var(--ease-out);
+}
+.wfx-loop-label::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  box-shadow: var(--gx-shadow-lift);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+.wfx-loop-label:disabled { cursor: default; }
+.wfx-loop-icon { flex: none; }
+.wfx-loop-name { flex: none; font-weight: 650; letter-spacing: -0.005em; }
+.wfx-loop-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; color: rgb(var(--c-ink-mute)); }
+.wfx-loop-warn { display: inline-flex; flex: none; }
+.wfx-loop[data-error] .wfx-loop-label {
+  border-color: rgb(var(--c-status-failed) / 0.45);
+  color: rgb(var(--c-status-failed));
+}
+.wfx-loop[data-selected] .wfx-loop-label { border-color: rgb(var(--c-brand-500) / 0.6); }
+@media (hover: hover) and (pointer: fine) {
+  .wfx-loop-label:not(:disabled):hover { translate: 0 -1px; border-color: rgb(var(--c-brand-500) / 0.55); }
+  .wfx-loop-label:not(:disabled):hover::after { opacity: 1; }
+  .wfx-loop:not([data-selected]):not([data-error]):has(.wfx-loop-label:not(:disabled):hover) {
+    border-color: rgb(var(--c-brand-500) / 0.6);
+    background: rgb(var(--c-brand-500) / 0.045);
+  }
+}
+.wfx-loop-label:not(:disabled):active { scale: 0.97; translate: none; }
+.wfx-loop-label:focus-visible {
+  outline: none;
+  box-shadow: var(--gx-shadow-rest), 0 0 0 3px rgb(var(--c-brand-500) / 0.3);
+}
+/* The live iteration count, in the status color of where the loop stands. */
+.wfx-loop-run {
+  right: 12px;
+  border-color: rgb(var(--gx-c) / 0.4);
+  color: rgb(var(--gx-c));
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* ── workflow editor: toolbar ── */
+/* The canvas toolbar is a raised panel like the controls; its buttons are
+   flat on it, warm on hover and give way when pressed; the step finder's
+   results rise into place. */
+.wfx-toolbar {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 11px;
+  background: rgb(var(--gx-card) / 0.94);
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  backdrop-filter: blur(6px);
+}
+.wfx-tbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  background: rgb(var(--gx-card));
+  color: rgb(var(--c-ink-dim));
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  line-height: 1;
+  white-space: nowrap;
+  box-shadow: 0 1px 1px rgb(var(--gx-sh) / 0.04), var(--gx-highlight);
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    color 150ms ease,
+    scale 120ms var(--ease-out);
+}
+/* In dark the toolbar is the card surface; a button sits a step above it. */
+[data-theme='dark'] .wfx-tbtn:not([data-tone]) {
+  border-color: rgb(var(--c-border-strong) / 0.7);
+  background: rgb(var(--c-surface-hover));
+}
+.wfx-tbtn[data-tone='info'] {
+  border-color: rgb(var(--c-info) / 0.3);
+  background: rgb(var(--c-info-bg));
+  color: rgb(var(--c-info));
+}
+.wfx-tbtn:disabled { cursor: not-allowed; opacity: 0.5; }
+@media (hover: hover) and (pointer: fine) {
+  .wfx-tbtn:not(:disabled):hover {
+    border-color: rgb(var(--c-border-strong));
+    background: rgb(var(--c-surface-hover));
+    color: rgb(var(--c-ink));
+  }
+  .wfx-tbtn[data-tone='info']:not(:disabled):hover {
+    border-color: rgb(var(--c-info) / 0.5);
+    background: rgb(var(--c-info) / 0.14);
+    color: rgb(var(--c-info));
+  }
+}
+.wfx-tbtn:not(:disabled):active { scale: 0.96; }
+.wfx-tbtn:focus-visible,
+.wfx-tfind:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.25);
+}
+.wfx-tsep { width: 1px; height: 16px; margin: 0 3px; background: rgb(var(--c-border)); }
+.wfx-tfind {
+  width: 7.5rem;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 7px;
+  background: rgb(var(--c-ink) / 0.035);
+  color: rgb(var(--c-ink));
+  font: inherit;
+  font-size: 12px;
+  box-shadow: inset 0 1px 2px rgb(var(--gx-sh) / 0.06);
+  transition: border-color 150ms ease, background-color 150ms ease;
+}
+.wfx-tfind::placeholder { color: rgb(var(--c-ink-mute)); }
+.wfx-tfind:focus { border-color: rgb(var(--c-brand-500) / 0.5); background: rgb(var(--gx-card)); }
+.wfx-tfind:disabled { cursor: not-allowed; opacity: 0.5; }
+.wfx-tmenu {
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 9px;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-lift), var(--gx-highlight);
+  animation: wfx-rise 160ms var(--ease-out) backwards;
+}
+.wfx-tmenu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 12px;
+  color: rgb(var(--c-ink));
+  transition: background-color 120ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .wfx-tmenu-item:hover { background: rgb(var(--c-surface-hover)); }
+}
+.wfx-tmenu-item:focus-visible { outline: none; background: rgb(var(--c-brand-500) / 0.1); }
+
+/* ── workflow editor: palette detail ── */
+/* The picked block's detail is a raised card under the grid: it rises into
+   place when a block is picked; its example sits in an inset; its Add button
+   is a raised brand control that gives way when pressed. */
+.wfx-palette-rail .wfx-palette-detail {
+  padding: 11px 11px 12px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 11px;
+  background: rgb(var(--gx-card));
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight);
+  animation: wfx-rise 200ms var(--ease-out) backwards;
+}
+.wfx-palette-rail .wfx-detail-example {
+  border-color: rgb(var(--c-ink) / 0.07);
+  background: rgb(var(--c-ink) / 0.035);
+  box-shadow: inset 0 1px 2px rgb(var(--gx-sh) / 0.05);
+}
+.wfx-palette-rail .wfx-detail-addbtn {
+  box-shadow:
+    0 1px 2px rgb(var(--c-brand-700) / 0.3),
+    0 4px 10px -4px rgb(var(--c-brand-500) / 0.45);
+  transition: background-color 150ms ease, scale 120ms var(--ease-out);
+}
+.wfx-palette-rail .wfx-detail-addbtn:not(:disabled):active { scale: 0.97; }
+.wfx-palette-rail .wfx-detail-addbtn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px rgb(var(--c-brand-500) / 0.3);
+}
+@keyframes wfx-rise {
+  from { opacity: 0; translate: 0 4px; }
+}
+
+/* ── reduced motion: fades, no travel, no breathing ── */
+@media (prefers-reduced-motion: reduce) {
+  .gx-node { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .gx-node > :is(.gx-card, .gx-lift) { translate: none !important; }
+  .gx-node > .gx-glow { animation: none; }
+  .gx-node[data-cue='done'] > .gx-bloom { animation: gx-bloom-fade 900ms ease-out; }
+  .gx-runline > i,
+  .gx-bar[data-live]::after { animation: none; translate: 80% 0; }
+  .gx-spin,
+  .gx-loop,
+  .gx-mini-cell[data-state='running'],
+  .gx-glyph .gx-g-dot,
+  .gx-approve,
+  .gx-approve::before { animation: none; }
+  .gx-g-ring, .gx-g-check, .gx-g-x1, .gx-g-x2 { transition-property: opacity; }
+  .gx-cell[data-cue], .gx-prow[data-cue] { animation: none; }
+  .gx-cell:hover, .gx-cell:active { scale: none; }
+  .gx-e-base { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .gx-e-comet, .gx-e-core { display: none; }
+  .wfx-node { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .react-flow__node.dragging .wfx-node { scale: none; }
+  .wfx-sil-lift { translate: none; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-base { animation: rgx-fade 240ms ease-out backwards; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-light { display: none; }
+  .react-flow__edge.react-flow__edge-flow path.wfx-e-halo { animation: none; }
+  .wfx-cline-halo { animation: none; }
+  .wfx-canvas .react-flow__handle { transition: none; }
+  .wfx-pcard:not(:disabled):hover, .wfx-pcard:not(:disabled):active { translate: none; scale: none; }
+  .wfx-ghosts .wfx-ghost-node { animation-name: wfx-exit-fade; }
+  .wfx-loop { animation-delay: 0ms; }
+  .wfx-loop-label:not(:disabled):hover, .wfx-loop-label:not(:disabled):active { translate: none; scale: none; }
+  .wfx-tbtn:not(:disabled):active,
+  .wfx-palette-rail .wfx-detail-addbtn:not(:disabled):active { scale: none; }
+  .wfx-tmenu, .wfx-palette-rail .wfx-palette-detail { animation-name: rgx-fade; }
+}
+@keyframes gx-bloom-fade {
+  30% { opacity: 0.6; }
+}
+
+/* Timeline axis (components/timeline/TimeAxis): bands on two rows (rounds,
+   steps), message ticks, scrubber, live pill. Arrivals ease out; the scrubber
+   moves with transform only. */
+.tl-axis { display: flex; align-items: center; gap: 12px; }
+.tl-track {
+  position: relative; flex: 1; height: 44px; touch-action: none; cursor: ew-resize;
+  border-radius: 6px; background: rgb(var(--c-surface)); overflow: hidden;
+}
+.tl-track:focus-visible { outline: 2px solid rgb(var(--c-brand-500)); outline-offset: 1px; }
+.tl-band {
+  position: absolute; height: 16px; display: flex; align-items: center; overflow: hidden;
+  background: color-mix(in srgb, rgb(var(--c-brand-500)) 10%, transparent);
+  animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
+}
+.tl-band[data-row='round'] { top: 2px; }
+.tl-band[data-row='step'] { top: 20px; }
+.tl-band[data-alt='1'] { background: color-mix(in srgb, rgb(var(--c-brand-500)) 20%, transparent); }
+.tl-band[data-inferred='true'] {
+  border-left: 1px dashed rgb(var(--c-ink-mute) / 0.7);
+  background: linear-gradient(to right, transparent, color-mix(in srgb, rgb(var(--c-brand-500)) 10%, transparent) 48px);
+}
+.tl-band[data-inferred='true'][data-alt='1'] {
+  background: linear-gradient(to right, transparent, color-mix(in srgb, rgb(var(--c-brand-500)) 20%, transparent) 48px);
+}
+.tl-band-label { padding: 0 6px; font-size: 11px; white-space: nowrap; color: rgb(var(--c-ink-dim)); }
+.tl-tick {
+  position: absolute; bottom: 3px; width: 2px; height: 8px; border-radius: 1px;
+  animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
+}
+.tl-scrubber {
+  position: absolute; inset: 0; pointer-events: none;
+  transition: transform 80ms var(--ease-in-out, cubic-bezier(0.77, 0, 0.175, 1));
+}
+.tl-scrubber-line { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; background: rgb(var(--c-brand-500)); }
+.tl-controls { display: flex; align-items: center; gap: 8px; }
+.tl-live {
+  display: inline-flex; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+  color: rgb(var(--c-ink));
+  background: color-mix(in srgb, rgb(var(--c-status-running)) 18%, transparent);
+  animation: tl-reveal 240ms var(--ease-out, cubic-bezier(0.23, 1, 0.32, 1)) backwards;
+}
+.tl-live-time { color: rgb(var(--c-ink-dim)); font-variant-numeric: tabular-nums; }
+.tl-btn {
+  font-size: 12px; padding: 2px 8px; border-radius: 6px; cursor: pointer;
+  color: rgb(var(--c-ink)); background: rgb(var(--c-panel)); border: 1px solid rgb(var(--c-border-strong));
+  transition: background-color 120ms var(--ease-out, ease-out), scale 120ms var(--ease-out, ease-out);
+}
+.tl-btn:hover { background: rgb(var(--c-surface-hover)); }
+.tl-btn:active { scale: 0.97; }
+@keyframes tl-reveal { from { opacity: 0; translate: 0 4px; } }
+@media (prefers-reduced-motion: reduce) {
+  .tl-band, .tl-tick, .tl-live { animation-name: rgx-fade; animation-duration: 240ms; }
+  .tl-scrubber { transition: none; }
+  .tl-btn:active { scale: none; }
+}
+
+/* ── agentiflow flow: message arcs, board rail, message list (afx-*) ──
+   An arc is the run graph's edge family: round caps, the same draw-in, a
+   packet that travels once as the message lands. Undelivered stops short in a
+   dashed red dead end. Reduced motion: the arc fades, no packet. */
+.afx-msg path { fill: none; stroke-linecap: round; }
+.afx-msg-base {
+  stroke-width: 1.5;
+  stroke-dasharray: 1 1;
+  opacity: 0.5;
+  animation: rgx-draw var(--rgx-draw) var(--ease-out) backwards;
+  transition: opacity 200ms ease;
+}
+.afx-msg-dashed { stroke-width: 1.5; opacity: 0.6; animation: rgx-fade var(--rgx-draw) var(--ease-out) backwards; transition: opacity 200ms ease; }
+.afx-msg-halo { stroke-width: 6; filter: blur(3px); opacity: 0; transition: opacity 240ms ease; }
+.afx-msg[data-highlighted='true'] :is(.afx-msg-base, .afx-msg-dashed) { opacity: 1; }
+.afx-msg[data-highlighted='true'] .afx-msg-halo { opacity: 0.28; }
+.afx-msg-packet {
+  stroke-width: 3.5;
+  stroke-dasharray: 0.07 1.2;
+  animation: afx-packet 900ms var(--ease-in-out) both;
+}
+@keyframes afx-packet {
+  from { stroke-dashoffset: 0.07; opacity: 1; }
+  85% { opacity: 1; }
+  to { stroke-dashoffset: -1; opacity: 0; }
+}
+.afx-msg-dead { animation: rgx-fade 300ms ease-out 200ms backwards; }
+.afx-msg-dead path { stroke-width: 1.5; }
+.afx-msg-hit { stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: default; outline: none; }
+.afx-msg-hit:focus-visible { stroke: rgb(var(--c-brand-500) / 0.25); }
+/* A tip over a card's unit squares hangs above the arch, its foot on it. */
+.afx-msg-tip[data-above] { position: absolute; bottom: 0; left: 0; right: 0; margin: 0 auto; }
+.afx-msg-tip {
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 10px;
+  background: rgb(var(--c-surface) / 0.96);
+  color: rgb(var(--c-ink));
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: var(--gx-shadow-lift);
+  animation: rgx-fade 140ms ease-out backwards;
+}
+.afx-msg-tip-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; font-weight: 600; }
+.afx-msg-tip-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.afx-msg-tip-body { color: rgb(var(--c-ink-dim)); white-space: pre-wrap; overflow-wrap: anywhere; }
+.afx-msg-tip-reason { margin-top: 4px; color: rgb(var(--c-status-failed)); }
+
+/* The board rail. */
+.afx-rail { display: flex; flex-direction: column; gap: 14px; padding: 10px 12px; font-size: 12px; overflow-y: auto; }
+.afx-rail-h { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: rgb(var(--c-ink-mute)); }
+.afx-rail-item {
+  position: relative;
+  display: block;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 6px 8px;
+  border: 1px solid rgb(var(--c-border));
+  border-radius: 8px;
+  background: rgb(var(--c-panel));
+  text-align: left;
+  color: rgb(var(--c-ink));
+  animation: rgx-enter 300ms var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * 40ms);
+}
+.afx-rail-btn { cursor: pointer; transition: background-color 120ms var(--ease-out); }
+.afx-rail-btn:hover { background: rgb(var(--c-surface-hover)); }
+.afx-rail-item[data-state='held'] { border-color: rgb(var(--c-status-running) / 0.6); }
+.afx-rail-item[data-state='expired'] { border-style: dashed; }
+.afx-rail-item[data-retracted='true'] { opacity: 0.55; }
+.afx-rail-item[data-retracted='true'] .afx-rail-body { text-decoration: line-through; }
+.afx-rail-line { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.afx-rail-key { font-weight: 600; }
+.afx-rail-state { color: rgb(var(--c-ink-mute)); }
+.afx-rail-who { font-weight: 600; }
+.afx-rail-sub { color: rgb(var(--c-ink-mute)); }
+.afx-rail-body { margin-top: 2px; color: rgb(var(--c-ink-dim)); overflow-wrap: anywhere; }
+.afx-rail-note { color: rgb(var(--c-ink-mute)); font-style: italic; overflow-wrap: anywhere; }
+.afx-rail-empty { color: rgb(var(--c-ink-mute)); }
+
+/* The message list and toolbar. */
+.afx-list { display: flex; flex-direction: column; overflow-y: auto; font-size: 12px; }
+.afx-list-empty { padding: 12px; color: rgb(var(--c-ink-mute)); font-size: 12px; }
+.afx-list-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 12px;
+  border-bottom: 1px solid rgb(var(--c-border));
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease-out);
+}
+.afx-list-row:hover { background: rgb(var(--c-surface-hover)); }
+.afx-list-row[data-selected='true'] { background: rgb(var(--c-surface-hover)); box-shadow: inset 2px 0 0 rgb(var(--c-brand-500)); }
+.afx-list-meta { display: flex; align-items: center; gap: 6px; color: rgb(var(--c-ink-mute)); }
+.afx-list-time { font-variant-numeric: tabular-nums; }
+.afx-list-tag { padding: 0 6px; border: 1px solid rgb(var(--c-border)); border-radius: 999px; font-size: 11px; }
+.afx-list-tag-dead { color: rgb(var(--c-status-failed)); border-color: rgb(var(--c-status-failed) / 0.5); }
+.afx-list-who { font-weight: 600; }
+.afx-list-body { color: rgb(var(--c-ink-dim)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.afx-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.afx-toolbar-kinds { display: flex; gap: 4px; }
+.afx-pill {
+  padding: 2px 9px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 999px;
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink-dim));
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 120ms var(--ease-out), scale 120ms var(--ease-out);
+}
+.afx-pill[aria-pressed='true'] { background: rgb(var(--c-surface-hover)); color: rgb(var(--c-ink)); }
+.afx-pill:active { scale: 0.97; }
+.afx-select {
+  padding: 2px 6px;
+  border: 1px solid rgb(var(--c-border-strong));
+  border-radius: 6px;
+  background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink));
+  font-size: 12px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .afx-msg-base { animation: rgx-fade 240ms ease-out backwards; }
+  .afx-msg-packet { display: none; }
+  .afx-rail-item { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-pill:active { scale: none; }
+}
+
+/* ── the agentiflow map (FlowMap) ──
+   Cards are the run graph's (NodeFrame); these are the map's own parts: the
+   spine, the lead's start, a workflow child's frame, the "+N more" card, the
+   rail node, the operator's entry, and the header strip and panels around
+   the canvas. The spine draws down as the map arrives and its live end
+   breathes; a frame arrives like a card. */
+.afx-canvas { height: max(520px, 72vh); }
+.afx-canvas:focus-visible { outline: 2px solid rgb(var(--c-brand-500) / 0.5); outline-offset: 2px; }
+
+/* The round navigator: a slim scrollbar of rounds on the canvas's left edge
+ * (clear of the controls below it; the map's left edge sits right of it). */
+.afx-nav {
+  position: absolute; z-index: 5; left: 10px; top: 56px; bottom: 132px; width: 10px;
+  border-radius: 5px; background: rgb(var(--c-ink) / 0.05); cursor: pointer; touch-action: none;
+}
+.afx-nav-mark {
+  position: absolute; left: 2px; right: 2px; border-radius: 1px;
+  background: rgb(var(--gx-c, var(--c-ink-mute)) / 0.85);
+}
+.afx-nav-mark[data-state='done'] { background: rgb(var(--gx-c) / 0.45); }
+.afx-nav-view {
+  position: absolute; left: -2px; right: -2px; min-height: 4px; border-radius: 4px; pointer-events: none;
+  border: 1.5px solid rgb(var(--c-ink) / 0.55); background: rgb(var(--c-ink) / 0.06);
+}
+/* The replay stopped following the operator's pan: take it back. */
+.afx-follow {
+  position: absolute; z-index: 5; top: 10px; left: 50%; translate: -50% 0;
+  padding: 3px 12px; border: 1px solid rgb(var(--c-brand-500) / 0.5); border-radius: 999px;
+  background: rgb(var(--c-panel)); color: rgb(var(--c-brand-500)); font-size: 11px; font-weight: 600;
+  box-shadow: var(--gx-shadow-rest); cursor: pointer;
+  animation: rgx-fade 200ms var(--ease-out) backwards;
+}
+.afx-follow:hover { background: rgb(var(--c-surface-hover)); }
+.afx-follow:active { scale: 0.97; }
+/* Previous / next round in the toolbar. */
+.afx-stepper { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 12px; color: rgb(var(--c-ink-dim)); }
+.afx-stepper .afx-pill { display: inline-grid; place-items: center; padding: 3px 6px; }
+.afx-stepper .afx-pill:disabled { opacity: 0.4; cursor: default; }
+.afx-stepper-at { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.afx-stepper-at b { color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-stepper-keys { padding: 0 5px; border: 1px solid rgb(var(--c-border)); border-radius: 4px; font-size: 10px; color: rgb(var(--c-ink-mute)); }
+.afx-note { font-size: 12px; color: rgb(var(--c-warn)); }
+
+/* Card parts. */
+.afx-mcount { gap: 3px; }
+.afx-result { margin-top: 3px; }
+.afx-decision {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12px; line-height: 16px; color: rgb(var(--c-ink));
+}
+.afx-foot-r {
+  display: inline-flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden;
+  white-space: nowrap; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums;
+}
+.afx-link { color: rgb(var(--c-brand-500)); font-weight: 600; }
+.afx-link:hover { text-decoration: underline; }
+.afx-inferred { display: inline-flex; flex: none; color: rgb(var(--c-ink-mute)); cursor: help; }
+.afx-icon-link { display: inline-flex; flex: none; }
+.afx-more {
+  display: flex; align-items: center; gap: 7px; width: 100%; height: 20px;
+  font-size: 13px; font-weight: 600; color: rgb(var(--c-ink)); text-align: left; cursor: pointer;
+}
+.afx-more:hover .afx-more-label { text-decoration: underline; }
+.afx-more + .gx-sub { margin-top: 6px; }
+
+/* The spine and the lead's start. */
+.afx-spine-svg { overflow: visible; pointer-events: none; }
+.afx-spine-line {
+  fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; opacity: 0.55;
+  stroke-dasharray: 1 1; animation: rgx-draw 900ms var(--ease-out) backwards;
+}
+.afx-spine-dot {
+  fill: currentColor; stroke: rgb(var(--c-bg)); stroke-width: 2;
+  animation: rgx-fade 300ms var(--ease-out) backwards; animation-delay: calc(var(--i, 0) * 40ms);
+}
+.afx-spine-ring {
+  fill: none; stroke: currentColor; stroke-width: 1.5;
+  transform-box: fill-box; transform-origin: center;
+  animation: afx-ring 1.8s var(--ease-out) infinite;
+}
+@keyframes afx-ring {
+  from { opacity: 0.7; scale: 1; }
+  to { opacity: 0; scale: 2.6; }
+}
+.afx-lead {
+  display: flex; align-items: baseline; gap: 8px; padding: 4px 0; white-space: nowrap;
+  /* Two columns wide at most: it never runs under the canvas's summary chip. */
+  max-width: 488px; font-size: 12px; color: rgb(var(--c-ink-mute));
+}
+.afx-lead b { flex: none; color: rgb(var(--c-ink)); font-weight: 600; }
+.afx-lead span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+/* A workflow child's frame. */
+.afx-frame {
+  position: relative; display: flex; flex-direction: column;
+  border: 1px dashed rgb(var(--c-brand-500) / 0.45); border-radius: 16px;
+  background: rgb(var(--c-brand-500) / 0.035);
+  animation: rgx-enter var(--rgx-enter) var(--ease-out) backwards;
+  animation-delay: calc(var(--i, 0) * var(--rgx-stagger));
+}
+.afx-frame[data-state='running'] { border-color: rgb(var(--c-status-running) / 0.6); }
+.afx-frame > .gx-glow { left: 20%; right: 20%; bottom: -10px; height: 28px; }
+.afx-frame[data-state='running'] > .gx-glow {
+  opacity: var(--gx-glow-rest);
+  animation: gx-breathe 2.8s var(--ease-in-out) infinite;
+}
+.afx-frame[data-state='failed'] { border-color: rgb(var(--c-status-failed) / 0.6); }
+/* An end of the selected message: the frame's border in the brand ring. */
+.afx-frame[data-lit] {
+  border-style: solid; border-color: rgb(var(--c-brand-500) / 0.7);
+  transition: border-color 160ms ease;
+}
+.afx-frame-head {
+  display: flex; align-items: center; gap: 8px; padding: 0 14px; min-width: 0;
+  font-size: 11px; color: rgb(var(--c-ink-dim)); white-space: nowrap;
+}
+.afx-frame-pen { display: inline-flex; align-items: center; gap: 5px; color: rgb(var(--c-brand-500)); font-weight: 600; }
+.afx-frame-icon { color: rgb(var(--c-brand-500)); }
+.afx-frame-name { color: rgb(var(--c-ink)); font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+.afx-frame-btn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px;
+  border: 1px solid rgb(var(--c-border-strong)); border-radius: 6px; background: rgb(var(--c-panel));
+  color: rgb(var(--c-ink)); cursor: pointer; transition: background-color 120ms var(--ease-out);
+}
+.afx-frame-btn:hover { background: rgb(var(--c-surface-hover)); }
+.afx-frame-graph { position: relative; flex: none; }
+.afx-frame-note {
+  position: absolute; inset: 0; display: grid; place-items: center;
+  font-size: 12px; color: rgb(var(--c-ink-mute));
+}
+.afx-frame-strip { padding: 0 14px; }
+.afx-frame-foot {
+  display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 6px 14px 10px;
+  font-size: 11px; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.afx-frame-who { color: rgb(var(--c-ink)); font-weight: 600; }
+
+/* A board rendered as a frame's strip: one row of compact items. */
+.afx-rail-compact { flex-direction: row; flex-wrap: wrap; gap: 6px 10px; padding: 6px 0; overflow: visible; }
+.afx-rail-compact section { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }
+.afx-rail-compact .afx-rail-h { margin: 3px 0 0; }
+.afx-rail-compact .afx-rail-item { width: auto; max-width: 220px; margin: 0; padding: 3px 7px; }
+.afx-rail-compact .afx-rail-empty { display: none; }
+.afx-rail-compact section:has(> .afx-rail-empty:only-of-type) { display: none; }
+
+/* The flow's board as a node on the canvas, and where arcs land in it. */
+.afx-rail-node {
+  border: 1px solid rgb(var(--c-border)); border-radius: 14px; background: rgb(var(--c-panel) / 0.85);
+  box-shadow: var(--gx-shadow-rest), var(--gx-highlight); cursor: default;
+}
+.afx-rail-title {
+  padding: 10px 12px 0; font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
+}
+.afx-rail-node .afx-rail { overflow: visible; }
+/* Arcs land on an item's anchor (or a section's "earlier" row), never on
+ * the rail's own port. */
+.afx-rail-node > .react-flow__handle.gx-port { opacity: 0; pointer-events: none; }
+.afx-rail-node .afx-rail-body,
+.afx-rail-compact .afx-rail-body {
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.afx-rail-compact .afx-rail-body { -webkit-line-clamp: 2; }
+.react-flow__handle.afx-anchor {
+  width: 6px; height: 6px; min-width: 0; min-height: 0; left: -4px;
+  border: 1.5px solid rgb(var(--c-ink-mute) / 0.6); background: rgb(var(--gx-card));
+}
+
+/* A section's folded items, and the row that opens it in place. */
+.afx-rail-earlier {
+  position: relative; display: block; width: 100%; margin: 0 0 6px; padding: 4px 8px;
+  border: 1px dashed rgb(var(--c-border-strong)); border-radius: 8px; background: none;
+  font-size: 11px; color: rgb(var(--c-ink-mute)); text-align: left; cursor: pointer;
+  transition: background-color 120ms var(--ease-out), color 120ms var(--ease-out);
+}
+.afx-rail-earlier:hover { background: rgb(var(--c-surface-hover)); color: rgb(var(--c-ink)); }
+.afx-rail-compact .afx-rail-earlier { width: auto; margin: 0; padding: 2px 7px; }
+/* A frame's strip with nothing on its board. */
+.afx-rail-none { display: flex; align-items: baseline; gap: 6px; color: rgb(var(--c-ink-mute)); }
+.afx-rail-none .afx-rail-h { margin: 0; }
+
+/* A stub's far end: the operator, or an address off the map. */
+.afx-msg-label {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em; stroke: none; pointer-events: none;
+  animation: rgx-fade 240ms ease-out backwards;
+}
+
+/* The panels under the canvas. */
+.afx-panel {
+  min-width: 0; border: 1px solid rgb(var(--c-border)); border-radius: 12px; background: rgb(var(--c-panel));
+  box-shadow: var(--gx-shadow-rest);
+}
+.afx-panel .afx-list { max-height: 420px; }
+.afx-panel-h {
+  display: flex; align-items: baseline; gap: 8px; margin: 0; padding: 10px 12px 6px;
+  font-size: 12px; font-weight: 600; color: rgb(var(--c-ink));
+}
+.afx-panel-h > span { font-weight: 400; color: rgb(var(--c-ink-mute)); }
+/* The title row folds its panel (CollapsiblePanel): instant, only the
+ * chevron turns. */
+.afx-panel[data-collapsed='true'] .afx-panel-h { padding-bottom: 10px; }
+.afx-panel-toggle {
+  display: inline-flex; flex: none; align-items: baseline; gap: 6px; padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; cursor: pointer; border-radius: 4px;
+}
+.afx-panel-toggle:focus-visible { outline: 2px solid rgb(var(--c-brand-500) / 0.6); outline-offset: 2px; }
+.afx-panel-count { font-weight: 400; color: rgb(var(--c-ink-mute)); font-variant-numeric: tabular-nums; }
+.afx-panel-chev {
+  flex: none; align-self: center; color: rgb(var(--c-ink-mute));
+  transition: rotate 150ms var(--ease-out);
+}
+.afx-panel[data-collapsed='true'] .afx-panel-chev { rotate: -90deg; }
+.gx-summary .afx-dot { width: 6px; height: 6px; border-radius: 50%; background: rgb(var(--gx-c)); }
+
+@media (prefers-reduced-motion: reduce) {
+  .afx-spine-line { animation: rgx-fade 240ms ease-out backwards; }
+  .afx-spine-ring { animation: none; opacity: 0; }
+  .afx-frame { animation: rgx-fade 240ms ease-out backwards; animation-delay: 0ms; }
+  .afx-frame > .gx-glow { animation: none; }
+  .afx-panel-chev { transition: none; }
+  .afx-follow { animation: none; }
+  .afx-follow:active { scale: none; }
+}
+
+/* The run page's turn window bar settles in when a selection is made. */
+.gx-window { animation: rgx-fade 220ms ease-out; }

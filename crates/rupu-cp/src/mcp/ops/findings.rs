@@ -1,8 +1,8 @@
-//! The findings operator tools: findings, tags, report exports, coverage and
-//! the asset inventory.
+//! The findings operator tools: findings, tags, report exports and imports,
+//! the report schema, coverage and the asset inventory.
 
 use super::{op, OpSpec};
-use crate::api::{assets, coverage, findings};
+use crate::api::{assets, coverage, findings, findings_import, local_only};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -61,6 +61,21 @@ pub(super) fn ops() -> Vec<OpSpec> {
         .query::<findings::FindingWsQuery>()
         .bytes(),
         op(
+            "findings.import",
+            Method::POST,
+            "/api/findings/import",
+            "Attach Markdown finding reports written before the full profile to their findings.\n\n`paths` are absolute paths on the control plane's machine: report files, or directories searched for `*.md`. Each report attaches to the finding its `Finding ID:` line names; `id` names it for a single report with no such line. `dry_run` checks everything and writes nothing. Each changed ledger is backed up first. Returns `{dry_run, files, backups, attached, skipped, failed, warnings}`, one `files` line per report with its `status`; `HTTP 400` when nothing can be imported. Local-only.",
+        )
+        .query::<local_only::LocalOnlyQuery>()
+        .body::<findings_import::ImportBody>(),
+        op(
+            "findings.schema",
+            Method::GET,
+            "/api/findings/schema",
+            "Read the finding report JSON Schema embedded in this build.\n\nReturns the canonical draft-07 schema; `advertised: true` returns the simplified copy used in tool definitions instead.",
+        )
+        .query::<findings::SchemaQuery>(),
+        op(
             "coverage.list",
             Method::GET,
             "/api/coverage",
@@ -101,6 +116,22 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Compare coverage between two runs of a target.\n\n`base` (default `previous`) and `compare` (default `latest`) are `latest`, `previous` or a run id; `ws_id` picks the workspace. Returns the run diff object; `HTTP 400` when a selector cannot resolve, `HTTP 404` for an unknown target.",
         )
         .query::<coverage::DiffQuery>(),
+        op(
+            "coverage.gap",
+            Method::GET,
+            "/api/coverage/:target/gap",
+            "List a coverage target's gaps: in-scope files a concern has no assertion for.\n\n`target` is the target id; `ws_id` picks the workspace. Returns `{kind, version, rows}`, each row `{concern_id, file}`; `HTTP 404` for an unknown target. Local-only.",
+        )
+        .query::<coverage::GapQuery>(),
+        op(
+            "coverage.rerun",
+            Method::POST,
+            "/api/coverage/:target/rerun",
+            "Replay a recorded agent run on its coverage target, appending a new run to the target.\n\n`target` is the target id, `run` the full id of the run to replay (from `coverage.runs`); `ws_id` picks the workspace. The run's agent, prompt, permission mode and launch skills start again, detached, in the workspace it was recorded in. Returns `202 {run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `coverage.diff`. `HTTP 404` for an unknown target or run, `409` for a continued run or one recorded in another workspace, `501` for a non-agent run. Local-only.",
+        )
+        .query::<coverage::RerunQuery>()
+        .body::<coverage::RerunBody>()
+        .open_world(),
         op(
             "coverage.templates",
             Method::GET,

@@ -28,6 +28,7 @@ subtle.workspace = true
 tempfile.workspace = true
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-config = { path = "../rupu-config" }
+rupu-scm = { path = "../rupu-scm" }
 
 [dev-dependencies]
 serial_test.workspace = true

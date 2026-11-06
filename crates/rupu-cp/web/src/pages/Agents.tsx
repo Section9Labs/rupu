@@ -22,6 +22,8 @@ import { cn } from '../lib/cn';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { AGENT_FIELDS } from '../lib/query/lists/agents';
+import ValidateAllDrawer from '../components/launch/ValidateAllDrawer';
+import FleetInstallDialog from '../components/launch/FleetInstallDialog';
 
 const STEP = 20;
 
@@ -36,6 +38,8 @@ export default function Agents() {
   // error above, but shown in the same banner (mirrors Sessions.tsx /
   // pages/runs/WorkflowRuns.tsx's `actionError`).
   const [actionError, setActionError] = useState<string | null>(null);
+  const [validateOpen, setValidateOpen] = useState(false);
+  const [fleetOpen, setFleetOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -127,13 +131,21 @@ export default function Agents() {
             each one runs with.
           </p>
         </div>
-        <Button
-          onClick={() => navigate('/agents/new')}
-          className="shrink-0 gap-1.5"
-        >
-          <Plus size={14} />
-          New agent
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="secondary" onClick={() => setValidateOpen(true)}>
+            Validate all
+          </Button>
+          <Button variant="secondary" onClick={() => setFleetOpen(true)}>
+            Install stock fleet
+          </Button>
+          <Button
+            onClick={() => navigate('/agents/new')}
+            className="shrink-0 gap-1.5"
+          >
+            <Plus size={14} />
+            New agent
+          </Button>
+        </div>
       </header>
 
       {bannerError && <ErrorBanner className="mb-4">{bannerError}</ErrorBanner>}
@@ -203,8 +215,16 @@ export default function Agents() {
         </section>
       )}
 
+      {validateOpen && <ValidateAllDrawer onClose={() => setValidateOpen(false)} />}
+      {fleetOpen && <FleetInstallDialog onClose={() => setFleetOpen(false)} onInstalled={() => void load()} />}
+
       {launchingAgent && (
-        <AgentLauncherSheet agent={launchingAgent} onClose={() => setLaunchingAgent(null)} />
+        <AgentLauncherSheet
+          agent={launchingAgent}
+          agentProvider={agents?.find((a) => a.name === launchingAgent)?.provider}
+          agentModel={agents?.find((a) => a.name === launchingAgent)?.model}
+          onClose={() => setLaunchingAgent(null)}
+        />
       )}
     </div>
   );

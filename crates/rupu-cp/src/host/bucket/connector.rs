@@ -495,6 +495,14 @@ impl HostConnector for BucketHostConnector {
         Err(crate::host::messages::no_message_transport("bucket"))
     }
 
+    /// A bucket carries no boards.
+    async fn run_board(
+        &self,
+        _id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        Err(crate::host::messages::no_board_transport("bucket"))
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,
@@ -598,6 +606,8 @@ mod tests {
 
         let run_id = conn
             .launch_run(LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "deploy".into(),
                 inputs: Default::default(),
                 mode: Some("bypass".into()),
@@ -639,6 +649,9 @@ mod tests {
 
         let run_id = conn
             .launch_agent(AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "my-agent".into(),
                 prompt: Some("do something".into()),
@@ -679,6 +692,9 @@ mod tests {
 
     fn profile_req(profile: Option<rupu_coverage::FindingProfile>) -> AgentLaunchRequest {
         AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "sec".into(),
             prompt: Some("audit".into()),
             mode: None,
@@ -1227,6 +1243,8 @@ mod tests {
         // Dispatch a run first so the run_id is valid for mirror.
         let run_id = conn
             .launch_run(LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "wf".into(),
                 inputs: Default::default(),
                 mode: None,
@@ -1275,6 +1293,8 @@ mod tests {
         let (conn, _run_store, bucket, _tmp) = make_conn();
         let run_id = conn
             .launch_run(LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "wf".into(),
                 inputs: Default::default(),
                 mode: None,
@@ -1305,6 +1325,8 @@ mod tests {
         let (conn, _run_store, bucket, _tmp) = make_conn();
         let run_id = conn
             .launch_run(LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "wf".into(),
                 inputs: Default::default(),
                 mode: None,
@@ -1543,6 +1565,8 @@ mod tests {
 
         let err = conn
             .launch_run(LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "wf".into(),
                 inputs: Default::default(),
                 mode: None,

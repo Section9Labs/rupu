@@ -557,6 +557,38 @@ async fn the_list_merges_layers_with_project_shadowing_and_lists_broken_files() 
     assert_eq!(rows[2]["scope_id"], "ws_repo");
 }
 
+/// A global-layer launch starts in the global dir's parent (`~` for
+/// `~/.rupu`), and the run registers that directory as a workspace. Its
+/// `.rupu/` IS the global dir, so it has no project layer (R5): the global
+/// definitions must not come back a second time as that "project's",
+/// shadowing the global rows, nor resolve there.
+#[tokio::test]
+async fn a_workspace_whose_rupu_dir_is_the_global_dir_has_no_project_layer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let user = tmp.path().join("user");
+    let global = user.join(".rupu");
+    write(&global.join("agentiflows/alpha.yaml"), &named("alpha"));
+    register_workspace(&global, "ws_user", &user);
+    let addr = serve(state(&global, false, None)).await;
+
+    let (status, rows) = get(addr, "/api/agentiflow-defs").await;
+    assert_eq!(status, 200, "{rows}");
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["scope_kind"], "global");
+    assert_eq!(rows[0]["scope_id"], Value::Null);
+
+    let (status, body) = get(addr, "/api/agentiflow-defs/alpha").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["scope_kind"], "global");
+    let (status, _) = get(
+        addr,
+        "/api/agentiflow-defs/alpha?scope_kind=project&scope_id=ws_user",
+    )
+    .await;
+    assert_eq!(status, 404);
+}
+
 #[tokio::test]
 async fn get_resolves_project_first_and_takes_an_explicit_scope() {
     let (tmp, global) = home();

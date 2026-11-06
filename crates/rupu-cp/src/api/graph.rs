@@ -752,6 +752,7 @@ fn agent_run_result(run: &rupu_orchestrator::RunRecord) -> Option<StepResultReco
         codename: None,
         error: run.error_message.clone(),
         cause: run.cause.clone(),
+        started_at: Some(run.started_at),
     })
 }
 
@@ -1248,6 +1249,12 @@ mod tests {
             _msg: crate::host::connector::OperatorMessageRequest,
         ) -> Result<rupu_runtime::services::operator::OperatorSendReply, HostConnectorError>
         {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
         async fn pull_finding_artifact(

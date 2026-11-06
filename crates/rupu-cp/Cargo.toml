@@ -55,6 +55,7 @@ rupu-launch = { workspace = true }
 rupu-config = { path = "../rupu-config" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-workspace = { path = "../rupu-workspace" }
+rupu-autoflow = { workspace = true }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-auth = { path = "../rupu-auth" }
@@ -65,6 +66,7 @@ rupu-scm = { path = "../rupu-scm" }
 rupu-findings-report = { path = "../rupu-findings-report", default-features = false }
 rupu-codename = { workspace = true }
 rupu-skills = { workspace = true }
+rupu-templates = { workspace = true }
 rupu-query = { workspace = true }
 # The operator MCP endpoint (`/mcp`): the protocol core over tool sources.
 rupu-mcp = { path = "../rupu-mcp" }
@@ -81,6 +83,7 @@ rupu-fleet = { path = "../rupu-fleet" }
 
 [dev-dependencies]
 chrono.workspace = true
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 serial_test.workspace = true
 git2.workspace = true

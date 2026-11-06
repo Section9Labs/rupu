@@ -22,6 +22,25 @@ pub(crate) fn validate_name(name: &str) -> Result<(), ApiError> {
     }
 }
 
+/// Names an agent or workflow can't be saved under: the literal segments of
+/// routes beside `/api/agents/:name` and `/api/workflows/:name`
+/// (`generate`, `validate`, `run`), which a request for a definition so
+/// named would reach instead, so HTTP could never read, save or delete it.
+pub(crate) const RESERVED_NAMES: &[&str] = &["generate", "validate", "run"];
+
+/// [`validate_name`] for a definition being created or saved: also refuses
+/// the [`RESERVED_NAMES`], naming `kind` (`agent` / `workflow`).
+pub(crate) fn validate_new_name(kind: &str, name: &str) -> Result<(), ApiError> {
+    validate_name(name)?;
+    if RESERVED_NAMES.contains(&name) {
+        return Err(ApiError::bad_request(format!(
+            "`{name}` is reserved: a {kind} can't be named {}",
+            RESERVED_NAMES.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// The read-side check for a definition name from a URL (`GET`, run, start
 /// a session): exactly one plain path component. Looser than
 /// [`validate_name`] so a definition already on disk under a stem that rule
@@ -109,6 +128,11 @@ mod tests {
         }
         assert!(validate_name("code-reviewer").is_ok());
         assert!(validate_name("Agent_1").is_ok());
+        for reserved in RESERVED_NAMES {
+            assert!(validate_name(reserved).is_ok());
+            assert!(validate_new_name("agent", reserved).is_err(), "{reserved}");
+        }
+        assert!(validate_new_name("agent", "runner").is_ok());
     }
 
     #[test]

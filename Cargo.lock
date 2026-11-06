@@ -4536,7 +4536,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-agent"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -4570,7 +4570,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-agentiflow"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4604,7 +4604,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-app-canvas"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "insta",
  "rupu-orchestrator",
@@ -4613,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-ast"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-auth"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -4658,8 +4658,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-autoflow"
+version = "0.87.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rupu-config",
+ "rupu-orchestrator",
+ "rupu-runtime",
+ "rupu-scm",
+ "rupu-transcript",
+ "rupu-workspace",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rupu-cli"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4690,6 +4709,7 @@ dependencies = [
  "rupu-agentiflow",
  "rupu-app-canvas",
  "rupu-auth",
+ "rupu-autoflow",
  "rupu-codename",
  "rupu-config",
  "rupu-coverage",
@@ -4704,6 +4724,7 @@ dependencies = [
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
+ "rupu-templates",
  "rupu-tools",
  "rupu-transcript",
  "rupu-update",
@@ -4736,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-codename"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4747,7 +4768,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-config"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4759,7 +4780,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-coverage"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "chrono",
  "glob",
@@ -4783,7 +4804,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-cp"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4806,6 +4827,7 @@ dependencies = [
  "rupu-agentiflow",
  "rupu-ast",
  "rupu-auth",
+ "rupu-autoflow",
  "rupu-codename",
  "rupu-config",
  "rupu-coverage",
@@ -4820,6 +4842,7 @@ dependencies = [
  "rupu-runtime",
  "rupu-scm",
  "rupu-skills",
+ "rupu-templates",
  "rupu-tools",
  "rupu-transcript",
  "rupu-workspace",
@@ -4843,19 +4866,22 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "ulid",
  "url",
 ]
 
 [[package]]
 name = "rupu-findings-report"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "pulldown-cmark",
  "rupu-coverage",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "typst",
  "typst-assets",
@@ -4866,7 +4892,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-fleet"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "chrono",
  "rustix 1.1.4",
@@ -4881,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-launch"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4914,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-mcp"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4933,7 +4959,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-netflow"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4955,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-netwatch"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "chrono",
  "libproc",
@@ -4969,12 +4995,13 @@ dependencies = [
 
 [[package]]
 name = "rupu-orchestrator"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "assert_fs",
  "async-trait",
  "chrono",
  "cron",
+ "fs2",
  "futures-util",
  "minijinja",
  "predicates",
@@ -5008,7 +5035,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-providers"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5033,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-query"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "chrono",
  "serde",
@@ -5043,11 +5070,12 @@ dependencies = [
 
 [[package]]
 name = "rupu-runtime"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "fs2",
  "futures-util",
  "hex",
  "httpmock",
@@ -5074,6 +5102,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -5081,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-scm"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5115,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-skills"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "git2",
  "hex",
@@ -5130,8 +5159,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-templates"
+version = "0.87.0"
+dependencies = [
+ "rupu-netflow",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "rupu-tools"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -5160,7 +5198,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-transcript"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5176,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-update"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "async-trait",
  "httpmock",
@@ -5195,7 +5233,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-webhook"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5218,7 +5256,7 @@ dependencies = [
 
 [[package]]
 name = "rupu-workspace"
-version = "0.85.0"
+version = "0.87.0"
 dependencies = [
  "assert_fs",
  "chrono",
@@ -5230,6 +5268,7 @@ dependencies = [
  "rand 0.8.6",
  "rupu-config",
  "rupu-runtime",
+ "rupu-scm",
  "serde",
  "serde_json",
  "serial_test",

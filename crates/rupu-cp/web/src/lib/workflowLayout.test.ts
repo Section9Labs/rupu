@@ -219,7 +219,13 @@ describe('editorNodeSize — per-kind shape boxes', () => {
       width: 214,
       height: 80,
     });
-    expect(editorNodeSize({ id: 'g', kind: 'approval_gate' })).toEqual({ width: 214, height: 80 });
+    // the gate is also taller: its prompt chip sits in a narrowed band
+    expect(editorNodeSize({ id: 'g', kind: 'approval_gate' })).toEqual({ width: 214, height: 92 });
+  });
+
+  it('a step with an inline approval reserves its gate badge row', () => {
+    expect(editorNodeSize({ id: 's', kind: 'step', agent: 'a', approvalRequired: true }).height).toBe(86);
+    expect(editorNodeSize({ id: 's', kind: 'step', agent: 'a' }).height).toBe(80);
   });
 
   it('for_each reserves extra width for its hexagon points, keeping its height', () => {

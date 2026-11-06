@@ -168,6 +168,14 @@ pub fn no_message_transport(transport: &str) -> HostConnectorError {
     ))
 }
 
+/// The refusal of a transport with no way to read a run's board (a tunnel
+/// node, a bucket worker): the API answers it 501.
+pub fn no_board_transport(transport: &str) -> HostConnectorError {
+    HostConnectorError::Unsupported(format!(
+        "run board: a {transport} host has no board transport"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

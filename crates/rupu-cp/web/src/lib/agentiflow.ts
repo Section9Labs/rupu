@@ -49,6 +49,13 @@ export function formatSpendUsd(usd: number | null | undefined): string {
   return usd == null ? '—' : formatCost(usd);
 }
 
+/** A short spend for a card: two decimals, `<$0.01` for a positive amount
+ *  under a cent (the page header's precision, without its tiny digits). */
+export function formatSpendShort(usd: number): string {
+  if (usd > 0 && usd < 0.01) return '<$0.01';
+  return `$${usd.toFixed(2)}`;
+}
+
 /** `1.2M tokens` style — the same abbreviation every other usage view uses. */
 export function formatSpendTokens(tokens: number): string {
   return `${formatTokens(tokens)} tokens`;

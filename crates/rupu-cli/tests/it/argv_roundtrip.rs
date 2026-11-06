@@ -12,8 +12,9 @@ use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
 use rupu_runtime::argv::{
-    AgentRun, AgentiflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace, RunArgv,
-    SessionSend, SessionStart, SessionWorker, WorkflowControl, WorkflowRef, WorkflowRun,
+    AgentRun, AgentiflowRun, AutoflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace,
+    RunArgv, SessionCompact, SessionSend, SessionStart, SessionWorker, WorkflowControl,
+    WorkflowRef, WorkflowRun,
 };
 use rupu_tools::PermissionMode;
 
@@ -160,6 +161,45 @@ fn agent_runs() -> Vec<RunArgv> {
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
+    // A CP continue, overriding the model and/or provider the original
+    // run was launched with; and a fresh launch on another model.
+    for (model, provider) in [
+        (Some("claude-opus-5-5"), None),
+        (None, Some("openai")),
+        (Some("-dash-model"), Some("anthropic")),
+    ] {
+        for continued in [false, true] {
+            let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+            r.continue_from = continued.then(|| "sub_01ROUNDTRIP".into());
+            r.prompt = (!continued).then(|| "go".into());
+            r.model = model.map(str::to_string);
+            r.provider = provider.map(str::to_string);
+            out.push(RunArgv::Agent(r));
+        }
+    }
+    // A continue given a prompt (the CP's optional `prompt`), alone, on
+    // another model, and as a launched child: every prompt shape travels
+    // as ONE `--prompt=` element next to `--continue`.
+    for (i, prompt) in PROMPTS.iter().enumerate() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some(if i % 2 == 0 {
+            "run_01ROUNDTRIP".into()
+        } else {
+            "sub_01ROUNDTRIP".into()
+        });
+        r.prompt = Some(prompt.to_string());
+        r.model = (i % 3 == 1).then(|| "claude-opus-5-5".into());
+        r.provider = (i % 3 == 2).then(|| "openai".into());
+        r.mode = MODES[i % MODES.len()];
+        out.push(RunArgv::Agent(r));
+    }
+    for (i, link) in links().into_iter().enumerate() {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some("run_01ROUNDTRIP".into());
+        r.prompt = Some(PROMPTS[i % PROMPTS.len()].into());
+        r.launch = Some(link);
+        out.push(RunArgv::Agent(r));
+    }
     // A placed unit continued with its workflow's messaging still set.
     for messaging in messagings() {
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
@@ -252,11 +292,14 @@ fn controls() -> Vec<RunArgv> {
             }
         }
         for if_unfinished in [false, true] {
-            out.push(RunArgv::WorkflowControl(WorkflowControl::Resume {
-                run_id: "run_x".into(),
-                mode,
-                if_unfinished,
-            }));
+            for restart_interrupted in [false, true] {
+                out.push(RunArgv::WorkflowControl(WorkflowControl::Resume {
+                    run_id: "run_x".into(),
+                    mode,
+                    if_unfinished,
+                    restart_interrupted,
+                }));
+            }
         }
     }
     out
@@ -313,6 +356,16 @@ fn sessions() -> Vec<RunArgv> {
     out.push(RunArgv::SessionWorker(SessionWorker {
         session_id: "ses_01X".into(),
     }));
+    for (session_id, window, compaction_id) in [
+        ("ses_01X", None, None),
+        ("-ses", Some(1_000_000), Some("cmp_01X")),
+    ] {
+        out.push(RunArgv::SessionCompact(SessionCompact {
+            session_id: session_id.into(),
+            window,
+            compaction_id: compaction_id.map(str::to_string),
+        }));
+    }
     out
 }
 
@@ -326,6 +379,27 @@ fn agentiflows() -> Vec<RunArgv> {
             })
         })
         .collect()
+}
+
+fn autoflow_runs() -> Vec<RunArgv> {
+    let mut out = Vec::new();
+    for name in ["fix-issues", "-x"] {
+        for repo in [None, Some("github:acme/widgets".to_string())] {
+            for mode in [
+                None,
+                Some(PermissionMode::Bypass),
+                Some(PermissionMode::Readonly),
+            ] {
+                out.push(RunArgv::AutoflowRun(AutoflowRun {
+                    name: name.into(),
+                    target: "github:acme/widgets/issues/42".into(),
+                    repo: repo.clone(),
+                    mode,
+                }));
+            }
+        }
+    }
+    out
 }
 
 fn mode(word: Option<String>) -> Option<PermissionMode> {
@@ -374,6 +448,8 @@ fn back(cli: Cli) -> RunArgv {
                     participant: f.participant,
                 }),
                 continue_from: a.continue_from,
+                model: a.model,
+                provider: a.provider,
                 launch: a.launch.link(),
             })
         }
@@ -437,11 +513,12 @@ fn back(cli: Cli) -> RunArgv {
                 if_unfinished,
                 restart_interrupted,
             } => {
-                assert!(!plain && !restart_interrupted, "never rendered");
+                assert!(!plain, "never rendered");
                 RunArgv::WorkflowControl(WorkflowControl::Resume {
                     run_id,
                     mode: mode(m),
                     if_unfinished,
+                    restart_interrupted,
                 })
             }
             other => panic!("not a rendered workflow command: {other:?}"),
@@ -469,6 +546,15 @@ fn back(cli: Cli) -> RunArgv {
             cmd::session::Action::RunWorker(w) => RunArgv::SessionWorker(SessionWorker {
                 session_id: w.session_id,
             }),
+            cmd::session::Action::Compact {
+                session_id,
+                window,
+                compaction_id,
+            } => RunArgv::SessionCompact(SessionCompact {
+                session_id,
+                window,
+                compaction_id,
+            }),
             other => panic!("not a rendered session command: {other:?}"),
         },
         Cmd::Agentiflow {
@@ -485,6 +571,20 @@ fn back(cli: Cli) -> RunArgv {
                 run_id: run_id.expect("the detached child carries its id"),
             })
         }
+        Cmd::Autoflow {
+            action:
+                cmd::autoflow::Action::Run {
+                    name,
+                    target,
+                    repo,
+                    mode: m,
+                },
+        } => RunArgv::AutoflowRun(AutoflowRun {
+            name,
+            target,
+            repo,
+            mode: mode(m),
+        }),
         other => panic!("not a rendered command: {other:?}"),
     }
 }
@@ -497,6 +597,7 @@ fn argv_roundtrip() {
         controls(),
         sessions(),
         agentiflows(),
+        autoflow_runs(),
     ]
     .concat();
     assert!(all.len() > 300, "the generated set shrank: {}", all.len());

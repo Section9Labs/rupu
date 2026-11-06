@@ -67,6 +67,44 @@ pub struct AuditReport {
     pub total_gap_files: usize,
 }
 
+impl AuditReport {
+    /// The coverage gaps alone: one row per (concern, in-scope file lacking
+    /// an assertion), in concern order — what `rupu coverage gap` prints and
+    /// `GET /api/coverage/:target/gap` serves.
+    pub fn gaps(&self) -> CoverageGaps {
+        let rows = self
+            .concerns
+            .iter()
+            .flat_map(|c| {
+                c.gap_files.iter().map(|f| GapRow {
+                    concern_id: c.concern_id.clone(),
+                    file: f.clone(),
+                })
+            })
+            .collect();
+        CoverageGaps {
+            kind: "coverage_gaps",
+            version: 1,
+            rows,
+        }
+    }
+}
+
+/// One coverage gap: an in-scope file the concern has no assertion for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GapRow {
+    pub concern_id: String,
+    pub file: String,
+}
+
+/// A target's coverage gaps ([`AuditReport::gaps`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CoverageGaps {
+    pub kind: &'static str,
+    pub version: u8,
+    pub rows: Vec<GapRow>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +124,48 @@ mod tests {
             not_applicable: 0,
         };
         assert!(cc.is_complete());
+    }
+
+    #[test]
+    fn gaps_are_one_row_per_concern_and_gap_file_in_order() {
+        let concern = |id: &str, gaps: &[&str]| ConcernCoverage {
+            concern_id: id.to_string(),
+            name: id.to_uppercase(),
+            severity: Severity::High,
+            in_scope_files: vec![],
+            asserted_files: vec![],
+            gap_files: gaps.iter().map(|g| g.to_string()).collect(),
+            clean: 0,
+            findings: 0,
+            examined: 0,
+            not_applicable: 0,
+        };
+        let report = AuditReport {
+            target_id: "t".to_string(),
+            concerns: vec![
+                concern("ssrf", &["b.rs", "a.rs"]),
+                concern("xss", &[]),
+                concern("sqli", &["c.rs"]),
+            ],
+            files: vec![],
+            cross_model: vec![],
+            serendipitous: vec![],
+            total_concerns: 3,
+            complete_concerns: 1,
+            total_gap_files: 3,
+        };
+        assert_eq!(
+            serde_json::to_value(report.gaps()).unwrap(),
+            serde_json::json!({
+                "kind": "coverage_gaps",
+                "version": 1,
+                "rows": [
+                    {"concern_id": "ssrf", "file": "b.rs"},
+                    {"concern_id": "ssrf", "file": "a.rs"},
+                    {"concern_id": "sqli", "file": "c.rs"},
+                ],
+            })
+        );
     }
 
     #[test]

@@ -133,3 +133,29 @@ fn rejects_bad_pr_number() {
 fn rejects_bad_issue_number() {
     assert!(parse_run_target("github:foo/bar/issues/notanumber").is_err());
 }
+
+/// A prompt that only starts like a target is not one: a target is a single
+/// token with no empty path segment.
+#[test]
+fn rejects_whitespace_and_empty_segments() {
+    for prompt in [
+        "github: compare foo/bar",
+        "github:compare foo/bar",
+        "github:foo/bar and then fix it",
+        "github:foo/bar ",
+        " github:foo/bar",
+        "github:foo/bar\n",
+        "github:foo/bar#4 2",
+        "github:foo/bar/issues/ 9",
+        "gitlab:group/sub project/repo",
+        "github:/bar",
+        "github:foo/",
+        "github:foo//bar",
+        "gitlab:group//project!7",
+        "github:/issues/3",
+        "github:foo//bar/issues/3",
+        "jira:acme.atlassian.net//issues/42",
+    ] {
+        assert!(parse_run_target(prompt).is_err(), "{prompt:?}");
+    }
+}

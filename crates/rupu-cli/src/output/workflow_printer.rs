@@ -4434,6 +4434,7 @@ mod tests {
             host: None,
             cause: None,
             error: None,
+            started_at: None,
         }
     }
 
@@ -4782,6 +4783,7 @@ mod tests {
             codename: None,
             cause: None,
             error: None,
+            started_at: None,
         };
         std::fs::write(
             &step_results,
@@ -5236,6 +5238,7 @@ mod tests {
             codename: None,
             cause: None,
             error: None,
+            started_at: None,
         };
         let prefs = UiPrefs::resolve(
             &rupu_config::UiConfig::default(),

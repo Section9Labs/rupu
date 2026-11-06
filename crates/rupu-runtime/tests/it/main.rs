@@ -15,6 +15,7 @@
 mod anthropic_prompt_cache;
 mod assembly;
 mod assembly_skills;
+mod board;
 mod gemini_code_assist_project;
 mod hop_builder;
 mod model_limits;
@@ -24,5 +25,6 @@ mod no_hand_built_run_opts;
 mod oauth_refresh_persists;
 mod oauth_refresh_tracking;
 mod provider_resolution;
+mod sessions;
 mod support;
 mod sync_provider_build;

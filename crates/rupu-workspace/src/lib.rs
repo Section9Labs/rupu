@@ -35,8 +35,8 @@ pub use autoflow_worktree::{
     ensure_issue_worktree, remove_issue_worktree, AutoflowWorktree, AutoflowWorktreeError,
 };
 pub use config_paths::{
-    config_paths, config_paths_for_customer, is_safe_definition_name, locate_workflow,
-    project_layer_dir, project_root_for, ConfigPaths,
+    config_paths, config_paths_for_customer, config_paths_for_display, is_safe_definition_name,
+    load_config_for_display, locate_workflow, project_layer_dir, project_root_for, ConfigPaths,
 };
 pub use customers::{
     validate_slug, validate_ws_id, Customer, CustomerError, CustomerMeta, CustomerStore, MetaPatch,
@@ -49,7 +49,7 @@ pub use host_store::{
 };
 pub use record::{new_id, Workspace};
 pub use repo_record::TrackedRepo;
-pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError};
+pub use repo_store::{repo_ref_key, RepoRegistryStore, RepoStoreError, TrackCheckoutError};
 pub use rupu_runtime::{WorkerCapabilities, WorkerKind, WorkerRecord};
 pub use store::{find_by_path, register, upsert, StoreError, WorkspaceStore};
 pub use worker_store::{WorkerStore, WorkerStoreError};

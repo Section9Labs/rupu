@@ -2,12 +2,13 @@
 // AgentLauncherSheet — tests for the Single-run / Session launch-kind toggle.
 // Pure-logic `buildAgentLaunch` tests are kept in the same file.
 //
-// Stubs: api.launchAgent, api.startSession, api.getRepos, api.getProjects,
+// Stubs: launchApi.launchAgentRun, api.startSession, api.getRepos, api.getProjects,
 // api.browseDir (TargetPicker deps), and useNavigate.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { launchApi } from '../lib/api3b/launch';
 import { api, ApiError, type PreviewResponse, type SkillRow } from '../lib/api';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
 import { buildAgentLaunch } from './AgentLauncherSheet';
@@ -33,6 +34,8 @@ beforeEach(() => {
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'getRepos').mockResolvedValue([]);
   vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+  vi.spyOn(launchApi, 'getEngagementProfiles').mockResolvedValue({ profiles: [], errors: [] });
+  vi.spyOn(api, 'getModelCatalog').mockResolvedValue([]);
   vi.spyOn(api, 'getSkills').mockResolvedValue([]);
 });
 
@@ -76,9 +79,9 @@ function stubTargetPickerDeps() {
 }
 
 describe('AgentLauncherSheet toggle', () => {
-  it('default (run) path: calls launchAgent and navigates to /runs/:id', async () => {
+  it('default (run) path: calls launchAgentRun and navigates to /runs/:id', async () => {
     stubTargetPickerDeps();
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-abc' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-abc' });
     const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-xyz' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
@@ -94,9 +97,9 @@ describe('AgentLauncherSheet toggle', () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith('/runs/run-abc'));
   });
 
-  it('session path: calls startSession (not launchAgent) and navigates to /sessions/:id', async () => {
+  it('session path: calls startSession (not launchAgentRun) and navigates to /sessions/:id', async () => {
     stubTargetPickerDeps();
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-abc' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-abc' });
     const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-001' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
@@ -118,7 +121,7 @@ describe('AgentLauncherSheet toggle', () => {
   it('switching to session resets ask mode to bypass and never submits ask', async () => {
     stubTargetPickerDeps();
     const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-bypass' });
-    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-abc' });
+    vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-abc' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
 
@@ -133,7 +136,7 @@ describe('AgentLauncherSheet toggle', () => {
     expect(calledMode).toBe('bypass');
   });
 
-  it('remote host run: passes host to launchAgent and carries ?host= in navigate', async () => {
+  it('remote host run: passes host to launchAgentRun and carries ?host= in navigate', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([
       { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
       { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
@@ -141,7 +144,7 @@ describe('AgentLauncherSheet toggle', () => {
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-remote' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-remote' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
 
@@ -159,7 +162,7 @@ describe('AgentLauncherSheet toggle', () => {
 
   it('local run: navigate URL has no ?host= query string', async () => {
     stubTargetPickerDeps();
-    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-local' });
+    vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-local' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
@@ -197,7 +200,7 @@ describe('AgentLauncherSheet toggle', () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/', parent: null, dirs: [] });
     const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-remote-1' });
-    vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-remote' });
+    vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-remote' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
 
@@ -260,7 +263,7 @@ describe('AgentLauncherSheet toggle', () => {
 
   it('disables Launch with the server message when the preview is a 409', async () => {
     vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(409, 'customer "gone" no longer exists'));
-    const launch = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'r' } as never);
+    const launch = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'r' } as never);
     render(<AgentLauncherSheet agent="scout" onClose={() => {}} />);
     expect(await screen.findByRole('alert')).toHaveTextContent('customer "gone" no longer exists');
     const btn = screen.getByRole('button', { name: 'Run' });
@@ -315,7 +318,7 @@ describe('AgentLauncherSheet skills', () => {
   it('sends the chosen skills with a run', async () => {
     stubTargetPickerDeps();
     vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf'), row('house-style')]);
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-s' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-s' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
     await pickSkills();
@@ -351,7 +354,7 @@ describe('AgentLauncherSheet skills', () => {
 
   it('sends no skill keys when none are chosen', async () => {
     stubTargetPickerDeps();
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-n' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-n' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
@@ -394,7 +397,7 @@ describe('AgentLauncherSheet skills', () => {
       { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
     ]);
     const getSkills = vi.spyOn(api, 'getSkills').mockResolvedValue([row('pdf')]);
-    const launchSpy = vi.spyOn(api, 'launchAgent').mockResolvedValue({ run_id: 'run-r' });
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-r' });
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
     const load = screen.getByTestId('launch-skills-load');
@@ -420,11 +423,107 @@ describe('AgentLauncherSheet skills', () => {
   it('shows the server message, not its JSON, when a launch is refused', async () => {
     stubTargetPickerDeps();
     const body = '{"error":"skills: entry \\"Bad_Name\\": skill name may only contain lowercase letters"}';
-    vi.spyOn(api, 'launchAgent').mockRejectedValue(new ApiError(400, body, body));
+    vi.spyOn(launchApi, 'launchAgentRun').mockRejectedValue(new ApiError(400, body, body));
 
     render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'Run' }));
 
     expect(await screen.findByText(/^skills: entry "Bad_Name": skill name may only contain/)).toBeInTheDocument();
+  });
+});
+
+describe('AgentLauncherSheet model, provider and engagement profiles (Plan 3b)', () => {
+  const CATALOG = [
+    {
+      provider: 'anthropic',
+      fetched_at: null,
+      stale: false,
+      models: [{ id: 'claude-opus-5-5', input_tokens: null, output_tokens: null, source: 'live' as const }],
+    },
+    {
+      provider: 'openai',
+      fetched_at: null,
+      stale: false,
+      models: [{ id: 'gpt-6', input_tokens: null, output_tokens: null, source: 'live' as const }],
+    },
+  ];
+  const PROFILES = {
+    profiles: [
+      {
+        id: 'network',
+        name: 'Network assessment',
+        layer: 'builtin' as const,
+        includes: [],
+        asset_kinds: [{ id: 'host', label: '{host}' }],
+        bundle: { agents: ['recon'], tools: [], workflows: [] },
+      },
+    ],
+    errors: [],
+  };
+
+  beforeEach(() => {
+    stubTargetPickerDeps();
+    vi.spyOn(api, 'getModelCatalog').mockResolvedValue(CATALOG);
+    vi.spyOn(launchApi, 'getEngagementProfiles').mockResolvedValue(PROFILES);
+  });
+
+  it('sends the chosen provider, model and profiles', async () => {
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-m' });
+    render(<AgentLauncherSheet agent="triage" agentProvider="anthropic" agentModel="claude-opus-5-5" onClose={() => {}} />);
+
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    await waitFor(() => expect(within(provider).getByRole('option', { name: 'openai' })).toBeInTheDocument());
+    fireEvent.change(provider, { target: { value: 'openai' } });
+    const add = screen.getByRole('combobox', { name: 'Add an engagement profile' });
+    await waitFor(() => expect(within(add).getByRole('option', { name: /network/ })).toBeInTheDocument());
+    fireEvent.change(add, { target: { value: 'network' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('triage', {
+        mode: 'ask',
+        provider: 'openai',
+        model: 'gpt-6',
+        engagement_profiles: ['network'],
+      }),
+    );
+  });
+
+  it('a remote host greys out model and provider with the reason, and sends neither', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    const launchSpy = vi.spyOn(launchApi, 'launchAgentRun').mockResolvedValue({ run_id: 'run-r' });
+    render(<AgentLauncherSheet agent="triage" agentProvider="anthropic" onClose={() => {}} />);
+
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    await waitFor(() => expect(within(provider).getByRole('option', { name: 'openai' })).toBeInTheDocument());
+    fireEvent.change(provider, { target: { value: 'openai' } });
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    expect(provider).toBeDisabled();
+    expect(screen.getByText(/no host transport carries a model or provider override/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+    await waitFor(() => expect(launchSpy).toHaveBeenCalled());
+    const body = launchSpy.mock.calls[0][1];
+    expect(body.provider).toBeUndefined();
+    expect(body.model).toBeUndefined();
+  });
+
+  it('a session takes neither, and says why', async () => {
+    const sessionSpy = vi.spyOn(api, 'startSession').mockResolvedValue({ session_id: 'ses-1' });
+    render(<AgentLauncherSheet agent="triage" onClose={() => {}} />);
+    const add = screen.getByRole('combobox', { name: 'Add an engagement profile' });
+    await waitFor(() => expect(within(add).getByRole('option', { name: /network/ })).toBeInTheDocument());
+    fireEvent.change(add, { target: { value: 'network' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Session' }));
+
+    expect(screen.getByText('A session doesn’t take engagement profiles.')).toBeInTheDocument();
+    expect(screen.getByText('A session runs on the agent’s own model and provider.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Start session' }));
+    await waitFor(() => expect(sessionSpy).toHaveBeenCalled());
+    expect(sessionSpy.mock.calls[0][1]).not.toHaveProperty('engagement_profiles');
   });
 });

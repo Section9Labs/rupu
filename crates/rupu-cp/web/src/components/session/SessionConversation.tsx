@@ -6,7 +6,7 @@
 // over SSE while the turn is in flight). The newest turn sits at the BOTTOM; a
 // "Load older turns" button at the TOP widens the visible window.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import TranscriptPanel from '../TranscriptPanel';
 import { Button } from '../ui/Button';
 import type { SessionSummary, SessionRunRow } from '../../lib/api';
@@ -26,6 +26,7 @@ export default function SessionConversation({
   session,
   runs,
   onTurnComplete,
+  footer,
 }: {
   session: SessionSummary;
   /** Turn-runs in stored order (oldest→newest). */
@@ -33,6 +34,8 @@ export default function SessionConversation({
   /** Called when the active turn's transcript stream fires run_complete/run_failed.
    *  Allows the parent (SessionDetail) to reload session + runs immediately. */
   onTurnComplete?: () => void;
+  /** A line after the newest turn (a finished compaction's result). */
+  footer?: ReactNode;
 }) {
   const [visible, setVisible] = useState(PAGE);
 
@@ -64,6 +67,7 @@ export default function SessionConversation({
     return (
       <div className="flex-1 overflow-y-auto px-4 py-10">
         <p className="text-center text-sm text-ink-dim">No messages yet — send one below.</p>
+        {footer}
       </div>
     );
   }
@@ -114,6 +118,7 @@ export default function SessionConversation({
         ))}
       </div>
 
+      {footer}
       <div ref={bottomRef} />
     </div>
   );

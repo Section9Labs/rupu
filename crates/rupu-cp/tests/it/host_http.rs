@@ -44,6 +44,8 @@ async fn launch_run_posts_with_bearer_and_returns_run_id() {
     let c = HttpHostConnector::new(server.base_url(), Some("tok".into()));
     let id = c
         .launch_run(LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: "wf".into(),
             ..Default::default()
         })
@@ -635,6 +637,9 @@ fn profiled_agent_req(
     profile: Option<rupu_coverage::FindingProfile>,
 ) -> rupu_cp::agent_launcher::AgentLaunchRequest {
     rupu_cp::agent_launcher::AgentLaunchRequest {
+        model: None,
+        provider: None,
+        continue_from: None,
         agent: "sec".into(),
         prompt: Some("audit".into()),
         mode: None,

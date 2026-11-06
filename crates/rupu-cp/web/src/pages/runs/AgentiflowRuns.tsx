@@ -8,7 +8,7 @@
 // the endpoint takes `?host=` / `offset` / `limit`.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw } from 'lucide-react';
+import { Plus, RefreshCw } from 'lucide-react';
 import { api, apiErrorMessage, type AgentiflowRow } from '../../lib/api';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { RunStatusChip } from '../../components/ui/RunStatusChip';
@@ -19,6 +19,7 @@ import { PageHeader } from '../../components/ui/PageHeader';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { ListSkeleton } from '../../components/lists/ListSkeleton';
+import AgentiflowLauncherSheet from '../../components/agentiflow/AgentiflowLauncherSheet';
 import { parseCodename } from '../../lib/codename';
 import { cn } from '../../lib/cn';
 import { relativeTime } from '../../lib/time';
@@ -176,6 +177,14 @@ export default function AgentiflowRuns() {
     };
   }, [load]);
 
+  const [launcherOpen, setLauncherOpen] = useState(false);
+  const newButton = (
+    <Button variant="solid" onClick={() => setLauncherOpen(true)} className="gap-1.5">
+      <Plus size={14} />
+      New agentiflow
+    </Button>
+  );
+
   const [q, setQ] = useListQuery();
   const loaded = useMemo(() => rows ?? [], [rows]);
   const filtered = useFilteredRows(loaded, q, AGENTIFLOW_FIELDS);
@@ -187,10 +196,13 @@ export default function AgentiflowRuns() {
         title="Agentiflow Runs"
         subtitle="Goal-directed agent fleets run from this machine."
         actions={
-          <Button variant="secondary" onClick={() => load()} className="gap-1.5">
-            <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
-            Refresh
-          </Button>
+          <>
+            <Button variant="secondary" onClick={() => load()} className="gap-1.5">
+              <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
+              Refresh
+            </Button>
+            {newButton}
+          </>
         }
       />
 
@@ -201,7 +213,8 @@ export default function AgentiflowRuns() {
       ) : rows === null ? null : rows.length === 0 ? (
         <EmptyState
           title="No agentiflow runs yet"
-          hint="Agentiflow runs appear here once you start one with `rupu agentiflow run`."
+          hint="Start a goal-directed fleet from one of your agentiflow definitions."
+          action={newButton}
         />
       ) : (
         <>
@@ -229,6 +242,8 @@ export default function AgentiflowRuns() {
           )}
         </>
       )}
+
+      {launcherOpen && <AgentiflowLauncherSheet onClose={() => setLauncherOpen(false)} />}
     </div>
   );
 }

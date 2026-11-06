@@ -1044,6 +1044,33 @@ impl HostConnector for HttpHostConnector {
         json_body(resp).await
     }
 
+    /// `GET /api/runs/:id/board` on the remote, once it advertises
+    /// [`crate::node::protocol::CAP_RUN_BOARD`]. Its 404 names the run.
+    async fn run_board(
+        &self,
+        id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        if MessageRoute::of_id(id) != Some(MessageRoute::Runs) {
+            return Err(HostConnectorError::NotFound(format!("no run `{id}`")));
+        }
+        self.require_known_feature(
+            crate::node::protocol::CAP_RUN_BOARD,
+            "this run's board cannot be read",
+        )
+        .await?;
+        let resp = self
+            .send(self.client.get(self.url(&format!("/api/runs/{id}/board"))))
+            .await
+            .map_err(|e| match e {
+                HostConnectorError::NotFound(_) => HostConnectorError::NotFound(format!(
+                    "remote host {} has no run `{id}`",
+                    self.base_url
+                )),
+                other => other,
+            })?;
+        json_body(resp).await
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,

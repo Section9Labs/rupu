@@ -27,6 +27,8 @@ import { CustomerChip } from '../components/customers/CustomerChip';
 import { PricingErrorMark } from '../components/customers/PricingErrorMark';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { PROJECT_FIELDS } from '../lib/query/lists/projects';
+import { Button } from '../components/ui/Button';
+import InitProjectDialog from '../components/launch/InitProjectDialog';
 
 const STEP = 20;
 
@@ -62,6 +64,7 @@ export default function Projects() {
   const [error, setError] = useState<string | null>(null);
   const [visible, setVisible] = useState(STEP);
   const { customer, guard } = useScopedList(undefined, []);
+  const [initOpen, setInitOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -100,6 +103,11 @@ export default function Projects() {
         className="mb-6"
         title="Projects"
         subtitle="Workspaces registered with this control plane — each with its own runs, sessions, and coverage."
+        actions={
+          <Button variant="solid" onClick={() => setInitOpen(true)}>
+            Initialize project
+          </Button>
+        }
       />
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
@@ -115,6 +123,13 @@ export default function Projects() {
               : customer
                 ? 'No project is assigned to this customer yet.'
                 : 'No projects yet — run an agent against a directory to register it as a project.'
+          }
+          action={
+            customer ? undefined : (
+              <Button variant="secondary" onClick={() => setInitOpen(true)}>
+                Initialize project
+              </Button>
+            )
           }
         />
       )}
@@ -165,6 +180,8 @@ export default function Projects() {
           )}
         </>
       )}
+
+      {initOpen && <InitProjectDialog onClose={() => setInitOpen(false)} />}
     </div>
   );
 }

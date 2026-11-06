@@ -57,6 +57,14 @@
   --c-ok: 22 163 74;    --c-ok-bg: 240 253 244;
   --c-warn: 217 119 6;  --c-warn-bg: 255 251 235;
   --c-info: 37 99 235;  --c-info-bg: 239 246 255;
+  /* Chart categorical palette, fixed order (never cycled). Validated with the
+     dataviz checker against the light panel: lightness band, chroma floor,
+     colorblind + normal-vision separation of adjacent slots, 3:1 contrast. */
+  --c-chart-1: 47 111 214;  /* blue   */
+  --c-chart-2: 31 138 70;   /* green  */
+  --c-chart-3: 122 82 209;  /* violet */
+  --c-chart-4: 176 109 0;   /* amber  */
+  --c-chart-5: 15 138 163;  /* cyan   */
 }
 
 [data-theme="dark"] {
@@ -100,6 +108,12 @@
   --c-ok: 74 222 128;   --c-ok-bg: 18 40 27;
   --c-warn: 251 191 36; --c-warn-bg: 48 36 12;
   --c-info: 96 165 250; --c-info-bg: 20 32 54;
+  /* The same five slots, stepped for the dark panel (validated against it). */
+  --c-chart-1: 76 142 239;
+  --c-chart-2: 51 172 90;
+  --c-chart-3: 140 109 226;
+  --c-chart-4: 201 130 18;
+  --c-chart-5: 33 163 188;
 }
 
 @layer base {
@@ -199,10 +213,8 @@
 /* ------------------------------------------------------------------ */
 /* Run-graph node + edge animation (Task 11)                          */
 /* Faithful to the approved graph-pro / fanout-loop mockups:          */
-/*   • running node  → soft blue pulse ring                           */
-/*   • awaiting node → soft amber pulse ring                          */
-/*   • active edge   → blue "marching-ants" (xyflow paints the path,  */
-/*     so animate stroke-dashoffset on the SVG path itself)           */
+/*   • running → soft blue pulse ring (status pills reuse it)         */
+/*   • awaiting → soft amber pulse ring                               */
 /* ------------------------------------------------------------------ */
 /* Unified status palette (see lib/status.ts / tailwind `status.*`):
  *   running #3b82f6 (59,130,246) · awaiting #f59e0b (245,158,11) */
@@ -217,19 +229,7 @@
 .rg-pulse-run   { animation: rg-pulse-blue  1.7s ease-in-out infinite; }
 .rg-pulse-await { animation: rg-pulse-amber 1.7s ease-in-out infinite; }
 
-@keyframes rg-march {
-  to { stroke-dashoffset: -28; }
-}
-/* xyflow renders the edge as `path.react-flow__edge-path`; mark the live
- * frontier edge via a wrapper class on the <g> and animate the dashed
- * stroke so the ants march along the rendered curve. Animation only, no
- * color — the stroke is supplied by the edge's inline style (RunGraph's edge
- * memo) so the marching-ants can render in ANY per-kind accent. */
-.react-flow__edge.rg-edge-flow .react-flow__edge-path {
-  stroke-width: 2;
-  stroke-dasharray: 7 7;
-  animation: rg-march 0.7s linear infinite;
-}
+/* The run graph's edges and node glows live in styles/graph-motion.css. */
 
 /* Animated panel-loop back-edge marker (round-counter loop cue). */
 @keyframes rg-loop-spin {
@@ -284,21 +284,10 @@
 }
 
 /* ================================================================== */
-/* Situation Room — the fullscreen Live Events wall.                  */
-/* Center = live editorial event stream, right = project roster.      */
-/* All colors come from the shared `--c-*` tokens (light + dark).     */
-/* Namespaced `.sr-*` so nothing here leaks into the rest of the app. */
+/* Live Events leftovers: the shell's live chip, and the error detail */
+/* block (situationRoom/ErrorDetail) the event rows reuse. The rows   */
+/* themselves are styles/events.css.                                  */
 /* ================================================================== */
-
-/* ── header pulse strip ── */
-.sr-brandcell { min-width: 258px; }
-.sr-mark {
-  width: 30px; height: 30px; border-radius: 8px;
-  background: linear-gradient(145deg, rgb(var(--c-brand-500)), rgb(var(--c-brand-700)));
-  display: grid; place-items: center; color: #fff; font-weight: 800; font-size: 15px;
-  box-shadow: 0 0 0 1px rgb(var(--c-brand-500) / .35), 0 6px 18px rgb(var(--c-brand-500) / .28);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
 .sr-live {
   display: inline-flex; align-items: center; gap: 6px; font-size: 10px; letter-spacing: .12em;
   text-transform: uppercase; font-weight: 600; color: rgb(var(--c-ok));
@@ -307,68 +296,14 @@
 .sr-live[data-state="connecting"], .sr-live[data-state="reconnecting"] { color: rgb(var(--c-warn)); background: rgb(var(--c-warn)/.1); border-color: rgb(var(--c-warn)/.3); }
 .sr-beacon { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: sr-beacon 2s ease-out infinite; }
 @keyframes sr-beacon { 0% { box-shadow: 0 0 0 0 currentColor; } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
-
-.sr-kpi { display: flex; flex-direction: column; justify-content: center; gap: 3px; padding: 10px 18px; border-right: 1px solid rgb(var(--c-border)); min-width: 112px; }
-.sr-kpi-lbl { font-size: 9px; letter-spacing: .15em; text-transform: uppercase; color: rgb(var(--c-ink-mute)); }
-.sr-kpi-val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 26px; font-weight: 620; line-height: 1; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
-.sr-kpi-val small { font-size: 12px; color: rgb(var(--c-ink-mute)); font-weight: 500; }
-.sr-kpi.flash .sr-kpi-val { animation: sr-valflash .6s ease; }
-@keyframes sr-valflash { 0% { color: rgb(var(--c-brand-500)); } 100% { color: inherit; } }
-.sr-sevpip { font-family: ui-monospace, monospace; font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; }
-.sr-sev-critical { color: rgb(var(--c-sev-critical)); background: rgb(var(--c-sev-critical-bg)); }
-.sr-sev-high     { color: rgb(var(--c-sev-high));     background: rgb(var(--c-sev-high-bg)); }
-.sr-sev-medium   { color: rgb(var(--c-sev-medium));   background: rgb(var(--c-sev-medium-bg)); }
-.sr-sev-low      { color: rgb(var(--c-sev-low));      background: rgb(var(--c-sev-low-bg)); }
-.sr-sev-info     { color: rgb(var(--c-sev-info));     background: rgb(var(--c-sev-info-bg)); }
-.sr-spark { display: flex; align-items: flex-end; gap: 2px; height: 26px; }
-.sr-spark i { width: 3px; background: rgb(var(--c-brand-500) / .55); border-radius: 1px; display: block; transition: height .5s ease; }
-
-/* ── the editorial event card ── */
-.sr-ev {
-  position: relative; border: 1px solid rgb(var(--c-border)); border-radius: 13px;
-  background: rgb(var(--c-panel)); overflow: hidden; padding: 13px 15px 13px 17px;
-}
-.sr-ev::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: rgb(var(--c-ink-mute)); }
-.sr-ev.sr-a-brand::before    { background: rgb(var(--c-brand-500)); }
-.sr-ev.sr-a-await::before    { background: rgb(var(--c-status-awaiting)); }
-.sr-ev.sr-a-error::before    { background: rgb(var(--c-status-failed)); }
-.sr-ev.sr-a-critical::before { background: rgb(var(--c-sev-critical)); }
-.sr-ev.sr-a-high::before     { background: rgb(var(--c-sev-high)); }
-.sr-ev.sr-a-medium::before   { background: rgb(var(--c-sev-medium)); }
-.sr-ev.sr-a-low::before      { background: rgb(var(--c-sev-low)); }
-.sr-ev.sr-a-info::before     { background: rgb(var(--c-sev-info)); }
-.sr-ev.is-fresh { animation: sr-evin .5s cubic-bezier(.2,.8,.2,1); }
-@keyframes sr-evin { from { opacity: 0; transform: translateY(-10px) scale(.985); } to { opacity: 1; transform: none; } }
-
-.sr-ev-head { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
-.sr-badge { font-family: ui-monospace, monospace; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; font-weight: 700; padding: 2px 7px; border-radius: 5px; white-space: nowrap; }
-.sr-badge.sr-a-brand    { color: rgb(var(--c-brand-600)); background: rgb(var(--c-brand-50)); }
-.sr-badge.sr-a-await    { color: rgb(var(--c-status-awaiting)); background: rgb(var(--c-status-awaiting)/.14); }
-.sr-badge.sr-a-error    { color: rgb(var(--c-status-failed)); background: rgb(var(--c-status-failed)/.12); }
-.sr-badge.sr-a-critical { color: rgb(var(--c-sev-critical)); background: rgb(var(--c-sev-critical-bg)); }
-.sr-badge.sr-a-high     { color: rgb(var(--c-sev-high)); background: rgb(var(--c-sev-high-bg)); }
-.sr-badge.sr-a-medium   { color: rgb(var(--c-sev-medium)); background: rgb(var(--c-sev-medium-bg)); }
-.sr-badge.sr-a-low      { color: rgb(var(--c-sev-low)); background: rgb(var(--c-sev-low-bg)); }
-.sr-badge.sr-a-info     { color: rgb(var(--c-sev-info)); background: rgb(var(--c-sev-info-bg)); }
-.sr-ev-repo { font-family: ui-monospace, monospace; font-size: 11.5px; font-weight: 640; color: rgb(var(--c-ink)); }
-.sr-ev-repo .br { color: rgb(var(--c-ink-mute)); font-weight: 400; margin-left: 5px; }
-.sr-ev-run { font-family: ui-monospace, monospace; font-size: 10.5px; color: rgb(var(--c-ink-mute)); }
-.sr-ev-ago { margin-left: auto; font-family: ui-monospace, monospace; font-size: 10.5px; color: rgb(var(--c-ink-mute)); white-space: nowrap; font-variant-numeric: tabular-nums; }
-
-.sr-actor { display: flex; align-items: center; gap: 9px; }
-.sr-avatar { width: 22px; height: 22px; border-radius: 6px; flex: none; display: grid; place-items: center; background: rgb(var(--c-brand-50)); color: rgb(var(--c-brand-600)); border: 1px solid rgb(var(--c-brand-500)/.3); }
-.sr-ev-title { font-size: 13.5px; font-weight: 650; line-height: 1.35; }
 .sr-note { font-size: 12px; color: rgb(var(--c-ink-dim)); margin-top: 9px; line-height: 1.5; }
-.sr-fileref { font-family: ui-monospace, monospace; font-size: 10.5px; color: rgb(var(--c-ink-mute)); margin-top: 6px; }
 .sr-code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.65;
   background: rgb(var(--c-surface)); border: 1px solid rgb(var(--c-border)); border-radius: 9px;
   padding: 8px 0; overflow-x: auto; margin-top: 9px; color: rgb(var(--c-ink-dim));
 }
-/* Block variant (error Parsed/Raw JSON) — padded, no per-line gutter. */
 .sr-code.sr-code-block { padding: 9px 12px; white-space: pre; }
 .sr-code.sr-code-block code.hljs { background: transparent; white-space: pre; }
-/* Line-numbered excerpt rows (findings). */
 .sr-code-row { display: flex; align-items: baseline; padding: 0 12px; min-height: 1.65em; }
 .sr-code-gutter {
   flex: none; width: 3ch; margin-right: 14px; text-align: right; user-select: none;
@@ -377,32 +312,8 @@
 .sr-code-line { min-width: 0; white-space: pre; }
 .sr-code-line code.hljs { background: transparent; }
 
-.sr-approve { display: flex; gap: 8px; margin-top: 11px; max-width: 320px; }
-.sr-btn { appearance: none; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 600; padding: 7px 14px; border-radius: 8px; border: 1px solid transparent; flex: 1; }
-.sr-btn.ok { background: rgb(var(--c-status-done)/.14); color: rgb(var(--c-status-done)); border-color: rgb(var(--c-status-done)/.35); }
-.sr-btn.no { background: rgb(var(--c-status-failed)/.12); color: rgb(var(--c-status-failed)); border-color: rgb(var(--c-status-failed)/.35); }
-.sr-btn:hover { filter: brightness(1.08); }
-.sr-btn:disabled { opacity: .5; cursor: default; }
-.sr-ev.resolved { opacity: .55; }
-.sr-resolved-tag { font-family: ui-monospace, monospace; font-size: 10.5px; margin-top: 9px; display: inline-block; }
-
-/* ── right rail: project roster ── */
-.sr-pcard { border: 1px solid rgb(var(--c-border)); border-radius: 11px; background: rgb(var(--c-panel)); padding: 11px 12px; transition: border-color .3s, box-shadow .3s; }
-.sr-pcard.hot { border-color: rgb(var(--c-brand-500)/.45); box-shadow: 0 0 0 1px rgb(var(--c-brand-500)/.2); }
-.sr-sdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-.sr-sdot.running { background: rgb(var(--c-status-running)); box-shadow: 0 0 0 3px rgb(var(--c-status-running)/.16); }
-.sr-sdot.await   { background: rgb(var(--c-status-awaiting)); box-shadow: 0 0 0 3px rgb(var(--c-status-awaiting)/.16); }
-.sr-sdot.idle    { background: rgb(var(--c-ink-mute)); }
-.sr-pcard-repo { font-family: ui-monospace, monospace; font-size: 12px; font-weight: 640; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sr-pcard-st { margin-left: auto; font-family: ui-monospace, monospace; font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--c-ink-mute)); flex: none; }
-.sr-pcard-cur { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 11.5px; color: rgb(var(--c-ink-dim)); overflow: hidden; }
-.sr-pcard-cur span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sr-pfoot { display: flex; align-items: center; gap: 8px; margin-top: 9px; font-family: ui-monospace, monospace; font-size: 10px; color: rgb(var(--c-ink-mute)); }
-.sr-pfoot .fp { margin-left: auto; display: flex; gap: 4px; }
-.sr-pfoot .fp span { padding: 0 5px; border-radius: 4px; font-weight: 600; }
-
 @media (prefers-reduced-motion: reduce) {
-  .sr-ev.is-fresh, .sr-beacon, .sr-kpi.flash .sr-kpi-val, .sr-spark i { animation: none !important; transition: none !important; }
+  .sr-beacon { animation: none !important; }
 }
 
 /* ================================================================== */
@@ -741,11 +652,10 @@
 /* ── Blocks-tab detail card ── */
 /* Rendered below the grid/connector chips when a block or connector is
  * `selected` (rail variant only). Title + kind badge, blurb, `*`-marked
- * required fields, a short example, and the primary "Add to canvas" CTA. */
+ * required fields, a short example, and the primary "Add to canvas" CTA.
+ * Its card surface and motion live in styles/graph-motion.css. */
 .wfx-palette-detail {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid rgb(var(--c-border));
+  margin-top: 12px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1301,67 +1211,280 @@ pre.ab-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-
    cmTooltips.ts's header comment for the full specificity accounting. */
 
 /* ──────────────────────────────────────────────────────────────────────────
- * Living stacked-area chart (components/ui/Chart.tsx). The plot draws in with a
- * left-to-right reveal (the series trace across time), the latest point pops
- * in and then breathes a now-pulse, and the hover crosshair glides. All
- * token-based (colors come from the component via inline `rgb(var(--c-*))`);
- * this file owns only the motion. Every rule is disabled under
- * prefers-reduced-motion, where the chart simply appears, static and complete.
+ * Chart motion (components/ui/Chart.tsx and components/charts/*). One small
+ * vocabulary shared by every chart, so they all move the same way:
+ *
+ *  - the plot is traced left to right by a sweep (a clip that opens over
+ *    1.4s) while its areas rise from the baseline; a glowing stylus rides the
+ *    leading edge (JS, Chart's `useStylus`);
+ *  - the frame (grid, ticks, axis names) settles in first, staggered, from a
+ *    slight blur;
+ *  - annotations (the peak stem and its label, end dots) land after the sweep;
+ *  - "now" breathes, only on a live series;
+ *  - hover is a crosshair that glides between buckets and a tooltip that
+ *    follows instantly once open.
+ *
+ * Arrivals use --ease-out, on-screen movement (zoom, morph) uses
+ * --ease-in-out. Colors come from the components (theme tokens); this file
+ * owns only motion. Under prefers-reduced-motion nothing moves or blurs:
+ * the finished chart fades in, and hover still works without gliding.
  * ────────────────────────────────────────────────────────────────────────── */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --chart-sweep: 1400ms;
+  --chart-land: 1000ms; /* when annotations start landing */
+}
 
-/* Reveal wipe: the clip rect scales from the left, uncovering the areas and
-   lines in sync so the chart reads as drawing across its time axis. */
-.cp-chart-wipe {
+/* The sweep: a clip rect that opens from the left, tracing the marks. */
+.cp-chart-sweep {
   transform: scaleX(0);
   transform-origin: left;
   transform-box: fill-box;
 }
-.cp-chart-wipe.cp-in {
+.cp-in .cp-chart-sweep {
   transform: scaleX(1);
-  transition: transform 1000ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: transform var(--chart-sweep) var(--ease-out);
 }
 
-/* The latest point: a solid dot that pops in once the reveal reaches it, then
-   its ring breathes continuously so "now" stays alive. */
-.cp-chart-now-dot {
+/* Areas rise from their baseline as the sweep passes (`.cp-down` for a panel
+   that hangs below its baseline, like the token flow's output). */
+.cp-chart-rise {
+  transform: scaleY(0.04);
+  transform-origin: bottom;
   transform-box: fill-box;
-  transform-origin: center;
-  animation: cp-now-pop 480ms 840ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
-}
-@keyframes cp-now-pop {
-  from { transform: scale(0); }
-  to { transform: scale(1); }
-}
-.cp-chart-now {
-  transform-box: fill-box;
-  transform-origin: center;
-  /* hidden until the reveal + pop are done, then it starts breathing */
   opacity: 0;
-  animation: cp-chart-ring 2.4s cubic-bezier(0.23, 1, 0.32, 1) 1200ms infinite;
+}
+.cp-chart-rise.cp-down {
+  transform-origin: top;
+}
+.cp-in .cp-chart-rise {
+  transform: scaleY(1);
+  opacity: 1;
+  transition:
+    transform 1050ms var(--ease-out),
+    opacity 280ms ease-out;
+}
+
+/* The frame: gridlines draw out from the axis, tick labels settle from a
+   slight blur, staggered by --i (set per element). */
+.cp-chart-grid {
+  transform: scaleX(0);
+  transform-origin: left;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-grid {
+  transform: scaleX(1);
+  transition: transform 700ms var(--ease-out) calc(var(--i, 0) * 45ms);
+}
+.cp-chart-tick {
+  opacity: 0;
+  transform: translateY(3px);
+  filter: blur(2px);
+}
+.cp-in .cp-chart-tick {
+  opacity: 1;
+  transform: none;
+  filter: none;
+  transition:
+    opacity 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms),
+    transform 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms),
+    filter 420ms var(--ease-out) calc(120ms + var(--i, 0) * 35ms);
+}
+
+/* Annotations land once the sweep has passed: the peak stem drops from its
+   label, the label and end dots fade up. */
+.cp-chart-late {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.cp-in .cp-chart-late {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 380ms var(--ease-out) calc(var(--chart-land) + var(--i, 0) * 60ms),
+    transform 380ms var(--ease-out) calc(var(--chart-land) + var(--i, 0) * 60ms);
+}
+.cp-chart-stem {
+  transform: scaleY(0);
+  transform-origin: top;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-stem {
+  transform: scaleY(1);
+  transition: transform 460ms var(--ease-out) var(--chart-land);
+}
+.cp-chart-pop {
+  opacity: 0;
+  transform: scale(0.4);
+  transform-origin: center;
+  transform-box: fill-box;
+}
+.cp-in .cp-chart-pop {
+  opacity: 1;
+  transform: scale(1);
+  transition:
+    opacity 240ms ease-out var(--chart-sweep),
+    transform 420ms cubic-bezier(0.34, 1.56, 0.64, 1) var(--chart-sweep);
+}
+
+/* "Now" on a live series: a ring that breathes out of the latest point. */
+.cp-chart-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation: cp-chart-ring 2.4s var(--ease-out) calc(var(--chart-sweep) + 200ms) infinite;
 }
 @keyframes cp-chart-ring {
   0% { transform: scale(0.55); opacity: 0.9; }
-  70%, 100% { transform: scale(2.6); opacity: 0; }
+  70%, 100% { transform: scale(2.8); opacity: 0; }
 }
-.cp-chart-cross {
-  transition: transform 90ms cubic-bezier(0.23, 1, 0.32, 1);
+.cp-chart-hovering .cp-chart-ring {
+  animation-play-state: paused;
 }
+
+/* The stylus riding the sweep's leading edge (positioned per frame in JS). */
+.cp-chart-stylus {
+  pointer-events: none;
+}
+
+/* Hover: the crosshair glides between buckets; its dots glide on y. */
+.cp-chart-cross,
+.cp-chart-veil {
+  pointer-events: none;
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-cross-dot {
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-cross.cp-appear,
+.cp-chart-cross.cp-appear .cp-chart-cross-dot,
+.cp-chart-veil.cp-appear {
+  transition: none;
+}
+
+/* The tooltip: the outer box follows the crosshair (instant on the first
+   show, gliding after), the inner card scales in from the point it names. */
+.cp-chart-tip {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 10;
+  pointer-events: none;
+  transition: transform 90ms var(--ease-out);
+}
+.cp-chart-tip.cp-appear {
+  transition: none;
+}
+.cp-chart-tip-card {
+  opacity: 0;
+  transform: scale(0.96);
+  transform-origin: 50% 100%;
+  transition:
+    opacity 130ms ease-out,
+    transform 160ms var(--ease-out);
+}
+.cp-chart-tip.cp-on .cp-chart-tip-card {
+  opacity: 1;
+  transform: none;
+}
+
+/* Focus: hovering a legend entry or a stage dims everything else. */
+.cp-chart-fade {
+  transition: opacity 180ms ease;
+}
+
+/* A brush selection, and a tick that joins the axis on a rescale, fade in. */
+.cp-chart-appear,
+.cp-chart-brush {
+  animation: cp-chart-fade-in 120ms ease-out both;
+}
+@keyframes cp-chart-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* A zoom chip / reset control slides in from the top-right corner. */
+.cp-chart-chip {
+  animation: cp-chart-chip-in 220ms var(--ease-out) backwards;
+}
+@keyframes cp-chart-chip-in {
+  from { opacity: 0; transform: translateY(-4px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+.cp-chart-chip:active {
+  transform: scale(0.97);
+}
+
+/* Heatmap cells (netflow timeline): they sweep in left to right, column by
+   column, and a hot cell lifts under the pointer. */
+.cp-heat-cell {
+  transform-origin: bottom;
+  /* backwards, not both: a held end value would block the hover lift */
+  animation: cp-heat-in 420ms var(--ease-out) backwards;
+  animation-delay: calc(min(var(--i, 0), 120) * 6ms);
+  transition:
+    transform 140ms var(--ease-out),
+    box-shadow 140ms ease;
+}
+@keyframes cp-heat-in {
+  from { opacity: 0; transform: scaleY(0.5); }
+  to { opacity: 1; transform: none; }
+}
+@media (hover: hover) and (pointer: fine) {
+  .cp-heat-hot:hover {
+    transform: scaleY(1.2);
+    box-shadow: 0 0 0 1px rgb(var(--c-ink) / 0.55);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  /* No reveal, no pop, no breathing: the finished chart, at rest. */
-  .cp-chart-wipe,
-  .cp-chart-wipe.cp-in {
+  /* No sweep, rise, blur or glide: the finished chart fades in whole. */
+  .cp-chart-sweep,
+  .cp-in .cp-chart-sweep,
+  .cp-chart-grid,
+  .cp-in .cp-chart-grid,
+  .cp-chart-stem,
+  .cp-in .cp-chart-stem {
     transform: none !important;
     transition: none !important;
   }
-  .cp-chart-now-dot {
-    animation: none !important;
+  .cp-chart-rise,
+  .cp-chart-tick,
+  .cp-chart-late,
+  .cp-chart-pop {
     transform: none !important;
+    filter: none !important;
   }
-  .cp-chart-now {
+  .cp-in .cp-chart-rise,
+  .cp-in .cp-chart-tick,
+  .cp-in .cp-chart-late,
+  .cp-in .cp-chart-pop {
+    transform: none !important;
+    filter: none !important;
+    transition: opacity 200ms ease !important;
+  }
+  .cp-chart-ring {
     animation: none !important;
     opacity: 0 !important;
   }
-  .cp-chart-cross {
+  .cp-chart-cross,
+  .cp-chart-cross-dot,
+  .cp-chart-veil,
+  .cp-chart-tip,
+  .cp-chart-tip-card {
     transition: none !important;
+  }
+  .cp-chart-tip-card {
+    transform: none !important;
+  }
+  .cp-heat-cell {
+    animation: cp-chart-fade-in 200ms ease both !important;
+    transition: none !important;
+  }
+  .cp-chart-appear,
+  .cp-chart-brush,
+  .cp-chart-chip {
+    animation: none !important;
   }
 }

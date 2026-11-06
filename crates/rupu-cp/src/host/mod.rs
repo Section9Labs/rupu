@@ -23,6 +23,8 @@ pub(crate) mod runtime_liveness;
 pub mod skill_ship;
 pub mod ssh;
 pub mod summary_build;
-pub mod transcript_paths;
+/// The mirror cache layout lives in `rupu_orchestrator` with the usage
+/// fold that resolves through it; re-exported at its old path.
+pub use rupu_orchestrator::transcript_paths;
 pub mod tunnel;
 pub mod workspace_stage;

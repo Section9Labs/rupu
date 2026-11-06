@@ -13,7 +13,6 @@
 //! `json` envelope, or raw `jsonl`.
 
 use crate::cmd::completers::{standalone_transcript_run_ids, transcript_run_ids};
-use crate::cmd::retention::parse_retention_duration;
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
 use crate::output::palette;
@@ -26,6 +25,9 @@ use crate::paths;
 use crate::standalone_run_metadata::{metadata_path_for_run, read_metadata};
 use clap::{Args as ClapArgs, Subcommand};
 use clap_complete::ArgValueCompleter;
+use rupu_orchestrator::archived_transcripts::{
+    remove_stream_only_run_dirs, stream_only_run_dir, TranscriptPruneReport, TranscriptPruneRow,
+};
 use rupu_transcript::{Event as TranscriptEvent, JsonlReader, RunStatus};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -255,15 +257,6 @@ struct TranscriptListOutput {
 }
 
 #[derive(Serialize)]
-struct TranscriptPruneRow {
-    run_id: String,
-    scope: String,
-    location: String,
-    archived_at: String,
-    action: String,
-}
-
-#[derive(Serialize)]
 struct TranscriptPruneCsvRow {
     run_id: String,
     scope: String,
@@ -272,26 +265,10 @@ struct TranscriptPruneCsvRow {
     action: String,
 }
 
-#[derive(Serialize)]
-struct TranscriptPruneReport {
-    kind: &'static str,
-    version: u8,
-    rows: Vec<TranscriptPruneRow>,
-}
-
 struct TranscriptPruneOutput {
     prefs: crate::cmd::ui::UiPrefs,
     report: TranscriptPruneReport,
     csv_rows: Vec<TranscriptPruneCsvRow>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct PrunedTranscript {
-    pub run_id: String,
-    pub scope: String,
-    pub location: String,
-    pub archived_at: String,
-    pub action: String,
 }
 
 #[derive(Serialize)]
@@ -2279,19 +2256,9 @@ async fn prune(
     absolute: bool,
     all_columns: bool,
 ) -> anyhow::Result<()> {
-    let mut pruned = prune_archived_transcripts(args.older_than.as_deref(), args.dry_run)?;
-    pruned.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-    let rows = pruned
-        .iter()
-        .map(|row| TranscriptPruneRow {
-            run_id: row.run_id.clone(),
-            scope: row.scope.clone(),
-            location: row.location.clone(),
-            archived_at: row.archived_at.clone(),
-            action: row.action.clone(),
-        })
-        .collect::<Vec<_>>();
-    let csv_rows = pruned
+    let report = prune_archived_transcripts(args.older_than.as_deref(), args.dry_run)?;
+    let csv_rows = report
+        .rows
         .iter()
         .map(|row| TranscriptPruneCsvRow {
             run_id: row.run_id.clone(),
@@ -2304,11 +2271,7 @@ async fn prune(
     let prefs = prune_ui_prefs()?.with_table_flags(absolute, all_columns);
     let output = TranscriptPruneOutput {
         prefs,
-        report: TranscriptPruneReport {
-            kind: "transcript_prune",
-            version: 1,
-            rows,
-        },
+        report,
         csv_rows,
     };
     report::emit_collection(global_format, &output)
@@ -2329,79 +2292,23 @@ fn prune_ui_prefs() -> anyhow::Result<crate::cmd::ui::UiPrefs> {
     ))
 }
 
+/// [`rupu_orchestrator::archived_transcripts::prune_archived_transcripts`]
+/// over the global dir and the working directory's project.
 pub(crate) fn prune_archived_transcripts(
     older_than: Option<&str>,
     dry_run: bool,
-) -> anyhow::Result<Vec<PrunedTranscript>> {
+) -> anyhow::Result<TranscriptPruneReport> {
     let global = paths::global_dir()?;
-    let cutoff = prune_cutoff(older_than, &global)?;
     let pwd = std::env::current_dir()?;
     let project_root = paths::project_root_for(&pwd)?;
-
-    let mut rows = Vec::new();
-    for location in scan_archived_transcripts(&global, project_root.as_deref())? {
-        let Some(archived_at) = archived_at_for_location(&location)? else {
-            continue;
-        };
-        if archived_at > cutoff {
-            continue;
-        }
-        let Some(run_id) = run_id_from_transcript_path(&location.transcript_path) else {
-            continue;
-        };
-        let metadata = load_metadata_if_present(&location)?;
-        if metadata
-            .as_ref()
-            .and_then(|value| value.session_id.as_ref())
-            .is_some()
-        {
-            continue;
-        }
-        let scope = if location
-            .transcript_path
-            .starts_with(global.join("transcripts"))
-        {
-            "global"
-        } else {
-            "project"
-        };
-        rows.push(PrunedTranscript {
-            run_id: run_id.clone(),
-            scope: scope.to_string(),
-            location: location.transcript_path.display().to_string(),
-            archived_at: archived_at.to_rfc3339(),
-            action: if dry_run {
-                "would_delete".into()
-            } else {
-                "deleted".into()
-            },
-        });
-        if !dry_run {
-            remove_stream_only_run_dirs(&global, &run_id)?;
-            remove_file_if_exists(&location.transcript_path)?;
-            remove_file_if_exists(&location.metadata_path)?;
-        }
-    }
-    Ok(rows)
-}
-
-/// `rupu run` writes its coverage stream to `<global>/runs/<run_id>/` from the
-/// moment it starts — and, when a coordinator launched it, its netflow
-/// stream `netflow.jsonl` (spec 2026-10-14 remote netflow transport §N1),
-/// each with its `.lock` — but only a run that finishes writes `run.json`
-/// there — and with it joins `RunStore`, which archives and deletes it. A run
-/// dir WITHOUT `run.json` (a launch that failed its pre-flight, a killed run)
-/// belongs to nothing but the transcript, so it follows the transcript: moved
-/// on archive, removed on prune and delete. The rule is the same whichever
-/// streams the dir holds. `None` for an id that is not a plain run id — it is
-/// joined onto a path that may be removed recursively.
-fn stream_only_run_dir(runs_root: &std::path::Path, run_id: &str) -> Option<PathBuf> {
-    let plain = !run_id.is_empty()
-        && run_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let dir = runs_root.join(run_id);
-    (plain && dir.is_dir() && !dir.join("run.json").exists()).then_some(dir)
+    Ok(
+        rupu_orchestrator::archived_transcripts::prune_archived_transcripts(
+            &global,
+            project_root.as_deref(),
+            older_than,
+            dry_run,
+        )?,
+    )
 }
 
 /// Archive `run_id`'s stream-only run dir with its transcript:
@@ -2424,18 +2331,6 @@ fn archive_stream_only_run_dir(global: &std::path::Path, run_id: &str) -> anyhow
     }
     fs::create_dir_all(store.archive_root())?;
     fs::rename(&src, &dst)?;
-    Ok(())
-}
-
-/// Remove `run_id`'s stream-only run dir from `runs/` and `runs-archive/`
-/// (a transcript archived before run dirs followed it left its dir active).
-fn remove_stream_only_run_dirs(global: &std::path::Path, run_id: &str) -> anyhow::Result<()> {
-    let store = rupu_orchestrator::RunStore::new(global.join("runs"));
-    for root in [store.root.clone(), store.archive_root()] {
-        if let Some(dir) = stream_only_run_dir(&root, run_id) {
-            fs::remove_dir_all(dir)?;
-        }
-    }
     Ok(())
 }
 
@@ -2695,86 +2590,6 @@ fn load_metadata_if_present(
         return Ok(None);
     }
     Ok(Some(read_metadata(&location.metadata_path)?))
-}
-
-fn scan_archived_transcripts(
-    global: &std::path::Path,
-    project_root: Option<&std::path::Path>,
-) -> anyhow::Result<Vec<TranscriptLocation>> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push_dir = |root: &std::path::Path| -> anyhow::Result<()> {
-        if !root.is_dir() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let dedupe_key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(dedupe_key) {
-                continue;
-            }
-            let Some(run_id) = run_id_from_transcript_path(&path) else {
-                continue;
-            };
-            let metadata_path = metadata_path_for_run(root, &run_id);
-            out.push(TranscriptLocation {
-                run_id,
-                metadata_path,
-                transcript_path: path,
-                archived: true,
-            });
-        }
-        Ok(())
-    };
-    if let Some(project_root) = project_root {
-        push_dir(&paths::archived_transcripts_dir(
-            &project_root.join(".rupu/transcripts"),
-        ))?;
-    }
-    push_dir(&paths::archived_transcripts_dir(
-        &global.join("transcripts"),
-    ))?;
-    Ok(out)
-}
-
-fn archived_at_for_location(
-    location: &TranscriptLocation,
-) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
-    if let Some(metadata) = load_metadata_if_present(location)? {
-        if let Some(value) = metadata.archived_at.as_deref() {
-            return Ok(Some(
-                chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
-            ));
-        }
-    }
-    let modified = fs::metadata(&location.transcript_path)?.modified()?;
-    Ok(Some(chrono::DateTime::<chrono::Utc>::from(modified)))
-}
-
-fn run_id_from_transcript_path(path: &std::path::Path) -> Option<String> {
-    path.file_stem()
-        .and_then(|value| value.to_str())
-        .map(ToOwned::to_owned)
-}
-
-fn prune_cutoff(
-    older_than: Option<&str>,
-    global: &std::path::Path,
-) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    let retention = if let Some(value) = older_than {
-        value.to_string()
-    } else {
-        let path = global.join("config.toml");
-        let cfg = rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&path))?;
-        cfg.storage
-            .archived_transcript_retention
-            .unwrap_or_else(|| "30d".to_string())
-    };
-    Ok(chrono::Utc::now() - parse_retention_duration(&retention)?)
 }
 
 fn move_if_exists(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {

@@ -290,6 +290,8 @@ async fn bucket_dead_drop_e2e() {
 
     let run_id = connector
         .launch_run(LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: "deploy".into(),
             inputs: BTreeMap::new(),
             mode: Some("bypass".into()),

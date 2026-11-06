@@ -37,6 +37,20 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Read the output one agentiflow unit produced.\n\n`id` is the agentiflow id, `unit_id` the unit's id. Returns `{output}`: the unit's output text, or null when it has none.",
         ),
         op(
+            "agentiflows.board",
+            Method::GET,
+            "/api/agentiflows/:id/board",
+            "Read an agentiflow's board: its claims and directives.\n\n`id` is the agentiflow id. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, key_known, owner, acquired, lease expiry, ended, state held|released|expired; key_known false means `key` is only the claim file's stem, from a claim written before the journal), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
+        )
+        .query::<agentiflows::LocalHostQuery>(),
+        op(
+            "agentiflows.generated",
+            Method::GET,
+            "/api/agentiflows/:id/generated/:handle",
+            "Read the workflow definition an agentiflow's lead wrote and dispatched.\n\n`id` is the agentiflow id, `handle` the child's handle (from `agentiflows.children`, where `generated` is true). Returns `{handle, name, file_name, yaml}`. 404 unless that child is a workflow the lead generated.",
+        )
+        .query::<agentiflows::LocalHostQuery>(),
+        op(
             "agentiflows.steer",
             Method::POST,
             "/api/agentiflows/:id/steer",

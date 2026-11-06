@@ -7,6 +7,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AgentiflowRow } from '../../lib/api';
+import { agentiflowsApi } from '../../lib/api3b/agentiflows';
 import AgentiflowRuns from './AgentiflowRuns';
 import { commitQuery } from '../../components/query/queryTestUtils';
 
@@ -63,10 +64,24 @@ describe('AgentiflowRuns', () => {
     expect(await screen.findByText('coordinator gone')).toBeInTheDocument();
   });
 
-  it('shows the empty state', async () => {
+  it('shows the empty state, which offers New agentiflow instead of a CLI hint', async () => {
     vi.spyOn(api, 'getAgentiflows').mockResolvedValue([]);
     renderList();
     expect(await screen.findByText('No agentiflow runs yet')).toBeInTheDocument();
+    expect(screen.queryByText(/rupu agentiflow run/)).not.toBeInTheDocument();
+    // The header's New agentiflow plus the empty state's.
+    expect(screen.getAllByRole('button', { name: 'New agentiflow' })).toHaveLength(2);
+  });
+
+  it('New agentiflow opens the launcher sheet', async () => {
+    vi.spyOn(api, 'getAgentiflows').mockResolvedValue([ROW]);
+    vi.spyOn(agentiflowsApi, 'listDefs').mockResolvedValue([]);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    renderList();
+    await screen.findByText('rupu-self-review');
+    fireEvent.click(screen.getByRole('button', { name: 'New agentiflow' }));
+    expect(await screen.findByRole('dialog', { name: 'New agentiflow run' })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/host/i)).not.toBeInTheDocument();
   });
 
   it('shows a fetch failure and re-fetches on Refresh', async () => {

@@ -5,7 +5,9 @@
 //! fonts. Built without it, everything else works and `Format::Pdf` returns
 //! [`ExportError::PdfUnavailable`].
 //!
-//! Also: a best-effort Markdown → FindingReport parser for `rupu findings import` ([`import`]).
+//! Also: a best-effort Markdown → FindingReport parser for `rupu findings import` ([`import`]),
+//! and the import run itself ([`import_files`]), which reads report files and writes
+//! findings ledgers.
 
 #![deny(clippy::all)]
 #![forbid(unsafe_code)]
@@ -13,6 +15,7 @@
 pub mod blocks;
 pub mod html;
 pub mod import;
+pub mod import_files;
 pub mod markdown;
 pub mod model;
 pub mod number;

@@ -1134,27 +1134,6 @@ impl CollectionOutput for AuthStatusOutput {
     }
 }
 
-/// [`rupu_runtime::provider_factory::resolve_kind`], extended to also
-/// resolve a declared `[scm.<name>]` account's `kind` — needed because
-/// that function is deliberately LLM-only (its own doc comment: `github`/
-/// `gitlab`/`linear`/`jira` are declarable-but-not-dispatchable kinds it
-/// was never meant to cover). Mirrors `crate::accounts::account_specs`'s
-/// two-branch resolution (`kind` override, or the account name itself
-/// parsed as the vendor) so `auth status`'s KIND column and the
-/// credential resolver's account list never drift apart.
-fn resolve_declared_kind(cfg: &rupu_config::Config, name: &str) -> Option<String> {
-    if let Some(k) = rupu_runtime::provider_factory::resolve_kind(name, &cfg.providers) {
-        return Some(k);
-    }
-    cfg.scm.platforms.get(name).and_then(|p| {
-        p.kind.clone().or_else(|| {
-            name.parse::<rupu_scm::Platform>()
-                .ok()
-                .map(|k| k.as_str().to_string())
-        })
-    })
-}
-
 async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
     let prefs = crate::output::diag::prefs_for_diag(false);
     let mut rows = Vec::new();
@@ -1171,47 +1150,12 @@ async fn status(global_format: Option<OutputFormat>) -> anyhow::Result<()> {
         .unwrap_or_default();
     let resolver = crate::accounts::resolver_for(&cfg);
 
-    // Built-in vendor names always listed, so a single-account user sees
-    // the same table as before.
-    let mut names: Vec<String> = [
-        "anthropic",
-        "openai",
-        "gemini",
-        "copilot",
-        "github",
-        "gitlab",
-        "linear",
-        "jira",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    // Then every declared account — `[providers.<name>]` AND
-    // `[scm.<name>]` (github/gitlab accounts declared via `auth login
-    // --kind github|gitlab` land in the latter; see
-    // `declare_account_in_config`'s doc comment) — in account-name
-    // order, skipping duplicates. A `BTreeSet` merge rather than two
-    // separate pushes: the two source maps are independently sorted,
-    // but simply concatenating them would not be.
-    let mut declared: std::collections::BTreeSet<String> = cfg.providers.keys().cloned().collect();
-    declared.extend(cfg.scm.platforms.keys().cloned());
-    for name in declared {
-        if !names.contains(&name) {
-            names.push(name);
-        }
-    }
-
-    for name in names {
-        let kind = resolve_declared_kind(&cfg, &name).unwrap_or_else(|| "-".to_string());
-        let api_present = resolver
-            .peek_named(&name, rupu_providers::AuthMode::ApiKey)
-            .await
-            || rupu_auth::resolver::KeychainResolver::has_env_api_key(&name);
+    for row in rupu_runtime::account_status::auth_status(&cfg, &resolver).await {
         rows.push(AuthStatusRow {
-            account: name.clone(),
-            kind,
-            api_key: api_present,
-            sso: resolver.peek_sso_named(&name).await.unwrap_or_default(),
+            account: row.account,
+            kind: row.kind.unwrap_or_else(|| "-".to_string()),
+            api_key: row.api_key,
+            sso: row.sso.map(|s| s.summary).unwrap_or_default(),
         });
     }
     let csv_rows = rows
@@ -1388,27 +1332,6 @@ mod tests {
         assert_eq!(v["scm"]["gh-work"]["kind"].as_str(), Some("github"));
         // And NOT under `[providers.*]`.
         assert!(v.get("providers").is_none());
-    }
-
-    #[test]
-    fn resolve_declared_kind_resolves_scm_declared_account() {
-        let mut cfg = rupu_config::Config::default();
-        cfg.scm.platforms.insert(
-            "gh-work".into(),
-            rupu_config::ScmPlatformConfig {
-                kind: Some("github".into()),
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            resolve_declared_kind(&cfg, "gh-work").as_deref(),
-            Some("github")
-        );
-        // Bare "github" with no [scm.github] table at all resolves to
-        // nothing — matches spec §7's acceptance table, which shows
-        // `github` with KIND `-` when undeclared (LLM builtins fall
-        // back to the bare name; SCM builtins deliberately do not).
-        assert_eq!(resolve_declared_kind(&cfg, "github"), None);
     }
 
     #[test]

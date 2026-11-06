@@ -1800,6 +1800,8 @@ mod tunnel_connector {
 
     fn make_launch_req(workflow: &str) -> rupu_cp::launcher::LaunchRequest {
         rupu_cp::launcher::LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: workflow.to_string(),
             inputs: BTreeMap::new(),
             mode: None,
@@ -1810,6 +1812,9 @@ mod tunnel_connector {
 
     fn make_agent_req(agent: &str) -> rupu_cp::agent_launcher::AgentLaunchRequest {
         rupu_cp::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             codename: None,
             agent: agent.to_string(),
             prompt: Some("do the thing".to_string()),

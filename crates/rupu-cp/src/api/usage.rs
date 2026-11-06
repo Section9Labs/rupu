@@ -1543,6 +1543,12 @@ mod tests {
         {
             Err(HostConnectorError::Unsupported("fake".into()))
         }
+        async fn run_board(
+            &self,
+            _id: &str,
+        ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+            Err(HostConnectorError::Unsupported("fake".into()))
+        }
         async fn pull_finding_artifact(
             &self,
             _sha256: &str,
@@ -2223,6 +2229,7 @@ mod tests {
                     codename: None,
                     cause: None,
                     error: None,
+                    started_at: None,
                 },
             )
             .unwrap();
