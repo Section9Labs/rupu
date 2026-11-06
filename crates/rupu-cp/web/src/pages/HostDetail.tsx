@@ -2,16 +2,22 @@
 // Route: /hosts/:id
 
 import { useEffect, useState } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { ChevronLeft } from 'lucide-react';
+import { useParams } from 'react-router-dom';
 import { api, type HostView, type RunListRow } from '../lib/api';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { SectionHeader } from '../components/lists/SectionHeader';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { StatusPill } from '../components/StatusPill';
 import { relativeTime } from '../lib/time';
 import { runHref } from '../lib/runs';
 import { HostStatusBadge } from '../components/ui/HostStatusBadge';
+import { PageHeader } from '../components/ui/PageHeader';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { Spinner } from '../components/ui/Spinner';
 import type { HostTransportKind } from '../lib/api';
+
+const BACK = { label: 'Hosts', to: '/hosts' };
 
 // ---------------------------------------------------------------------------
 // Visual tokens
@@ -115,35 +121,27 @@ export default function HostDetail() {
 
   return (
     <div className="p-8">
-      {/* Breadcrumb */}
-      <nav className="mb-4">
-        <Link
-          to="/hosts"
-          className="inline-flex items-center gap-1 text-sm text-ink-dim hover:text-ink"
-        >
-          <ChevronLeft size={14} />
-          Hosts
-        </Link>
-      </nav>
-
       {/* Host info */}
       {hostError ? (
-        <div className="mb-6 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {hostError}
-        </div>
+        <>
+          <PageHeader back={BACK} title="Host" />
+          <ErrorBanner className="mt-4">{hostError}</ErrorBanner>
+        </>
       ) : host === null ? (
-        <div className="mb-6 text-sm text-ink-dim">Loading host…</div>
+        <>
+          <PageHeader back={BACK} title="Host" />
+          <div className="mt-6"><Spinner label="Loading host…" /></div>
+        </>
       ) : (
         <div className="mb-8">
-          <header className="mb-4 flex items-start gap-3">
-            <div>
-              <h1 className="text-2xl font-semibold text-ink">{host.name}</h1>
-              <p className="mt-0.5 text-sm font-mono text-ink-mute">{host.id}</p>
-            </div>
-            <HostStatusBadge status={host.status} />
-          </header>
+          <PageHeader
+            back={BACK}
+            title={host.name}
+            subtitle={<span className="font-mono">{host.id}</span>}
+            actions={<HostStatusBadge status={host.status} />}
+          />
 
-          <dl className="grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4 rounded-xl border border-border bg-panel px-5 py-4 text-sm">
+          <dl className="mt-6 grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4 rounded-xl border border-border bg-panel px-5 py-4 text-sm">
             <div>
               <dt className="text-note font-medium text-ink-mute">Transport</dt>
               <dd className="mt-0.5 text-ink">{TRANSPORT_LABEL[host.transport_kind]}</dd>
@@ -187,18 +185,12 @@ export default function HostDetail() {
           hint={host ? `on ${host.name}` : undefined}
         />
 
-        {runsError && (
-          <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-            {runsError}
-          </div>
-        )}
+        {runsError && <ErrorBanner className="mb-4">{runsError}</ErrorBanner>}
 
         {runs === null ? (
-          <div className="text-sm text-ink-dim">Loading runs…</div>
+          <ListSkeleton label="Loading runs…" />
         ) : runs.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-border bg-panel/50 py-10 flex items-center justify-center">
-            <p className="text-sm text-ink-dim">No runs found for this host.</p>
-          </div>
+          <EmptyState title="No runs found for this host." />
         ) : (
           <SortableTable<RunListRow>
             columns={RUN_COLUMNS}

@@ -10,9 +10,11 @@ import { shortId } from '../lib/shortId';
 import { relativeTime } from '../lib/time';
 import { Chip } from '../components/ui/Chip';
 import { HostStatusBadge } from '../components/ui/HostStatusBadge';
+import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
 import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
-import { Spinner } from '../components/ui/Spinner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { HOST_FIELDS } from '../lib/query/lists/hosts';
 
@@ -172,8 +174,8 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
       interactive: true,
       render: (h) =>
         h.transport_kind === 'local' ? null : (
-          <button
-            type="button"
+          <Button
+            variant="ring-danger"
             aria-label={`Remove host ${h.name}`}
             onClick={(e) => {
               // The row is now link-wrapped (rowHref) — without both of
@@ -185,10 +187,9 @@ function buildColumns(onRemove: (id: string) => void): Column<HostView>[] {
               e.stopPropagation();
               onRemove(h.id);
             }}
-            className="text-note text-err hover:text-err hover:underline"
           >
             Remove
-          </button>
+          </Button>
         ),
     },
   ];
@@ -344,29 +345,27 @@ export default function Hosts() {
 
   return (
     <div className="p-8">
-      <header className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Hosts</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Registered execution hosts — the local process and any remote HTTP CP peers.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            setShowAdd((v) => !v);
-            setAddError(null);
-            setForm(EMPTY_FORM);
-            if (!showAdd) {
-              // Focus name field after state update paints
-              requestAnimationFrame(() => nameRef.current?.focus());
-            }
-          }}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-panel px-3 py-1.5 text-sm font-medium text-ink hover:bg-bg transition-colors"
-        >
-          {showAdd ? 'Cancel' : 'Add host'}
-        </button>
-      </header>
+      <PageHeader
+        className="mb-6"
+        title="Hosts"
+        subtitle="Registered execution hosts — the local process and any remote HTTP CP peers."
+        actions={
+          <Button
+            variant={showAdd ? 'secondary' : 'solid'}
+            onClick={() => {
+              setShowAdd((v) => !v);
+              setAddError(null);
+              setForm(EMPTY_FORM);
+              if (!showAdd) {
+                // Focus name field after state update paints
+                requestAnimationFrame(() => nameRef.current?.focus());
+              }
+            }}
+          >
+            {showAdd ? 'Cancel' : 'Add host'}
+          </Button>
+        }
+      />
 
       {/* One-time enrollment panel — shown after a successful tunnel node enroll */}
       {enrollResult && (
@@ -625,25 +624,21 @@ export default function Hosts() {
           )}
 
           <div className="flex items-center gap-2">
-            <button
-              type="submit"
-              disabled={submitting}
-              className="rounded-lg bg-brand-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-brand-700 disabled:opacity-60 transition-colors"
-            >
+            <Button type="submit" variant="solid" disabled={submitting}>
               {submitting
                 ? (form.mode === 'tunnel' ? 'Enrolling…' : 'Adding…')
                 : (form.mode === 'tunnel' ? 'Enroll node'
                   : form.mode === 'ssh' ? 'Add SSH host'
                   : form.mode === 'bucket' ? 'Add bucket host'
                   : 'Add host')}
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
+              variant="ghost"
               onClick={() => { setShowAdd(false); setAddError(null); }}
-              className="text-sm text-ink-dim hover:text-ink"
             >
               Cancel
-            </button>
+            </Button>
           </div>
         </form>
       )}
@@ -653,9 +648,7 @@ export default function Hosts() {
       {removeError && <ErrorBanner className="mb-4">{removeError}</ErrorBanner>}
 
       {hosts === null ? (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading hosts…" />
-        </div>
+        <ListSkeleton label="Loading hosts…" />
       ) : hosts.length === 0 ? (
         <EmptyState
           title="No hosts registered"
