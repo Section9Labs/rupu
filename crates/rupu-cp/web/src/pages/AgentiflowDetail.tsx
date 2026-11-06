@@ -11,7 +11,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
-  ArrowLeft,
   Boxes,
   CheckCircle2,
   Circle,
@@ -50,9 +49,12 @@ import NetflowExplorer from '../components/netflow/explorer/NetflowExplorer';
 import { TabBar, TabButton } from '../components/TabBar';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
+import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { EmptyState } from '../components/ui/EmptyState';
 import { Spinner } from '../components/ui/Spinner';
+
+const BACK = { label: 'Agentiflows', to: '/runs/agentiflows' };
 import { parseCodename } from '../lib/codename';
 import { cn } from '../lib/cn';
 import { absoluteTime, durationBetween, relativeTime } from '../lib/time';
@@ -176,7 +178,7 @@ export default function AgentiflowDetail() {
   if (notFound) {
     return (
       <div className="p-8">
-        <BackLink />
+        <PageHeader back={BACK} title="Agentiflow" />
         <div className="mt-4">
           <EmptyState title="Agentiflow not found" hint={<span className="font-mono">{id}</span>} />
         </div>
@@ -187,11 +189,11 @@ export default function AgentiflowDetail() {
   if (!detail) {
     return (
       <div className="p-8">
-        <BackLink />
+        <PageHeader back={BACK} title="Agentiflow" />
         {error ? (
           <ErrorBanner className="mt-4">{error}</ErrorBanner>
         ) : (
-          <div className="py-16 flex items-center justify-center">
+          <div className="mt-6">
             <Spinner label="Loading agentiflow…" />
           </div>
         )}
@@ -205,62 +207,62 @@ export default function AgentiflowDetail() {
   return (
     <div className="p-8 space-y-4">
       <div>
-        <BackLink />
-        <header className="mt-3 flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-3">
-              <h1 className="truncate text-2xl font-semibold text-ink">{record.name}</h1>
-              <CrewChip crew={parseCodename(record.codename).crew} derived={record.codename_derived} />
-              <StatusPill status={agentiflowPillStatus(record.status)} />
-              {record.engagement_profiles.map((p) => (
-                <Badge key={p} tone="violet">
-                  {p}
-                </Badge>
-              ))}
-            </div>
-            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
-              <span className="font-mono">{record.id}</span>
-              <span title={absoluteTime(record.started_at)}>started {relativeTime(record.started_at)}</span>
-              {record.ended_at && (
-                <span title={absoluteTime(record.ended_at)}>
-                  ended {relativeTime(record.ended_at)} · ran {durationBetween(record.started_at, record.ended_at)}
-                </span>
-              )}
-              <span>
-                {record.rounds} {record.rounds === 1 ? 'round' : 'rounds'}
-              </span>
-              <span className="inline-flex items-center gap-1.5 font-medium text-ink tabular-nums">
-                {formatSpendUsd(record.spent_usd)}
-                <span className="font-normal text-ink-mute">· {formatSpendTokens(record.spent_tokens)}</span>
-              </span>
-            </div>
-            {record.stop_reason && (
-              <div className="mt-1.5 text-note text-ink-dim">
-                <span className="text-ink-mute">stopped: </span>
-                <span className={cn('break-words font-mono', STOP_TONE_TEXT[stopReasonTone(record.stop_reason)])}>
-                  {record.stop_reason}
-                </span>
-              </div>
-            )}
-            {record.status === 'running' && record.runner_alive === false && (
-              <div
-                role="status"
-                className="mt-2 rounded-md border border-warn/30 bg-warn-bg px-3 py-1.5 text-note text-warn"
-              >
-                The coordinator process (pid {record.runner_pid ?? '?'}) is no longer running — this run died without
-                finalizing and will be closed out by the orphan reaper.
-              </div>
-            )}
-            {def?.description && <p className="mt-2 max-w-3xl text-sm text-ink-dim">{def.description}</p>}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
+        <PageHeader
+          back={BACK}
+          title={record.name}
+          actions={
+            <>
             {stopControls.buttons}
             <Button variant="secondary" onClick={() => void load(false)} className="gap-1.5">
               <RefreshCw size={12} className={cn(loading && 'animate-spin')} />
               Refresh
             </Button>
+            </>
+          }
+        />
+        <div className="mt-2 flex flex-wrap items-center gap-3">
+          <CrewChip crew={parseCodename(record.codename).crew} derived={record.codename_derived} />
+          <StatusPill status={agentiflowPillStatus(record.status)} />
+          {record.engagement_profiles.map((p) => (
+            <Badge key={p} tone="violet">
+              {p}
+            </Badge>
+          ))}
+        </div>
+        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-0.5 text-note text-ink-dim">
+          <span className="font-mono">{record.id}</span>
+          <span title={absoluteTime(record.started_at)}>started {relativeTime(record.started_at)}</span>
+          {record.ended_at && (
+            <span title={absoluteTime(record.ended_at)}>
+              ended {relativeTime(record.ended_at)} · ran {durationBetween(record.started_at, record.ended_at)}
+            </span>
+          )}
+          <span>
+            {record.rounds} {record.rounds === 1 ? 'round' : 'rounds'}
+          </span>
+          <span className="inline-flex items-center gap-1.5 font-medium text-ink tabular-nums">
+            {formatSpendUsd(record.spent_usd)}
+            <span className="font-normal text-ink-mute">· {formatSpendTokens(record.spent_tokens)}</span>
+          </span>
+        </div>
+        {record.stop_reason && (
+          <div className="mt-1.5 text-note text-ink-dim">
+            <span className="text-ink-mute">stopped: </span>
+            <span className={cn('break-words font-mono', STOP_TONE_TEXT[stopReasonTone(record.stop_reason)])}>
+              {record.stop_reason}
+            </span>
           </div>
-        </header>
+        )}
+        {record.status === 'running' && record.runner_alive === false && (
+          <div
+            role="status"
+            className="mt-2 rounded-md border border-warn/30 bg-warn-bg px-3 py-1.5 text-note text-warn"
+          >
+            The coordinator process (pid {record.runner_pid ?? '?'}) is no longer running — this run died without
+            finalizing and will be closed out by the orphan reaper.
+          </div>
+        )}
+        {def?.description && <p className="mt-2 max-w-3xl text-sm text-ink-dim">{def.description}</p>}
         {stopControls.panel && <div className="mt-3 max-w-3xl">{stopControls.panel}</div>}
       </div>
 
@@ -476,17 +478,6 @@ export default function AgentiflowDetail() {
   );
 }
 
-function BackLink() {
-  return (
-    <Link
-      to="/runs/agentiflows"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Agentiflows
-    </Link>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Chrome

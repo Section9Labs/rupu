@@ -1,12 +1,12 @@
 // Global coverage Templates page — bundled concern templates (target-independent).
 // Route: /coverage/templates
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
 import { api, type TemplateSummary, type TemplateDetail } from '../lib/api';
 import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
+import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { Spinner } from '../components/ui/Spinner';
 import { SEVERITY_STYLE, type Severity } from '../lib/severity';
 import { UnscopedNote } from '../components/customers/UnscopedNote';
@@ -41,27 +41,19 @@ export default function CoverageTemplates() {
 
   return (
     <div className="p-8">
-      <Link
-        to="/coverage"
-        className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-      >
-        <ArrowLeft size={14} />
-        Coverage
-      </Link>
-      <header className="mt-3">
-        <h1 className="text-2xl font-semibold text-ink">Concern Templates</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Bundled concern catalogs (OWASP, CWE, STRIDE, …).
-        </p>
-      </header>
+      <PageHeader
+        back={{ label: 'Coverage', to: '/coverage' }}
+        title="Concern Templates"
+        subtitle="Bundled concern catalogs (OWASP, CWE, STRIDE, …)."
+      />
       <UnscopedNote className="mt-4">
         Concern templates aren’t per customer — every customer shares this catalog.
       </UnscopedNote>
 
       {error && <ErrorBanner className="mt-4">{error}</ErrorBanner>}
       {templates === null ? (
-        <div className="mt-4 py-16 flex items-center justify-center">
-          <Spinner label="Loading templates…" />
+        <div className="mt-6">
+          <ListSkeleton label="Loading templates…" />
         </div>
       ) : (
         <section className="mt-6">
