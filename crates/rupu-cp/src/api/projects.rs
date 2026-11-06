@@ -108,7 +108,7 @@ pub fn routes() -> Router<AppState> {
     // axum's static-over-dynamic preference is reinforced by registration
     // order.
     Router::new()
-        .route("/api/projects", get(list_projects))
+        .route("/api/projects", get(list_projects).post(register_project))
         .route("/api/projects/:ws_id", get(get_project))
         .route("/api/projects/:ws_id/runs", get(project_runs))
         .route("/api/projects/:ws_id/sessions", get(project_sessions))
@@ -120,6 +120,62 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/:ws_id/agents", get(project_agents))
         .route("/api/projects/:ws_id/workflows", get(project_workflows))
         .route("/api/projects/:ws_id/autoflows", get(project_autoflows))
+}
+
+/// Register an existing local directory without running an agent or initializing
+/// project files. Omitted/null customer preserves an existing assignment; removal
+/// remains the compare-and-remove customer endpoint.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegisterProjectBody {
+    path: String,
+    #[serde(default)]
+    customer: Option<String>,
+}
+
+async fn register_project(
+    State(s): State<AppState>,
+    Query(q): Query<crate::api::fleet::LocalQuery>,
+    Json(body): Json<RegisterProjectBody>,
+) -> ApiResult<Json<ProjectRow>> {
+    crate::api::fleet::require_local(q.host.as_deref(), "registering a project")?;
+    crate::api::config::require_writable_to(&s, "registering a project")?;
+    let global = s.global_dir.clone();
+    let id = crate::api::runs::blocking(move || {
+        let path = std::path::PathBuf::from(&body.path);
+        if !path.is_absolute() {
+            return Err(ApiError::bad_request("project path must be absolute"));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|_| ApiError::bad_request("project path must name an existing directory"))?;
+        if !canonical.is_dir() {
+            return Err(ApiError::bad_request(
+                "project path must name an existing directory",
+            ));
+        }
+        let workspace = if let Some(customer) = body.customer {
+            // assign validates the customer before registering the path, and
+            // stores only the assignment sidecar, not a rewritten workspace.
+            rupu_workspace::CustomerStore::new(&global)
+                .assign(&customer, rupu_workspace::ProjectRef::Path(&canonical))
+                .map_err(crate::api::customers::api_err)?
+        } else {
+            rupu_workspace::register(
+                &WorkspaceStore {
+                    root: global.join("workspaces"),
+                },
+                &canonical,
+            )
+            .map_err(|e| ApiError::internal(e.to_string()))?
+        };
+        Ok(workspace.id)
+    })
+    .await?;
+    // Reuse the normal read projection, including existing activity and usage;
+    // re-registration must not make an existing project look like a fresh one.
+    let Json(detail) = get_project(State(s), Path(id)).await?;
+    Ok(Json(detail.project))
 }
 
 /// The Projects page's per-project rollups: every workflow run grouped by
@@ -409,6 +465,8 @@ fn session_is_active(v: &Value) -> bool {
 /// `?offset=&limit=&q=&facets=` on a project's run and session lists.
 #[derive(serde::Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct ProjectListQuery {
+    /// Session list only: descending archive date (legacy fallback to activity).
+    sort: Option<crate::api::sessions::SessionSort>,
     offset: Option<usize>,
     limit: Option<usize>,
     /// `?q=` — the list query (the workflow-run registry for runs, the
@@ -444,6 +502,9 @@ async fn project_runs(
     Path(ws_id): Path<String>,
     Query(q): Query<ProjectListQuery>,
 ) -> Result<crate::query::ListResponse, crate::query::ListError> {
+    if q.sort.is_some() {
+        return Err(ApiError::bad_request("sort is supported only for project sessions").into());
+    }
     // 404 when the project is unknown, mirroring the rollup endpoint.
     load_workspace(&s, &ws_id)?;
     let query =
@@ -547,7 +608,7 @@ async fn project_sessions(
         .collect();
     // Newest-first by `updated_at`, as `GET /api/sessions` pages: the scan
     // walks the session dirs in `read_dir` order.
-    crate::api::host_fanout::sort_values_newest_first(&mut probes, "updated_at");
+    crate::api::sessions::sort_sessions(&mut probes, q.sort);
     let merged = crate::query::filter_merged(probes, &filter, |_| true, facets);
     let headers = merged.headers();
     let rows = unpriced
@@ -1015,5 +1076,175 @@ mod tests {
             "must be labeled project-scoped even though its file stem differs from its name"
         );
         assert_eq!(rows[0].scope_kind, ScopeKind::Project);
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    struct NoLaunch;
+    #[async_trait::async_trait]
+    impl crate::launcher::RunLauncher for NoLaunch {
+        async fn launch(
+            &self,
+            _: crate::launcher::LaunchRequest,
+        ) -> Result<String, crate::launcher::LaunchError> {
+            panic!("registering a project must never launch work")
+        }
+    }
+    fn state(global: &std::path::Path, writable: bool) -> AppState {
+        AppState::new(global.into(), rupu_config::PricingConfig::default()).with_launcher(
+            writable.then(|| Arc::new(NoLaunch) as Arc<dyn crate::launcher::RunLauncher>),
+        )
+    }
+    async fn post(s: AppState, body: Value, query: &str) -> (StatusCode, Value) {
+        let app = routes().with_state(s);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/projects{query}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    #[tokio::test]
+    async fn register_preserves_identity_and_activity_without_initializing_or_launching() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("keep.txt"), "existing project content").unwrap();
+        let s = state(global.path(), true);
+        let body = json!({"path": project.path()});
+        let (status, first) = post(s.clone(), body.clone(), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            first["path"],
+            project.path().canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(first["last_run_at"], Value::Null);
+        assert_eq!(first["customer"], Value::Null);
+        let store = store(&s);
+        let executed = rupu_workspace::upsert(&store, project.path()).unwrap();
+        let (_, second) = post(s.clone(), body, "").await;
+        assert_eq!(second["ws_id"], first["ws_id"]);
+        assert_eq!(second["last_run_at"], json!(executed.last_run_at));
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(!global.path().join("sessions").exists());
+        assert!(!project.path().join(".rupu").exists());
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("keep.txt")).unwrap(),
+            "existing project content"
+        );
+    }
+    #[tokio::test]
+    async fn customer_is_optional_and_reregistration_preserves_it() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let customers = rupu_workspace::CustomerStore::new(global.path());
+        customers
+            .create(
+                "team",
+                &rupu_workspace::NewCustomer {
+                    name: "Team".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let s = state(global.path(), true);
+        let (status, assigned) = post(
+            s.clone(),
+            json!({"path":project.path(), "customer":"team"}),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(assigned["customer"]["slug"], "team");
+        for body in [
+            json!({"path":project.path()}),
+            json!({"path":project.path(),"customer":null}),
+        ] {
+            let (_, row) = post(s.clone(), body, "").await;
+            assert_eq!(row["ws_id"], assigned["ws_id"]);
+            assert_eq!(row["customer"]["slug"], "team");
+        }
+    }
+    #[tokio::test]
+    async fn rejects_invalid_paths_customer_readonly_and_remote_without_registration() {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let file = project.path().join("file");
+        std::fs::write(&file, "preserve").unwrap();
+        let s = state(global.path(), true);
+        for path in [
+            std::path::PathBuf::from("relative"),
+            project.path().join("missing"),
+            file,
+        ] {
+            assert_eq!(
+                post(s.clone(), json!({"path":path}), "").await.0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            post(
+                s.clone(),
+                json!({"path":project.path(),"customer":"missing"}),
+                ""
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post(s.clone(), json!({"path":project.path()}), "?host=remote")
+                .await
+                .0,
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            post(
+                state(global.path(), false),
+                json!({"path":project.path()}),
+                ""
+            )
+            .await
+            .0,
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert!(store(&s).list().unwrap().is_empty());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aliases_and_concurrent_requests_reuse_canonical_identity() {
+        let global = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        let alias = parent.path().join("alias");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let s = state(global.path(), true);
+        let (a, b) = tokio::join!(
+            post(s.clone(), json!({"path":project}), ""),
+            post(s.clone(), json!({"path":alias}), "")
+        );
+        assert_eq!(a.0, StatusCode::OK);
+        assert_eq!(b.0, StatusCode::OK);
+        assert_eq!(a.1["ws_id"], b.1["ws_id"]);
+        assert_eq!(store(&s).list().unwrap().len(), 1);
     }
 }

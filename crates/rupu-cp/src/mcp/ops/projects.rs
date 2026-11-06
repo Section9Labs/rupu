@@ -3,7 +3,7 @@
 //! file list).
 
 use super::{op, OpSpec};
-use crate::api::{code, projects};
+use crate::api::{code, fleet, projects};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -15,6 +15,14 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "List the registered projects with their usage rollup and customer.\n\n`customer` (a slug, or `none`) keeps the projects currently assigned to that customer; a bad slug is `HTTP 400`. Returns a JSON array of rows `{ws_id, name, path, repo_remote, branch, repo_home_url?, created_at, last_run_at, usage, run_count, last_active, customer}`.",
         )
         .query::<projects::ProjectsQuery>(),
+        op(
+            "projects.register",
+            Method::POST,
+            "/api/projects",
+            "Register an existing local project directory without starting work.\n\n`path` must be absolute and name an existing directory. Registration reuses the canonical workspace identity and preserves last-run time. Optional `customer` assigns an existing active customer; omitted or null preserves its current assignment. Returns the normal project row. Remote hosts and read-only deployments are unsupported.",
+        )
+        .query::<fleet::LocalQuery>()
+        .body::<projects::RegisterProjectBody>(),
         op(
             "projects.get",
             Method::GET,
@@ -32,7 +40,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "projects.sessions",
             Method::GET,
             "/api/projects/:ws_id/sessions",
-            "List a project's sessions, newest first by last update.\n\n`q` is the session query line (e.g. `is:active`), applied before paging with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Returns a JSON array of session rows; `HTTP 400` for a `q` that does not parse, `HTTP 404` for an unknown project.",
+            "List a project's sessions, newest activity first by default.\n\n`sort=archived_at` orders by archive transition before paging, falling back to activity for legacy records without an archive date.\n\n`q` is the session query line (e.g. `is:active`), applied before paging with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Returns a JSON array of session rows; `HTTP 400` for a `q` that does not parse, `HTTP 404` for an unknown project.",
         )
         .query::<projects::ProjectListQuery>(),
         op(

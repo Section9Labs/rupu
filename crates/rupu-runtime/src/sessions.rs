@@ -175,6 +175,9 @@ pub struct SessionRecord {
     pub workspace_strategy: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Most recent archive transition; absent on active and legacy archived records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
     pub status: SessionStatus,
     #[serde(default)]
     pub active_run_id: Option<String>,

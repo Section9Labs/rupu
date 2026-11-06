@@ -363,6 +363,8 @@ struct SessionListRow {
     target: Option<String>,
     active_run_id: Option<String>,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<String>,
     /// The customer the session is attributed to — `customer` (the one its
     /// record holds, else its workspace's current assignment) and
     /// `customer_derived` — serialized whenever known (`customer: null` = no
@@ -420,6 +422,8 @@ struct SessionShowItem {
     total_tokens_out: u64,
     created_at: String,
     updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<String>,
     last_error: Option<String>,
     runs: Vec<SessionRunView>,
 }
@@ -1107,6 +1111,7 @@ async fn list(
                 target: session.target.clone(),
                 active_run_id: session.active_run_id.clone(),
                 updated_at: session.updated_at.to_rfc3339(),
+                archived_at: session.archived_at.map(|time| time.to_rfc3339()),
             });
         }
     }
@@ -1211,6 +1216,7 @@ async fn show(
                 total_tokens_out: session.total_tokens_out,
                 created_at: session.created_at.to_rfc3339(),
                 updated_at: session.updated_at.to_rfc3339(),
+                archived_at: session.archived_at.map(|time| time.to_rfc3339()),
                 last_error: session.last_error.clone(),
                 runs: session
                     .runs
@@ -1543,6 +1549,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         workspace_strategy,
         created_at: now,
         updated_at: now,
+        archived_at: None,
         status: SessionStatus::Idle,
         active_run_id: None,
         active_transcript_path: None,
@@ -6552,6 +6559,7 @@ async fn archive(session_id: &str) -> anyhow::Result<()> {
         SessionScope::Active,
         SessionScope::Archived,
     )?;
+    session.archived_at = Some(Utc::now());
     write_session(&global, SessionScope::Archived, &session)?;
     println!("archived session {}", session.session_id);
     Ok(())
@@ -6570,6 +6578,7 @@ async fn restore(session_id: &str) -> anyhow::Result<()> {
         SessionScope::Archived,
         SessionScope::Active,
     )?;
+    session.archived_at = None;
     write_session(&global, SessionScope::Active, &session)?;
     println!("restored session {}", session.session_id);
     Ok(())
@@ -10949,6 +10958,7 @@ mod tests {
             workspace_strategy: Some("direct_checkout".into()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            archived_at: None,
             status: SessionStatus::Running,
             active_run_id: Some("run_live123".into()),
             active_transcript_path: Some(PathBuf::from(

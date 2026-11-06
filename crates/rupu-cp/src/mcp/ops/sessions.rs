@@ -11,7 +11,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "sessions.list",
             Method::GET,
             "/api/sessions",
-            "List interactive agent sessions, newest first.\n\nFilter with `q` (the query line, e.g. `is:active`), `scope`, `since`/`until`, `customer` and `host`, and page with `offset`/`limit`. Returns a JSON array of session rows; with `facets` set, an object `{rows, facets, facets_partial}`.",
+            "List interactive agent sessions, newest activity first by default.\n\n`sort=archived_at` orders by archive transition before paging, falling back to activity only for legacy records without an archive date.\n\nFilter with `q` (the query line, e.g. `is:active`), `scope`, `since`/`until`, `customer` and `host`, and page with `offset`/`limit`. Returns a JSON array of session rows; with `facets` set, an object `{rows, facets, facets_partial}`.",
         )
         .query::<sessions::SessionsQuery>(),
         op(
