@@ -465,6 +465,8 @@ fn session_is_active(v: &Value) -> bool {
 /// `?offset=&limit=&q=&facets=` on a project's run and session lists.
 #[derive(serde::Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct ProjectListQuery {
+    /// Session list only: descending archive date (legacy fallback to activity).
+    sort: Option<crate::api::sessions::SessionSort>,
     offset: Option<usize>,
     limit: Option<usize>,
     /// `?q=` — the list query (the workflow-run registry for runs, the
@@ -500,6 +502,9 @@ async fn project_runs(
     Path(ws_id): Path<String>,
     Query(q): Query<ProjectListQuery>,
 ) -> Result<crate::query::ListResponse, crate::query::ListError> {
+    if q.sort.is_some() {
+        return Err(ApiError::bad_request("sort is supported only for project sessions").into());
+    }
     // 404 when the project is unknown, mirroring the rollup endpoint.
     load_workspace(&s, &ws_id)?;
     let query =
@@ -603,7 +608,7 @@ async fn project_sessions(
         .collect();
     // Newest-first by `updated_at`, as `GET /api/sessions` pages: the scan
     // walks the session dirs in `read_dir` order.
-    crate::api::host_fanout::sort_values_newest_first(&mut probes, "updated_at");
+    crate::api::sessions::sort_sessions(&mut probes, q.sort);
     let merged = crate::query::filter_merged(probes, &filter, |_| true, facets);
     let headers = merged.headers();
     let rows = unpriced

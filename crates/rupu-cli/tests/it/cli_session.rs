@@ -574,6 +574,12 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
     let tmp = assert_fs::TempDir::new().unwrap();
     let home = tmp.path().join("home");
     write_session(&home, "ses_archive01", "idle", None, false);
+    let before: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("sessions/ses_archive01/session.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(before.get("archived_at").is_none());
+    let archive_started = Utc::now();
 
     Command::cargo_bin("rupu")
         .unwrap()
@@ -588,6 +594,15 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
         .assert()
         .success();
 
+    let archived: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("sessions-archive/ses_archive01/session.json")).unwrap(),
+    )
+    .unwrap();
+    let archived_at =
+        chrono::DateTime::parse_from_rfc3339(archived["archived_at"].as_str().unwrap()).unwrap();
+    assert!(archived_at >= archive_started);
+    assert!(archived_at <= Utc::now());
+    assert_eq!(archived["session_id"], before["session_id"]);
     assert!(!home.join("sessions/ses_archive01").is_dir());
     assert!(home
         .join("sessions-archive/ses_archive01/session.json")
@@ -628,6 +643,12 @@ async fn session_archive_restore_round_trip_moves_owned_transcripts() {
         .success();
 
     assert!(home.join("sessions/ses_archive01/session.json").is_file());
+    let restored: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(home.join("sessions/ses_archive01/session.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(restored.get("archived_at").is_none());
+    assert_eq!(restored["session_id"], before["session_id"]);
     assert!(tmp
         .path()
         .join("repo/.rupu/transcripts/run_prev123.jsonl")

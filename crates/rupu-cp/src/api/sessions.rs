@@ -66,6 +66,8 @@ pub(crate) struct SessionDto {
     created_at: String,
     #[serde(default)]
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived_at: Option<String>,
     #[serde(default)]
     active_run_id: Option<String>,
     #[serde(default)]
@@ -671,8 +673,41 @@ pub(crate) fn collect_sessions(
     Ok(rows)
 }
 
+/// Session lists default to last activity; archive ordering is explicit.
+#[derive(Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionSort {
+    UpdatedAt,
+    ArchivedAt,
+}
+
+pub(crate) fn sort_sessions(rows: &mut [serde_json::Value], sort: Option<SessionSort>) {
+    if !matches!(sort, Some(SessionSort::ArchivedAt)) {
+        sort_values_newest_first(rows, "updated_at");
+        return;
+    }
+    // Parse RFC3339 so offsets and fractional precision do not change order.
+    // Legacy archives have no transition time: use activity without inventing
+    // or writing an archived_at field. Stable identity breaks equal-time ties.
+    fn at(row: &serde_json::Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        row["archived_at"]
+            .as_str()
+            .or_else(|| row["updated_at"].as_str())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    }
+    rows.sort_by(|a, b| {
+        at(b).cmp(&at(a)).then_with(|| {
+            (a["host_id"].as_str(), a["session_id"].as_str())
+                .cmp(&(b["host_id"].as_str(), b["session_id"].as_str()))
+        })
+    });
+}
+
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct SessionsQuery {
+    /// `updated_at` (default) or `archived_at`, descending before pagination.
+    /// Missing archive dates fall back to last activity, without changing records.
+    sort: Option<SessionSort>,
     // Flat fields, NOT `#[serde(flatten)] PageQuery` — serde_urlencoded (axum
     // `Query`) cannot deserialize integers through a flattened struct.
     offset: Option<usize>,
@@ -810,7 +845,7 @@ async fn list_sessions(
     // the web's per-host merge relies on. `collect_sessions` walks the
     // session dirs in `read_dir` order, and a connector returns the host's
     // whole list in CLI / mirror order.
-    sort_values_newest_first(&mut rows, "updated_at");
+    sort_sessions(&mut rows, q.sort);
 
     let merged = crate::query::filter_merged(rows, &filter, scope, facets);
     if host != "local" && host != "all" {
@@ -1501,6 +1536,101 @@ pub(crate) async fn compact_session(
 pub(crate) mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn archive_sort_precedes_paging_for_instance_and_project_sessions() {
+        use tower::ServiceExt;
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let workspace = rupu_workspace::register(
+            &rupu_workspace::WorkspaceStore {
+                root: global.path().join("workspaces"),
+            },
+            project.path(),
+        )
+        .unwrap();
+        for (id, activity, archived) in [
+            (
+                "recent_archive",
+                "2020-01-01T00:00:00Z",
+                Some("2026-11-05T12:00:00Z"),
+            ),
+            (
+                "recent_activity",
+                "2026-11-04T00:00:00Z",
+                Some("2026-11-04T12:00:00Z"),
+            ),
+            ("legacy", "2026-11-03T00:00:00Z", None),
+        ] {
+            let dir = global.path().join("sessions-archive").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("session.json"),
+                serde_json::json!({
+                    "session_id":id, "workspace_id": workspace.id, "status":"idle",
+                    "created_at":activity, "updated_at":activity, "archived_at":archived
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let state = AppState::new(global.path().into(), rupu_config::PricingConfig::default());
+        let app = routes()
+            .merge(crate::api::projects::routes())
+            .with_state(state);
+        for base in [
+            "/api/sessions?host=local&scope=archived".to_string(),
+            format!("/api/projects/{}/sessions?q=is%3Aarchived", workspace.id),
+        ] {
+            for (suffix, expected) in [
+                ("&sort=archived_at&offset=0&limit=1", "recent_archive"),
+                ("&sort=archived_at&offset=1&limit=1", "recent_activity"),
+                ("&sort=archived_at&offset=2&limit=1", "legacy"),
+                ("&offset=0&limit=1", "recent_activity"),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri(format!("{base}{suffix}"))
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let rows: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(rows[0]["session_id"], expected);
+                if expected == "legacy" {
+                    assert!(rows[0].get("archived_at").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn archive_timestamp_projection_preserves_known_and_legacy_records() {
+        let old: SessionDto = serde_json::from_value(serde_json::json!({
+            "session_id": "legacy", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(old.archived_at.is_none());
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("archived_at")
+            .is_none());
+        let new: SessionDto = serde_json::from_value(serde_json::json!({
+            "session_id": "new", "updated_at": "2026-01-01T00:00:00Z",
+            "archived_at": "2026-11-05T12:00:00Z"
+        }))
+        .unwrap();
+        let projected = serde_json::to_value(new).unwrap();
+        assert_eq!(projected["archived_at"], "2026-11-05T12:00:00Z");
+        assert_eq!(projected["updated_at"], "2026-01-01T00:00:00Z");
+    }
+
     /// An active session in `workspace` with one turn, updated `day` of
     /// September 2026; the turn's transcript path.
     pub(crate) fn seed_session_with_turn(
@@ -1710,6 +1840,7 @@ pub(crate) mod tests {
             total_tokens_cached: 0,
             created_at: String::new(),
             updated_at: String::new(),
+            archived_at: None,
             active_run_id: None,
             last_error: None,
             target: None,
@@ -1882,6 +2013,7 @@ pub(crate) mod tests {
             total_tokens_cached: 0,
             created_at: String::new(),
             updated_at: String::new(),
+            archived_at: None,
             active_run_id: Some("run_live".into()),
             last_error: None,
             target: None,

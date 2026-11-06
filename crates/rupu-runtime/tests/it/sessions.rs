@@ -46,6 +46,27 @@ fn archive_session(global: &Path, id: &str, version: u32, days: i64) -> PathBuf 
 }
 
 #[test]
+fn archive_timestamp_is_optional_for_legacy_records_and_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = archive_session(tmp.path(), "ses_archive_time", SessionRecord::VERSION, 30);
+    let bytes = std::fs::read(dir.join("session.json")).unwrap();
+    let mut record = parse_session_record(&bytes).unwrap();
+    assert!(record.archived_at.is_none());
+    let activity = record.updated_at;
+    let now = chrono::Utc::now();
+    record.archived_at = Some(now);
+    let encoded = serde_json::to_vec(&record).unwrap();
+    let decoded = parse_session_record(&encoded).unwrap();
+    assert_eq!(decoded.archived_at, Some(now));
+    assert_eq!(decoded.updated_at, activity);
+    record.archived_at = None;
+    assert!(serde_json::to_value(record)
+        .unwrap()
+        .get("archived_at")
+        .is_none());
+}
+
+#[test]
 fn a_record_newer_than_this_rupu_is_shown_never_written_back() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = archive_session(tmp.path(), "ses_new", SessionRecord::VERSION + 1, 1);

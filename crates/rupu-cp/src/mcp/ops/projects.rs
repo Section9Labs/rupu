@@ -40,7 +40,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "projects.sessions",
             Method::GET,
             "/api/projects/:ws_id/sessions",
-            "List a project's sessions, newest first by last update.\n\n`q` is the session query line (e.g. `is:active`), applied before paging with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Returns a JSON array of session rows; `HTTP 400` for a `q` that does not parse, `HTTP 404` for an unknown project.",
+            "List a project's sessions, newest activity first by default.\n\n`sort=archived_at` orders by archive transition before paging, falling back to activity for legacy records without an archive date.\n\n`q` is the session query line (e.g. `is:active`), applied before paging with `offset`/`limit`; `facets=1` answers `{rows, facets, facets_partial}`. Returns a JSON array of session rows; `HTTP 400` for a `q` that does not parse, `HTTP 404` for an unknown project.",
         )
         .query::<projects::ProjectListQuery>(),
         op(
