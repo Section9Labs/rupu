@@ -401,22 +401,89 @@ async fn list_workflows(State(s): State<AppState>) -> ApiResult<Json<Vec<Workflo
     Ok(Json(rows))
 }
 
-/// Load workflow `name` and build the full detail DTO (`workflow` + raw `yaml` +
-/// aggregate `usage` + resolved `scope`/`scope_kind`/`scope_id`). Shared by
-/// GET / PUT / POST.
-///
-/// Project-aware: resolves `name` project-first, falling back to the global
-/// layer (see [`resolve_workflow_scoped`]'s doc comment for why) so a
-/// project-only workflow's detail route doesn't 404. The resolved layer is
-/// carried on the response's `scope`/`scope_kind`/`scope_id`, which the CP
-/// detail page shows (scope chip + naming the layer in the delete
-/// confirmation) and threads back on its own Delete/toggle calls —
-/// `DELETE /api/workflows/:name` independently resolves the SAME way (see
-/// [`resolve_workflow_scoped`]), so Delete always removes the file this page
-/// is actually showing when no explicit scope is passed.
-async fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Value>> {
-    let (path, _dir, scope, scope_kind, scope_id) = resolve_workflow_scoped(s, name)
-        .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))?;
+/// One resolved definition layer, retained through read/save/reload.
+type Definition = (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    String,
+    ScopeKind,
+    Option<String>,
+);
+
+fn selected_definition(s: &AppState, name: &str, q: &ScopeQuery) -> ApiResult<Definition> {
+    if let Some(kind) = q.scope_kind {
+        if kind == ScopeKind::Global && q.scope_id.is_some() {
+            return Err(ApiError::bad_request(
+                "global scope does not accept scope_id",
+            ));
+        }
+        let (path, dir, scope, kind) =
+            resolve_workflow_scoped_explicit(s, name, kind, q.scope_id.as_deref()).ok_or_else(
+                || ApiError::not_found(format!("workflow {name} not found in requested scope")),
+            )?;
+        Ok((
+            path,
+            dir,
+            scope,
+            kind,
+            if kind == ScopeKind::Project {
+                q.scope_id.clone()
+            } else {
+                None
+            },
+        ))
+    } else {
+        if q.scope_id.is_some() {
+            return Err(ApiError::bad_request("scope_id requires scope_kind"));
+        }
+        resolve_workflow_scoped(s, name)
+            .ok_or_else(|| ApiError::not_found(format!("workflow {name} not found")))
+    }
+}
+
+fn revision(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))
+}
+
+fn check_revision(path: &std::path::Path, expected: Option<&str>) -> ApiResult<()> {
+    if let Some(expected) = expected {
+        let current = std::fs::read_to_string(path).map_err(|_| {
+            ApiError::conflict("workflow changed or was removed; reload before saving")
+        })?;
+        if revision(&current) != expected {
+            return Err(ApiError::conflict(
+                "workflow revision changed; reload before continuing",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize CP definition writers across processes; never block an async worker waiting for the lock.
+pub(crate) async fn definition_lock(dir: &std::path::Path) -> ApiResult<std::fs::File> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".workflow-definitions.lock"))?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok::<_, std::io::Error>(file)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| ApiError::internal(e.to_string()))
+}
+
+async fn load_detail(
+    s: &AppState,
+    name: &str,
+    selected: Definition,
+) -> ApiResult<Json<serde_json::Value>> {
+    let (path, _dir, scope, scope_kind, scope_id) = selected;
     let yaml = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
     let workflow = Workflow::parse(&yaml).map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -439,6 +506,7 @@ async fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Val
 
     Ok(Json(serde_json::json!({
         "workflow": workflow,
+        "revision": revision(&yaml),
         "yaml": yaml,
         "usage": usage,
         "scope": scope,
@@ -450,16 +518,28 @@ async fn load_detail(s: &AppState, name: &str) -> ApiResult<Json<serde_json::Val
 async fn get_workflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
+    Query(q): Query<ScopeQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     fs_safety::validate_stem(&name)?;
-    load_detail(&s, &name).await
+    load_detail(&s, &name, selected_definition(&s, &name, &q)?).await
 }
 
 /// Request body for `PUT /api/workflows/:name` and `POST /api/workflows`: the
 /// full raw `.yaml` to validate and persist.
-#[derive(Deserialize, schemars::JsonSchema)]
+#[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct WorkflowWriteBody {
     raw: String,
+    #[serde(default)]
+    expected_revision: Option<String>,
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct WorkflowCreateBody {
+    raw: String,
+    #[serde(default)]
+    scope_kind: Option<ScopeKind>,
+    #[serde(default)]
+    scope_id: Option<String>,
 }
 
 /// `PUT /api/workflows/:name` — overwrite (or create) the workflow definition
@@ -489,9 +569,9 @@ pub(crate) struct WorkflowWriteBody {
 /// never surface (project shadows global). See [`resolve_workflow_scoped`]'s
 /// doc comment for the identical reasoning `DELETE` already applies.
 ///
-/// Returns the reloaded detail DTO — [`load_detail`] resolves the SAME
-/// project-first way, so the response always echoes the file this handler
-/// actually just wrote.
+/// `expected_revision` requires an explicit scope and refuses stale bytes with
+/// 409 under the definition writer lock. Reload uses the exact selected layer.
+/// External editors do not participate in this advisory lock.
 async fn write_workflow(
     State(s): State<AppState>,
     Path(name): Path<String>,
@@ -506,36 +586,33 @@ async fn write_workflow(
         ));
     }
 
-    let (target, dir) = match q.scope_kind {
-        Some(kind) => {
-            let (path, dir, _scope, _kind) =
-                resolve_workflow_scoped_explicit(&s, &name, kind, q.scope_id.as_deref())
-                    .ok_or_else(|| {
-                        ApiError::not_found(format!(
-                            "workflow {name} not found in the requested scope"
-                        ))
-                    })?;
-            (path, dir)
-        }
-        None => match resolve_workflow_scoped(&s, &name) {
-            Some((path, dir, _scope, _kind, _scope_id)) => (path, dir),
-            None => {
+    if body.expected_revision.is_some() && q.scope_kind.is_none() {
+        return Err(ApiError::bad_request(
+            "guarded save requires explicit scope_kind",
+        ));
+    }
+    let selected =
+        if q.scope_kind.is_some() || q.scope_id.is_some() || body.expected_revision.is_some() {
+            selected_definition(&s, &name, &q)?
+        } else {
+            resolve_workflow_scoped(&s, &name).unwrap_or_else(|| {
                 let dir = workflows_dir(&s);
-                (dir.join(format!("{name}.yaml")), dir)
-            }
-        },
-    };
-    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
-    fs_safety::write_atomic(&target, body.raw.as_bytes())
+                (
+                    dir.join(format!("{name}.yaml")),
+                    dir,
+                    "global".into(),
+                    ScopeKind::Global,
+                    None,
+                )
+            })
+        };
+    let (target, dir, _, _, _) = &selected;
+    let _lock = definition_lock(dir).await?;
+    check_revision(target, body.expected_revision.as_deref())?;
+    fs_safety::write_atomic(target, body.raw.as_bytes())
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    // Defense in depth, mirroring `delete_workflow`'s `validate_within` — run
-    // AFTER the write here (rather than before, as delete does) because
-    // `target` may not exist yet on disk when this is a genuine create.
-    // `target/dir` above are always constructed from a `validate_name`-
-    // checked identifier joined onto a trusted directory, so this can never
-    // actually fire today; see `fs_safety::validate_within`'s doc comment.
-    fs_safety::validate_within(&target, &dir)?;
-    load_detail(&s, &name).await
+    fs_safety::validate_within(target, dir)?;
+    load_detail(&s, &name, selected).await
 }
 
 /// `POST /api/workflows` — create a new workflow. The name is taken from the
@@ -543,25 +620,73 @@ async fn write_workflow(
 /// resolves ANYWHERE (project-first, then global — the SAME resolver
 /// `GET`/`PUT`/`DELETE` use), not just the global layer, so create can never
 /// silently shadow an existing PROJECT definition with a brand-new global
-/// file of the same name. Always writes into the global layer (creating
-/// directly into a specific project via this endpoint is not supported).
-/// Returns the reloaded detail DTO.
+/// file of the same name. With no body scope, writes into the global layer.
+/// Explicit `scope_kind: project, scope_id` creates in that registered project,
+/// refuses an existing definition in that layer, and may shadow a global name.
+/// Returns the exact selected layer and its raw-content revision.
 async fn create_workflow(
     State(s): State<AppState>,
-    Json(body): Json<WorkflowWriteBody>,
+    Json(body): Json<WorkflowCreateBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let wf = Workflow::parse(&body.raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let name = wf.name;
     fs_safety::validate_new_name("workflow", &name)?;
-    if resolve_workflow_scoped(&s, &name).is_some() {
-        return Err(ApiError::conflict("workflow already exists"));
+    let (dir, scope, kind, id) = match body.scope_kind {
+        Some(ScopeKind::Project) => {
+            let id = body
+                .scope_id
+                .ok_or_else(|| ApiError::bad_request("project scope requires scope_id"))?;
+            let ws = store(&s)
+                .list()
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .into_iter()
+                .find(|w| w.id == id)
+                .ok_or_else(|| ApiError::not_found("project not found"))?;
+            let root = std::path::PathBuf::from(&ws.path)
+                .canonicalize()
+                .map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let layer = root.join(".rupu");
+            std::fs::create_dir_all(&layer).map_err(|e| ApiError::internal(e.to_string()))?;
+            if !layer
+                .canonicalize()
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .starts_with(&root)
+            {
+                return Err(ApiError::bad_request(
+                    "project definition layer escapes project",
+                ));
+            }
+            let dir = layer.join("workflows");
+            std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+            if !dir
+                .canonicalize()
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .starts_with(&root)
+            {
+                return Err(ApiError::bad_request("workflow directory escapes project"));
+            }
+            (dir, scope_name(&ws), ScopeKind::Project, Some(id))
+        }
+        _ => {
+            if body.scope_id.is_some() {
+                return Err(ApiError::bad_request("scope_id requires project scope"));
+            }
+            if resolve_workflow_scoped(&s, &name).is_some() {
+                return Err(ApiError::conflict("workflow already exists"));
+            }
+            (workflows_dir(&s), "global".into(), ScopeKind::Global, None)
+        }
+    };
+    let _lock = definition_lock(&dir).await?;
+    if definition_file(&dir, &name).is_some() {
+        return Err(ApiError::conflict(
+            "workflow already exists in requested scope",
+        ));
     }
-    let dir = workflows_dir(&s);
     let target = dir.join(format!("{name}.yaml"));
-    std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
     fs_safety::write_atomic(&target, body.raw.as_bytes())
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    load_detail(&s, &name).await
+    load_detail(&s, &name, (target, dir, scope, kind, id)).await
 }
 
 /// `POST /api/workflows/validate` — stateless parse-check of a raw workflow
@@ -612,6 +737,7 @@ async fn delete_workflow(
             (target, dir, scope, scope_kind)
         }
     };
+    let _lock = definition_lock(&dir).await?;
     // Defense in depth — see `fs_safety::validate_within`'s doc comment.
     fs_safety::validate_within(&target, &dir)?;
     std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -626,6 +752,13 @@ async fn delete_workflow(
 /// bodyless POST launches the workflow with no inputs in its default mode.
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct LaunchBody {
+    /// Guarded launches may execute a global definition in this registered project.
+    #[serde(default)]
+    workspace_id: Option<String>,
+    /// Guard the selected source and launch an immutable copy of these exact bytes.
+    #[serde(default)]
+    expected_revision: Option<String>,
+
     #[serde(default)]
     inputs: std::collections::BTreeMap<String, String>,
     #[serde(default)]
@@ -794,6 +927,9 @@ async fn launch_run(
     let engagement_profiles =
         crate::api::agents::parse_engagement_profiles(std::mem::take(&mut b.engagement_profiles))?;
     if host != "local" {
+        if b.expected_revision.is_some() || b.workspace_id.is_some() {
+            return Err(ApiError::not_available("revision-guarded workflow launch is local-only; connect directly to the owning HTTP control plane"));
+        }
         // Remote: scope fields, if present, are silently ignored — see this
         // function's doc comment. Engagement profiles are refused: no host
         // transport carries a workflow run's.
@@ -830,11 +966,40 @@ async fn launch_run(
             "scope_kind and working_dir are mutually exclusive — the scope selector determines the working directory",
         ));
     }
-    let scope_working_dir =
-        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?;
-    // Unchanged local behavior (including the 501 when no launcher is
-    // installed) except for the scope-driven working_dir override computed
-    // above, which only ever fills in a working_dir the body left unset.
+    let scope_working_dir = if let Some(workspace_id) = &b.workspace_id {
+        if b.expected_revision.is_none() || b.scope_kind.is_none() {
+            return Err(ApiError::bad_request(
+                "workspace_id requires expected_revision and explicit source scope",
+            ));
+        }
+        if b.working_dir.is_some() {
+            return Err(ApiError::bad_request(
+                "workspace_id and working_dir are mutually exclusive",
+            ));
+        }
+        if b.scope_kind.as_deref() == Some("project") && b.scope_id.as_ref() != Some(workspace_id) {
+            return Err(ApiError::bad_request(
+                "a project definition must execute in its owning workspace",
+            ));
+        }
+        let workspace = store(&s)
+            .list()
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .into_iter()
+            .find(|w| &w.id == workspace_id)
+            .ok_or_else(|| ApiError::not_found("execution workspace not found"))?;
+        let root = std::path::PathBuf::from(workspace.path)
+            .canonicalize()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if !root.is_dir() {
+            return Err(ApiError::bad_request(
+                "execution workspace is not a directory",
+            ));
+        }
+        Some(root)
+    } else {
+        resolve_launch_scope(&s, &name, b.scope_kind.as_deref(), b.scope_id.as_deref())?
+    };
     if b.working_dir.is_none() {
         b.working_dir = scope_working_dir.map(|p| p.display().to_string());
     }
@@ -842,9 +1007,75 @@ async fn launch_run(
         .launcher
         .as_ref()
         .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
+    let pinned_file = if let Some(expected) = b.expected_revision.as_deref() {
+        let kind = b
+            .scope_kind
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("guarded launch requires explicit scope_kind"))?
+            .parse()
+            .map_err(|_| ApiError::bad_request("invalid scope_kind"))?;
+        let selected = selected_definition(
+            &s,
+            &name,
+            &ScopeQuery {
+                scope_kind: Some(kind),
+                scope_id: b.scope_id.clone(),
+            },
+        )?;
+        let _lock = definition_lock(&selected.1).await?;
+        let raw =
+            std::fs::read_to_string(&selected.0).map_err(|e| ApiError::internal(e.to_string()))?;
+        if revision(&raw) != expected {
+            return Err(ApiError::conflict(
+                "workflow revision changed; reload before launching",
+            ));
+        }
+        let workflow = Workflow::parse(&raw).map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if workflow.name != name {
+            return Err(ApiError::bad_request(
+                "workflow name must equal the workflow file name",
+            ));
+        }
+        crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
+        let dir = yaml_launch_dir(&s);
+        std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
+        let path = dir.join(format!("{}.yaml", ulid::Ulid::new()));
+        // This durable source outlives the detached child; it may contain private
+        // workflow inputs/defaults, so never widen the original file's visibility.
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut snapshot = options
+            .open(&path)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        snapshot
+            .write_all(raw.as_bytes())
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        snapshot
+            .sync_all()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        Some(path)
+    } else {
+        None
+    };
+    let source = b.expected_revision.as_ref().map(|revision| {
+        serde_json::json!({
+            "scope_kind": b.scope_kind, "scope_id": b.scope_id, "revision": revision,
+        })
+    });
+    let execution_workspace = b.workspace_id.clone().or_else(|| {
+        (b.scope_kind.as_deref() == Some("project"))
+            .then(|| b.scope_id.clone())
+            .flatten()
+    });
     let req = crate::launcher::LaunchRequest {
         engagement_profiles,
-        file: None,
+        file: pinned_file,
         workflow: name,
         inputs: b.inputs,
         mode: b.mode,
@@ -852,9 +1083,14 @@ async fn launch_run(
         working_dir: b.working_dir,
     };
     match launcher.launch(req).await {
-        Ok(run_id) => Ok(Json(
-            serde_json::json!({ "run_id": run_id, "host_id": "local" }),
-        )),
+        Ok(run_id) => {
+            let mut reply = serde_json::json!({ "run_id": run_id, "host_id": "local" });
+            if let Some(source) = source {
+                reply["source"] = source;
+                reply["workspace_id"] = serde_json::json!(execution_workspace);
+            }
+            Ok(Json(reply))
+        }
         Err(LaunchError::Invalid(m)) => Err(ApiError::bad_request(m)),
         Err(LaunchError::Spawn(m)) => Err(ApiError::internal(m)),
     }
@@ -970,6 +1206,8 @@ mod tests {
         let mut inputs = std::collections::BTreeMap::new();
         inputs.insert("repo".to_string(), "acme/widgets".to_string());
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: inputs.clone(),
             mode: Some("bypass".into()),
@@ -1001,6 +1239,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1051,6 +1291,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1090,6 +1332,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1122,6 +1366,8 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1154,6 +1400,8 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1199,6 +1447,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1239,6 +1489,8 @@ mod tests {
         std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1274,6 +1526,8 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1310,6 +1564,8 @@ mod tests {
             .expect("add_host should succeed");
 
         let body = LaunchBody {
+            workspace_id: None,
+            expected_revision: None,
             engagement_profiles: Vec::new(),
             inputs: Default::default(),
             mode: None,
@@ -1355,6 +1611,7 @@ mod tests {
             Query(ScopeQuery::default()),
             Json(WorkflowWriteBody {
                 raw: VALID_YAML.into(),
+                ..Default::default()
             }),
         )
         .await
@@ -1366,9 +1623,13 @@ mod tests {
         );
 
         // Re-reading via get_workflow returns the new yaml.
-        let got = get_workflow(State(s.clone()), Path("demo".into()))
-            .await
-            .expect("get ok");
+        let got = get_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Query(ScopeQuery::default()),
+        )
+        .await
+        .expect("get ok");
         assert_eq!(got.0["yaml"], serde_json::json!(VALID_YAML));
     }
 
@@ -1381,7 +1642,10 @@ mod tests {
             State(s.clone()),
             Path("demo".into()),
             Query(ScopeQuery::default()),
-            Json(WorkflowWriteBody { raw: "".into() }),
+            Json(WorkflowWriteBody {
+                raw: "".into(),
+                ..Default::default()
+            }),
         )
         .await
         .expect_err("should reject");
@@ -1400,6 +1664,7 @@ mod tests {
             Query(ScopeQuery::default()),
             Json(WorkflowWriteBody {
                 raw: VALID_YAML.into(),
+                ..Default::default()
             }),
         )
         .await
@@ -1415,8 +1680,9 @@ mod tests {
 
         let resp = create_workflow(
             State(s.clone()),
-            Json(WorkflowWriteBody {
+            Json(WorkflowCreateBody {
                 raw: VALID_YAML.into(),
+                ..Default::default()
             }),
         )
         .await
@@ -1429,8 +1695,9 @@ mod tests {
 
         let err = create_workflow(
             State(s.clone()),
-            Json(WorkflowWriteBody {
+            Json(WorkflowCreateBody {
                 raw: VALID_YAML.into(),
+                ..Default::default()
             }),
         )
         .await
@@ -1455,8 +1722,9 @@ mod tests {
 
         let err = create_workflow(
             State(s.clone()),
-            Json(WorkflowWriteBody {
+            Json(WorkflowCreateBody {
                 raw: VALID_YAML.into(),
+                ..Default::default()
             }),
         )
         .await
@@ -1513,6 +1781,7 @@ mod tests {
             }),
             Json(WorkflowWriteBody {
                 raw: edited.clone(),
+                ..Default::default()
             }),
         )
         .await
@@ -1562,6 +1831,7 @@ mod tests {
             }),
             Json(WorkflowWriteBody {
                 raw: edited.clone(),
+                ..Default::default()
             }),
         )
         .await
@@ -1607,6 +1877,7 @@ mod tests {
                 raw: VALID_YAML
                     .replace("demo", "shared-name")
                     .replace("hi", "should-not-land"),
+                ..Default::default()
             }),
         )
         .await
@@ -1651,6 +1922,7 @@ mod tests {
             Query(ScopeQuery::default()),
             Json(WorkflowWriteBody {
                 raw: edited.clone(),
+                ..Default::default()
             }),
         )
         .await
@@ -1677,6 +1949,7 @@ mod tests {
     async fn validate_valid_yaml_is_ok() {
         let resp = validate_workflow(Json(WorkflowWriteBody {
             raw: VALID_YAML.into(),
+            ..Default::default()
         }))
         .await
         .expect("valid yaml should validate");
@@ -1688,6 +1961,7 @@ mod tests {
         // An empty/invalid workflow (no steps) fails `Workflow::parse`.
         let err = validate_workflow(Json(WorkflowWriteBody {
             raw: "steps: []".into(),
+            ..Default::default()
         }))
         .await
         .expect_err("invalid workflow should reject");
@@ -2212,7 +2486,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         // Absent from global, present only in the project — must resolve, not 404.
-        let resp = get_workflow(State(s), Path("demo".into()))
+        let resp = get_workflow(State(s), Path("demo".into()), Query(ScopeQuery::default()))
             .await
             .expect("project-only workflow should resolve via detail");
         assert_eq!(resp.0["yaml"], serde_json::json!(VALID_YAML));
@@ -2238,7 +2512,7 @@ mod tests {
         std::fs::create_dir_all(workflows_dir(&s)).unwrap();
         std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
 
-        let resp = get_workflow(State(s), Path("demo".into()))
+        let resp = get_workflow(State(s), Path("demo".into()), Query(ScopeQuery::default()))
             .await
             .expect("global workflow should resolve");
         assert_eq!(resp.0["scope"], serde_json::json!("global"));
@@ -2578,5 +2852,293 @@ mod tests {
                 .join("workflows")
                 .join("issue-triage.yaml")
         );
+    }
+    fn project_scope(id: &str) -> ScopeQuery {
+        ScopeQuery {
+            scope_kind: Some(ScopeKind::Project),
+            scope_id: Some(id.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_revision_project_create_get_and_save_never_cross_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        register_workspace(&tmp, "ws_a", a.path());
+        register_workspace(&tmp, "ws_b", b.path());
+        for (id, label) in [("ws_a", "project-a"), ("ws_b", "project-b")] {
+            let created = create_workflow(
+                State(s.clone()),
+                Json(WorkflowCreateBody {
+                    raw: VALID_YAML.replace("hi", label),
+                    scope_kind: Some(ScopeKind::Project),
+                    scope_id: Some(id.into()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(created["scope_id"], id);
+            assert_eq!(
+                created["revision"],
+                revision(&VALID_YAML.replace("hi", label))
+            );
+        }
+        let detail = get_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Query(project_scope("ws_b")),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(detail["yaml"], VALID_YAML.replace("hi", "project-b"));
+        let save = write_workflow(
+            State(s.clone()),
+            Path("demo".into()),
+            Query(project_scope("ws_b")),
+            Json(WorkflowWriteBody {
+                raw: VALID_YAML.replace("hi", "updated-b"),
+                expected_revision: detail["revision"].as_str().map(str::to_string),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(save["scope_id"], "ws_b");
+        assert_eq!(save["yaml"], VALID_YAML.replace("hi", "updated-b"));
+        assert_eq!(
+            std::fs::read_to_string(wf_path(&s, "demo")).unwrap(),
+            VALID_YAML
+        );
+        assert_eq!(
+            std::fs::read_to_string(a.path().join(".rupu/workflows/demo.yaml")).unwrap(),
+            VALID_YAML.replace("hi", "project-a")
+        );
+        let duplicate = create_workflow(
+            State(s.clone()),
+            Json(WorkflowCreateBody {
+                raw: VALID_YAML.into(),
+                scope_kind: Some(ScopeKind::Project),
+                scope_id: Some("ws_b".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(duplicate.0, axum::http::StatusCode::CONFLICT);
+        let missing = get_workflow(
+            State(s),
+            Path("demo".into()),
+            Query(project_scope("ws_missing")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.0, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn scoped_revision_concurrent_saves_have_one_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = test_state(&tmp);
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+        let save = |text: &str| {
+            write_workflow(
+                State(s.clone()),
+                Path("demo".into()),
+                Query(ScopeQuery {
+                    scope_kind: Some(ScopeKind::Global),
+                    scope_id: None,
+                }),
+                Json(WorkflowWriteBody {
+                    raw: VALID_YAML.replace("hi", text),
+                    expected_revision: Some(revision(VALID_YAML)),
+                    ..Default::default()
+                }),
+            )
+        };
+        let (a, b) = tokio::join!(save("first"), save("second"));
+        assert_ne!(a.is_ok(), b.is_ok());
+        let loser = if a.is_err() {
+            a.unwrap_err()
+        } else {
+            b.unwrap_err()
+        };
+        assert_eq!(loser.0, axum::http::StatusCode::CONFLICT);
+        let raw = std::fs::read_to_string(wf_path(&s, "demo")).unwrap();
+        assert!(
+            raw == VALID_YAML.replace("hi", "first") || raw == VALID_YAML.replace("hi", "second")
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_revision_stale_launch_never_spawns_and_valid_launch_pins_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_guarded".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+        register_workspace(&tmp, "ws_a", project.path());
+        let dir = project.path().join(".rupu/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("demo.yaml"), VALID_YAML).unwrap();
+        let body = |rev: &str| LaunchBody {
+            expected_revision: Some(rev.into()),
+            scope_kind: Some("project".into()),
+            scope_id: Some("ws_a".into()),
+            mode: Some("readonly".into()),
+            ..Default::default()
+        };
+        let error = launch_run(
+            State(s.clone()),
+            Path("demo".into()),
+            Some(Json(body("stale"))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+        assert!(mock.last.lock().unwrap().is_none());
+        assert!(!yaml_launch_dir(&s).exists());
+        let result = launch_run(
+            State(s.clone()),
+            Path("demo".into()),
+            Some(Json(body(&revision(VALID_YAML)))),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(result["run_id"], "run_guarded");
+        let req = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.working_dir.as_deref(), project.path().to_str());
+        assert_eq!(req.mode.as_deref(), Some("readonly"));
+        let pinned = req.file.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&pinned).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_ne!(pinned, dir.join("demo.yaml"));
+        std::fs::write(dir.join("demo.yaml"), VALID_YAML.replace("hi", "later")).unwrap();
+        assert_eq!(std::fs::read_to_string(pinned).unwrap(), VALID_YAML);
+    }
+
+    #[tokio::test]
+    async fn scoped_revision_global_source_uses_registered_execution_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "run_project".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+        register_workspace(&tmp, "ws_a", project.path());
+        std::fs::create_dir_all(workflows_dir(&s)).unwrap();
+        std::fs::write(wf_path(&s, "demo"), VALID_YAML).unwrap();
+        let response = launch_run(
+            State(s),
+            Path("demo".into()),
+            Some(Json(LaunchBody {
+                scope_kind: Some("global".into()),
+                expected_revision: Some(revision(VALID_YAML)),
+                workspace_id: Some("ws_a".into()),
+                mode: Some("readonly".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .0;
+        let req = mock.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            req.working_dir.as_deref(),
+            project.path().canonicalize().unwrap().to_str()
+        );
+        assert_eq!(response["source"]["scope_kind"], "global");
+        assert_eq!(response["source"]["revision"], revision(VALID_YAML));
+        assert_eq!(response["workspace_id"], "ws_a");
+        assert_eq!(
+            std::fs::read_to_string(req.file.unwrap()).unwrap(),
+            VALID_YAML
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_revision_project_cannot_retarget_or_launch_unknown_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "never".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+        register_workspace(&tmp, "ws_a", project.path());
+        let dir = project.path().join(".rupu/workflows");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("demo.yaml"), VALID_YAML).unwrap();
+        let result = launch_run(
+            State(s.clone()),
+            Path("demo".into()),
+            Some(Json(LaunchBody {
+                scope_kind: Some("project".into()),
+                scope_id: Some("ws_a".into()),
+                expected_revision: Some(revision(VALID_YAML)),
+                workspace_id: Some("ws_b".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.0, axum::http::StatusCode::BAD_REQUEST);
+        let result = launch_run(
+            State(s.clone()),
+            Path("demo".into()),
+            Some(Json(LaunchBody {
+                scope_kind: Some("global".into()),
+                expected_revision: Some(revision(VALID_YAML)),
+                workspace_id: Some("missing".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.0, axum::http::StatusCode::NOT_FOUND);
+        assert!(mock.last.lock().unwrap().is_none());
+        assert!(!yaml_launch_dir(&s).exists());
+    }
+    #[tokio::test]
+    async fn scoped_revision_remote_launch_is_refused_before_host_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockLauncher {
+            last: Mutex::new(None),
+            run_id: "never".into(),
+        });
+        let s = test_state(&tmp).with_launcher(Some(mock.clone()));
+        let error = launch_run(
+            State(s.clone()),
+            Path("demo".into()),
+            Some(Json(LaunchBody {
+                host: Some("unregistered-remote".into()),
+                scope_kind: Some("global".into()),
+                expected_revision: Some(revision(VALID_YAML)),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(mock.last.lock().unwrap().is_none());
+        assert!(!yaml_launch_dir(&s).exists());
     }
 }

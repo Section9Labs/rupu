@@ -66,6 +66,10 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             scm_hosts: scm_hosts_vec,
             permission_modes: permission_modes_vec,
         },
-        features: crate::node::protocol::host_features(),
+        features: {
+            let mut features = crate::node::protocol::host_features();
+            features.push("workflow.scoped_revision".to_string());
+            features
+        },
     }))
 }
