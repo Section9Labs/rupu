@@ -28,8 +28,8 @@ Primary reference: [Codex 0.166.0 model-list implementation](https://github.com/
 
 ## Validation
 
-The superseded fallback passed its 30 unit tests but failed live acceptance with a scope error; those tests did not prove the credential-flow assumption. The corrected version-gate implementation has new regressions for current-versus-obsolete requests, preservation of a configured custom endpoint and selected bearer/account header, and visibility filtering across both listing methods. Existing API-key fallback and token-refresh persistence coverage is retained. `rustfmt` and scoped `git diff --check` pass; the corrected provider test filter is pending the shared target becoming available.
+All 27 corrected `fetch_models_tests` passed on the combined tree. Coverage includes the obsolete-versus-current protocol gate, selected custom endpoint and bearer/account preservation, visibility filtering, API-key fallback, and token-refresh persistence. Scoped formatting and whitespace checks passed.
 
-The direct live probe proves the version gate and real account model counts. A targeted refresh through the rebuilt CP and its authoritative cache remains pending parent integration. No completion request, agent job, CP restart, provider reauthentication, or release was performed by this workstream. Probes printed only status/count/schema metadata, not credentials or account IDs.
+The rebuilt dedicated CP then completed a targeted `openai` refresh successfully with 13 models. A separate `GET /api/models` confirmed 13 cached entries and a fresh retrieval time. The native app displayed those actual OpenAI choices and accepted a first-turn model selection before any session execution. The same existing account and credential store were retained.
 
-The final corrected implementation passed all 27 `fetch_models_tests` on the combined tree. The earlier 30-test result covered the removed public fallback and is superseded. No model completion was part of this check.
+This establishes live catalog discovery through Rupu and its native client. No new provider completion, reauthentication, or release was performed. Earlier tests of a public-endpoint fallback were superseded after live acceptance exposed its incompatible token scopes. Raw receipts, exact session identities and credentials are excluded from this repository.

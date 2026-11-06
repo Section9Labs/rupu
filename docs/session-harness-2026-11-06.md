@@ -126,7 +126,7 @@ silently discard the marker. Legacy records retain their prior minimum versions,
 frozen prompts/tools, history, and fallback lookup. Existing agent-based HTTP
 creation remains available.
 
-## Validation and handoff
+## Validation
 
 The component checks below use the isolated checkout's target directory with
 `CARGO_BUILD_JOBS=4`, `CARGO_PROFILE_DEV_DEBUG=0`, and
@@ -150,18 +150,17 @@ The component checks below use the isolated checkout's target directory with
 | `cargo test -p rupu-cp --no-default-features --test it mcp_ops_sessions` | 3 passed |
 | `cargo test -p rupu-cp --no-default-features --test it first_turn_session_selection` | 1 passed |
 | `cargo test -p rupu-cp --no-default-features --test it mcp_routes` | 5 passed; all 193 operator tools pinned, including the four new session/history operations |
-| `cargo test -p rupu-cp --no-default-features --lib scoped_revision` | 6 passed after the parent's test-only Clippy correction |
+| `cargo test -p rupu-cp --no-default-features --lib scoped_revision` | 6 passed after the test-only Clippy correction |
 | `cargo build -p rupu-cli --no-default-features --bin rupu` | Passed; resulting binary reports `rupu 0.87.0 (dev)` |
+| `cargo build -p rupu-cli --bin rupu` | Passed with the corrected provider catalog and actual web assets |
+| `cargo test -p rupu-cli --no-default-features --test it cli_session::` | 17 passed, including newer-record preservation |
+| `cargo test -p rupu-providers --lib fetch_models_tests` | 27 passed on the final catalog implementation |
 
-Provider discovery changed after the published snapshot: the initial public
-catalog fallback passed 30 mocked tests but failed the parent's live acceptance
-because the selected token lacked the required scope. Parent commit `cec4cefd`
-replaced that fallback with a current Codex catalog client version. Its owner
-reports all 27 corrected provider catalog tests passing. The updated contract,
-direct probe evidence, and remaining acceptance are in
-`docs/harness-2026-11-06/provider-model-discovery.md`. The binary build above
-predates this correction; the parent owns the rebuilt runtime, cache refresh,
-and deployment acceptance. Catalog discovery does not
+The final OpenAI catalog implementation preserves the selected Codex account and
+uses the verified catalog compatibility version. A real refresh through the
+rebuilt CP returned 13 models; a separate catalog read confirmed those cached
+entries, and the native picker displayed them. The diagnosis and boundaries are
+in `docs/harness-2026-11-06/provider-model-discovery.md`. Model discovery does not
 establish successful model completion.
 
 Combined CP/CLI test logs and machine-readable results are under
@@ -171,18 +170,28 @@ allowed passed. Project creation was rerun successfully after the parent's
 provider discovery change settled. Apple's linker emitted a nonfatal
 compact-unwind size warning for the large integration-test binaries.
 
-The implementation snapshot is commit `1f3da72a`, published by the parent in
-draft Rupu PR #946. The MCP fixture/count correction and this completed validation
-record are a separate follow-up. Parent commit `cec4cefd` contains the provider
-correction, test-only Clippy changes, and the CLI newer-record fixture update
-from hardcoded version 4 to `SessionRecord::VERSION + 1`. The full `cli_session::` regression
-filter for that last update remains with the parent; it is not included in the
-focused results above. This workstream has released the isolated Cargo target.
+The implementation and follow-up corrections are published in Rupu PR #946,
+above the #944/#945 dependency stack. The first remote CI run built macOS,
+Linux x64, and Linux ARM64 binaries. Its workflow-test lint findings and stale
+session-version/MCP fixtures were corrected; CI is rerunning on code commit
+`6e4577e5`. These notes distinguish local component checks from remote release
+gates and real integration evidence.
 
-No real provider work, installation, control-plane restart, push, or merge is
-part of this backend workstream. Native UI integration, a successful live
-provider journey, final combined permission acceptance, packaging and deployment
-remain with the parent workstream. Mock provider and disposable filesystem tests
-are component evidence, not live integration acceptance.
+## Real integration acceptance
+
+A dedicated verification CP built from the published PR source created a real
+idle built-in session in the existing application project. It contained zero
+turns and no runs. Attaching and reopening an existing completed review workflow
+preserved the original session and run records and did not start a provider
+worker. The native app loaded actual project history, restored the pinned graph,
+and expanded the original agent conversation with recorded identity. Exact
+receipts and private screenshots remain outside Git.
+
+The full local CLI build and native signed release build passed. The native
+suite passed 213 tests, and the final CLI session regression filter passed all
+17 tests, including future-version preservation. This milestone does not claim
+a new provider completion, remote harness execution, interactive approval,
+whole-platform UI parity, or a released beta. Platform publication and release
+remain separate from dedicated-instance acceptance.
 
 AI-assisted implementation: OpenAI Codex.
