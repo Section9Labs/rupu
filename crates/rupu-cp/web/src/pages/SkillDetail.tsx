@@ -4,15 +4,17 @@
 // its project's ws_id).
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Link, useParams, useSearchParams } from 'react-router-dom';
-import { ArrowLeft } from 'lucide-react';
+import { useParams, useSearchParams } from 'react-router-dom';
 import { api, apiErrorMessage, type SkillDetail, type SkillLayer } from '../lib/api';
 import Markdown from '../components/transcript/Markdown';
 import { Badge } from '../components/ui/Badge';
+import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
 import { SkillActions } from '../components/skills/SkillActions';
+
+const BACK = { label: 'Skills', to: '/library?tab=skills' };
 
 export default function SkillDetailPage() {
   const { layer = '', name = '' } = useParams<{ layer: string; name: string }>();
@@ -47,7 +49,7 @@ export default function SkillDetailPage() {
   if (error) {
     return (
       <div className="p-8">
-        <BackLink />
+        <PageHeader back={BACK} title="Skill" />
         <ErrorBanner className="mt-4">{error}</ErrorBanner>
       </div>
     );
@@ -56,8 +58,8 @@ export default function SkillDetailPage() {
   if (!skill) {
     return (
       <div className="p-8">
-        <BackLink />
-        <div className="mt-4">
+        <PageHeader back={BACK} title="Skill" />
+        <div className="mt-6">
           <Spinner label="Loading…" />
         </div>
       </div>
@@ -68,39 +70,29 @@ export default function SkillDetailPage() {
 
   return (
     <div className="p-8">
-      <BackLink />
+      <PageHeader back={BACK} title={<span className="break-all font-mono">{skill.name}</span>}
+        actions={<SkillActions key={`${skill.layer}/${skill.name}`} name={skill.name} layer={skill.layer}
+          wsId={wsId} hasSource={skill.source !== null} onChanged={() => setReload((n) => n + 1)} />}
+      />
 
       <header className="mt-3">
-        <div className="flex flex-wrap items-start gap-4">
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h1 className="break-all font-mono text-2xl font-semibold text-ink">{skill.name}</h1>
-              <ScopeChip scope={skill.layer} />
-              {skill.both_layers && <Badge ring>both layers</Badge>}
-              {skill.disable_model_invocation && (
-                <Badge ring title="disable-model-invocation: only an operator or a preload brings it in">
-                  operator-invoked only
-                </Badge>
-              )}
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-note text-ink-mute">
-              <span>
-                source{' '}
-                <span className="font-mono text-ink-dim">
-                  {skill.source ?? (skill.source_error ? `unreadable (${skill.source_error})` : '-')}
-                </span>
-              </span>
-              <span className="break-all font-mono">{skill.path}</span>
-            </div>
-          </div>
-          <SkillActions
-            key={`${skill.layer}/${skill.name}`}
-            name={skill.name}
-            layer={skill.layer}
-            wsId={wsId}
-            hasSource={skill.source !== null}
-            onChanged={() => setReload((n) => n + 1)}
-          />
+        <div className="flex flex-wrap items-center gap-2">
+          <ScopeChip scope={skill.layer} />
+          {skill.both_layers && <Badge ring>both layers</Badge>}
+          {skill.disable_model_invocation && (
+            <Badge ring title="disable-model-invocation: only an operator or a preload brings it in">
+              operator-invoked only
+            </Badge>
+          )}
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-note text-ink-mute">
+          <span>
+            source{' '}
+            <span className="font-mono text-ink-dim">
+              {skill.source ?? (skill.source_error ? `unreadable (${skill.source_error})` : '-')}
+            </span>
+          </span>
+          <span className="break-all font-mono">{skill.path}</span>
         </div>
         {skill.status === 'invalid' && skill.error && (
           <ErrorBanner className="mt-3">
@@ -203,17 +195,5 @@ function Code({ children }: { children: ReactNode }) {
     <span className="inline-flex items-center rounded bg-surface px-1.5 py-0.5 font-mono text-note text-ink ring-1 ring-border">
       {children}
     </span>
-  );
-}
-
-function BackLink() {
-  return (
-    <Link
-      to="/library?tab=skills"
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-ink-dim hover:text-ink"
-    >
-      <ArrowLeft size={14} />
-      Skills
-    </Link>
   );
 }

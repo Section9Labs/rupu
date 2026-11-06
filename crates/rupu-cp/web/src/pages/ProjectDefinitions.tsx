@@ -4,7 +4,7 @@
 // Each row carries a scope badge: project (local override) or global.
 
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useParams } from 'react-router-dom';
 import { Sparkles, Workflow as WorkflowIcon, Zap } from 'lucide-react';
 import {
   api,
@@ -15,6 +15,10 @@ import {
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import { TriggerChip } from '../components/TriggerChip';
 import { TabBar, TabButton } from '../components/TabBar';
+import { PageHeader } from '../components/ui/PageHeader';
+import { EmptyState } from '../components/ui/EmptyState';
+import { ErrorBanner } from '../components/ui/ErrorBanner';
+import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { EnabledChip } from './AutoflowsDefs';
 import { cn } from '../lib/cn';
 
@@ -178,12 +182,15 @@ const AUTOFLOW_COLUMNS: Column<AutoflowDefRow>[] = [
 
 function EmptyDefs({ label }: { label: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-border bg-panel/50 py-12 flex flex-col items-center justify-center text-center">
-      <p className="text-sm font-medium text-ink">No {label} visible</p>
-      <p className="mt-1 text-xs text-ink-dim max-w-xs">
-        Global and project-local <span className="font-mono">.rupu/</span> {label} will appear here.
-      </p>
-    </div>
+    <EmptyState
+      title={`No ${label} visible`}
+      hint={
+        <>
+          Global and project-local <span className="font-mono">.rupu/</span> {label} will appear
+          here.
+        </>
+      }
+    />
   );
 }
 
@@ -225,19 +232,18 @@ export default function ProjectDefinitions() {
 
   return (
     <div>
-      <header className="px-8 pt-8 pb-3">
-        <Link
-          to={`/projects/${encodedId}`}
-          className="text-note font-medium text-brand-600 hover:text-brand-700"
-        >
-          ← Back to project
-        </Link>
-        <h1 className="mt-2 text-2xl font-semibold text-ink">Definitions</h1>
-        <p className="mt-1 text-sm text-ink-dim">
-          Agents, workflows, and autoflows visible to this project — global defs merged with the
-          project&apos;s local <span className="font-mono">.rupu/</span> overrides.
-        </p>
-      </header>
+      <div className="px-8 pt-8 pb-3">
+        <PageHeader
+          back={{ label: 'Back to project', to: `/projects/${encodedId}` }}
+          title="Definitions"
+          subtitle={
+            <>
+              Agents, workflows, and autoflows visible to this project — global defs merged with the
+              project&apos;s local <span className="font-mono">.rupu/</span> overrides.
+            </>
+          }
+        />
+      </div>
 
       <TabBar>
         <TabButton
@@ -261,11 +267,7 @@ export default function ProjectDefinitions() {
       </TabBar>
 
       <div className="px-8 py-6">
-        {error && (
-          <div className="mb-4 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-            {error}
-          </div>
-        )}
+        {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
         {tab === 'agents' && <AgentsTab agents={agents} />}
         {tab === 'workflows' && <WorkflowsTab workflows={workflows} />}
@@ -278,7 +280,7 @@ export default function ProjectDefinitions() {
 // ── Tabs ────────────────────────────────────────────────────────────────────
 
 function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
-  if (agents === null) return <div className="text-sm text-ink-dim">Loading agents…</div>;
+  if (agents === null) return <ListSkeleton label="Loading agents…" />;
   if (agents.length === 0) return <EmptyDefs label="agents" />;
   return (
     <SortableTable<AgentSummary>
@@ -292,7 +294,7 @@ function AgentsTab({ agents }: { agents: AgentSummary[] | null }) {
 }
 
 function WorkflowsTab({ workflows }: { workflows: WorkflowSummary[] | null }) {
-  if (workflows === null) return <div className="text-sm text-ink-dim">Loading workflows…</div>;
+  if (workflows === null) return <ListSkeleton label="Loading workflows…" />;
   if (workflows.length === 0) return <EmptyDefs label="workflows" />;
   return (
     <SortableTable<WorkflowSummary>
@@ -306,7 +308,7 @@ function WorkflowsTab({ workflows }: { workflows: WorkflowSummary[] | null }) {
 }
 
 function AutoflowsTab({ autoflows }: { autoflows: AutoflowDefRow[] | null }) {
-  if (autoflows === null) return <div className="text-sm text-ink-dim">Loading autoflows…</div>;
+  if (autoflows === null) return <ListSkeleton label="Loading autoflows…" />;
   if (autoflows.length === 0) return <EmptyDefs label="autoflows" />;
   return (
     <SortableTable<AutoflowDefRow>
