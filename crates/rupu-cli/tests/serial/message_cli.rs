@@ -251,3 +251,49 @@ fn count_messages(global: &Path) -> usize {
         .filter(|l| l.contains(r#""t":"msg""#))
         .count()
 }
+
+/// The hidden `rupu __board` (the SSH transport's board read): one
+/// `BoardView` on stdout, or `{"error": {code, message}}` and exit 3.
+#[test]
+fn board_helper_prints_the_view_and_errors_with_exit_3() {
+    use rupu_fleet::{Board, ClaimOutcome, Directive};
+    use rupu_runtime::services::board::BoardView;
+    let _guard = ENV_LOCK.blocking_lock();
+    let fx = fixture();
+    let board = Board::new(fx.global.join("runs").join(RUN).join("messages"));
+    match board
+        .claim("auth-flow", "lynx#1", Duration::from_secs(3600))
+        .unwrap()
+    {
+        ClaimOutcome::Granted(guard) => std::mem::forget(guard),
+        other => panic!("{other:?}"),
+    }
+    board
+        .put_directive(&Directive {
+            id: String::new(),
+            author: "lead".into(),
+            ts: "2026-10-21T10:00:00Z".into(),
+            body: "focus on login".into(),
+            addressed_to: None,
+        })
+        .unwrap();
+
+    let out = fx.rupu(&["__board", RUN]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout(&out).lines().count(), 1, "one JSON object: {out:?}");
+    let view: BoardView = serde_json::from_slice(&out.stdout).unwrap();
+    let claims: Vec<(&str, &str)> = view
+        .claims
+        .iter()
+        .map(|c| (c.key.as_str(), c.owner.as_str()))
+        .collect();
+    assert_eq!(claims, [("auth-flow", "lynx#1")]);
+    assert_eq!(view.directives.len(), 1);
+    assert_eq!(view.directives[0].body, "focus on login");
+    assert!(view.journal);
+
+    let out = fx.rupu(&["__board", "run_nope"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let err: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(err["error"]["code"], json!("not_found"), "{err}");
+}

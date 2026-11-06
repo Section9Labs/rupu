@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 // LauncherSheet — fills a declared input, picks a mode, launches, and asserts
-// the launch call shape + navigation to the new run. `api.launchRun` and
+// the launch call shape + navigation to the new run. `launchApi.launchWorkflowRun` and
 // react-router's `useNavigate` are both stubbed.
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { launchApi } from '../lib/api3b/launch';
 import { api, ApiError, type PreviewResponse } from '../lib/api';
 
 // Stub useNavigate — keep the rest of react-router-dom intact.
@@ -29,6 +30,8 @@ beforeEach(() => {
   vi.spyOn(api, 'getProjects').mockResolvedValue([]);
   vi.spyOn(api, 'getRepos').mockResolvedValue([]);
   vi.spyOn(api, 'launchPreview').mockResolvedValue(GLOBAL_PREVIEW);
+  vi.spyOn(launchApi, 'getEngagementProfiles').mockResolvedValue({ profiles: [], errors: [] });
+  vi.spyOn(api, 'getModelCatalog').mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -42,7 +45,7 @@ describe('LauncherSheet', () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-xyz' });
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-xyz' });
 
     render(<LauncherSheet workflow="audit" declaredInputs={['target_dir']} onClose={() => {}} />);
 
@@ -70,7 +73,7 @@ describe('LauncherSheet', () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    vi.spyOn(api, 'launchRun').mockRejectedValue(new Error('no launcher'));
+    vi.spyOn(launchApi, 'launchWorkflowRun').mockRejectedValue(new Error('no launcher'));
 
     render(<LauncherSheet workflow="audit" declaredInputs={['target_dir']} onClose={() => {}} />);
     fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
@@ -84,7 +87,7 @@ describe('LauncherSheet', () => {
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
     vi.spyOn(api, 'browseDir').mockResolvedValue({ path: '/tmp/myproject', parent: null, dirs: [] });
-    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-dir' });
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-dir' });
 
     render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
 
@@ -107,14 +110,14 @@ describe('LauncherSheet', () => {
     );
   });
 
-  it('remote host launch: passes host to launchRun and carries ?host= in navigate', async () => {
+  it('remote host launch: passes host to launchWorkflowRun and carries ?host= in navigate', async () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([
       { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
       { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
     ]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-remote' });
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-remote' });
 
     render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
 
@@ -138,7 +141,7 @@ describe('LauncherSheet', () => {
     ]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-local' });
+    vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-local' });
 
     render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
 
@@ -151,7 +154,7 @@ describe('LauncherSheet', () => {
     vi.spyOn(api, 'getHosts').mockResolvedValue([]);
     vi.spyOn(api, 'getProjects').mockResolvedValue([]);
     vi.spyOn(api, 'getRepos').mockResolvedValue([]);
-    const launchSpy = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'run-repo' });
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-repo' });
 
     render(<LauncherSheet workflow="deploy" declaredInputs={[]} onClose={() => {}} />);
 
@@ -202,7 +205,7 @@ describe('LauncherSheet', () => {
 
   it('disables Launch with the server message when the preview is a 409', async () => {
     vi.spyOn(api, 'launchPreview').mockRejectedValue(new ApiError(409, 'customer "gone" no longer exists'));
-    const launch = vi.spyOn(api, 'launchRun').mockResolvedValue({ run_id: 'r' } as never);
+    const launch = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'r' } as never);
     render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
     expect(await screen.findByRole('alert')).toHaveTextContent('customer "gone" no longer exists');
     const btn = screen.getByRole('button', { name: 'Launch' });
@@ -224,5 +227,58 @@ describe('LauncherSheet', () => {
     fireEvent.change(picker, { target: { value: 'github:o/r' } });
     fireEvent.keyDown(picker, { key: 'Enter' });
     expect(await screen.findByText(/control plane's working directory/)).toBeInTheDocument();
+  });
+});
+
+describe('LauncherSheet engagement profiles (Plan 3b)', () => {
+  const PROFILES = {
+    profiles: [
+      {
+        id: 'web',
+        name: 'Web application',
+        layer: 'global' as const,
+        includes: [],
+        asset_kinds: [{ id: 'endpoint', label: '{url}' }],
+        bundle: { agents: ['crawler'], tools: [], workflows: ['web-assessment'] },
+      },
+    ],
+    errors: [],
+  };
+
+  beforeEach(() => {
+    vi.spyOn(launchApi, 'getEngagementProfiles').mockResolvedValue(PROFILES);
+  });
+
+  it('sends the chosen profiles', async () => {
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-p' });
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    const add = screen.getByRole('combobox', { name: 'Add an engagement profile' });
+    await waitFor(() => expect(within(add).getByRole('option', { name: /web/ })).toBeInTheDocument());
+    fireEvent.change(add, { target: { value: 'web' } });
+    expect(screen.getByText('crawler, web-assessment · asset kinds endpoint')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+    await waitFor(() =>
+      expect(launchSpy).toHaveBeenCalledWith('audit', expect.objectContaining({ engagement_profiles: ['web'] })),
+    );
+  });
+
+  it('a remote host can’t take profiles: disabled with the reason, none sent', async () => {
+    vi.spyOn(api, 'getHosts').mockResolvedValue([
+      { id: 'local', name: 'Local', transport_kind: 'local', status: 'online', active_run_count: 0 },
+      { id: 'host_x', name: 'host_x', transport_kind: 'http_cp', status: 'online', active_run_count: 0 },
+    ]);
+    const launchSpy = vi.spyOn(launchApi, 'launchWorkflowRun').mockResolvedValue({ run_id: 'run-r' });
+    render(<LauncherSheet workflow="audit" declaredInputs={[]} onClose={() => {}} />);
+    const add = screen.getByRole('combobox', { name: 'Add an engagement profile' });
+    await waitFor(() => expect(within(add).getByRole('option', { name: /web/ })).toBeInTheDocument());
+    fireEvent.change(add, { target: { value: 'web' } });
+    await waitFor(() => expect(screen.getByRole('option', { name: 'host_x' })).toBeInTheDocument());
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'host_x' } });
+
+    expect(screen.getByText(/a workflow launched on a remote host can’t take engagement profiles/)).toBeInTheDocument();
+    expect(add).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Launch' }));
+    await waitFor(() => expect(launchSpy).toHaveBeenCalled());
+    expect(launchSpy.mock.calls[0][1].engagement_profiles).toBeUndefined();
   });
 });

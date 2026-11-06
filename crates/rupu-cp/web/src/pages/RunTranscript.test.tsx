@@ -51,14 +51,14 @@ describe('RunTranscript query params', () => {
 describe('RunTranscript children', () => {
   it('lists a standalone run\'s children under a collapsible section', async () => {
     vi.spyOn(api, 'getTranscript').mockResolvedValue(EMPTY);
-    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([
+    const children = vi.spyOn(api, 'getRunChildTree').mockResolvedValue({ truncated: false, children: [
       {
         handle: 'ch_1', kind: 'subagent', name: 'helper', run_id: 'sub_1', parent_run_id: 'run_01ABC',
         depth: 1, codename: null, address: null, status: 'done', success: true, error: null,
         tokens: null, duration_ms: null, started_at: null, finished_at: null,
         transcript_path: '/t/sub_1.jsonl', legacy: false,
       },
-    ]);
+    ] });
     const { findByRole, getByTestId } = renderAt('?path=%2Ft%2Frun_01ABC.jsonl');
 
     const toggle = await findByRole('button', { name: /Children \(1\)/ });
@@ -70,7 +70,7 @@ describe('RunTranscript children', () => {
 
   it('asks for no children for a remote run or a transcript not named after a run', async () => {
     vi.spyOn(api, 'getTranscript').mockResolvedValue(EMPTY);
-    const children = vi.spyOn(api, 'getRunChildren').mockResolvedValue([]);
+    const children = vi.spyOn(api, 'getRunChildTree').mockResolvedValue({ truncated: false, children: [] });
     renderAt('?path=%2Ft%2Frun_01ABC.jsonl&host=h&run=run_01ABC');
     cleanup();
     renderAt('?path=%2Ft%2Fsession-turn.jsonl');

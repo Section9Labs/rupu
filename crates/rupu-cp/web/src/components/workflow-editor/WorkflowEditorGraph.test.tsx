@@ -86,6 +86,7 @@ vi.mock('@xyflow/react', () => ({
   ),
   Controls: () => null,
   MiniMap: () => null,
+  ViewportPortal: ({ children }: { children?: ReactNode }) => <>{children}</>,
   Handle: () => null,
   Position: { Top: 'top', Bottom: 'bottom', Left: 'left', Right: 'right' },
   MarkerType: { ArrowClosed: 'arrowclosed' },
@@ -1006,6 +1007,30 @@ describe('kind-colored + animated edges (Task 1 round 2)', () => {
     expect(plain?.style?.strokeWidth).toBe(2);
     expect(plain?.markerEnd?.color).toBe(`rgb(${accentKey} / 0.55)`);
     expect(plain?.animated).toBe(true);
+  });
+
+  it('a plain edge is a FlowEdge whose gradient runs from the source kind into the target kind', () => {
+    const g = makeGraph();
+    g.nodes[1] = { ...g.nodes[1], data: { ...g.nodes[1].data, kind: 'for_each' } };
+    render(
+      <WorkflowEditorGraph
+        graph={g}
+        onChange={() => {}}
+        selectedId={null}
+        onSelect={() => {}}
+        problemsById={{}}
+        onInvalidConnection={() => {}}
+      />,
+    );
+    const edges = JSON.parse(screen.getByTestId('rf').getAttribute('data-edges')!) as Array<{
+      id: string;
+      type?: string;
+      data?: { from?: string; to?: string };
+    }>;
+    const plain = edges.find((e) => e.id === 'a->b');
+    expect(plain?.type).toBe('flow');
+    expect(plain?.data?.from).toBe(`rgb(${KIND_ACCENT.step} / 0.55)`);
+    expect(plain?.data?.to).toBe(`rgb(${KIND_ACCENT.for_each} / 0.55)`);
   });
 
   it('next plain edge from a `step`-kind source uses the step accent, distinct from a `branch` source', () => {

@@ -1,6 +1,7 @@
 // Skills library — the installed skills (`GET /api/skills`): the global layer
-// plus the project a `project:` query term names. Read-only: install and
-// update are `rupu skill` operations. Each row links to /skills/:layer/:name.
+// plus the project a `project:` query term names. "Install skills" opens the
+// install dialog (a dry run, then the install); update and validate live on
+// each skill's page. Each row links to /skills/:layer/:name.
 
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, BookOpen } from 'lucide-react';
@@ -13,6 +14,8 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { ListSkeleton } from '../components/lists/ListSkeleton';
 import { ScopeChip } from '../components/ScopeChip';
+import { Button } from '../components/ui/Button';
+import { InstallSkillsDialog } from '../components/skills/InstallSkillsDialog';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { SKILL_FIELDS, skillsProject } from '../lib/query/lists/skills';
 
@@ -27,6 +30,10 @@ export default function Skills() {
   const [layerWarnings, setLayerWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [q, setQ] = useListQuery();
+  const [installing, setInstalling] = useState(false);
+  // Bumped after an install: the list is read again, so a new skill shows
+  // when the server lists it.
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,7 +81,7 @@ export default function Skills() {
     return () => {
       cancelled = true;
     };
-  }, [wsId, ready]);
+  }, [wsId, ready, reload]);
 
   const all = useMemo(() => skills ?? [], [skills]);
   const filtered = useFilteredRows(all, rest, SKILL_FIELDS);
@@ -85,11 +92,18 @@ export default function Skills() {
   const queryError = projectError ?? unknownProject ?? filtered.error;
   const rows = unknownProject ? [] : filtered.rows;
 
+  const installButton = (
+    <Button variant="solid" onClick={() => setInstalling(true)}>
+      Install skills
+    </Button>
+  );
+
   return (
     <div className="p-8">
       <PageHeader
         className="mb-6"
         title="Skills"
+        actions={installButton}
         subtitle={
           <>
             Skills installed on this control plane — globally, and in a project named with{' '}
@@ -138,11 +152,8 @@ export default function Skills() {
           <EmptyState
             icon={<BookOpen size={20} />}
             title="No skills installed"
-            hint={
-              <>
-                Install skills with <span className="font-mono">rupu skill install &lt;source&gt;</span>
-              </>
-            }
+            hint="Install skills from a directory, owner/repo or a git URL."
+            action={installButton}
           />
         )
       ) : rows.length === 0 ? (
@@ -158,6 +169,14 @@ export default function Skills() {
             initialSort={{ key: 'name', dir: 'asc' }}
           />
         </section>
+      )}
+
+      {installing && (
+        <InstallSkillsDialog
+          projects={projects ?? []}
+          onClose={() => setInstalling(false)}
+          onInstalled={() => setReload((n) => n + 1)}
+        />
       )}
     </div>
   );
@@ -222,7 +241,11 @@ const skillColumns: Column<SkillRow>[] = [
     sortValue: (s) => s.source,
     render: (s) =>
       s.source ? (
-        <span className="font-mono text-ui text-ink-dim">{s.source}</span>
+        // A local-directory source is a long absolute path: truncated, so
+        // it never squeezes the name column out.
+        <span className="block max-w-xs truncate font-mono text-ui text-ink-dim" title={s.source}>
+          {s.source}
+        </span>
       ) : (
         <span className="text-ink-mute">-</span>
       ),

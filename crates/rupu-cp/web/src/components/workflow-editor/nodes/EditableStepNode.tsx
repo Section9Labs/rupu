@@ -24,6 +24,8 @@ import { shapeFor, type HandleAnchor } from '../nodeShapes';
 export interface NodeData extends Record<string, unknown> {
   node: GraphNode;
   problems: string[];
+  /** Entrance slot (see `useEntranceSlots`). */
+  slot?: number;
 }
 
 type EditableFlowNode = Node<NodeData, 'editable'>;
@@ -188,7 +190,11 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
   const shape = shapeFor(KIND_SHAPE[d.kind], box.width, box.height);
   const stroke = selected ? color : 'rgb(var(--c-border))';
   return (
-    <div data-ui="next" className="wfx-node" style={{ width: box.width, minHeight: box.height }}>
+    <div
+      data-ui="next"
+      className="wfx-node"
+      style={{ width: box.width, minHeight: box.height, ['--i' as string]: data.slot ?? 0 }}
+    >
       <Handle type="target" {...anchorProps(shape.target, handleStyle)} />
 
       {/* The silhouette is painted in SVG rather than clipped with
@@ -198,9 +204,18 @@ function EditableStepNode({ data, selected }: NodeProps<EditableFlowNode>) {
           opaque fill paints straight over them — `extra` is stroked-only
           and always on top, per nodeShapes.ts's NodeShape contract. */}
       <svg className="wfx-sil" viewBox={`0 0 ${box.width} ${box.height}`} aria-hidden>
-        {selected && (
-          <path d={shape.path} fill="none" stroke={color} strokeWidth={5} strokeLinejoin="round" opacity={0.25} />
-        )}
+        {/* lift shadow (hover / drag) and selection glow: always present,
+            faded by CSS so selecting or grabbing a card never pops */}
+        <path className="wfx-sil-lift" d={shape.path} aria-hidden />
+        <path
+          className="wfx-sil-glow"
+          data-on={selected || undefined}
+          d={shape.path}
+          fill="none"
+          stroke={color}
+          strokeWidth={6}
+          strokeLinejoin="round"
+        />
         <path
           className="wfx-sil-shape"
           d={shape.path}

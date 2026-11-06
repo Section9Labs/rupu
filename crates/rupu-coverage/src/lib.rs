@@ -37,7 +37,8 @@ pub use profile::{
 
 pub use audit::generate::audit as run_audit;
 pub use audit::{
-    AuditReport, ConcernCoverage, CrossModelEntry, FileCoverage, SerendipitousCluster,
+    AuditReport, ConcernCoverage, CoverageGaps, CrossModelEntry, FileCoverage, GapRow,
+    SerendipitousCluster,
 };
 pub use catalog::{
     builtin_names, flatten, partition_by_mode, read_snapshot, render_full_mode, render_index_mode,

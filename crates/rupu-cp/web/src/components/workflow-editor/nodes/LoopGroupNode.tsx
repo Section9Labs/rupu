@@ -11,11 +11,11 @@
 // primitive exists (there isn't one). Not draggable/selectable/connectable —
 // it's a read-derived visual, not something the canvas lets you grab.
 
-import { memo } from 'react';
+import { memo, type CSSProperties } from 'react';
+import { IterationCw, TriangleAlert } from 'lucide-react';
 import type { Node, NodeProps } from '@xyflow/react';
 import type { GraphNode, WorkflowLoop } from '../../../lib/workflowGraph';
 import { editorNodeSize } from '../../../lib/workflowLayout';
-import { useThemeColors } from '../../../lib/useThemeColors';
 
 /** Padding (px) around the tightest bounding box of the loop's member
  *  nodes — enough to read as a distinct enclosing boundary rather than a
@@ -85,64 +85,50 @@ export interface LoopGroupNodeData extends Record<string, unknown> {
    *  absent (see the file-level note in WorkflowEditorGraph on why this is
    *  usually absent today). */
   runtime?: { iteration: number; converged: boolean; failed: boolean };
+  /** The selection is exactly this loop's members, or its form is open. */
+  selected?: boolean;
+  /** Entrance slot of its earliest member, so the tray arrives with them. */
+  slot?: number;
   onEdit?: () => void;
 }
 
 type LoopGroupFlowNode = Node<LoopGroupNodeData, 'loopGroup'>;
 
+// The look lives in styles/graph-motion.css (`wfx-loop*`): a faint tray the
+// member cards sit in, its name on a raised chip astride the top edge.
 function LoopGroupNodeView({ data }: NodeProps<LoopGroupFlowNode>) {
-  const { loop, width, height, problems, runtime, onEdit } = data;
-  const colors = useThemeColors();
+  const { loop, width, height, problems, runtime, selected, slot, onEdit } = data;
   const hasError = problems.length > 0;
-  const borderColor = hasError ? colors.status.failed : colors.alpha('brand.500', 0.45);
+  const runState = runtime ? (runtime.failed ? 'failed' : runtime.converged ? 'done' : 'running') : undefined;
 
   return (
     <div
       data-testid="loop-group"
       data-loop-name={loop.name}
-      className="pointer-events-none rounded-[18px] border-2 border-dashed"
-      style={{
-        width,
-        height,
-        borderColor,
-        background: colors.alpha(hasError ? 'status.failed' : 'brand.500', hasError ? 0.05 : 0.035),
-      }}
+      data-error={hasError || undefined}
+      data-selected={selected || undefined}
+      className="wfx-loop"
+      style={{ width, height, ['--i' as string]: slot ?? 0 } as CSSProperties}
     >
       <button
         type="button"
         onClick={onEdit}
         disabled={!onEdit}
-        className="pointer-events-auto absolute -top-3 left-3 inline-flex max-w-[calc(100%-2rem)] items-center gap-1 truncate rounded-full border px-2 py-0.5 text-meta font-medium shadow-card"
-        style={{
-          borderColor,
-          background: colors.panel,
-          color: hasError ? colors.status.failed : colors.get('brand.500'),
-        }}
+        className="wfx-loop-label"
         title={hasError ? problems.join('\n') : `${loop.name}: until ${loop.until || '(no condition)'}`}
       >
-        <span aria-hidden>⟳</span>
-        <span className="truncate">{loop.name}</span>
-        <span className="text-ink-mute">· until {truncateUntil(loop.until)} · ≤{loop.maxIterations}</span>
-        {hasError && <span aria-label="loop has problems">⚠</span>}
+        <IterationCw className="wfx-loop-icon" size={11} strokeWidth={2.25} aria-hidden />
+        <span className="wfx-loop-name">{loop.name}</span>
+        <span className="wfx-loop-meta">· until {truncateUntil(loop.until)} · ≤{loop.maxIterations}</span>
+        {hasError && (
+          <span className="wfx-loop-warn" role="img" aria-label="loop has problems">
+            <TriangleAlert size={11} strokeWidth={2.25} aria-hidden />
+          </span>
+        )}
       </button>
 
       {runtime && (
-        <div
-          className="pointer-events-none absolute -top-3 right-3 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-meta font-medium shadow-card"
-          style={{
-            borderColor: runtime.failed
-              ? colors.status.failed
-              : runtime.converged
-                ? colors.status.done
-                : colors.status.running,
-            background: colors.panel,
-            color: runtime.failed
-              ? colors.status.failed
-              : runtime.converged
-                ? colors.status.done
-                : colors.status.running,
-          }}
-        >
+        <div className="wfx-loop-run gx-s" data-state={runState}>
           iteration {runtime.iteration}/{loop.maxIterations}
           {runtime.converged ? ' · converged' : runtime.failed ? ' · failed' : ''}
         </div>

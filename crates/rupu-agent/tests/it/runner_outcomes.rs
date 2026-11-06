@@ -308,7 +308,12 @@ async fn a_standalone_run_hints_at_continue() {
     let ran = run_script(turns, "").await;
     let err = ran.result.error.as_deref().unwrap();
     assert!(
-        err.contains("rupu run outcomes --continue run_outcomes --model <model>"),
+        err.contains(
+            "no recovery left — continue with a prompt on the same model: \
+             rupu run outcomes --continue run_outcomes \"<instruction>\", \
+             or with another model: \
+             rupu run outcomes --continue run_outcomes --model <model> [--provider <provider>]"
+        ),
         "{err}"
     );
 }

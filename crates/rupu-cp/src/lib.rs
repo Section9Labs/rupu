@@ -2,7 +2,9 @@
 //!
 //! `serve` is the main entrypoint; wire it from `rupu cp serve`.
 
+pub mod admin_ops;
 pub mod agent_launcher;
+pub mod agentiflow_launcher;
 pub mod api;
 pub mod auth;
 pub mod codename;
@@ -19,6 +21,7 @@ pub mod launcher;
 pub mod mcp;
 pub mod model_catalog;
 pub mod netflow_index;
+pub mod netflow_prune;
 pub mod net;
 pub mod node;
 pub mod pagination;
@@ -27,14 +30,19 @@ pub mod query;
 pub mod repos;
 pub mod server;
 pub mod session_mutator;
+pub mod session_commands;
 pub mod session_sender;
 pub mod session_starter;
+pub mod skill_installer;
 pub mod sse;
 pub mod state;
 pub mod transcript_mutator;
 pub mod transcript_tail;
 pub mod usage;
-pub mod usage_index;
+/// The usage index moved to `rupu_orchestrator` (a run's usage is one
+/// definition for the control plane and the CLI); re-exported at its old
+/// path.
+pub use rupu_orchestrator::usage_index;
 pub mod usage_sources;
 
 use anyhow::Context as _;
@@ -95,6 +103,17 @@ pub struct ServeOpts {
     pub web: bool,
     /// Serve `/mcp` over these options. `None` (`--no-mcp`): `/mcp` is a 404.
     pub mcp: Option<mcp::McpOpts>,
+    /// Optional agentiflow-launcher adapter. rupu-cli's `cp serve` provides
+    /// the detached-start impl; `None` → `POST /api/agentiflows` returns 501.
+    pub agentiflow_launcher:
+        Option<std::sync::Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    /// Optional skill-installer adapter (the git fetch behind
+    /// `/api/skills/install|update`). rupu-cli's `cp serve` provides it;
+    /// `None` → those endpoints return 501.
+    pub skill_installer: Option<std::sync::Arc<crate::skill_installer::SkillInstaller>>,
+    /// Optional cron-tick and autoflow-cycle adapter. rupu-cli's `cp serve`
+    /// provides it; `None` → those two endpoints return 501.
+    pub admin_ops: Option<std::sync::Arc<dyn crate::admin_ops::AdminOps>>,
 }
 
 /// The browser-clickable URL for a bound address. An unspecified bind host
@@ -261,8 +280,11 @@ pub fn build_state(opts: &ServeOpts) -> state::AppState {
         .with_generator(opts.generator.clone())
         .with_session_mutator(opts.session_mutator.clone())
         .with_transcript_mutator(opts.transcript_mutator.clone())
+        .with_agentiflow_launcher(opts.agentiflow_launcher.clone())
+        .with_skill_installer(opts.skill_installer.clone())
         .with_bind(opts.bind.to_string())
-        .with_token_set(opts.token.is_some());
+        .with_token_set(opts.token.is_some())
+        .with_admin_ops(opts.admin_ops.clone());
 
     // Replace the default read-only registry with a fully-wired one that
     // holds the real launcher / sender / starter adapters.

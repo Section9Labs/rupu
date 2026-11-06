@@ -182,6 +182,45 @@ pub(crate) fn scope_name(w: &Workspace) -> String {
         .unwrap_or_else(|| w.id.clone())
 }
 
+/// The directory a scope-pinned launch starts in, given the definitions
+/// directory (`<layer>/.rupu/<kind>/` or `<global>/<kind>/`) a definition
+/// resolved from in `kind`'s layer, so the child's cwd-based discovery finds
+/// the same definition the caller picked:
+///
+/// - `Project`: the workspace root (`dir`'s grandparent).
+/// - `Global`: the global dir's PARENT, so `project_root_for`'s walk hits the
+///   global dir itself first. Only when the global dir is literally named
+///   `.rupu`; otherwise 400 (loud beats wrong) rather than launching without
+///   the pin under a non-default `$RUPU_HOME`.
+pub(crate) fn launch_dir_for(
+    dir: &std::path::Path,
+    kind: ScopeKind,
+) -> Result<Option<std::path::PathBuf>, crate::error::ApiError> {
+    use crate::error::ApiError;
+    match kind {
+        ScopeKind::Project => Ok(dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::PathBuf::from)),
+        ScopeKind::Global => {
+            let global_dir = dir.parent().ok_or_else(|| {
+                ApiError::internal("resolved global definitions dir has no parent")
+            })?;
+            if global_dir.file_name() != Some(std::ffi::OsStr::new(".rupu")) {
+                return Err(ApiError::bad_request(
+                    "global-scope launch pinning isn't available: RUPU_HOME is set to a \
+                     directory not named \".rupu\", so the cwd-based trick that forces \
+                     global-only resolution can't be applied here",
+                ));
+            }
+            let global_parent = global_dir
+                .parent()
+                .ok_or_else(|| ApiError::internal("global dir has no parent"))?;
+            Ok(Some(global_parent.to_path_buf()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

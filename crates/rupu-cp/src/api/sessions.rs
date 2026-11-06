@@ -1,3 +1,6 @@
+#[path = "session_orchestration.rs"]
+mod orchestration;
+
 use crate::api::host_fanout::{fan_out_sessions, sort_values_newest_first};
 use crate::{
     error::{ApiError, ApiResult},
@@ -9,10 +12,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rupu_runtime::services::session_compaction as compaction;
 use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(super::session_commands::routes())
+        .merge(orchestration::routes())
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route(
@@ -21,8 +27,14 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/sessions/:id/runs", get(get_session_runs))
         .route("/api/sessions/:id/send", post(send_session))
+        .route(
+            "/api/sessions/:id/settings",
+            get(get_settings).put(put_settings),
+        )
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/restore", post(restore_session))
+        .route("/api/sessions/:id/stop", post(stop_session))
+        .route("/api/sessions/:id/compact", post(compact_session))
 }
 
 /// Minimal projection of the on-disk `session.json`. All fields are
@@ -704,7 +716,7 @@ impl SessionsQuery {
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct SessionHostQuery {
     #[serde(default)]
-    host: Option<String>,
+    pub(crate) host: Option<String>,
 }
 
 /// `GET /api/sessions[?host=<id>][&customer=<slug>|none][&q=…]`
@@ -896,6 +908,18 @@ async fn get_session(
                 serde_json::json!(who.derived),
             );
         }
+        let (live, last) = {
+            let dir = dir.clone();
+            crate::api::runs::blocking(move || {
+                let live = compaction::live(&dir, rupu_launch::proc::process_alive)
+                    .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))?;
+                Ok((live, compaction::last_result(&dir)))
+            })
+            .await?
+        };
+        map.insert("compacting".to_string(), serde_json::json!(live.is_some()));
+        map.insert("compaction".to_string(), serde_json::json!(live));
+        map.insert("last_compaction".to_string(), serde_json::json!(last));
     }
     crate::codename::inject_codename(&mut val, &dto.session_id, Some(&dto.agent_name));
     Ok(Json(val))
@@ -1225,6 +1249,7 @@ async fn send_session(
             }
             None => return Err(ApiError::not_found(format!("session {id} not found"))),
         }
+        refuse_while_compacting(&s, &id).await?;
     } else {
         return Err(ApiError::not_found(format!("session {id} not found")));
     }
@@ -1287,8 +1312,11 @@ async fn archive_session(
         conn.archive_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
+    refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Archive).await
 }
 
@@ -1305,7 +1333,9 @@ async fn restore_session(
         conn.restore_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Restore).await
 }
@@ -1323,9 +1353,148 @@ async fn delete_session(
         conn.delete_session(&id)
             .await
             .map_err(map_host_session_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
+    refuse_while_compacting(&s, &id).await?;
     mutate_session(&s, &id, crate::session_mutator::SessionAction::Delete).await
+}
+
+// ---------------------------------------------------------------------------
+// Session stop / compact — /api/sessions/:id/{stop,compact} (local only: no
+// host transport carries them)
+// ---------------------------------------------------------------------------
+
+/// The local session `id` a stop or compact acts on, read from its active
+/// directory: 404 when there is none, 409 when it is archived (the CLI
+/// refuses both commands on an archived session).
+pub(crate) fn active_session(s: &AppState, id: &str, command: &str) -> ApiResult<SessionDto> {
+    let active = s.global_dir.join("sessions").join(id);
+    if let Some(dto) = load_session_file(&active)? {
+        return Ok(dto);
+    }
+    let archived = s.global_dir.join("sessions-archive").join(id);
+    if load_session_file(&archived)?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "session {id} is archived; restore it before `{command}`"
+        )));
+    }
+    Err(ApiError::not_found(format!("session {id} not found")))
+}
+
+/// 409 while a compaction of the local session `id` runs: the command would
+/// write the session under it (`rupu_runtime::services::session_compaction`).
+async fn refuse_while_compacting(s: &AppState, id: &str) -> ApiResult<()> {
+    let dir = s.global_dir.join("sessions").join(id);
+    let live = crate::api::runs::blocking(move || {
+        compaction::live(&dir, rupu_launch::proc::process_alive)
+            .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))
+    })
+    .await?;
+    match live {
+        Some(m) => Err(ApiError::conflict(compaction::busy_message(id, &m))),
+        None => Ok(()),
+    }
+}
+
+/// `POST /api/sessions/:id/stop`: `rupu session stop <id>` — ends the
+/// session's worker and its running turn, and marks the session stopped.
+/// Answers `{ok, id}` once the session record says stopped.
+pub(crate) async fn stop_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(&id)?;
+    crate::api::fleet::require_local(q.host.as_deref(), "stopping a session")?;
+    crate::api::config::require_writable_to(&s, "stopping a session")?;
+    active_session(&s, &id, "session stop")?;
+    refuse_while_compacting(&s, &id).await?;
+    mutate_session(&s, &id, crate::session_mutator::SessionAction::Stop).await
+}
+
+#[derive(Deserialize, Default, schemars::JsonSchema)]
+pub(crate) struct CompactBody {
+    /// Context-window size (tokens) to size the compaction against, in place
+    /// of the session's stored one; required for a session whose model's
+    /// input limit is unknown.
+    #[serde(default)]
+    window: Option<u32>,
+}
+
+/// `POST /api/sessions/:id/compact {window?}`: `rupu session compact`,
+/// started detached (it summarizes older turns with a model call). The
+/// compaction is recorded first — a marker under the session lock naming
+/// this process, then the child it starts — so send, stop, archive, delete
+/// and another compact answer 409 while it runs, and the child writes its
+/// result only if the session is unchanged. 202 `{ok, id, compaction_id,
+/// log}` once it has started; `GET /api/sessions/:id` shows `compacting`
+/// and, when it ends, `last_compaction`. 409 while a turn or another
+/// compaction is running.
+pub(crate) async fn compact_session(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SessionHostQuery>,
+    crate::api::runs::OptionalJson(body): crate::api::runs::OptionalJson<CompactBody>,
+) -> ApiResult<(axum::http::StatusCode, Json<serde_json::Value>)> {
+    crate::api::runs::validate_id(&id)?;
+    crate::api::fleet::require_local(q.host.as_deref(), "compacting a session")?;
+    crate::api::config::require_writable_to(&s, "compacting a session")?;
+    let window = body.and_then(|b| b.window);
+    let dto = active_session(&s, &id, "session compact")?;
+    if dto.status.as_str() == Some("running") {
+        return Err(ApiError::conflict(format!(
+            "session {id} is running a turn; stop it or wait for the turn to end"
+        )));
+    }
+    let m = s
+        .session_mutator
+        .clone()
+        .ok_or_else(|| ApiError::not_available("compacting a session requires `rupu cp serve`"))?;
+    let dir = s.global_dir.join("sessions").join(&id);
+    let log = dir.join("compact.log");
+    let cid = compaction::new_id();
+    let record = |pid: u32, start: Option<u64>| {
+        let (dir, cid) = (dir.clone(), cid.clone());
+        crate::api::runs::blocking(move || {
+            compaction::begin(&dir, &cid, pid, start, rupu_launch::proc::process_alive)
+                .map_err(|e| ApiError::internal(format!("compaction marker: {e}")))
+        })
+    };
+    if let compaction::Begin::Busy(m) =
+        record(std::process::id(), rupu_launch::proc::own_start_stamp()).await?
+    {
+        return Err(ApiError::conflict(compaction::busy_message(&id, &m)));
+    }
+    let pid = match m.compact(&id, &cid, window, &log).await {
+        Ok(pid) => pid,
+        Err(e) => {
+            let err = match e {
+                crate::session_mutator::SessionMutateError::NotFound(_) => {
+                    ApiError::not_found(format!("session {id} not found"))
+                }
+                crate::session_mutator::SessionMutateError::Invalid(msg) => ApiError::conflict(msg),
+                crate::session_mutator::SessionMutateError::Failed { message, .. } => {
+                    ApiError::internal(message)
+                }
+            };
+            let (dir, cid, why) = (dir.clone(), cid.clone(), err.1.clone());
+            crate::api::runs::blocking(move || {
+                compaction::end(&dir, &cid, Some((compaction::Outcome::Failed, why)))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            })
+            .await?;
+            return Err(err);
+        }
+    };
+    // Hand the marker to the child (it takes it over itself too, whichever
+    // comes first); once the child is gone the marker is stale.
+    record(pid, rupu_launch::proc::start_stamp(pid)).await?;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true, "id": id, "compaction_id": cid, "log": log })),
+    ))
 }
 
 #[cfg(test)]
@@ -1870,6 +2039,15 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+        async fn compact(
+            &self,
+            _id: &str,
+            _compaction_id: &str,
+            _window: Option<u32>,
+            _log: &std::path::Path,
+        ) -> Result<u32, SessionMutateError> {
+            Ok(0)
+        }
     }
 
     #[tokio::test]
@@ -1991,7 +2169,10 @@ pub(crate) mod tests {
         .0;
 
         assert_eq!(absent, serde_json::json!({ "ok": true, "id": "s1" }));
-        assert_eq!(explicit_local, serde_json::json!({ "ok": true, "id": "s1" }));
+        assert_eq!(
+            explicit_local,
+            serde_json::json!({ "ok": true, "id": "s1" })
+        );
     }
 
     #[tokio::test]
@@ -2452,5 +2633,153 @@ pub(crate) mod tests {
         .expect("a malformed until must degrade, never error")
         .rows;
         assert_eq!(rows.len(), 1);
+    }
+}
+
+/// Settings are local to the session and take effect when the next turn starts.
+/// Existing turns keep their provider and grant; the agent definition is unchanged.
+async fn get_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SendQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || settings_response(&s, &id, q.host.as_deref(), None))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+}
+async fn put_settings(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SendQuery>,
+    Json(settings): Json<rupu_runtime::session_settings::SessionSettings>,
+) -> ApiResult<Json<serde_json::Value>> {
+    tokio::task::spawn_blocking(move || {
+        settings_response(&s, &id, q.host.as_deref(), Some(settings))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+}
+fn settings_response(
+    s: &AppState,
+    id: &str,
+    host: Option<&str>,
+    update: Option<rupu_runtime::session_settings::SessionSettings>,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::runs::validate_id(id)?;
+    if host.is_some_and(|h| h != "local") {
+        return Err(ApiError::not_available(
+            "session settings require a direct connection to the owning host",
+        ));
+    }
+    if update.is_some() {
+        crate::api::config::require_writable_to(s, "changing session settings")?;
+    }
+    let dto = active_session(s, id, "settings")?;
+    let dir = s.global_dir.join("sessions").join(id);
+    let settings = if let Some(settings) = update {
+        settings
+            .validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        settings
+            .save(&dir)
+            .map_err(|e| ApiError::conflict(e.to_string()))?
+    } else {
+        rupu_runtime::session_settings::SessionSettings::read(&dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("session.json")).map_err(|e| ApiError::internal(e.to_string()))?,
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "session_id": id, "host_id": "local", "settings": settings,
+        "defaults": { "provider": dto.provider_name, "model": dto.model, "tools": record["agent_tools"] },
+        "applies": "next_turn", "permission_mode": record["permission_mode"],
+        "tools": crate::api::tools::catalog(),
+        "history": "The conversation is retained. The selected provider receives Rupu's normalized message history on the next turn. Provider-specific options and learned model limits are re-resolved when the model changes."
+    })))
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    struct SettingsLauncher;
+    #[async_trait::async_trait]
+    impl crate::launcher::RunLauncher for SettingsLauncher {
+        async fn launch(
+            &self,
+            _req: crate::launcher::LaunchRequest,
+        ) -> Result<String, crate::launcher::LaunchError> {
+            unreachable!("settings updates do not launch runs")
+        }
+    }
+    #[test]
+    fn settings_preserve_history_reject_wrong_host_and_detect_stale_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sessions/ses_settings");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = serde_json::json!({"session_id":"ses_settings","provider_name":"anthropic","model":"original","status":"idle","agent_tools":["read_file"],"message_history":[{"private":"retained"}]});
+        let bytes = serde_json::to_vec(&record).unwrap();
+        std::fs::write(dir.join("session.json"), &bytes).unwrap();
+        let state = AppState::new(tmp.path().to_owned(), Default::default());
+        let first = settings_response(&state, "ses_settings", Some("local"), None)
+            .unwrap()
+            .0;
+        assert_eq!(first["settings"]["revision"], 0);
+        assert!(first.get("message_history").is_none());
+        let edit = rupu_runtime::session_settings::SessionSettings {
+            model: Some("next".into()),
+            tools: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(
+            settings_response(&state, "ses_settings", Some("local"), Some(edit.clone())).is_err()
+        );
+        assert!(!dir.join("settings.json").exists());
+        let state = state.with_launcher(Some(std::sync::Arc::new(SettingsLauncher)));
+        let saved = settings_response(&state, "ses_settings", Some("local"), Some(edit.clone()))
+            .unwrap()
+            .0;
+        assert_eq!(saved["settings"]["model"], "next");
+        assert_eq!(saved["defaults"]["model"], "original");
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("local"), Some(edit))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            settings_response(&state, "ses_settings", Some("remote"), None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            settings_response(&state, "../ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        let invalid = rupu_runtime::session_settings::SessionSettings {
+            revision: 1,
+            tools: Some(vec!["unknown_tool".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, Some(invalid))
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), bytes);
+        let archived = tmp.path().join("sessions-archive");
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::rename(&dir, archived.join("ses_settings")).unwrap();
+        assert_eq!(
+            settings_response(&state, "ses_settings", None, None)
+                .unwrap_err()
+                .0,
+            axum::http::StatusCode::CONFLICT
+        );
     }
 }

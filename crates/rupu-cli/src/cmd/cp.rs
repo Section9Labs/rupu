@@ -481,9 +481,30 @@ pub async fn handle(action: Action) -> ExitCode {
                 cp_runtime_cfg.cron_tick_enabled,
                 Duration::from_secs(cp_runtime_cfg.cron_tick_interval_secs.max(1)),
                 shutdown_tx.subscribe(),
-                || async {
-                    if let Err(e) = crate::cmd::cron::tick(false, false, false).await {
-                        tracing::warn!(error = %e, "cp serve: cron tick failed");
+                {
+                    let global = global_dir.clone();
+                    move || {
+                        let global = global.clone();
+                        async move {
+                            // One tick at a time per RUPU_HOME: a tick a
+                            // `POST /api/cron/tick`, a crontab `rupu cron
+                            // tick` or another `cp serve` holds makes this
+                            // turn a skip.
+                            let _lock = match rupu_orchestrator::cron_triggers::TickLock::try_acquire(&global) {
+                                Ok(Some(lock)) => lock,
+                                Ok(None) => {
+                                    tracing::info!("cp serve: cron tick skipped: a tick is already running");
+                                    return;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::cmd::cron::tick(false, false, false, &mut |_| {}).await {
+                                tracing::warn!(error = %e, "cp serve: cron tick failed");
+                            }
+                        }
                     }
                 },
             ));
@@ -659,6 +680,17 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::new(crate::cp_agent_launcher::SubprocessAgentLauncher { exe: exe.clone() }),
             );
 
+            // Adapter for rupu-cp's AgentiflowLauncher port: the detached
+            // start `rupu agentiflow run --detach` runs, with this binary.
+            let agentiflow_launcher: Option<
+                Arc<dyn rupu_cp::agentiflow_launcher::AgentiflowLauncher>,
+            > = Some(Arc::new(
+                crate::cp_agentiflow_launcher::SubprocessAgentiflowLauncher {
+                    exe: exe.clone(),
+                    global_dir: global_dir.clone(),
+                },
+            ));
+
             // Adapter for rupu-cp's SessionSender port: shells
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
@@ -679,11 +711,26 @@ pub async fn handle(action: Action) -> ExitCode {
                 crate::cp_transcript_mutator::SubprocessTranscriptMutator { exe: exe.clone() },
             ));
 
+            // Adapter for rupu-cp's AdminOps port: the cron tick (the CLI's
+            // own, single-flighted with the loop above) and an autoflow cycle
+            // (`rupu autoflow run`, detached).
+            let admin_ops: Arc<dyn rupu_cp::admin_ops::AdminOps> =
+                Arc::new(crate::cp_admin_ops::CliAdminOps {
+                    exe: exe.clone(),
+                    global: global_dir.clone(),
+                });
+
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
                 Arc::new(crate::cp_session_starter::SubprocessSessionStarter { exe }),
             );
+
+            // Adapter for rupu-cp's SkillInstaller port: the git fetch behind
+            // `/api/skills/install|update` (only this crate enables
+            // rupu-skills' `git` feature).
+            let skill_installer: Option<Arc<rupu_cp::skill_installer::SkillInstaller>> =
+                Some(Arc::new(rupu_skills::git::GitFetcher));
 
             // Adapter for rupu-cp's DefinitionGenerator port: calls the
             // orchestrator generation core with the real resolver.
@@ -776,6 +823,9 @@ pub async fn handle(action: Action) -> ExitCode {
                     inventory: Some(inventory),
                     web: !no_web,
                     mcp,
+                    agentiflow_launcher,
+                    skill_installer,
+                    admin_ops: Some(admin_ops),
                 },
             )
             .await;
@@ -1198,6 +1248,7 @@ fn resume_control(
             run_id,
             mode,
             if_unfinished: true,
+            restart_interrupted: false,
         },
         other => return Err(format!("unknown resume subcommand `{other}`")),
     }))

@@ -41,6 +41,9 @@ function base(over: Partial<UseInbox>): UseInbox {
     approve: vi.fn(),
     reject: vi.fn(),
     resume: vi.fn(),
+    retry: vi.fn(),
+    retryRequested: {},
+    retryErrors: {},
     snooze: vi.fn(),
     dismiss: vi.fn(),
     unsnooze: vi.fn(),
@@ -120,5 +123,44 @@ describe('InboxBoard', () => {
     fireEvent.click(screen.getByRole('button', { name: /Snoozed/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Un-snooze' }));
     expect(unsnooze).toHaveBeenCalledWith('s1');
+  });
+  it('a local failed row offers Retry beside View run', () => {
+    const retry = vi.fn();
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed', workflowName: 'lint-sweep' });
+    wrap(<InboxBoard data={base({ failures: [it0], counts: { gates: 0, paused: 0, failed: 1 }, retry })} />);
+    expect(screen.getByText(/open the run, retry it or clear it/)).toBeInTheDocument();
+    const btn = screen.getByRole('button', { name: 'Retry' });
+    const view = screen.getByRole('link', { name: 'View run' });
+    expect(btn.compareDocumentPosition(view) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(btn);
+    expect(retry).toHaveBeenCalledWith(it0);
+  });
+
+  it('a retried row shows the pending chip in place of Retry', () => {
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed' });
+    wrap(<InboxBoard data={base({ failures: [it0], retryRequested: { f1: true } })} />);
+    expect(screen.getByText('retry requested')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+  });
+
+  it('a retry that failed shows its message under the row', () => {
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed' });
+    wrap(<InboxBoard data={base({ failures: [it0], retryErrors: { f1: 'run f1 is `running`' } })} />);
+    expect(screen.getByRole('alert')).toHaveTextContent('run f1 is `running`');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  it('a remote failed row has Retry disabled, with the reason', () => {
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed', host: 'h1' });
+    wrap(<InboxBoard data={base({ failures: [it0] })} />);
+    const btn = screen.getByRole('button', { name: 'Retry' });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('title', expect.stringContaining('local-only'));
+  });
+  it('a failed standalone agent run offers no Retry (it is continued, not retried)', () => {
+    const it0 = item({ id: 'f1', kind: 'failed', status: 'failed', workflowName: 'agent:code-reviewer' });
+    wrap(<InboxBoard data={base({ failures: [it0] })} />);
+    expect(screen.getByRole('link', { name: 'View run' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
   });
 });

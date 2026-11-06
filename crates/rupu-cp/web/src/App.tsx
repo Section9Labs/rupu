@@ -13,6 +13,8 @@ const Inbox             = React.lazy(() => import('./pages/Inbox'));
 const Usage             = React.lazy(() => import('./pages/Usage'));
 const RunDetail         = React.lazy(() => import('./pages/RunDetail'));
 const AgentiflowDetail  = React.lazy(() => import('./pages/AgentiflowDetail'));
+const AgentiflowDefs    = React.lazy(() => import('./pages/AgentiflowDefs'));
+const AgentiflowDefDetail = React.lazy(() => import('./pages/AgentiflowDefDetail'));
 const Events            = React.lazy(() => import('./pages/Events'));
 const Coverage          = React.lazy(() => import('./pages/Coverage'));
 const Assets            = React.lazy(() => import('./pages/Assets'));
@@ -120,6 +122,9 @@ export function AppRoutes({ shell }: { shell: ShellVersion }) {
         <Route path="/runs" element={<Navigate to={v2 ? '/activity' : '/runs/workflows'} replace />} />
         {/* Run detail graph — wildcard must come after static /runs/* segments */}
         <Route path="/runs/:id" element={page(<RunDetail />)} />
+        {/* Agentiflow definitions — static /agentiflows/defs precedes the :id wildcard */}
+        <Route path="/agentiflows/defs" element={v2 ? <Navigate to="/library?tab=agentiflows" replace /> : page(<AgentiflowDefs />)} />
+        <Route path="/agentiflows/defs/:name" element={page(<AgentiflowDefDetail />)} />
         <Route path="/agentiflows/:id" element={page(<AgentiflowDetail />)} />
         <Route path="/events" element={page(<Events />)} />
         <Route path="/coverage" element={v2 ? <Navigate to="/security?tab=coverage" replace /> : page(<Coverage />)} />

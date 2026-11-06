@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { FindingOut, FindingsResponse } from '../../lib/api';
 import { FindingsExplorer, type FindingsExplorerProps } from './FindingsExplorer';
@@ -50,6 +50,37 @@ function renderExplorer(entry: string, props: Partial<FindingsExplorerProps> & P
 }
 
 describe('FindingsExplorer', () => {
+  it('imports reports next to Export, then reloads the list', async () => {
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/api/findings/import') {
+        const dry = JSON.parse(init?.body as string).dry_run as boolean;
+        return new Response(
+          JSON.stringify({ dry_run: dry, files: [{ path: '/r/a.md', status: 'attached', finding_id: 'f1' }], backups: [], attached: 1, skipped: 0, failed: 0 }),
+        );
+      }
+      return new Response(JSON.stringify(BODY), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    renderExplorer('/security?tab=findings', { scope: {} });
+    await screen.findByText('Default admin token accepted');
+    expect(screen.getByRole('button', { name: 'Export report' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    const dialog = screen.getByRole('dialog', { name: 'Import finding reports' });
+    fireEvent.change(within(dialog).getByLabelText('Files or directories on this machine'), { target: { value: '/r' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Dry run' }));
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Import 1 report' }));
+
+    await waitFor(() => expect(urls(fetchMock).filter((u) => u === '/api/findings' || u.startsWith('/api/findings?'))).toHaveLength(2));
+  });
+
+  it('offers no import on a run scope', async () => {
+    stubFetch();
+    renderExplorer('/runs/r1', { scope: { runId: 'r1' } });
+    await screen.findByText('Default admin token accepted');
+    expect(screen.queryByRole('button', { name: 'Import' })).not.toBeInTheDocument();
+  });
+
   it('asks for a project scope together with the query, under a query bar', async () => {
     const fetchMock = stubFetch();
     renderExplorer('/projects/p/findings?tab=x&q=severity%3Ahigh', { scope: { wsId: 'ws-1' } });

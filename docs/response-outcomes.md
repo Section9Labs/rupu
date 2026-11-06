@@ -254,7 +254,7 @@ followed by the hint. The hint depends on where the run was started:
   record get the same hint):
 
   ```
-  refused · cyber; no recovery left — continue with another model: rupu run dependency-auditor --continue <run id> --model <model> [--provider <provider>]
+  refused · cyber; no recovery left — continue with a prompt on the same model: rupu run dependency-auditor --continue <run id> "<instruction>", or with another model: rupu run dependency-auditor --continue <run id> --model <model> [--provider <provider>]
   ```
 
 - **A workflow step:**
@@ -295,6 +295,11 @@ which model it is continuing on.
   still treats a failed run as finished with an error and refuses it, as
   before. The model and provider a bare `--continue` restores from the original
   command do not count.
+- A continue given a prompt (`rupu run <agent> --continue <agent_run_id>
+  "<instruction>"`) needs neither: any failed run, with or without an outcome,
+  continues with it on its own model. The note about the earlier attempt goes
+  first when the run failed on an outcome. See
+  [agent-format.md](agent-format.md#continuing-with-a-prompt).
 - `--model` and `--provider` override the agent's own `model:` and `provider:`
   for any `rupu run`, not only a continuation.
 - They also drop the agent's settings that were chosen for its own model. A

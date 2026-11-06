@@ -1,9 +1,9 @@
 // Skill detail — one installed skill (`GET /api/skills/:layer/:name`): its
-// facts, files and `SKILL.md` body. Read-only: install and update are
-// `rupu skill` operations. Route: /skills/:layer/:name[?ws_id=] (a project
-// skill needs its project's ws_id).
+// facts, files and `SKILL.md` body, with Update (from its recorded source)
+// and Validate. Route: /skills/:layer/:name[?ws_id=] (a project skill needs
+// its project's ws_id).
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { api, apiErrorMessage, type SkillDetail, type SkillLayer } from '../lib/api';
 import Markdown from '../components/transcript/Markdown';
@@ -12,6 +12,7 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { ErrorBanner } from '../components/ui/ErrorBanner';
 import { Spinner } from '../components/ui/Spinner';
 import { ScopeChip } from '../components/ScopeChip';
+import { SkillActions } from '../components/skills/SkillActions';
 
 const BACK = { label: 'Skills', to: '/library?tab=skills' };
 
@@ -21,10 +22,16 @@ export default function SkillDetailPage() {
   const wsId = params.get('ws_id') ?? undefined;
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Bumped after an update: the skill is read again, quietly.
+  const [reload, setReload] = useState(0);
+  const shown = useRef('');
 
   useEffect(() => {
     let cancelled = false;
-    setSkill(null);
+    // A reload after an update keeps the page up; another skill clears it.
+    const key = `${layer}/${name}/${wsId ?? ''}`;
+    if (shown.current !== key) setSkill(null);
+    shown.current = key;
     setError(null);
     api
       .getSkill(layer as SkillLayer, name, wsId)
@@ -37,7 +44,7 @@ export default function SkillDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [layer, name, wsId]);
+  }, [layer, name, wsId, reload]);
 
   if (error) {
     return (
@@ -63,7 +70,10 @@ export default function SkillDetailPage() {
 
   return (
     <div className="p-8">
-      <PageHeader back={BACK} title={<span className="break-all font-mono">{skill.name}</span>} />
+      <PageHeader back={BACK} title={<span className="break-all font-mono">{skill.name}</span>}
+        actions={<SkillActions key={`${skill.layer}/${skill.name}`} name={skill.name} layer={skill.layer}
+          wsId={wsId} hasSource={skill.source !== null} onChanged={() => setReload((n) => n + 1)} />}
+      />
 
       <header className="mt-3">
         <div className="flex flex-wrap items-center gap-2">

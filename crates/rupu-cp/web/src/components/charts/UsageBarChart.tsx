@@ -36,7 +36,9 @@ export default function UsageBarChart({ bars }: { bars: UsageBar[] }) {
   const totalIn = bars.reduce((a, b) => a + b.input_tokens, 0);
   const totalOut = bars.reduce((a, b) => a + b.output_tokens, 0);
   const totalCached = bars.reduce((a, b) => a + b.cached_tokens, 0);
-  const totalTokens = totalIn + totalOut + totalCached;
+  // Cache reads are a subset of input (rupu_providers::Usage), so the total
+  // is input + output, the server's own `total_tokens` rule.
+  const totalTokens = totalIn + totalOut;
 
   if (bars.length === 0 || totalTokens === 0) {
     return <div className="py-2 text-center text-note text-ink-mute">No token usage in this list yet</div>;

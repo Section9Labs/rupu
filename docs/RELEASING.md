@@ -98,8 +98,10 @@ Decide skips — logging which condition fired on the run page and exiting
 
 1. **Nothing shipped changed** since the nearest beta tag in `main`'s
    history: either `main` has not moved, or every changed path is outside
-   the product — `docs/`, root-level `*.md`, `.github/`, `scripts/`, or a
-   crate's `tests/` (`scripts/shipped-paths.sh`). A CI-only or tests-only
+   the product — `docs/superpowers/`, `docs/pages/`, root-level `*.md`,
+   `.github/`, `scripts/`, or a crate's `tests/` (`scripts/shipped-paths.sh`).
+   A top-level `docs/*.md` does ship: the binary embeds the docs and serves
+   them as MCP resources (`rupu://docs/<name>`). A CI-only or tests-only
    batch therefore never cuts a beta. Bypassable with the `force` input, for
    re-cutting after a botched upload or re-publishing after a release-workflow
    fix.

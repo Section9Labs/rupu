@@ -1,3 +1,5 @@
+pub mod account_status;
+pub mod accounts;
 pub mod admission;
 pub mod argv;
 mod artifacts;
@@ -7,14 +9,19 @@ mod backend;
 pub mod children;
 pub mod credential_manifest;
 pub mod file_cache;
+pub mod findings_opts;
 pub mod hop_builder;
 pub mod model_limits;
 pub mod net_capture;
 pub mod netflow;
 pub mod provider_factory;
+pub mod retention;
 mod run_envelope;
 pub mod services;
+pub mod session_settings;
+pub mod sessions;
 pub mod spawn;
+pub mod standalone_run_metadata;
 pub mod usage_ledger;
 mod wake;
 mod worker;
@@ -40,3 +47,7 @@ pub use wake::{
     WakeStoreError,
 };
 pub use worker::{WorkerCapabilities, WorkerKind, WorkerRecord};
+
+pub mod session_commands;
+pub mod session_cancel;
+pub mod session_orchestration;

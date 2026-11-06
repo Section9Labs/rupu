@@ -1,17 +1,20 @@
 use crate::{
+    api::local_only::LocalOnlyQuery,
     error::{ApiError, ApiResult},
     state::AppState,
 };
 use axum::{
     extract::{Path, Query, State},
-    routing::get,
+    http::StatusCode,
+    routing::{get, post},
     Json, Router,
 };
 use rupu_coverage::report::ReportSummary;
 use rupu_coverage::{
-    builtin_names, coverage_status, discover_targets, file_views, list_runs,
-    read_declared_findings, read_file_events, read_findings, read_snapshot, resolve_builtin,
-    run_audit, run_diff, CoveragePaths, CoverageStatusInput, DiffError, FindingRecord, RunSelector,
+    builtin_names, coverage_status, discover_targets, file_views, find_manifest, list_runs,
+    plan_rerun, read_declared_findings, read_file_events, read_findings, read_snapshot,
+    resolve_builtin, run_audit, run_diff, CoveragePaths, CoverageStatusInput, DiffError,
+    FindingRecord, RerunError, RunSelector,
 };
 use rupu_workspace::WorkspaceStore;
 use serde::{Deserialize, Serialize};
@@ -27,6 +30,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/coverage/:target/audit", get(get_audit))
         .route("/api/coverage/:target/runs", get(get_runs))
         .route("/api/coverage/:target/diff", get(get_diff))
+        .route("/api/coverage/:target/gap", get(get_gap))
+        .route("/api/coverage/:target/rerun", post(rerun))
 }
 
 #[derive(Serialize)]
@@ -408,6 +413,155 @@ async fn get_diff(
     Err(ApiError::not_found(format!(
         "coverage target {target} not found"
     )))
+}
+
+// ── Gap + Rerun (per-target; local-only) ─────────────────────────────────
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct GapQuery {
+    ws_id: Option<String>,
+    /// Must be absent or `local`: coverage is read from this control plane's
+    /// registered workspaces.
+    host: Option<String>,
+}
+
+/// `GET /api/coverage/:target/gap` — the in-scope files each concern has no
+/// assertion for: [`rupu_coverage::AuditReport::gaps`], what `rupu coverage
+/// gap` prints.
+async fn get_gap(
+    State(s): State<AppState>,
+    Path(target): Path<String>,
+    Query(q): Query<GapQuery>,
+) -> ApiResult<Json<rupu_coverage::CoverageGaps>> {
+    LocalOnlyQuery { host: q.host }.require_local("coverage gap")?;
+    for w in scoped_workspaces(&s, &q.ws_id) {
+        let wp = std::path::Path::new(&w.path);
+        match run_target_audit(wp, &target) {
+            Ok(Some(report)) => return Ok(Json(report.gaps())),
+            Ok(None) => continue,
+            Err(e) => return Err(ApiError::internal(e)),
+        }
+    }
+    Err(ApiError::not_found(format!(
+        "coverage target {target} not found"
+    )))
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct RerunQuery {
+    ws_id: Option<String>,
+    /// Must be absent or `local`: the replay runs in the target's workspace
+    /// on this control plane's host.
+    host: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RerunBody {
+    /// The run to replay: its full id, as `GET /api/coverage/:target/runs`
+    /// lists it.
+    run: String,
+}
+
+/// `POST /api/coverage/:target/rerun` — replay a recorded agent run on its
+/// target, what `rupu coverage rerun` launches: the run's agent, prompt,
+/// permission mode and launch skills, in the workspace it was recorded in,
+/// started detached through the agent launcher. `202 {run_id, host_id,
+/// agent, target_id, ws_id, replays}` once it is started; `404` for an
+/// unknown target or a run with no manifest; `409` for a run that continued
+/// another (rerun that one) or was recorded in another workspace; `501` for
+/// a session/workflow/autoflow run, a remote `host`, or a control plane that
+/// is not `rupu cp serve`.
+async fn rerun(
+    State(s): State<AppState>,
+    Path(target): Path<String>,
+    Query(q): Query<RerunQuery>,
+    Json(body): Json<RerunBody>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    LocalOnlyQuery { host: q.host }.require_local("coverage rerun")?;
+    crate::api::config::require_writable_to(&s, "rerunning coverage")?;
+    let launcher = s
+        .agent_launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("rerunning coverage requires `rupu cp serve`"))?;
+    let run = body.run.trim();
+    let Some((ws, paths)) = scoped_workspaces(&s, &q.ws_id).into_iter().find_map(|w| {
+        let wp = std::path::Path::new(&w.path);
+        discover_targets(wp)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|t| t.target_id == target)
+            .then(|| (w.clone(), CoveragePaths::new(wp, &target)))
+    }) else {
+        return Err(ApiError::not_found(format!(
+            "coverage target {target} not found"
+        )));
+    };
+    let manifest = find_manifest(&paths, run)
+        .map_err(|e| ApiError::internal(format!("reading manifests: {e}")))?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no manifest for run '{run}' on target '{target}' \
+                 (runs before Slice B are not replayable)"
+            ))
+        })?;
+    let invocation = plan_rerun(&manifest).map_err(|e| match e {
+        RerunError::UnsupportedSurface(_) => ApiError::not_available(e.to_string()),
+        RerunError::ContinuedRun { .. } => ApiError::conflict(e.to_string()),
+    })?;
+    // The replay derives its target from its working directory, so it must
+    // run where the original did for the new run to land on this target.
+    let recorded = &invocation.workspace_path;
+    let here = std::path::Path::new(&ws.path);
+    let same = recorded == here
+        || matches!(
+            (std::fs::canonicalize(recorded), std::fs::canonicalize(here)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if !same {
+        return Err(ApiError::conflict(format!(
+            "run '{run}' was recorded in workspace {}, not in {}, where target {target} is",
+            recorded.display(),
+            ws.path
+        )));
+    }
+    let req = crate::agent_launcher::AgentLaunchRequest {
+        agent: invocation.agent_name.clone(),
+        prompt: Some(invocation.user_prompt),
+        mode: Some(invocation.permission_mode),
+        target: None,
+        working_dir: Some(recorded.display().to_string()),
+        run_id: None,
+        findings_profile: None,
+        // As `rupu coverage rerun`: the manifest records no engagement
+        // selection, so the replay never guesses one.
+        engagement_profiles: Vec::new(),
+        skills: invocation.skills,
+        preload_skills: invocation.preload_skills,
+        skill_bundle: None,
+        messaging: Default::default(),
+        codename: None,
+        // As `rupu coverage rerun`: the agent's own model and provider, a
+        // fresh run.
+        model: None,
+        provider: None,
+        continue_from: None,
+    };
+    let run_id = launcher.launch(req).await.map_err(|e| match e {
+        crate::agent_launcher::AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
+        crate::agent_launcher::AgentLaunchError::Spawn(m) => ApiError::internal(m),
+    })?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "run_id": run_id,
+            "host_id": "local",
+            "agent": invocation.agent_name,
+            "target_id": target,
+            "ws_id": ws.id,
+            "replays": run,
+        })),
+    ))
 }
 
 #[cfg(test)]

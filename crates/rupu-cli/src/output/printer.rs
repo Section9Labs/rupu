@@ -1312,20 +1312,8 @@ fn truncate_plain_single_line(value: &str, max: usize) -> String {
 
 /// Format a `Duration` as `Xs` or `Xm Ys` or `HhXmYs`.
 pub fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        let tenths = d.subsec_millis() / 100;
-        format!("{secs}.{tenths}s")
-    } else if secs < 3600 {
-        let m = secs / 60;
-        let s = secs % 60;
-        format!("{m}m {s}s")
-    } else {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        let s = secs % 60;
-        format!("{h}h {m}m {s}s")
-    }
+    // One duration format: the autoflow reports' (whose JSON carries it).
+    rupu_autoflow::format::format_duration(d)
 }
 
 /// Map severity string to (color, bold) for findings display.

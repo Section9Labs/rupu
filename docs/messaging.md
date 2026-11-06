@@ -221,6 +221,12 @@ The control plane serves the same thing as `GET/POST /api/{runs,sessions,agentif
 and a local SSE stream ([cp-api.md](cp-api.md)). Remote hosts answer over HTTP and SSH when
 their rupu advertises `run.messages`. Tunnel and bucket hosts answer 501.
 
+## The claim journal
+
+`board/claims.jsonl` records every claim's life, so the board can say who held what and when, not only what is held now. It is append-only, one line per event: `claimed` (key, owner, `at`, `lease_expires_at`, and the claim's token), `released` and `expired` (key, owner, `at`, token). The claim files stay the lock; the journal is the history. Writing it is best-effort: a failed append is logged and the claim still works, so a view can miss an event but never blocks a claim. Retractions in `directives.jsonl` carry the time they were made (`at`).
+
+The CP, `rupu __board` and the MCP tools read it as a `BoardView` ([cp-api.md](cp-api.md#board)). A space from before the journal has no `claims.jsonl`: its claims show only while live, as `held` with the claim file's stem for a key (`key_known: false`), and `journal` is false. Retractions from before they were timed show as retracted with no time.
+
 ## What is kept
 
 The log is the record. It is append-only and never trimmed. Past `[messaging].log_max_mb`

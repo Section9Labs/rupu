@@ -3,17 +3,20 @@
 // One text field per declared input (when known), else a small add-row
 // key/value editor; a Mode picker (Ask / Bypass / Read-only); an optional
 // Target field. On Launch it POSTs to the launcher endpoint and navigates to
-// the new run's detail page.
+// the new run's detail page. Engagement profiles (Plan 3b) ride along on a
+// local launch; a remote host can't take them (`launchFieldGates`).
 
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api, type LaunchMode, type PreviewBody } from '../lib/api';
+import { type LaunchMode, type PreviewBody } from '../lib/api';
 import TargetPicker from './TargetPicker';
 import HostSelect from './HostSelect';
 import { Button } from './ui/Button';
 import { LaunchBillingPanel, type BillingState } from './customers/LaunchBillingPanel';
 import { CustomerChip } from './customers/CustomerChip';
 import { WORKSPACE_ITEM, type TargetItem } from '../lib/targetItems';
+import { launchApi, launchFieldGates } from '../lib/api3b/launch';
+import EngagementProfilePicker from './launch/EngagementProfilePicker';
 
 interface KvRow {
   key: string;
@@ -65,6 +68,8 @@ export default function LauncherSheet({
   const [mode, setMode] = useState<LaunchMode>('ask');
   const [target, setTarget] = useState<TargetItem>(WORKSPACE_ITEM);
   const [host, setHost] = useState('local');
+  const [profiles, setProfiles] = useState<string[]>([]);
+  const gates = launchFieldGates({ kind: 'workflow', host });
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Which customer/accounts the launch would use, and whether it would fail.
@@ -94,12 +99,13 @@ export default function LauncherSheet({
     setLaunching(true);
     setError(null);
     try {
-      const res = await api.launchRun(workflow, {
+      const res = await launchApi.launchWorkflowRun(workflow, {
         inputs: Object.keys(inputs).length > 0 ? inputs : undefined,
         mode,
         target: target.resolved.target,
         working_dir: target.resolved.working_dir,
         host: host !== 'local' ? host : undefined,
+        ...(gates.profiles === null && profiles.length > 0 ? { engagement_profiles: profiles } : {}),
       });
       const hostParam = host !== 'local' ? `?host=${encodeURIComponent(host)}` : '';
       navigate(`/runs/${res.run_id}${hostParam}`);
@@ -242,6 +248,14 @@ export default function LauncherSheet({
               className="w-full"
             />
           </label>
+
+          <EngagementProfilePicker
+            value={profiles}
+            onChange={setProfiles}
+            wsId={target.wsId}
+            disabledReason={gates.profiles}
+            disabled={launching}
+          />
 
           <LaunchBillingPanel
             body={previewBody}

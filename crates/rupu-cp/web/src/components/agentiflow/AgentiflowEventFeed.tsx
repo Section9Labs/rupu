@@ -2,7 +2,7 @@
 // granular event feed (`GET /api/agentiflows/:id/events`: coordinator lifecycle
 // + per-unit lifecycle, oldest first), maps it to the shared Situation Room
 // StreamCards (`agentiflowEventCards`), and renders it through the SAME
-// RunEventFeed / EventCard the run detail and the global /events wall use. Polls
+// RunEventFeed event rail the run detail and the global /events wall use. Polls
 // while the engagement is running (no SSE yet — a later pass).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -61,5 +61,5 @@ export default function AgentiflowEventFeed({ id, codename, running }: { id: str
     );
   }
   if (error && events === null) return <ErrorBanner>{error}</ErrorBanner>;
-  return <RunEventFeed cards={cards} connection={running ? 'live' : undefined} />;
+  return <RunEventFeed cards={cards} connection={running ? 'live' : undefined} status={running ? 'running' : undefined} />;
 }

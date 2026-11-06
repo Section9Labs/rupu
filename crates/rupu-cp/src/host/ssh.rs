@@ -66,6 +66,7 @@ pub fn resume_argv(run_id: &str, if_unfinished: bool) -> RunArgv {
         run_id: run_id.to_string(),
         mode: None,
         if_unfinished,
+        restart_interrupted: false,
     })
 }
 
@@ -223,6 +224,31 @@ fn message_command(argv: &[String]) -> String {
         &[(CAP_RUN_MESSAGES, MESSAGES_UNSUPPORTED)],
         &build_remote_command(&cmd),
     )
+}
+
+/// Printed, instead of running `rupu __board`, by [`board_command`]'s gate
+/// when the remote `rupu __features` doesn't list
+/// [`crate::node::protocol::CAP_RUN_BOARD`].
+const BOARD_UNSUPPORTED: &str = "rupu-board: unsupported";
+
+/// The one remote command an SSH board read sends: `rupu __board <id>`
+/// ([`board_argv`]) behind [`feature_gate`] on `run.board`, as
+/// [`message_command`] gates `__message`.
+fn board_command(id: &str) -> String {
+    let cmd: Vec<String> = std::iter::once("rupu".to_string())
+        .chain(board_argv(id))
+        .collect();
+    feature_gate(
+        &[(crate::node::protocol::CAP_RUN_BOARD, BOARD_UNSUPPORTED)],
+        &build_remote_command(&cmd),
+    )
+}
+
+/// The argv (after `rupu`) of the `rupu __board` that reads run `id`'s
+/// board. Public so `rupu-cli` can check its own clap accepts it.
+#[doc(hidden)]
+pub fn board_argv(id: &str) -> Vec<String> {
+    vec!["__board".to_string(), id.to_string()]
 }
 
 /// The argv (after `rupu`) of the `rupu __message list` that reads `q` of
@@ -1828,6 +1854,21 @@ fn is_ssh_transport_failure(stderr: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// The error a remote `rupu` command that exited nonzero stands for: the
+/// ONE place a per-host read tells a host that is down from one that
+/// answered. ssh itself exits nonzero and says why on `stderr` when the
+/// transport failed ([`is_ssh_transport_failure`]) — the remote command
+/// never ran, the host is `Unreachable` (a 502, shown offline). Anything
+/// else is the remote rupu's own failure, in its own words: `Remote(0,
+/// stderr)` (`RemoteOutput` carries no exit code).
+fn nonzero_exit(stderr: String) -> HostConnectorError {
+    if is_ssh_transport_failure(&stderr) {
+        HostConnectorError::Unreachable(stderr)
+    } else {
+        HostConnectorError::Remote(0, stderr)
+    }
+}
+
 /// Classify a failed remote `rupu run list` ([`run_list_command`]).
 ///
 /// - a remote rupu that FAILED and advertises [`CAP_RUN_LIST`] (its stderr
@@ -1850,16 +1891,18 @@ fn run_list_failure(host_id: &str, e: HostConnectorError) -> HostConnectorError 
         // failure is the remote rupu's own — even if its error text happens
         // to contain a transport phrase ("broken pipe", "connection refused"
         // from something it talked to) — never an offline host.
-        HostConnectorError::Unreachable(msg) if msg.contains(RUN_LIST_SUPPORTED) => {
+        HostConnectorError::Unreachable(msg) | HostConnectorError::Remote(_, msg)
+            if msg.contains(RUN_LIST_SUPPORTED) =>
+        {
             let reason: Vec<&str> = msg
                 .lines()
                 .filter(|l| l.trim() != RUN_LIST_SUPPORTED)
                 .collect();
             HostConnectorError::Invalid(reason.join("\n").trim().to_string())
         }
-        HostConnectorError::Unreachable(msg) if is_ssh_transport_failure(&msg) => {
-            HostConnectorError::Unreachable(msg)
-        }
+        // `nonzero_exit` already read the transport markers: an
+        // `Unreachable` here is a host that is down.
+        down @ HostConnectorError::Unreachable(_) => down,
         other => HostConnectorError::Unsupported(format!(
             "remote host {host_id} does not support `rupu run list` \
              (it doesn't advertise `{CAP_RUN_LIST}`): {other}"
@@ -1990,7 +2033,7 @@ async fn exec_json(
     }
     .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
     if !out.success {
-        return Err(HostConnectorError::Unreachable(out.stderr));
+        return Err(nonzero_exit(out.stderr));
     }
     serde_json::from_str(out.stdout.trim())
         .map_err(|e| HostConnectorError::Remote(0, format!("parse `rupu {label}` output: {e}")))
@@ -2308,17 +2351,37 @@ impl SshHostConnector {
         &self,
         argv: Vec<String>,
     ) -> Result<T, HostConnectorError> {
+        self.helper_call(
+            &message_command(&argv),
+            "__message",
+            CAP_RUN_MESSAGES,
+            MESSAGES_UNSUPPORTED,
+        )
+        .await
+    }
+
+    /// Run `command` — a hidden `rupu <helper>` behind [`feature_gate`] on
+    /// `feature`, which prints `marker` instead on a remote without it —
+    /// and read what it printed: `T`, or its `{"error": …}` reply
+    /// (`MessageErrorReply`), which keeps its code's status.
+    async fn helper_call<T: serde::de::DeserializeOwned>(
+        &self,
+        command: &str,
+        helper: &str,
+        feature: &str,
+        marker: &str,
+    ) -> Result<T, HostConnectorError> {
         let out = self
             .exec
-            .run(&message_command(&argv))
+            .run(command)
             .await
             .map_err(|e| HostConnectorError::Unreachable(e.to_string()))?;
         if printed(&out.stdout, LAUNCH_RUPU_NOT_FOUND) {
             return Err(self.rupu_not_found());
         }
-        if printed(&out.stdout, MESSAGES_UNSUPPORTED) {
+        if printed(&out.stdout, marker) {
             return Err(HostConnectorError::Unsupported(format!(
-                "host {}: the remote rupu predates `{CAP_RUN_MESSAGES}`; upgrade rupu there",
+                "host {}: the remote rupu predates `{feature}`; upgrade rupu there",
                 self.host_id
             )));
         }
@@ -2330,7 +2393,7 @@ impl SshHostConnector {
         }
         if out.success {
             return serde_json::from_str(stdout).map_err(|e| {
-                HostConnectorError::Remote(0, format!("parse `rupu __message` output: {e}"))
+                HostConnectorError::Remote(0, format!("parse `rupu {helper}` output: {e}"))
             });
         }
         let stderr = out.stderr.trim();
@@ -2339,7 +2402,7 @@ impl SshHostConnector {
         }
         Err(HostConnectorError::Remote(
             0,
-            format!("`rupu __message` failed on host {}: {stderr}", self.host_id),
+            format!("`rupu {helper}` failed on host {}: {stderr}", self.host_id),
         ))
     }
 
@@ -2957,30 +3020,45 @@ impl SshHostConnector {
         (lower.contains("unknown session") || lower.contains("not found")) && message.contains(id)
     }
 
-    /// The useful half of a failed `remote_json` call.
-    ///
-    /// [`remote_json`](Self::remote_json) maps a NON-ZERO EXIT to
-    /// `Unreachable`, whose Display prefixes "host unreachable:". For a host
-    /// that answered and simply rejected the command (an out-of-date `rupu`
-    /// printing "unrecognized subcommand"), that prefix is actively wrong —
-    /// it points an operator at the network instead of at the binary. Unwrap
-    /// the inner message so callers can report what the remote actually
-    /// said.
+    /// The useful half of a failed `remote_json` call: a remote rupu that
+    /// ran and exited nonzero is `Remote(0, stderr)` ([`nonzero_exit`]),
+    /// whose Display prefixes "remote error 0:" — report what it actually
+    /// said (an out-of-date `rupu` printing "unrecognized subcommand").
     fn remote_failure_detail(e: &HostConnectorError) -> String {
         match e {
-            HostConnectorError::Unreachable(m) => m.trim().to_string(),
+            HostConnectorError::Remote(0, m) => m.trim().to_string(),
             other => other.to_string(),
         }
+    }
+
+    /// The error a failed per-host read stands for, once the remote has NOT
+    /// said the entity is absent (that is the caller's `NotFound`). A host
+    /// that is down passes through as `Unreachable` (a 502, shown offline).
+    /// Everything else — an old rupu without `rupu <command>`, a malformed
+    /// reply — is `Unsupported`: "the host cannot report", never "the entity
+    /// is absent", which would render an empty page as truth.
+    fn cannot_report(&self, command: &str, e: HostConnectorError) -> HostConnectorError {
+        if let HostConnectorError::Unreachable(_) = e {
+            return e;
+        }
+        tracing::warn!(
+            host_id = %self.host_id,
+            error = %e,
+            "remote `rupu {command}` failed; host may predate it"
+        );
+        HostConnectorError::Unsupported(format!(
+            "remote host {} does not support `rupu {command}`: {}",
+            self.host_id,
+            Self::remote_failure_detail(&e)
+        ))
     }
 
     /// Fetch one session's `session show` report `item` over ssh.
     ///
     /// A remote that explicitly says the session is absent maps to
-    /// `NotFound`; anything else (a host predating the command, unreachable,
-    /// malformed body) maps to `Unsupported` — "the host cannot report" is
-    /// not the same as "the session does not exist", and rendering the
-    /// latter would present an empty page as truth. Same rule as
-    /// [`get_run`](Self::get_run).
+    /// `NotFound`; everything else is [`cannot_report`](Self::cannot_report)
+    /// (a down host stays unreachable, an old or malformed one is
+    /// `Unsupported`). Same rule as [`get_run`](Self::get_run).
     async fn session_show_item(&self, id: &str) -> Result<serde_json::Value, HostConnectorError> {
         match self
             .remote_json_item(&["--format", "json", "session", "show", id])
@@ -2991,17 +3069,7 @@ impl SshHostConnector {
                 if Self::says_session_absent(&e.to_string(), id) {
                     return Err(HostConnectorError::NotFound(id.to_string()));
                 }
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    session_id = %id,
-                    error = %e,
-                    "session_show_item: remote `rupu session show` failed; host may predate it"
-                );
-                Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session show --format json`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                )))
+                Err(self.cannot_report("session show --format json", e))
             }
         }
     }
@@ -3353,19 +3421,9 @@ impl HostConnector for SshHostConnector {
                     );
                     return Err(HostConnectorError::NotFound(run_id.to_string()));
                 }
-                // Anything else (old host that can't parse `run show`,
-                // unreachable, malformed body): the host cannot report, not
-                // "the run is absent". Map to Unsupported, never NotFound.
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    run_id = %run_id,
-                    error = %e,
-                    "get_run: remote `rupu run show` failed; host may predate the command"
-                );
-                Err(HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu run show`: {e}",
-                    self.host_id
-                )))
+                // Anything else: the host cannot report, not "the run is
+                // absent" — never NotFound.
+                Err(self.cannot_report("run show", e))
             }
         }
     }
@@ -3594,6 +3652,26 @@ impl HostConnector for SshHostConnector {
         self.message_call(message_send_argv(id, &msg)).await
     }
 
+    /// Shells `rupu __board <id>` (no listing cache: a board is read when
+    /// asked for).
+    async fn run_board(
+        &self,
+        id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        if crate::host::messages::MessageRoute::of_id(id)
+            != Some(crate::host::messages::MessageRoute::Runs)
+        {
+            return Err(HostConnectorError::NotFound(format!("no run `{id}`")));
+        }
+        self.helper_call(
+            &board_command(id),
+            "__board",
+            crate::node::protocol::CAP_RUN_BOARD,
+            BOARD_UNSUPPORTED,
+        )
+        .await
+    }
+
     async fn pull_finding_artifact(
         &self,
         sha256: &str,
@@ -3794,19 +3872,7 @@ impl HostConnector for SshHostConnector {
         let report = self
             .remote_json(&["--format", "json", "netflow", "show", run_id])
             .await
-            .map_err(|e| {
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    run_id = %run_id,
-                    error = %e,
-                    "run_netflow: remote command failed; host may predate it"
-                );
-                HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu netflow show`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                ))
-            })?;
+            .map_err(|e| self.cannot_report("netflow show", e))?;
         Ok(serde_json::json!({
             "flows": report.get("rows").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
             // A dropped record is data the sink could not write; carrying the
@@ -3858,17 +3924,7 @@ impl HostConnector for SshHostConnector {
                 if Self::says_session_absent(&e.to_string(), id) {
                     return HostConnectorError::NotFound(id.to_string());
                 }
-                tracing::warn!(
-                    host_id = %self.host_id,
-                    session_id = %id,
-                    error = %e,
-                    "session_usage_timeline: remote command failed; host may predate it"
-                );
-                HostConnectorError::Unsupported(format!(
-                    "remote host {} does not support `rupu session usage-timeline`: {}",
-                    self.host_id,
-                    Self::remote_failure_detail(&e)
-                ))
+                self.cannot_report("session usage-timeline", e)
             })?;
         Ok(serde_json::Value::Array(rows))
     }
@@ -5646,6 +5702,96 @@ mod tests {
         assert!(matches!(err, HostConnectorError::Unreachable(_)), "{err}");
     }
 
+    /// A dead host is unreachable on EVERY per-host read (a 502, shown
+    /// "offline", through `host_read_error` / `host_list_error`), never a
+    /// host that predates the command (a 501, "upgrade rupu there") —
+    /// `docs/cp-api.md`'s status table, which the detail reads broke.
+    #[tokio::test]
+    async fn a_down_host_is_unreachable_on_every_read() {
+        let stderr = "ssh: connect to host 192.0.2.1 port 22: Operation timed out";
+        let fake = std::sync::Arc::new(FakeExec::offline(stderr));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let errs = [
+            ("get_run", conn.get_run("run_x").await.unwrap_err()),
+            ("get_session", conn.get_session("ses_x").await.unwrap_err()),
+            (
+                "session_runs",
+                conn.session_runs("ses_x").await.unwrap_err(),
+            ),
+            (
+                "session_usage_timeline",
+                conn.session_usage_timeline("ses_x").await.unwrap_err(),
+            ),
+            ("run_netflow", conn.run_netflow("run_x").await.unwrap_err()),
+            ("list_sessions", conn.list_sessions(None).await.unwrap_err()),
+            ("list_agent_runs", conn.list_agent_runs().await.unwrap_err()),
+            (
+                "usage_rollup",
+                conn.usage_rollup("2026-01-01", "2026-01-02", "model")
+                    .await
+                    .unwrap_err(),
+            ),
+        ];
+        for (what, err) in errs {
+            assert!(
+                matches!(&err, HostConnectorError::Unreachable(m) if m.contains("Operation timed out")),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    /// A remote rupu that ran and exited nonzero has answered: that is a
+    /// remote error, never "host unreachable", which sends an operator to
+    /// the network instead of the binary.
+    #[tokio::test]
+    async fn a_remote_rupu_failure_on_a_listing_is_a_remote_error_not_unreachable() {
+        let fake = std::sync::Arc::new(FakeExec::offline(
+            "error: unrecognized subcommand 'transcript'",
+        ));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.list_agent_runs().await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Remote(_, m) if m.contains("unrecognized subcommand")),
+            "{err}"
+        );
+    }
+
+    /// An `Unreachable` that is not a nonzero exit — a spawn failure, the
+    /// listing cache's own bound — is a host that is down, whatever its
+    /// wording: `run_list_failure` no longer re-reads the transport markers.
+    #[test]
+    fn run_list_failure_keeps_an_unreachable_without_a_transport_phrase() {
+        let err = run_list_failure(
+            "host_abc",
+            HostConnectorError::Unreachable("no data from host_abc for 60s".into()),
+        );
+        assert!(
+            matches!(&err, HostConnectorError::Unreachable(m) if m == "no data from host_abc for 60s"),
+            "{err}"
+        );
+    }
+
+    /// A remote rupu too old for `run show` is unsupported, in its own
+    /// words: neither "remote error 0" nor "host unreachable" reaches the
+    /// operator.
+    #[tokio::test]
+    async fn get_run_reports_an_old_host_in_the_remotes_own_words() {
+        let fake = std::sync::Arc::new(FakeExec::offline("error: unrecognized subcommand 'show'"));
+        let (conn, _store, _tmp) = make_conn(fake);
+        let err = conn.get_run("run_x").await.unwrap_err();
+        let message = err.to_string();
+        assert!(
+            matches!(err, HostConnectorError::Unsupported(_)),
+            "{message}"
+        );
+        assert!(
+            message.contains("unrecognized subcommand 'show'"),
+            "{message}"
+        );
+        assert!(!message.contains("remote error 0"), "{message}");
+        assert!(!message.contains("host unreachable"), "{message}");
+    }
+
     #[tokio::test]
     async fn list_runs_still_reports_an_old_remote_rupu_as_unsupported() {
         let fake = std::sync::Arc::new(FakeExec::offline("error: agent 'list' not found"));
@@ -6066,8 +6212,9 @@ mod tests {
     /// A host whose `rupu` predates `session usage-timeline` must say so,
     /// not report an empty chart as if the session had no turns.
     /// A host that ANSWERED and rejected the command is not an unreachable
-    /// host. `remote_json` maps a non-zero exit to `Unreachable`, so the
-    /// reported reason must not carry that prefix onward — it would point an
+    /// host: `nonzero_exit` keeps the remote's own words as `Remote(0, _)`,
+    /// and the reported reason must carry neither that variant's "remote
+    /// error 0:" nor "host unreachable:" — the latter would point an
     /// operator at the network instead of at the out-of-date binary.
     #[tokio::test]
     async fn an_old_hosts_reason_does_not_claim_the_host_is_unreachable() {
@@ -6975,6 +7122,8 @@ mod tests {
 
         let run_id = conn
             .launch_run(crate::launcher::LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "deploy".into(),
                 inputs: Default::default(),
                 mode: Some("bypass".into()),
@@ -7057,6 +7206,7 @@ mod tests {
                     codename: None,
                     cause: None,
                     error: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -7959,6 +8109,8 @@ mod tests {
         // launch_run maps a failed ssh dispatch to Unreachable.
         let err = conn
             .launch_run(crate::launcher::LaunchRequest {
+                engagement_profiles: Vec::new(),
+                file: None,
                 workflow: "deploy".into(),
                 inputs: Default::default(),
                 mode: None,
@@ -8098,6 +8250,9 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: None,
                 mode: None,
@@ -8316,6 +8471,9 @@ mod tests {
         let fake = std::sync::Arc::new(fake);
         let (conn, run_store, tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "sec".into(),
             prompt: None,
             mode: None,
@@ -9713,6 +9871,9 @@ mod tests {
         let run_id = rt.block_on(async {
             let run_id = conn
                 .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                    model: None,
+                    provider: None,
+                    continue_from: None,
                     codename: None,
                     agent: "reviewer".into(),
                     prompt: Some("go".into()),
@@ -10016,6 +10177,9 @@ mod tests {
 
         let run_id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
@@ -10062,6 +10226,9 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: Some("go".into()),
@@ -10097,6 +10264,9 @@ mod tests {
         let (conn, run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let id = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 agent: "sec".into(),
                 prompt: Some("audit".into()),
                 mode: None,
@@ -10132,6 +10302,9 @@ mod tests {
         let fake = std::sync::Arc::new(FakeExec::ok(vec![]));
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         conn.launch_agent(crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: Some("enumerate".into()),
             mode: None,
@@ -10161,6 +10334,9 @@ mod tests {
 
     fn skilled_launch(run_id: &str) -> crate::agent_launcher::AgentLaunchRequest {
         crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             agent: "recon".into(),
             prompt: Some("enumerate".into()),
             mode: None,
@@ -10190,6 +10366,9 @@ mod tests {
         messaging: LaunchMessaging,
     ) -> crate::agent_launcher::AgentLaunchRequest {
         crate::agent_launcher::AgentLaunchRequest {
+            model: None,
+            provider: None,
+            continue_from: None,
             skills: Vec::new(),
             preload_skills: Vec::new(),
             messaging,
@@ -10453,6 +10632,9 @@ mod tests {
         let (conn, _run_store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
         let err = conn
             .launch_agent(crate::agent_launcher::AgentLaunchRequest {
+                model: None,
+                provider: None,
+                continue_from: None,
                 codename: None,
                 agent: "reviewer".into(),
                 prompt: None,
@@ -10479,6 +10661,8 @@ mod tests {
         let (conn, _store, _tmp) = make_conn(std::sync::Arc::clone(&fake));
 
         conn.launch_run(crate::launcher::LaunchRequest {
+            engagement_profiles: Vec::new(),
+            file: None,
             workflow: "deploy".into(),
             inputs: Default::default(),
             mode: None,
@@ -11823,6 +12007,43 @@ mod tests {
         assert!(matches!(
             conn.send_operator_message("run_01MSG", send).await,
             Err(HostConnectorError::Unreachable(_))
+        ));
+    }
+
+    /// A board read runs `rupu __board <id>` only on a remote whose `rupu
+    /// __features` lists `run.board`, and reads its view or its refusal.
+    #[tokio::test]
+    async fn the_board_runs_only_on_a_remote_advertising_it() {
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let view = r#"{"claims":[],"directives":[],"journal":true}"#;
+        let bin = fake_message_rupu(&format!("echo '{report}'"), &format!("echo '{view}'"));
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let got = conn.run_board("run_01BOARD").await.unwrap();
+        assert!(got.journal && got.claims.is_empty());
+        assert_eq!(recorded_argv(&bin).unwrap(), ["__board", "run_01BOARD"]);
+
+        let bin = fake_message_rupu(
+            &format!("echo '{report}'"),
+            r#"echo '{"error":{"code":"not_found","message":"no run"}}'; exit 3"#,
+        );
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        assert!(matches!(
+            conn.run_board("run_01BOARD").await,
+            Err(HostConnectorError::NotFound(m)) if m == "no run"
+        ));
+
+        let bin = fake_message_rupu(r#"echo '{"features":["run.messages"]}'"#, "echo '{}'");
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let err = conn.run_board("run_01BOARD").await.unwrap_err();
+        assert!(
+            matches!(&err, HostConnectorError::Unsupported(m) if m.contains("predates `run.board`")),
+            "{err:?}"
+        );
+        assert_eq!(recorded_argv(&bin), None, "`__board` never ran");
+        assert!(matches!(
+            conn.run_board("af_01BOARD").await,
+            Err(HostConnectorError::NotFound(_))
         ));
     }
 }

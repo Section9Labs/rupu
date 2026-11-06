@@ -1,4 +1,5 @@
 use crate::{
+    admin_ops,
     api::{
         fs_safety,
         repo_scope::{distinct_repo_workspaces, ScopeKind, ScopeQuery},
@@ -9,18 +10,177 @@ use crate::{
 };
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use rupu_orchestrator::Workflow;
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/autoflows", get(list_autoflow_defs))
+        // Literal siblings of `/api/autoflows/:name`: the router prefers a
+        // literal segment, and the MCP route guard refuses a `name` equal
+        // to one (`autoflows.get {name: "doctor"}` never reaches doctor).
+        .route("/api/autoflows/doctor", get(autoflow_doctor))
+        .route("/api/autoflows/wakes", get(autoflow_wakes))
+        .route("/api/autoflows/explain", get(autoflow_explain))
+        .route("/api/autoflows/:name", get(autoflow_show))
+        .route("/api/autoflows/:name/run", post(autoflow_run))
         .route("/api/autoflows/:name/enable", post(enable_autoflow))
         .route("/api/autoflows/:name/disable", post(disable_autoflow))
+}
+
+/// `?repo=&host=` on the autoflow reads.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowRepoQuery {
+    /// Limit to one tracked repo, e.g. `github:owner/repo`.
+    pub(crate) repo: Option<String>,
+    /// A host id; only `local` (or none) is served, any other is a 501.
+    pub(crate) host: Option<String>,
+}
+
+/// `GET /api/autoflows/explain` query.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ExplainQuery {
+    /// The issue in full form, `<tracker>:<project>/issues/<number>`
+    /// (`github:owner/repo/issues/42`, `linear:eng/issues/42`); a bare
+    /// number is a 400. A query parameter, not a path segment: an issue ref
+    /// carries `/`.
+    pub(crate) issue_ref: String,
+    /// Limit resolution to one bound repo, e.g. `github:owner/repo`.
+    pub(crate) repo: Option<String>,
+    /// A host id; only `local` (or none) is served, any other is a 501.
+    pub(crate) host: Option<String>,
+}
+
+/// `POST /api/autoflows/:name/run` body.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AutoflowRunBody {
+    /// The issue in full run-target form: `github:owner/repo/issues/42` or
+    /// `gitlab:group/project/issues/9`.
+    pub(crate) issue: String,
+    /// Limit resolution to one bound repo, e.g. `github:owner/repo`.
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
+    /// Permission mode override: `bypass` or `readonly`.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+}
+
+/// The `RUPU_HOME` and the directory whose project layer the autoflow reads
+/// see: the one `cp serve` serves, as the CLI sees its working directory.
+fn visibility(s: &AppState) -> (std::path::PathBuf, std::path::PathBuf) {
+    (s.global_dir.clone(), s.workspace_dir.clone())
+}
+
+/// `GET /api/autoflows/:name` — `rupu autoflow show <name>`: the
+/// autoflow's resolved metadata (repo, entity, selector, workspace, claim
+/// TTL, ...) and its YAML `body`. 404 when no autoflow by that name is
+/// visible; 409 when several are (pass `repo`).
+async fn autoflow_show(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<AutoflowRepoQuery>,
+) -> ApiResult<Json<rupu_autoflow::AutoflowShowReport>> {
+    admin_ops::local_only(q.host.as_deref(), "showing an autoflow")?;
+    fs_safety::validate_name(&name)?;
+    let (global, pwd) = visibility(&s);
+    let report = admin_ops::blocking(move || {
+        rupu_autoflow::show_report(&global, &pwd, &name, q.repo.as_deref())
+    })
+    .await?;
+    Ok(Json(report))
+}
+
+/// `GET /api/autoflows/explain?issue_ref=` — `rupu autoflow explain`: the
+/// issue's claim, last run, queued wakes and recent cycle events. The last
+/// run is priced as the CLI prices it from `cp serve`'s directory.
+async fn autoflow_explain(
+    State(s): State<AppState>,
+    Query(q): Query<ExplainQuery>,
+) -> ApiResult<Json<rupu_autoflow::AutoflowExplainReport>> {
+    admin_ops::local_only(q.host.as_deref(), "explaining an autoflow issue")?;
+    let issue_ref = admin_ops::full_issue_ref(&q.issue_ref)?;
+    let (global, pwd) = visibility(&s);
+    let report = admin_ops::blocking(move || {
+        let project_root = rupu_autoflow::paths::project_root_for(&pwd).ok().flatten();
+        let pricing =
+            rupu_workspace::load_config_for_display(&global, project_root.as_deref(), &pwd, true)
+                .pricing;
+        rupu_autoflow::explain_report(&global, &pwd, &issue_ref, q.repo.as_deref(), &pricing)
+    })
+    .await?;
+    Ok(Json(report))
+}
+
+/// `GET /api/autoflows/doctor` — `rupu autoflow doctor`: consistency
+/// problems across claims, wakes and runs (`ok` when there are none).
+async fn autoflow_doctor(
+    State(s): State<AppState>,
+    Query(q): Query<AutoflowRepoQuery>,
+) -> ApiResult<Json<rupu_autoflow::AutoflowDoctorReport>> {
+    admin_ops::local_only(q.host.as_deref(), "the autoflow doctor")?;
+    let global = s.global_dir.clone();
+    let report =
+        admin_ops::blocking(move || rupu_autoflow::doctor_report(&global, q.repo.as_deref()))
+            .await?;
+    Ok(Json(report))
+}
+
+/// `GET /api/autoflows/wakes` — `rupu autoflow wakes`: queued wakes and the
+/// ten most recently processed.
+async fn autoflow_wakes(
+    State(s): State<AppState>,
+    Query(q): Query<AutoflowRepoQuery>,
+) -> ApiResult<Json<rupu_autoflow::AutoflowWakesReport>> {
+    admin_ops::local_only(q.host.as_deref(), "listing autoflow wakes")?;
+    let global = s.global_dir.clone();
+    let report =
+        admin_ops::blocking(move || rupu_autoflow::wakes_report(&global, q.repo.as_deref()))
+            .await?;
+    Ok(Json(report))
+}
+
+/// `POST /api/autoflows/:name/run` — `rupu autoflow run <name> <issue>`,
+/// detached. Checked first (`rupu_autoflow::run_precheck`: the autoflow
+/// resolves for the issue, the mode is one autoflows take, no other cycle
+/// holds the issue's claim: 400 / 404 / 409), then spawned through the
+/// `AdminOps` port; 202 means the cycle's process started, not that it
+/// finished. Follow it with `GET /api/autoflows/explain`.
+async fn autoflow_run(
+    State(s): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<admin_ops::HostQuery>,
+    Json(body): Json<AutoflowRunBody>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    admin_ops::local_only(q.host.as_deref(), "running an autoflow")?;
+    crate::api::config::require_writable_to(&s, "running an autoflow")?;
+    fs_safety::validate_name(&name)?;
+    let ops = admin_ops::ops(&s, "running an autoflow")?;
+    let req = admin_ops::AutoflowRunRequest {
+        name,
+        issue: admin_ops::full_issue_ref(&body.issue)?,
+        repo: body.repo,
+        mode: body.mode,
+    };
+    let (global, pwd) = visibility(&s);
+    let check = req.clone();
+    admin_ops::blocking(move || {
+        rupu_autoflow::run_precheck(
+            &global,
+            &pwd,
+            &check.name,
+            &check.issue,
+            check.repo.as_deref(),
+            check.mode.as_deref(),
+        )
+    })
+    .await?;
+    let started = ops.autoflow_run(req).await?;
+    Ok((StatusCode::ACCEPTED, Json(started)))
 }
 
 /// Slim DTO for a single workflow definition carrying an `autoflow:` block

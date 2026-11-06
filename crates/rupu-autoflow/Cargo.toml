@@ -1,0 +1,27 @@
+[package]
+name = "rupu-autoflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rupu-config = { path = "../rupu-config" }
+rupu-orchestrator = { path = "../rupu-orchestrator" }
+rupu-runtime = { path = "../rupu-runtime" }
+rupu-scm = { path = "../rupu-scm" }
+rupu-transcript = { path = "../rupu-transcript" }
+rupu-workspace = { path = "../rupu-workspace" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

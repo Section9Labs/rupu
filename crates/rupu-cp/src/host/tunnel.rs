@@ -671,6 +671,14 @@ impl HostConnector for TunnelHostConnector {
         Err(crate::host::messages::no_message_transport("tunnel"))
     }
 
+    /// A tunnel carries no board frames.
+    async fn run_board(
+        &self,
+        _id: &str,
+    ) -> Result<rupu_runtime::services::board::BoardView, HostConnectorError> {
+        Err(crate::host::messages::no_board_transport("tunnel"))
+    }
+
     /// Ask the node for the blob over the tunnel (`Frame::ArtifactPull`) and
     /// write its ordered `ArtifactChunk`s to `dest` until `ArtifactPullDone`.
     async fn pull_finding_artifact(

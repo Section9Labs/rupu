@@ -6,7 +6,7 @@
 // "see all" content). The header project name shows in both.
 
 import '@testing-library/jest-dom/vitest';
-import { afterEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import {
@@ -21,6 +21,7 @@ import {
 import { ACME, withCustomerScope } from '../lib/customerScopeTestUtils';
 import { type UsageSummary } from '../lib/usage';
 import ProjectDetail, { type ProjectTab } from './ProjectDetail';
+import { admin } from '../lib/api3b/admin';
 
 afterEach(() => {
   cleanup();
@@ -195,6 +196,12 @@ describe('ProjectDetail shell', () => {
 // ---------------------------------------------------------------------------
 
 describe('ProjectDetail Config tab', () => {
+  // The tab's Repositories section reads the tracked repos (UI-5); its own
+  // behaviour is covered in components/project/ProjectRepositories.test.tsx.
+  beforeEach(() => {
+    vi.spyOn(admin, 'getTrackedRepos').mockResolvedValue([]);
+  });
+
   it('calls getConfig(projectId) and renders the resolved project config with provenance', async () => {
     vi.spyOn(api, 'getProject').mockResolvedValue(DETAIL);
     vi.spyOn(api, 'getProjectAssessedPct').mockResolvedValue({ assessed_pct: null });

@@ -1,5 +1,6 @@
 //! [`McpServer`]: JSON-RPC 2.0 over a [`Transport`] (or per HTTP request),
-//! serving the tools of its [`ToolSource`]s.
+//! serving the tools of its [`ToolSource`]s, and the resources and prompts
+//! of its [`ResourceSource`]s and [`PromptSource`]s when it has any.
 //!
 //! Every `tools/call` runs as its own task, so a slow call (a `bash`, a
 //! connector) never holds up a `ping` or another call, and a
@@ -8,10 +9,13 @@
 
 use crate::error::{McpError, ServeError};
 use crate::filter::ToolFilter;
-use crate::source::{CallCx, Progress, ToolDef, ToolResult, ToolSource};
+use crate::source::{
+    CallCx, Progress, PromptDef, PromptSource, ResourceDef, ResourceSource, ResourceTemplate,
+    ToolDef, ToolResult, ToolSource,
+};
 use crate::transport::Transport;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinSet};
@@ -43,6 +47,18 @@ async fn send_logged<T: Transport>(transport: &T, msg: Value) {
 // McpServer: the protocol core over pluggable tool sources.
 // ---------------------------------------------------------------------------
 
+/// Entries per page of `resources/list`, `resources/templates/list` and
+/// `prompts/list`; a fuller list answers `nextCursor`.
+pub const LIST_PAGE: usize = 50;
+
+/// What an [`McpServer`] serves.
+#[derive(Default, Clone)]
+pub struct Sources {
+    pub tools: Vec<Arc<dyn ToolSource>>,
+    pub resources: Vec<Arc<dyn ResourceSource>>,
+    pub prompts: Vec<Arc<dyn PromptSource>>,
+}
+
 /// What the transport knows about the request a message arrived on.
 #[derive(Debug, Clone, Default)]
 pub struct HandleCx<'a> {
@@ -69,7 +85,25 @@ struct Core {
     /// Tool name → the source index that serves it.
     owner: HashMap<String, usize>,
     sources: Vec<Arc<dyn ToolSource>>,
+    /// `None` for a server with no resource source: it advertises no
+    /// `resources` capability and answers no `resources/*` method.
+    resources: Option<Resources>,
+    /// Likewise for prompts.
+    prompts: Option<Prompts>,
     in_flight: Mutex<SessionFlight>,
+}
+
+struct Resources {
+    /// Listed resources and templates, in source order.
+    defs: Vec<ResourceDef>,
+    templates: Vec<ResourceTemplate>,
+    sources: Vec<Arc<dyn ResourceSource>>,
+}
+
+struct Prompts {
+    /// Listed prompts with the index of the source that serves each.
+    defs: Vec<(PromptDef, usize)>,
+    sources: Vec<Arc<dyn PromptSource>>,
 }
 
 /// In-flight `tools/call`s keyed by (session, request id).
@@ -102,6 +136,30 @@ impl McpServer {
     /// Lists every tool of `sources` that `filter` keeps. A name served by
     /// two sources is `ServeError::Duplicate(name)`.
     pub fn new(sources: Vec<Arc<dyn ToolSource>>, filter: &ToolFilter) -> Result<Self, ServeError> {
+        Self::from_sources(
+            Sources {
+                tools: sources,
+                ..Sources::default()
+            },
+            filter,
+        )
+    }
+
+    /// [`McpServer::new`] over `sources.tools`, plus the resources and
+    /// prompts of the other sources (`filter` applies to tools only). A URI
+    /// or prompt name listed twice is an error, as a tool name is.
+    pub fn from_sources(sources: Sources, filter: &ToolFilter) -> Result<Self, ServeError> {
+        let Sources {
+            tools: sources,
+            resources,
+            prompts,
+        } = sources;
+        let resources = (!resources.is_empty())
+            .then(|| Resources::new(resources))
+            .transpose()?;
+        let prompts = (!prompts.is_empty())
+            .then(|| Prompts::new(prompts))
+            .transpose()?;
         let mut defs = Vec::new();
         let mut owner: HashMap<String, usize> = HashMap::new();
         let all: Vec<_> = sources.iter().map(|s| s.tools()).collect();
@@ -123,6 +181,8 @@ impl McpServer {
                 defs,
                 owner,
                 sources,
+                resources,
+                prompts,
                 in_flight: Mutex::new(SessionFlight::default()),
             }),
         })
@@ -299,15 +359,72 @@ impl Core {
         match method {
             "initialize" => {
                 let requested = params.get("protocolVersion").and_then(Value::as_str);
+                let mut capabilities = json!({ "tools": {} });
+                if self.resources.is_some() {
+                    capabilities["resources"] = json!({});
+                }
+                if self.prompts.is_some() {
+                    capabilities["prompts"] = json!({});
+                }
                 ok(json!({
                     "protocolVersion": negotiate_protocol_version(requested),
                     "serverInfo": { "name": "rupu", "version": env!("CARGO_PKG_VERSION") },
-                    "capabilities": { "tools": {} },
+                    "capabilities": capabilities,
                 }))
             }
             "ping" => ok(json!({})),
             "tools/list" => ok(json!({ "tools": self.list() })),
             "tools/call" => self.tools_call(id, params, session, host, notify).await,
+            "resources/list" | "resources/templates/list" | "resources/read" => {
+                let Some(resources) = &self.resources else {
+                    return Some(McpError::UnknownMethod(method.to_string()).to_jsonrpc(id));
+                };
+                let result = match method {
+                    "resources/list" => page(&resources.defs, &params, "resources", |d| {
+                        json!({
+                            "uri": d.uri,
+                            "name": d.name,
+                            "description": d.description,
+                            "mimeType": d.mime_type,
+                        })
+                    }),
+                    "resources/templates/list" => {
+                        page(&resources.templates, &params, "resourceTemplates", |t| {
+                            let mut v = json!({
+                                "uriTemplate": t.uri_template,
+                                "name": t.name,
+                                "description": t.description,
+                            });
+                            if let Some(m) = &t.mime_type {
+                                v["mimeType"] = json!(m);
+                            }
+                            v
+                        })
+                    }
+                    _ => resources.read(&params).await,
+                };
+                reply(id, result)
+            }
+            "prompts/list" | "prompts/get" => {
+                let Some(prompts) = &self.prompts else {
+                    return Some(McpError::UnknownMethod(method.to_string()).to_jsonrpc(id));
+                };
+                let result = match method {
+                    "prompts/list" => page(&prompts.defs, &params, "prompts", |(d, _)| {
+                        json!({
+                            "name": d.name,
+                            "description": d.description,
+                            "arguments": d.arguments.iter().map(|a| json!({
+                                "name": a.name,
+                                "description": a.description,
+                                "required": a.required,
+                            })).collect::<Vec<_>>(),
+                        })
+                    }),
+                    _ => prompts.get(&params).await,
+                };
+                reply(id, result)
+            }
             other => Some(McpError::UnknownMethod(other.to_string()).to_jsonrpc(id)),
         }
     }
@@ -467,5 +584,141 @@ impl Core {
         for (_, task) in calls.into_values() {
             task.abort();
         }
+    }
+}
+
+fn reply(id: Value, result: Result<Value, McpError>) -> Option<Value> {
+    Some(match result {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err(e) => e.to_jsonrpc(id),
+    })
+}
+
+/// One page of `items` under `key`, from `params.cursor` (the offset of the
+/// page, as the previous page's `nextCursor` gave it).
+fn page<T>(
+    items: &[T],
+    params: &Value,
+    key: &str,
+    render: impl Fn(&T) -> Value,
+) -> Result<Value, McpError> {
+    let start = match params.get("cursor") {
+        None | Some(Value::Null) => 0,
+        Some(c) => c
+            .as_str()
+            .and_then(|c| c.parse::<usize>().ok())
+            .filter(|n| *n <= items.len())
+            .ok_or_else(|| McpError::InvalidArgs(format!("invalid cursor: {c}")))?,
+    };
+    let end = (start + LIST_PAGE).min(items.len());
+    let mut out = json!({ key: items[start..end].iter().map(render).collect::<Vec<_>>() });
+    if end < items.len() {
+        out["nextCursor"] = json!(end.to_string());
+    }
+    Ok(out)
+}
+
+impl Resources {
+    fn new(sources: Vec<Arc<dyn ResourceSource>>) -> Result<Self, ServeError> {
+        let mut seen = HashSet::new();
+        let mut defs = Vec::new();
+        let mut templates = Vec::new();
+        for source in &sources {
+            for def in source.resources() {
+                if !seen.insert(def.uri.clone()) {
+                    return Err(ServeError::DuplicateResource(def.uri));
+                }
+                defs.push(def);
+            }
+            templates.extend(source.templates());
+        }
+        Ok(Self {
+            defs,
+            templates,
+            sources,
+        })
+    }
+
+    async fn read(&self, params: &Value) -> Result<Value, McpError> {
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::InvalidArgs("resources/read needs a `uri`".into()))?;
+        for source in &self.sources {
+            if let Some(r) = source.read(uri).await {
+                return Ok(json!({ "contents": [r.to_contents()] }));
+            }
+        }
+        Err(McpError::ResourceNotFound(uri.to_string()))
+    }
+}
+
+impl Prompts {
+    fn new(sources: Vec<Arc<dyn PromptSource>>) -> Result<Self, ServeError> {
+        let mut seen = HashSet::new();
+        let mut defs = Vec::new();
+        for (i, source) in sources.iter().enumerate() {
+            for def in source.prompts() {
+                if !seen.insert(def.name.clone()) {
+                    return Err(ServeError::DuplicatePrompt(def.name));
+                }
+                defs.push((def, i));
+            }
+        }
+        Ok(Self { defs, sources })
+    }
+
+    /// `prompts/get`: the arguments are checked against the prompt's
+    /// definition before its source renders it.
+    async fn get(&self, params: &Value) -> Result<Value, McpError> {
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| McpError::InvalidArgs("prompts/get needs a `name`".into()))?;
+        let (def, i) = self
+            .defs
+            .iter()
+            .find(|(d, _)| d.name == name)
+            .ok_or_else(|| McpError::InvalidArgs(format!("unknown prompt: {name}")))?;
+        let mut args = BTreeMap::new();
+        match params.get("arguments") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(m)) => {
+                for (k, v) in m {
+                    let v = v.as_str().ok_or_else(|| {
+                        McpError::InvalidArgs(format!(
+                            "prompt `{name}`: argument `{k}` must be a string"
+                        ))
+                    })?;
+                    args.insert(k.clone(), v.to_string());
+                }
+            }
+            Some(_) => {
+                return Err(McpError::InvalidArgs(format!(
+                    "prompt `{name}`: `arguments` must be an object"
+                )))
+            }
+        }
+        if let Some(missing) = def
+            .arguments
+            .iter()
+            .find(|a| a.required && !args.contains_key(&a.name))
+        {
+            return Err(McpError::InvalidArgs(format!(
+                "prompt `{name}` needs the argument `{}`",
+                missing.name
+            )));
+        }
+        let reply = self.sources[*i]
+            .get(name, &args)
+            .await
+            .ok_or_else(|| McpError::InvalidArgs(format!("unknown prompt: {name}")))?;
+        Ok(json!({
+            "description": reply.description,
+            "messages": [{
+                "role": "user",
+                "content": { "type": "text", "text": reply.text },
+            }],
+        }))
     }
 }

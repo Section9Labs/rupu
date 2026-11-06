@@ -109,6 +109,13 @@ pub enum RoundOutcome {
 /// work (a session turn) internally and blocks until the round completes.
 pub trait LeadDriver: Send {
     fn run_round(&mut self, ctx: &RoundContext) -> RoundOutcome;
+
+    /// The text of the lead's last assistant message in the round that just
+    /// ran: what it decided. `None` when the driver keeps no conversation or
+    /// the round said nothing.
+    fn last_decision(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Why the envelope stopped. See the module docs for the check order.

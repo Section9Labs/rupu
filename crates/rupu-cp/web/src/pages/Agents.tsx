@@ -23,6 +23,8 @@ import { relativeTime } from '../lib/time';
 import { useInfiniteScroll } from '../lib/useInfiniteScroll';
 import { ListQueryBar, NoMatches, useFilteredRows, useListQuery } from '../components/query/ListQueryBar';
 import { AGENT_FIELDS } from '../lib/query/lists/agents';
+import ValidateAllDrawer from '../components/launch/ValidateAllDrawer';
+import FleetInstallDialog from '../components/launch/FleetInstallDialog';
 
 const STEP = 20;
 
@@ -37,6 +39,8 @@ export default function Agents() {
   // error above, but shown in the same banner (mirrors Sessions.tsx /
   // pages/runs/WorkflowRuns.tsx's `actionError`).
   const [actionError, setActionError] = useState<string | null>(null);
+  const [validateOpen, setValidateOpen] = useState(false);
+  const [fleetOpen, setFleetOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -125,10 +129,14 @@ export default function Agents() {
         title="Agents"
         subtitle="Agent files discovered across this control plane — provider, model, and the system prompt each one runs with."
         actions={
+          <>
+          <Button variant="secondary" onClick={() => setValidateOpen(true)}>Validate all</Button>
+          <Button variant="secondary" onClick={() => setFleetOpen(true)}>Install stock fleet</Button>
           <Button variant="solid" onClick={() => navigate('/agents/new')} className="gap-1.5">
             <Plus size={14} />
             New agent
           </Button>
+          </>
         }
       />
 
@@ -197,8 +205,16 @@ export default function Agents() {
         </section>
       )}
 
+      {validateOpen && <ValidateAllDrawer onClose={() => setValidateOpen(false)} />}
+      {fleetOpen && <FleetInstallDialog onClose={() => setFleetOpen(false)} onInstalled={() => void load()} />}
+
       {launchingAgent && (
-        <AgentLauncherSheet agent={launchingAgent} onClose={() => setLaunchingAgent(null)} />
+        <AgentLauncherSheet
+          agent={launchingAgent}
+          agentProvider={agents?.find((a) => a.name === launchingAgent)?.provider}
+          agentModel={agents?.find((a) => a.name === launchingAgent)?.model}
+          onClose={() => setLaunchingAgent(null)}
+        />
       )}
     </div>
   );

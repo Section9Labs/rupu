@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // AgentiflowDetail — header + goals + budget (always shown) plus the tabbed
-// Flow (graph + fleet) / Assets / Findings / Network / Messages / Transcript / Events
+// Flow (map + fleet) / Assets / Findings / Network / Messages / Transcript / Events
 // views over one GET /api/agentiflows/:id. TranscriptPanel is mocked (heavy;
 // its own tests); the Findings/Assets/Messages tabs fetch on open and aren't
 // exercised here.
@@ -10,6 +10,13 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, cleanup, within, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { api, ApiError, type AgentiflowDetail as Detail } from '../lib/api';
+
+// The Flow tab's map has its own tests (components/flowmap); its canvas
+// can't mount under jsdom.
+vi.mock('../components/flowmap/FlowMap', () => ({
+  __esModule: true,
+  default: ({ running }: { running: boolean }) => <div data-testid="flow-map" data-running={String(running)} />,
+}));
 
 vi.mock('../components/TranscriptPanel', () => ({
   __esModule: true,
@@ -163,6 +170,8 @@ describe('AgentiflowDetail', () => {
     expect(await screen.findByRole('heading', { name: 'rupu-self-review' })).toBeInTheDocument();
     expect(screen.getByText('af_01ABC')).toBeInTheDocument();
     expect(screen.getByText('Review rupu with a fleet.')).toBeInTheDocument();
+    // The Flow tab (the default) draws the map.
+    expect(screen.getByTestId('flow-map')).toBeInTheDocument();
 
     // Goals: the objective comes from the definition, the counters from the record.
     expect(screen.getByText('Find real issues')).toBeInTheDocument();
@@ -175,8 +184,14 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByRole('progressbar', { name: 'rounds used' })).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByRole('progressbar', { name: 'spend used' })).toHaveAttribute('aria-valuenow', '25');
 
-    // Fleet (the default Flow tab). Unit identities also render in the graph
-    // above, so scope these assertions to the Fleet panel.
+    // Goals and budget show once, in the one Status panel.
+    expect(screen.getAllByRole('heading', { name: 'Goals' })).toHaveLength(1);
+    expect(screen.getAllByRole('heading', { name: 'Budget' })).toHaveLength(1);
+    expect(within(screen.getByTestId('af-status')).getByRole('heading', { name: 'Budget' })).toBeInTheDocument();
+
+    // Fleet (its own tab now; the flow map is always shown above the tabs).
+    // Unit identities also render in the map, so scope these to the panel.
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet/ }));
     const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
     expect(within(fleet).getByText('heron#1 · recon')).toBeInTheDocument();
     expect(within(fleet).getByText('lynx#1 · triage')).toBeInTheDocument();
@@ -191,18 +206,20 @@ describe('AgentiflowDetail', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(screen.getByTestId('transcript-panel')).toHaveTextContent('/tmp/lead/transcript.r1.jsonl:false');
 
-    // Events tab: the shared live-events feed (RunEventFeed / EventCard), fed by
+    // Events tab: the shared event rail (RunEventFeed / EventRail), fed by
     // GET /api/agentiflows/:id/events (fetched async, hence findByText).
     fireEvent.click(screen.getByRole('button', { name: 'Events' }));
     expect(await screen.findByText('3 events')).toBeInTheDocument();
-    expect(screen.getByText('Engagement started')).toBeInTheDocument();
-    expect(screen.getByText('Engagement stopped')).toBeInTheDocument();
-    expect(screen.getByText('provider: API error 401')).toBeInTheDocument();
+    expect(screen.getByText('engagement started')).toBeInTheDocument();
+    expect(screen.getByText('engagement stopped')).toBeInTheDocument();
+    // The failed round is a raised row; older than a day, it is not pinned.
+    expect(screen.getByText('provider: API error 401').closest('[data-evkey]')).toHaveAttribute('data-kind', 'error');
+    expect(screen.queryByTestId('needs-you-deck')).toBeNull();
   });
 
   it('shows the Children tab — the deep launch tree under the flow', async () => {
     vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
-    const getChildren = vi.spyOn(api, 'getAgentiflowChildren').mockResolvedValue([
+    const getChildren = vi.spyOn(api, 'getAgentiflowChildTree').mockResolvedValue({ truncated: false, children: [
       {
         handle: 'u_recon',
         kind: 'agent',
@@ -241,7 +258,7 @@ describe('AgentiflowDetail', () => {
         transcript_path: '/tmp/run_sub.jsonl',
         legacy: false,
       },
-    ]);
+    ] });
     renderDetail();
     await screen.findByRole('heading', { name: 'rupu-self-review' });
 
@@ -288,6 +305,7 @@ describe('AgentiflowDetail', () => {
     renderDetail();
     await screen.findByRole('heading', { name: 'rupu-self-review' });
 
+    fireEvent.click(screen.getByRole('button', { name: /^Fleet/ }));
     const fleet = screen.getByRole('heading', { name: 'Fleet' }).closest('section')!;
     // Nothing is fetched until the row is expanded.
     expect(getOutput).not.toHaveBeenCalled();

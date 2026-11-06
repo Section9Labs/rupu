@@ -34,6 +34,9 @@ fn serve_opts(dir: &std::path::Path) -> rupu_cp::ServeOpts {
         inventory: None,
         web: true,
         mcp: None,
+        agentiflow_launcher: None,
+        skill_installer: None,
+        admin_ops: None,
     }
 }
 

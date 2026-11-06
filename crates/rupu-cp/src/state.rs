@@ -105,6 +105,18 @@ pub struct AppState {
     /// the shell from every page) answers without waiting on SSH — see
     /// [`crate::host::probe_cache`].
     pub host_probes: Arc<crate::host::probe_cache::HostProbeCache<crate::api::hosts::RemoteProbe>>,
+    /// Optional agentiflow-launcher port (`POST /api/agentiflows`). Defaults
+    /// to `None`; rupu-cli's `cp serve` installs its detached-start adapter
+    /// via [`AppState::with_agentiflow_launcher`].
+    pub agentiflow_launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    /// Optional skill-installer port (the git fetch behind
+    /// `/api/skills/install|update`). Defaults to `None`; rupu-cli's `cp
+    /// serve` installs `GitFetcher` via [`AppState::with_skill_installer`].
+    pub skill_installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
+    /// The cron-tick and autoflow-cycle port (rupu-cli's `cp serve`
+    /// provides it). `None` → `POST /api/cron/tick` and
+    /// `POST /api/autoflows/:name/run` return 501.
+    pub admin_ops: Option<Arc<dyn crate::admin_ops::AdminOps>>,
 }
 
 impl AppState {
@@ -177,6 +189,9 @@ impl AppState {
                 crate::netflow_index::DEFAULT_BUDGET_MB * 1024 * 1024,
             )),
             host_probes: Arc::default(),
+            agentiflow_launcher: None,
+            skill_installer: None,
+            admin_ops: None,
         }
     }
 
@@ -258,6 +273,24 @@ impl AppState {
         self
     }
 
+    /// Install an agentiflow-launcher adapter (or clear it with `None`).
+    pub fn with_agentiflow_launcher(
+        mut self,
+        launcher: Option<Arc<dyn crate::agentiflow_launcher::AgentiflowLauncher>>,
+    ) -> Self {
+        self.agentiflow_launcher = launcher;
+        self
+    }
+
+    /// Install a skill-installer adapter (or clear it with `None`).
+    pub fn with_skill_installer(
+        mut self,
+        installer: Option<Arc<crate::skill_installer::SkillInstaller>>,
+    ) -> Self {
+        self.skill_installer = installer;
+        self
+    }
+
     /// Replace the host registry. Used by `cp serve` to install a fully-wired
     /// registry (with real launchers) after the default read-only one built in
     /// [`AppState::new`].
@@ -285,6 +318,12 @@ impl AppState {
     /// The token value itself is never threaded through `AppState`.
     pub fn with_token_set(mut self, token_set: bool) -> Self {
         self.token_set = token_set;
+        self
+    }
+
+    /// Install the autoflow / cron / maintenance adapter (or clear it).
+    pub fn with_admin_ops(mut self, ops: Option<Arc<dyn crate::admin_ops::AdminOps>>) -> Self {
+        self.admin_ops = ops;
         self
     }
 

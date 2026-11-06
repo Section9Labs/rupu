@@ -1,7 +1,9 @@
 //! The runs operator tools: workflow run lists, details and run control.
 
 use super::{op, OpSpec};
-use crate::api::{autoflow_runs, events, run_streams, runs, source, transcript, transcripts};
+use crate::api::{
+    autoflow_runs, board, events, run_streams, runs, source, transcript, transcripts,
+};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -110,6 +112,13 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns `{children}`, each with its handle, kind, status and tokens.",
         ),
         op(
+            "runs.board",
+            Method::GET,
+            "/api/runs/:id/board",
+            "Read a run's board: the claims and directives in its message space.\n\n`id` is the run id; `host` picks a remote host. Returns `{claims, directives, journal}`: every claim the board's journal recorded (key, key_known, owner, acquired, lease expiry, ended, state held|released|expired; key_known false means `key` is only the claim file's stem, from a claim written before the journal), each directive with whether and when it was retracted, and whether the board keeps a journal (without one, only live claims are known).",
+        )
+        .query::<board::BoardQuery>(),
+        op(
             "runs.usage",
             Method::GET,
             "/api/runs/:id/usage",
@@ -206,5 +215,24 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "List autoflow cycle events (claimed, dispatched, failed and so on), newest first.\n\n`host` is `local`, a host id, or absent for all; `since`/`until` bound the time; page with `offset`/`limit`. Returns a JSON array of events.",
         )
         .query::<run_streams::AutoflowEventsQuery>(),
+        // Plan 3a, package B: retry and continue.
+        op(
+            "runs.retry",
+            Method::POST,
+            "/api/runs/:id/retry",
+            "Retry a failed, rejected or cancelled workflow run (`rupu workflow resume`).\n\n`id` is the run id; `restart_interrupted` starts interrupted steps and units over instead of continuing them; `mode` (ask|bypass|readonly) overrides the run's own launch mode, which it keeps otherwise. A run left running by a dead runner is marked failed first and retried. Answers 202 `{run_id, retrying, restart_interrupted, host_id}` once the resume is spawned: watch the run's status. 409 for a running, paused (use runs.resume), awaiting-approval or completed run, and for a standalone agent run (use agent_runs.continue); local-only (a remote `host` is a 501).",
+        )
+        .query::<runs::RunControlQuery>()
+        .body::<runs::RetryBody>()
+        .open_world(),
+        op(
+            "agent_runs.continue",
+            Method::POST,
+            "/api/runs/agents/:id/continue",
+            "Continue a standalone agent run, or a sub-agent's run, from its transcript (`rupu run --continue`).\n\n`id` is a `run_…` or `sub_…` id. The continuation restores every flag the run was launched with and runs in its directory; `model`, `provider`, `mode`, `findings_profile`, `engagement_profiles`, `skills`, `preload_skills` and `messaging` replace the launch's own (an empty list keeps it). `prompt` (optional, not blank) is what the run is told next: with one, ANY ended run carries on — an interrupted run gets the interruption note then the prompt, a finished run gets the prompt as a new turn (a real model call), a failed run continues on the same model. Without one, an interrupted run carries on, a finished run answers with its recorded answer and calls no model, and a failed run continues only on a different `model`/`provider`. Answers 202 `{run_id, continues, host_id}` with the new run's id. 409 while the run is still running; local-only (a remote `host` is a 501).",
+        )
+        .query::<runs::RunControlQuery>()
+        .body::<run_streams::ContinueAgentRunBody>()
+        .open_world(),
     ]
 }

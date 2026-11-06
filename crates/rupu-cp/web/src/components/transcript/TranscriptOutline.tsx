@@ -35,10 +35,20 @@ interface Tick {
   findings: number;
 }
 
-export default function TranscriptOutline({ turns, filter }: { turns: TurnView[]; filter: FilterKind }) {
+export default function TranscriptOutline({
+  turns,
+  filter,
+  only,
+}: {
+  turns: TurnView[];
+  filter: FilterKind;
+  /** Only these 1-based turns are on the page (a window over the run). */
+  only?: ReadonlySet<number>;
+}) {
   const ticks = useMemo<Tick[]>(() => {
     const out: Tick[] = [];
     turns.forEach((t, i) => {
+      if (only && !only.has(i + 1)) return;
       const shown = t.blocks.filter((b) => blockMatchesFilter(b, filter));
       if (shown.length === 0) return;
       out.push({
@@ -48,7 +58,7 @@ export default function TranscriptOutline({ turns, filter }: { turns: TurnView[]
       });
     });
     return out;
-  }, [turns, filter]);
+  }, [turns, filter, only]);
 
   const [active, setActive] = useState<number | null>(null);
   const [rail, setRail] = useState<HTMLElement | null>(null);

@@ -23,3 +23,5 @@ pub use launcher::{LaunchEnv, RunLauncher, DEFAULT_MAX_CONCURRENT_CHILDREN, TERM
 pub use process::{
     ProcOutcome, ProcState, ProcessBackend, ProcessLaunch, SpawnedProcess, Stop, Subprocess,
 };
+
+pub mod session;

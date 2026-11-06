@@ -2609,6 +2609,12 @@ async fn runs(
     // expired runs the next time they look at the list.
     let now = chrono::Utc::now();
     for r in &mut all {
+        // Native session command inspection is read-only even when an overdue
+        // gate would normally be lazily expired by this CLI listing.
+        if std::env::var_os("RUPU_SESSION_READ_ONLY").is_some() {
+            break;
+        }
+
         let on_timeout = gate_on_timeout_for(&store, r);
 
         // ISSUES.md I-25: `rupu workflow runs` is a *listing* command and
@@ -2780,7 +2786,7 @@ async fn runs(
 }
 
 /// One run's usage rows (by provider, model, agent) from the shared usage
-/// fold ([`rupu_cp::usage::run_usage`]): every usage-ledger row — fan-out
+/// fold ([`rupu_orchestrator::usage_summary::run_usage`]): every usage-ledger row — fan-out
 /// units, panelists and dispatched sub-agents included, running steps
 /// too — plus a fold of any known transcript without ledger rows (legacy
 /// runs, remote mirrors). The same definition the control plane serves,
@@ -2790,7 +2796,9 @@ fn aggregate_run_usage_from_store(
     store: &rupu_orchestrator::RunStore,
     run_id: &str,
 ) -> Vec<rupu_transcript::UsageRow> {
-    rupu_cp::usage::run_usage(store, run_id).rows.clone()
+    rupu_orchestrator::usage_summary::run_usage(store, run_id)
+        .rows
+        .clone()
 }
 
 fn total_tokens(rows: &[rupu_transcript::UsageRow]) -> u64 {
@@ -3830,7 +3838,12 @@ pub(crate) async fn resume_run(
     let mcp_registry =
         Arc::new(rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink).await);
 
-    let permission_mode = rupu_tools::PermissionMode::parse(mode.unwrap_or("ask"))?;
+    // The run's own launch mode unless one is given: a retried `readonly`
+    // run stays `readonly` (the CP's resume worker passes the web resume's
+    // mode explicitly). `resume_decided` reads it the same way.
+    let permission_mode = rupu_tools::PermissionMode::parse(
+        mode.or(record.permission_mode.as_deref()).unwrap_or("ask"),
+    )?;
 
     // Hoisted above the dispatcher build (was created a few lines further
     // down, right before `opts`) so the sub-agent dispatcher can be handed a

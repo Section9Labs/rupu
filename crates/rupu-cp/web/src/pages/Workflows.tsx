@@ -9,6 +9,7 @@ import { SectionHeader } from '../components/lists/SectionHeader';
 import SortableTable, { type Column } from '../components/lists/SortableTable';
 import LauncherSheet from '../components/LauncherSheet';
 import CodeEditor from '../components/CodeEditor';
+import RunYamlBar from '../components/launch/RunYamlBar';
 import { Button } from '../components/ui/Button';
 import { PageHeader } from '../components/ui/PageHeader';
 import { Chip } from '../components/ui/Chip';
@@ -372,12 +373,15 @@ function NewWorkflowModal({ onClose }: { onClose: () => void }) {
               </div>
             </>
           ) : (
-            <CodeEditor
-              value={raw}
-              onChange={setRaw}
-              language="yaml"
-              ariaLabel="New workflow definition"
-            />
+            <>
+              <CodeEditor
+                value={raw}
+                onChange={setRaw}
+                language="yaml"
+                ariaLabel="New workflow definition"
+              />
+              <RunYamlBar yamlText={raw} onLaunched={onClose} />
+            </>
           )}
 
           {error && (

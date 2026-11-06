@@ -1,14 +1,19 @@
 //! The operator MCP server inside `cp serve`: `/mcp` ([`endpoint`]) over the
-//! tool sources [`build_server`] assembles.
+//! tool sources [`build_server`] assembles, plus the [`resources`] and
+//! [`prompts`] an agent learns rupu from.
 
 pub mod endpoint;
 pub mod operator_source;
 pub mod ops;
+pub mod prompts;
+pub mod resources;
 pub mod wait;
 
 use crate::state::AppState;
 use async_trait::async_trait;
-use rupu_mcp::{CallCx, McpServer, ServeError, ToolDef, ToolFilter, ToolResult, ToolSource};
+use rupu_mcp::{
+    CallCx, McpServer, ServeError, Sources, ToolDef, ToolFilter, ToolResult, ToolSource,
+};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,15 +48,23 @@ pub struct McpOpts {
 }
 
 /// The operator source + the wait source + `opts.catalog` ([`sources`]),
-/// filtered by `opts.tools`.
+/// filtered by `opts.tools`, with the [`resources`] and [`prompts`]
+/// (`--tools` filters tools only).
 pub fn build_server(state: &AppState, opts: &McpOpts) -> Result<Arc<McpServer>, ServeError> {
-    let sources = sources(
+    let tools = sources(
         Arc::new(operator_source::OperatorSource::new(inner_api(state))),
         Arc::new(wait::WaitSource::new(state.clone())),
         opts.catalog.as_ref(),
     );
     let filter = ToolFilter::parse(&opts.tools);
-    Ok(Arc::new(McpServer::new(sources, &filter)?))
+    Ok(Arc::new(McpServer::from_sources(
+        Sources {
+            tools,
+            resources: vec![Arc::new(resources::RupuResources)],
+            prompts: vec![Arc::new(prompts::RupuPrompts)],
+        },
+        &filter,
+    )?))
 }
 
 /// Check `tools` (the `--tools` entries) against the names the server would

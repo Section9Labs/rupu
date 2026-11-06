@@ -6,9 +6,10 @@
 
 import '@testing-library/jest-dom/vitest';
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { render, screen, cleanup, waitFor } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { api, type AgentSummary } from '../lib/api';
+import { launchApi } from '../lib/api3b/launch';
 
 const navigateMock = vi.fn();
 vi.mock('react-router-dom', async () => {
@@ -132,5 +133,24 @@ describe('Agents query line', () => {
       </MemoryRouter>,
     );
     expect(await screen.findByText('No agents match the filter.')).toBeInTheDocument();
+  });
+});
+
+describe('Agents header: Validate all and Install stock fleet (Plan 3b)', () => {
+  it('opens the validation drawer and the fleet dialog', async () => {
+    vi.spyOn(api, 'getAgents').mockResolvedValue(SCOPE_ROWS);
+    vi.spyOn(api, 'getProjects').mockResolvedValue([]);
+    vi.spyOn(launchApi, 'validateAllAgents').mockResolvedValue({ ok: true, rows: [] });
+    vi.spyOn(launchApi, 'getFleet').mockResolvedValue({ entries: [], global_root: '/h/.rupu', project_root: null });
+    render(
+      <MemoryRouter initialEntries={['/agents']}>
+        {withCustomerScope(<Agents />)}
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Validate all' }));
+    expect(await screen.findByRole('dialog', { name: 'Validate all agents' })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Install stock fleet' }));
+    expect(await screen.findByRole('dialog', { name: 'Install stock fleet' })).toBeInTheDocument();
   });
 });

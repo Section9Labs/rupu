@@ -116,6 +116,7 @@ fn seed_step(run_id: &str, step_id: &str) -> StepResultRecord {
         codename: None,
         cause: None,
         error: None,
+        started_at: None,
     }
 }
 
@@ -160,8 +161,18 @@ async fn run_graph_returns_workflow_step_results_and_units() {
     store.create(seed_run(run_id), WF_YAML).unwrap();
 
     // Seed ONE step result for the first step only — second-step is pending.
+    // It carries its start, which the run page's time axis reads.
+    let started_at = chrono::DateTime::parse_from_rfc3339("2026-10-22T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
     store
-        .append_step_result(run_id, &seed_step(run_id, "first-step"))
+        .append_step_result(
+            run_id,
+            &StepResultRecord {
+                started_at: Some(started_at),
+                ..seed_step(run_id, "first-step")
+            },
+        )
         .unwrap();
 
     // Seed ONE unit checkpoint for the for_each step.
@@ -224,6 +235,11 @@ async fn run_graph_returns_workflow_step_results_and_units() {
         results[0]["step_id"].as_str(),
         Some("first-step"),
         "step_result step_id should match"
+    );
+    assert_eq!(
+        results[0]["started_at"].as_str(),
+        Some("2026-10-22T10:00:00Z"),
+        "the step's start is served"
     );
 
     // units: exactly the seeded checkpoint

@@ -57,7 +57,14 @@ export interface AgentBuilderProps {
   agentNames?: string[];
   /** Installed skill names, the Skills card's suggestions. */
   skillNames?: string[];
+  /** The server's check of the file text (`POST /api/agents/validate`),
+   *  asked debounced once the browser's check passes; its answer wins for the
+   *  text it was asked about. A rejection (offline, an unknown project) keeps
+   *  the browser's answer. */
+  serverValidate?: (raw: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 }
+
+const SERVER_VALIDATE_DEBOUNCE_MS = 400;
 
 type Mode = 'cards' | 'raw' | 'ai';
 
@@ -196,6 +203,7 @@ export default function AgentBuilder({
   onGenerate,
   agentNames,
   skillNames,
+  serverValidate,
 }: AgentBuilderProps) {
   const [draft, setDraft] = useState<AgentDraft>(() => parseAgent(initialRaw));
   const [order, setOrder] = useState<string[]>(() => computeInitialOrder(draft));
@@ -312,7 +320,32 @@ export default function AgentBuilder({
     }
   }
 
-  const validation = validateAgentDraft(draft);
+  const browserValidation = validateAgentDraft(draft);
+  const serialized = serializeAgent(draft);
+  // The server's answer, kept with the text it was asked about, so a stale
+  // answer for an earlier draft never shows.
+  const [server, setServer] = useState<{ raw: string; ok: boolean; error?: string } | null>(null);
+  useEffect(() => {
+    if (!serverValidate || !browserValidation.ok) return;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      serverValidate(serialized)
+        .then((r) => {
+          if (!cancelled) setServer(r.ok ? { raw: serialized, ok: true } : { raw: serialized, ok: false, error: r.error });
+        })
+        .catch(() => {
+          // The server can't be asked: the browser's answer stands.
+        });
+    }, SERVER_VALIDATE_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [serverValidate, serialized, browserValidation.ok]);
+  const serverError = browserValidation.ok && server?.raw === serialized && !server.ok ? (server.error ?? 'invalid') : null;
+  const validation = serverError
+    ? { ...browserValidation, ok: false, errors: [{ field: 'server', message: serverError }] }
+    : browserValidation;
   const activeIds = new Set(order);
 
   const modeOptions = [
@@ -364,6 +397,10 @@ export default function AgentBuilder({
         <div className="border-b border-err/30 bg-err-bg px-4 py-2 text-note text-err" role="alert">
           {error}
         </div>
+      )}
+
+      {serverError && (
+        <div className="border-b border-err/30 bg-err-bg px-4 py-2 text-note text-err">{serverError}</div>
       )}
 
       {validation.warnings.length > 0 && (

@@ -14,7 +14,7 @@ import { Graph } from '@dagrejs/graphlib';
 import { layout } from '@dagrejs/dagre';
 import type { GraphLabel, NodeLabel } from '@dagrejs/dagre';
 import yaml from 'js-yaml';
-import { withDerivedEdges, yamlToGraph } from './workflowGraph';
+import { hasInlineApproval, withDerivedEdges, yamlToGraph } from './workflowGraph';
 import type { GraphNode, GraphEdge, StepNodeData, WorkflowGraph } from './workflowGraph';
 
 // ── Per-kind size constants (shared with EditableStepNode) ───────────────────
@@ -56,6 +56,12 @@ export const BRANCH_H = 128;
  *  room to slanted sides; the box grows so the text band stays step-sized. */
 export const ACTION_W = 214;
 export const GATE_W = 214;
+/** A gate's trapezoid narrows its text band, and its prompt chip sits under
+ *  the head: measured in the browser, the base box clipped the chip by 10px. */
+export const GATE_H = NODE_H + 12;
+/** A step carrying an inline approval adds its "gate" badge row (2px over the
+ *  base box, measured), plus a cushion. */
+export const APPROVAL_STEP_H = NODE_H + 6;
 
 /** for_each (hexagon) loses room to its left/right points. Height unchanged. */
 export const FOR_EACH_W = 214;
@@ -93,7 +99,9 @@ export const PARALLEL_PAD_V = 18;
 export const PANEL_W = 220;
 export const PANEL_HEADER_H = 31;
 export const PANEL_PORT_ROW_H = 17;
-export const PANEL_PAD_V = 34;
+// Re-measured in the browser (every kind, worst-case labels): a one-panelist
+// panel clipped its pill by 7px at 34, so the pad carries that plus a cushion.
+export const PANEL_PAD_V = 42;
 export const PANEL_GATE_H = 34;
 
 export interface NodeBox {
@@ -122,11 +130,11 @@ export function editorNodeSize(d: StepNodeData): NodeBox {
     case 'action':
       return { width: ACTION_W, height: NODE_H };
     case 'approval_gate':
-      return { width: GATE_W, height: NODE_H };
+      return { width: GATE_W, height: GATE_H };
     case 'for_each':
       return { width: FOR_EACH_W, height: FOR_EACH_H };
     default:
-      return { width: NODE_W, height: NODE_H };
+      return { width: NODE_W, height: hasInlineApproval(d) ? APPROVAL_STEP_H : NODE_H };
   }
 }
 

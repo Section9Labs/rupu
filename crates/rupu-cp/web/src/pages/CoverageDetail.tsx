@@ -1,6 +1,7 @@
 // Per-target coverage detail — a tabbed shell (Overview | Catalog | Audit |
 // Gap). Overview shows findings, files touched, and the assertion grid; the
-// other tabs lazily fetch their own endpoints. Routes: /coverage/:target and
+// other tabs lazily fetch their own endpoints. The header's "Rerun…" replays a
+// recorded run on the target. Routes: /coverage/:target and
 // /coverage/:target/{catalog,audit,gap}. The ?ws_id= scope is preserved across
 // tabs.
 
@@ -11,6 +12,7 @@ import CoverageCatalogTab from '../components/coverage/CoverageCatalogTab';
 import CoverageAuditTab from '../components/coverage/CoverageAuditTab';
 import CoverageGapTab from '../components/coverage/CoverageGapTab';
 import CoverageDiffTab from '../components/coverage/CoverageDiffTab';
+import { CoverageRerunButton } from '../components/coverage/CoverageRerunDialog';
 import { Spinner } from '../components/ui/Spinner';
 import {
   api,
@@ -143,6 +145,7 @@ export default function CoverageDetail({ tab = 'overview' }: { tab?: CoverageTab
             <span>{files.length} file{files.length !== 1 ? 's' : ''} touched</span>
           </div>
         </div>
+        <CoverageRerunButton target={target} wsId={wsId} />
       </header>
 
       {/* Tab bar */}
