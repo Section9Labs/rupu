@@ -154,6 +154,18 @@ pub enum Action {
 pub struct StartArgs {
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
+    /// Provider account for the first and later turns (requires --model).
+    #[arg(long, requires = "model")]
+    pub provider: Option<String>,
+    /// Model identifier for the first and later turns.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Registered project identity supplied by the control plane.
+    #[arg(long, hide = true)]
+    pub workspace_id: Option<String>,
+    /// Create an idle session without a first turn or provider worker.
+    #[arg(long, conflicts_with_all = ["target", "prompt", "prompt_flag", "into"])]
+    pub idle: bool,
     /// Optional target reference, e.g. `github:owner/repo#42`.
     pub target: Option<String>,
     /// Optional initial user message. Defaults to `go` if omitted. Leading
@@ -1358,19 +1370,83 @@ fn usage_timeline(session_id: &str, global_format: Option<OutputFormat>) -> anyh
 }
 
 async fn start(args: StartArgs) -> anyhow::Result<()> {
+    start_in(args, paths::global_dir()?, std::env::current_dir()?).await
+}
+
+async fn start_in(args: StartArgs, global: PathBuf, pwd: PathBuf) -> anyhow::Result<()> {
+    let (session, first_turn) = prepare_start(&args, global.clone(), pwd).await?;
+    write_session(&global, SessionScope::Active, &session)?;
+    if args.provider.is_some() || args.model.is_some() {
+        // Persist selection before the worker can read the record. Besides
+        // freezing identity, this suppresses a definition/config fallback
+        // chain for an explicit selection on the first and later turns.
+        rupu_runtime::session_settings::SessionSettings {
+            provider: args.provider.clone(),
+            model: args.model.clone(),
+            ..Default::default()
+        }
+        .save(&session_dir(
+            &global,
+            SessionScope::Active,
+            &session.session_id,
+        ))?;
+    }
+    if args.idle {
+        println!("session: {}", session.session_id);
+        return Ok(());
+    }
+    launch_turn(
+        &global,
+        &session.session_id,
+        first_turn.prompt,
+        first_turn.invoked,
+        args.detach,
+        args.view,
+    )
+    .await
+}
+
+/// Freeze identity, configuration and the first message before writing or
+/// enqueuing any turn. Kept separate so this boundary can be tested without
+/// spawning a worker or making a provider request.
+async fn prepare_start(
+    args: &StartArgs,
+    global: PathBuf,
+    pwd: PathBuf,
+) -> anyhow::Result<(SessionRecord, rupu_skills::SlashTurn)> {
+    anyhow::ensure!(
+        !args.idle
+            || (args.prompt.is_none()
+                && args.prompt_flag.is_none()
+                && args.target.is_none()
+                && args.into.is_none()),
+        "idle session creation cannot include a prompt, target, or clone directory"
+    );
     if args.mode.as_deref() == Some("ask") {
         anyhow::bail!(
             "session start does not support `ask` mode; use `--mode bypass` or `--mode readonly`"
         );
     }
-    let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
     paths::ensure_dir(&paths::sessions_dir(&global))?;
 
-    let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
+    let project_root =
+        if args.agent == rupu_agent::builtin::SESSION_AGENT_NAME || args.workspace_id.is_some() {
+            // A registered project needs no .rupu marker, and must not accidentally
+            // borrow an ancestor project's definition/configuration scope.
+            Some(pwd.canonicalize()?)
+        } else {
+            paths::project_root_for(&pwd)?
+        };
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
-    let spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
+    let mut spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
+    let initial_settings = rupu_runtime::session_settings::SessionSettings {
+        provider: args.provider.clone(),
+        model: args.model.clone(),
+        ..Default::default()
+    };
+    initial_settings.validate()?;
+    initial_settings.apply(&mut spec);
     let (skill_index, skill_prompt) = freeze_session_skills(
         &global,
         project_root.as_deref(),
@@ -1384,7 +1460,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     let parse = |s: &str| PermissionMode::parse(s).ok();
-    let cli_mode = args.mode.as_deref().and_then(parse);
+    let cli_mode = args.mode.as_deref().map(PermissionMode::parse).transpose()?;
     let agent_mode = spec.permission_mode.as_deref().and_then(parse);
     let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
@@ -1394,7 +1470,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         );
     }
 
-    let resolver = crate::accounts::resolver_for(&cfg);
+    let resolver = crate::accounts::resolver_for_home(&cfg, &global);
     // No run exists yet at this point, so this SCM traffic is not attributed
     // to a ledger. A run-routing FlowSink would close this; see the netflow
     // per-run plan.
@@ -1474,7 +1550,20 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let ws_store = rupu_workspace::WorkspaceStore {
         root: global.join("workspaces"),
     };
+    if let Some(expected) = &args.workspace_id {
+        let workspace = ws_store
+            .load(expected)?
+            .ok_or_else(|| anyhow::anyhow!("registered project {expected} no longer exists"))?;
+        anyhow::ensure!(
+            Path::new(&workspace.path).canonicalize()? == workspace_path.canonicalize()?,
+            "registered project path changed; reload before starting the session"
+        );
+    }
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
+    anyhow::ensure!(
+        args.workspace_id.as_ref().is_none_or(|id| id == &ws.id),
+        "registered project identity changed; reload before starting the session"
+    );
     // A bad or unloadable engagement profile fails the start, not a turn.
     crate::findings_opts::resolve_engagement(&global, &workspace_path, &args.engagement_profiles)?;
 
@@ -1490,6 +1579,13 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
             .map(|p| p.default_model.as_str()),
     );
 
+    if args.provider.is_some() || spec.name == rupu_agent::builtin::SESSION_AGENT_NAME {
+        anyhow::ensure!(
+            provider_factory::is_dispatchable_provider(&provider_name, &cfg.providers),
+            "provider {provider_name} is not configured on this Rupu instance"
+        );
+    }
+
     let mode_str = mode.as_str().to_string();
 
     let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
@@ -1504,6 +1600,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         version: SessionRecord::VERSION,
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
+        builtin_harness: spec.name == rupu_agent::builtin::SESSION_AGENT_NAME,
         codename: Some(
             rupu_codename::Codename::crew_only(rupu_codename::crew_for(&session_id))
                 .child(rupu_codename::role_word(&spec.name), None)
@@ -1576,16 +1673,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         loaded_skills: Vec::new(),
         unseen_messages: Vec::new(),
     };
-    write_session(&global, SessionScope::Active, &session)?;
-    launch_turn(
-        &global,
-        &session_id,
-        first_turn.prompt,
-        first_turn.invoked,
-        args.detach,
-        args.view,
-    )
-    .await
+    Ok((session, first_turn))
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
@@ -7860,11 +7948,25 @@ fn session_agent_file(global: &Path, session: &SessionRecord) -> Option<rupu_age
     let project_agents_parent = session.project_root.as_ref().map(|p| p.join(".rupu"));
     // Only the fallback chain is read here, so the agent's `tools:` aren't
     // checked: the turn's own grant does that.
-    match rupu_agent::find_agent(
-        global,
-        project_agents_parent.as_deref(),
-        &session.agent_name,
-    ) {
+    let loaded = if !session.builtin_harness
+        && session.agent_name == rupu_agent::builtin::SESSION_AGENT_NAME
+    {
+        // A pre-harness session with the same name keeps its original disk
+        // fallback semantics; it does not acquire the bundled root's policy.
+        rupu_agent::load_agents(global, project_agents_parent.as_deref()).and_then(|agents| {
+            agents
+                .into_iter()
+                .find(|a| a.name == session.agent_name)
+                .ok_or_else(|| rupu_agent::AgentLoadError::NotFound(session.agent_name.clone()))
+        })
+    } else {
+        rupu_agent::find_agent(
+            global,
+            project_agents_parent.as_deref(),
+            &session.agent_name,
+        )
+    };
+    match loaded {
         Ok(spec) => Some(spec),
         Err(e) => {
             // Loading one agent parses every file in the agent dirs, so a
@@ -8018,6 +8120,7 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             },
         ));
         let mut agent = session_agent_spec(&global, &session)?;
+        workflow_context::append(&mut agent, &global, scope, &session)?;
         let model_overridden = settings.apply(&mut agent);
         // The session's frozen skills as installed now, joined by the skills
         // the operator invoked in this turn (spec 2026-10-12 §5.2); one that
@@ -8225,6 +8328,7 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             pause: Some(cancellation.token.clone()),
             services: rupu_runtime::assembly::LaunchServices {
                 session_orchestration: orchestration.enabled,
+                builtin_session_harness: session.builtin_harness,
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
@@ -9147,6 +9251,12 @@ use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
 #[cfg(test)]
 #[path = "session_command_tests.rs"]
 mod session_command_tests;
+#[path = "session_workflow_context.rs"]
+mod workflow_context;
+
+#[cfg(test)]
+#[path = "session_harness_tests.rs"]
+mod session_harness_tests;
 
 #[cfg(test)]
 #[path = "session_skills_tests.rs"]
@@ -10922,6 +11032,7 @@ mod tests {
             version: SessionRecord::VERSION,
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
+            builtin_harness: false,
             codename: None,
             description: Some("Persistent issue reader".into()),
             provider_name: "anthropic".into(),

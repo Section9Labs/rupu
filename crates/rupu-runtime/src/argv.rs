@@ -258,6 +258,10 @@ pub struct LaunchLink {
     /// `--launch-no-messaging`. Absent in a ledger written before it.
     #[serde(default)]
     pub no_messaging: bool,
+    /// The harness forbids headless Ask from degrading to bypass. Inherited
+    /// across local process boundaries; absent on legacy launch records.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_approval: bool,
 }
 
 /// Which workflow a [`WorkflowRun`] runs.
@@ -319,6 +323,12 @@ pub enum WorkflowControl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
     pub agent: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Expected registered workspace identity; checked before creating the session.
+    pub workspace_id: Option<String>,
+    /// `--idle`: create a zero-turn session, without a worker.
+    pub idle: bool,
     pub target: Option<String>,
     pub mode: Option<PermissionMode>,
     pub prompt: Option<String>,
@@ -610,7 +620,13 @@ impl RunArgv {
                 a.push("session");
                 a.push("start");
                 a.push(&s.agent);
+                a.opt_flag_value("--provider", s.provider.as_deref());
+                a.opt_flag_value("--model", s.model.as_deref());
+                a.opt_flag_value("--workspace-id", s.workspace_id.as_deref());
                 a.opt_positional(s.target.as_deref());
+                if s.idle {
+                    a.push("--idle");
+                }
                 if s.detach {
                     a.push("--detach");
                 }
@@ -826,6 +842,9 @@ impl Args {
         }
         if l.no_messaging {
             self.push("--launch-no-messaging");
+        }
+        if l.strict_approval {
+            self.push("--launch-strict-approval");
         }
     }
 }
@@ -1111,6 +1130,10 @@ mod tests {
         );
         let start = RunArgv::SessionStart(SessionStart {
             agent: "triage".into(),
+            provider: None,
+            model: None,
+            workspace_id: None,
+            idle: false,
             target: None,
             mode: None,
             prompt: None,
@@ -1258,6 +1281,7 @@ mod tests {
             workflows: vec![],
             actions: Some(vec![]),
             no_messaging: false,
+            strict_approval: false,
         });
         assert_eq!(
             strs(&RunArgv::Agent(run)),
@@ -1297,12 +1321,34 @@ mod tests {
             workflows: vec![],
             actions: None,
             no_messaging,
+            strict_approval: false,
         };
         let mut off = AgentRun::new("recon", "run_1");
         off.launch = Some(link(true));
         let args = strs(&RunArgv::Agent(off));
-        assert_eq!(args.last().map(String::as_str), Some("--launch-no-messaging"));
-        assert_eq!(args.iter().filter(|a| a.starts_with("--launch-no")).count(), 1);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("--launch-no-messaging")
+        );
+        assert_eq!(
+            args.iter().filter(|a| a.starts_with("--launch-no")).count(),
+            1
+        );
+        let legacy = serde_json::to_value(link(false)).unwrap();
+        assert!(legacy.get("strict_approval").is_none());
+        assert!(
+            !serde_json::from_value::<LaunchLink>(legacy)
+                .unwrap()
+                .strict_approval
+        );
+        let mut strict = AgentRun::new("recon", "run_strict");
+        strict.launch = Some(LaunchLink {
+            strict_approval: true,
+            ..link(false)
+        });
+        assert!(strs(&RunArgv::Agent(strict))
+            .iter()
+            .any(|a| a == "--launch-strict-approval"));
         let mut on = AgentRun::new("recon", "run_1");
         on.launch = Some(link(false));
         assert!(!strs(&RunArgv::Agent(on))
@@ -1324,7 +1370,14 @@ mod tests {
         let off = run(LaunchMessaging::Off);
         assert_eq!(
             strs(&off),
-            ["run", "recon", "--run-id", "run_1", "--tmp", "--no-messaging"]
+            [
+                "run",
+                "recon",
+                "--run-id",
+                "run_1",
+                "--tmp",
+                "--no-messaging"
+            ]
         );
         assert_eq!(
             off.to_shell("rupu"),

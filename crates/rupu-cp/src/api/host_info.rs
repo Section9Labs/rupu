@@ -65,6 +65,16 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
         features: {
             let mut features = crate::node::protocol::host_features();
             features.push("workflow.scoped_revision".to_string());
+            features.push("workflow.session_history".to_string());
+            if s.launcher.is_some() {
+                features.push("workflow.session_attach".to_string());
+            }
+            if super::project_session_start::available(&s) {
+                features.push(super::project_session_start::CAP_BUILTIN_HARNESS.to_string());
+            }
+            if super::project_session_start::idle_available(&s) {
+                features.push(super::project_session_start::CAP_IDLE_HARNESS.to_string());
+            }
             if s.launcher
                 .as_ref()
                 .is_some_and(|l| l.supports_session_workflows())

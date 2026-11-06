@@ -204,6 +204,20 @@ async fn run_graph(
         return run_graph_from_host(&s, host_id, &id).await.map(Json);
     }
 
+    // Archived workflows are rendered from their original stored graph and
+    // events. The generic resolver intentionally remains active-run oriented
+    // for its other consumers; reading history must not restore a run.
+    if let Some(store) = super::run_resolve::local_recorded_store(&s, &id)? {
+        let (global, pricing) = (
+            s.global_dir.clone(),
+            std::sync::Arc::clone(&s.customer_pricing),
+        );
+        return crate::api::runs::blocking(move || {
+            build_run_graph_json(&store, &global, &pricing, &id)
+        })
+        .await
+        .map(Json);
+    }
     match resolve_run_location(&s, &id).await {
         // Store reads + the usage fold run on the blocking pool.
         RunLocation::Global => {
@@ -226,7 +240,12 @@ async fn run_graph(
                 .await
                 .map(Json)
         }
-        RunLocation::Host { host_id } => run_graph_from_host(&s, &host_id, &id).await.map(Json),
+        RunLocation::Host { host_id } if q.host.as_deref() != Some("local") => {
+            run_graph_from_host(&s, &host_id, &id).await.map(Json)
+        }
+        RunLocation::Host { .. } => Err(ApiError::not_found(format!(
+            "run {id} not found on the local host"
+        ))),
         RunLocation::Unpersisted {
             cycle_id,
             status,

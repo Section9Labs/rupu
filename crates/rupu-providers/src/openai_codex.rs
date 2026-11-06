@@ -13,6 +13,7 @@ use crate::types::*;
 
 const DEFAULT_API_URL: &str = "https://api.openai.com/v1/responses";
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const PUBLIC_CHATGPT_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The Codex model catalog. The only OpenAI endpoint that carries
@@ -177,6 +178,9 @@ pub struct OpenAiCodexClient {
     /// platform API (ISSUES.md I-12).
     org_id: Option<String>,
     chatgpt_models_url: String,
+    /// Only the default production ChatGPT OAuth route may use the documented
+    /// public catalog fallback. Custom gateways never forward credentials there.
+    public_chatgpt_models_url: Option<String>,
     /// [`CODEX_CATALOG_ATTEMPT_TIMEOUT`]; tests shorten it.
     catalog_attempt_timeout: std::time::Duration,
     /// The OAuth token endpoint ([`OPENAI_TOKEN_URL`]; tests point it at a
@@ -248,6 +252,8 @@ impl OpenAiCodexClient {
                     refresh_token: refresh,
                     expires_ms: expires,
                     account_id,
+                    public_chatgpt_models_url: (api_url == CODEX_BACKEND_URL)
+                        .then(|| PUBLIC_CHATGPT_MODELS_URL.to_string()),
                     api_url,
                     auth_json_path,
                     credential_store: None,
@@ -267,6 +273,7 @@ impl OpenAiCodexClient {
                 expires_ms: 0,
                 account_id: String::new(),
                 api_url: DEFAULT_API_URL.to_string(),
+                public_chatgpt_models_url: None,
                 auth_json_path,
                 credential_store: None,
                 org_id: None,
@@ -846,11 +853,23 @@ impl OpenAiCodexClient {
     }
 
     async fn get_models_json(&self, url: &str) -> Result<serde_json::Value, ProviderError> {
-        let mut req = self.client.get(url).header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", self.access_token),
-        );
-        if !self.account_id.is_empty() {
+        self.get_models_json_with_account(url, true).await
+    }
+
+    async fn get_models_json_with_account(
+        &self,
+        url: &str,
+        include_account: bool,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let mut req = self
+            .client
+            .get(url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.access_token),
+            )
+            .header(reqwest::header::ACCEPT, "application/json");
+        if include_account && !self.account_id.is_empty() {
             req = req.header("chatgpt-account-id", &self.account_id);
         }
         let resp = req
@@ -1020,7 +1039,29 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
                 "{}?client_version=0.50.0",
                 self.api_url.replace("/responses", "/models")
             );
-            return models_from_listing(&self.get_models_json(&url).await?, false, pid);
+            let Some(public_url) = self.public_chatgpt_models_url.as_deref() else {
+                return models_from_listing(&self.get_models_json(&url).await?, false, pid);
+            };
+            let legacy =
+                tokio::time::timeout(self.catalog_attempt_timeout, self.get_models_json(&url))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ProviderError::Http(
+                            "legacy ChatGPT model catalog timed out".into(),
+                        ))
+                    })
+                    .and_then(|value| models_from_listing(&value, false, pid));
+            if let Ok(models) = legacy {
+                if !models.is_empty() {
+                    return Ok(models);
+                }
+            }
+            // Current OpenAI guidance lists account-specific ChatGPT choices at
+            // /v1/models with the SAME selected access token. Never substitute
+            // an API key or another account when the legacy catalog is empty.
+            // https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference
+            let value = self.get_models_json_with_account(public_url, false).await?;
+            return public_chatgpt_models_from_listing(&value);
         }
         // API key: Codex metadata is only on the ChatGPT backend. Try it
         // first, then fall back to ids-only `/v1/models`.
@@ -1253,6 +1294,33 @@ fn listing_entry_id(v: &serde_json::Value) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+/// Current ChatGPT plan catalog: only explicitly picker-visible entries are
+/// choices. Preserve server order and canonical slug; display names are not IDs.
+fn public_chatgpt_models_from_listing(
+    value: &serde_json::Value,
+) -> Result<Vec<crate::model_pool::ModelInfo>, ProviderError> {
+    let entries = value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            crate::error::listing_shape_error("openai_chatgpt", "a `models` array", value)
+        })?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.get("visibility").and_then(serde_json::Value::as_str) == Some("list"))
+        .filter_map(|entry| {
+            let slug = entry
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .filter(|slug| !slug.trim().is_empty())?;
+            let mut model =
+                make_model_info(slug.into(), crate::provider_id::ProviderId::OpenaiCodex);
+            model.context_window = codex_input_limit(entry);
+            Some(model)
+        })
+        .collect())
 }
 
 /// A Codex `/codex/models` entry's usable input limit (spec §3):
@@ -3898,6 +3966,155 @@ mod tuning_tests {
 mod fetch_models_tests {
     use super::*;
     use crate::provider_id::ProviderId;
+
+    #[test]
+    fn public_chatgpt_catalog_keeps_visible_slugs_in_server_order() {
+        let raw = serde_json::json!({"models": [
+            {"slug": "second", "display_name": "Second model", "visibility": "list", "context_window": 1000},
+            {"slug": "hidden", "visibility": "hide"},
+            {"slug": "first", "id": "not-the-slug", "visibility": "list"},
+            {"display_name": "Not a model ID", "visibility": "list"},
+            {"slug": "unspecified"}
+        ]});
+        let models = public_chatgpt_models_from_listing(&raw).unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+        assert_eq!(models[0].context_window, 950);
+        assert_eq!(models[1].context_window, 0);
+        assert!(public_chatgpt_models_from_listing(&serde_json::json!({"data": []})).is_err());
+    }
+
+    #[test]
+    fn public_chatgpt_fallback_is_only_for_default_production_oauth() {
+        let make = |override_url: Option<&str>| {
+            let mut extra = HashMap::from([("account_id".into(), serde_json::json!("acct"))]);
+            if let Some(url) = override_url {
+                extra.insert("api_url".into(), serde_json::json!(url));
+            }
+            OpenAiCodexClient::new(
+                AuthCredentials::OAuth {
+                    access: "selected-token".into(),
+                    refresh: "".into(),
+                    expires: u64::MAX,
+                    extra,
+                },
+                None,
+                Arc::new(rupu_netflow::NullSink),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            make(None).public_chatgpt_models_url.as_deref(),
+            Some(PUBLIC_CHATGPT_MODELS_URL)
+        );
+        for custom in [
+            "https://gateway.example/backend-api/codex/responses",
+            "https://chatgpt.com.evil.example/backend-api/codex/responses",
+            "http://chatgpt.com/backend-api/codex/responses",
+            "https://api.openai.com/v1/responses",
+        ] {
+            assert!(make(Some(custom)).public_chatgpt_models_url.is_none());
+        }
+        let key = OpenAiCodexClient::new(
+            AuthCredentials::ApiKey {
+                key: "api-key".into(),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        assert!(key.public_chatgpt_models_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_legacy_oauth_catalog_uses_same_credential_public_catalog() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let legacy = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .header("Authorization", "Bearer t")
+                .header("chatgpt-account-id", "acct");
+            then.status(200)
+                .json_body(serde_json::json!({"models": []}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .header("Authorization", "Bearer t")
+                .header("Accept", "application/json")
+                .matches(|request| {
+                    !request.headers.as_ref().is_some_and(|headers| {
+                        headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+                    })
+                });
+            then.status(200).json_body(serde_json::json!({"models": [
+                {"slug": "account-model", "visibility": "list"}, {"slug": "hidden", "visibility": "hide"}
+            ]}));
+        });
+        let mut client = oauth_backend_client(&server);
+        client.account_id = "acct".into();
+        client.public_chatgpt_models_url = Some(server.url("/v1/models"));
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["account-model"]
+        );
+        legacy.assert_hits(1);
+        public.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn usable_legacy_oauth_catalog_does_not_call_public_fallback() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let legacy = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(200)
+                .json_body(serde_json::json!({"models": [{"slug": "existing"}]}));
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET).path("/v1/models");
+            then.status(500);
+        });
+        let mut client = oauth_backend_client(&server);
+        client.public_chatgpt_models_url = Some(server.url("/v1/models"));
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "existing");
+        legacy.assert_hits(1);
+        public.assert_hits(0);
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_oauth_catalog_reports_the_public_failure() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let legacy = server.mock(|when, then| {
+            when.method(GET).path("/backend-api/codex/models");
+            then.status(500);
+        });
+        let public = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/models")
+                .header("Authorization", "Bearer t");
+            then.status(403)
+                .json_body(serde_json::json!({"error": {"message": "account unavailable"}}));
+        });
+        let mut client = oauth_backend_client(&server);
+        client.public_chatgpt_models_url = Some(server.url("/v1/models"));
+        let error = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), Some(403));
+        legacy.assert_hits(1);
+        public.assert_hits(1);
+    }
 
     #[test]
     fn codex_input_limit_applies_effective_percent() {

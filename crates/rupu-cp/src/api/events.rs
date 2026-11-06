@@ -103,11 +103,9 @@ async fn events_stream(
 
     // --- local: explicit run parameter ---
     if let Some(id) = run_id {
-        s.run_store.load(id).map_err(|e| match e {
-            RunStoreError::NotFound(_) => ApiError::not_found(format!("run {id} not found")),
-            other => ApiError::internal(other.to_string()),
-        })?;
-        let sse = crate::sse::tail_events_sse(s.run_store.clone(), id, after)
+        let store = super::run_resolve::local_recorded_store(&s, id)?
+            .ok_or_else(|| ApiError::not_found(format!("run {id} not found on the local host")))?;
+        let sse = crate::sse::tail_events_sse(store, id, after)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
         return Ok(sse.into_response());

@@ -1233,6 +1233,10 @@ async fn serve_session_cp(
 fn skilled_session_start() -> rupu_cp::session_starter::SessionStartRequest {
     rupu_cp::session_starter::SessionStartRequest {
         agent: "triage".into(),
+        provider: None,
+        model: None,
+        workspace_id: None,
+        idle: false,
         prompt: Some("hi".into()),
         mode: None,
         target: None,
@@ -2525,4 +2529,21 @@ async fn launch_agent_refuses_a_skill_bundle_the_remote_does_not_advertise() {
         "{err:?}"
     );
     post.assert_hits(0);
+}
+
+#[tokio::test]
+async fn first_turn_session_selection_is_never_discarded_by_legacy_remote_transport() {
+    let connector = HttpHostConnector::new("http://unreachable.invalid".into(), None);
+    for field in ["provider", "model", "workspace"] {
+        let mut request = skilled_session_start();
+        match field {
+            "provider" => request.provider = Some("openai".into()),
+            "model" => request.model = Some("deliberate-model".into()),
+            _ => request.workspace_id = Some("ws_selected".into()),
+        }
+        let error = connector.start_session(request).await.unwrap_err();
+        assert!(
+            matches!(error, HostConnectorError::Unsupported(message) if message.contains("direct connection"))
+        );
+    }
 }

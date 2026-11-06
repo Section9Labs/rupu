@@ -412,6 +412,7 @@ mod tests {
             workflows: Vec::new(),
             actions: None,
             no_messaging: false,
+            strict_approval: false,
         };
         assert_eq!(link_stream(&link, "run_child"), None, "root never began");
         rupu_netflow::stream::write_stream_begin(&root.join("netflow.jsonl"), "run_root").unwrap();

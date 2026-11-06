@@ -71,11 +71,13 @@ fn links() -> Vec<LaunchLink> {
         workflows: vec!["sweep".into()],
         actions: Some(vec!["issues.get".into()]),
         no_messaging: false,
+        strict_approval: false,
     };
     vec![
         base.clone(),
         LaunchLink {
             no_messaging: true,
+            strict_approval: true,
             ..base.clone()
         },
         LaunchLink {
@@ -320,6 +322,10 @@ fn sessions() -> Vec<RunArgv> {
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
             agent: "triage".into(),
+            provider: on(4).then(|| "named-account".into()),
+            model: on(4).then(|| "deliberate-model".into()),
+            workspace_id: on(5).then(|| "ws_selected".into()),
+            idle: false,
             into: target
                 .as_ref()
                 .filter(|_| on(1))
@@ -332,6 +338,20 @@ fn sessions() -> Vec<RunArgv> {
             preload_skills: skills(if on(5) { 1 } else { 0 }),
         }));
     }
+    out.push(RunArgv::SessionStart(SessionStart {
+        agent: "rupu-session".into(),
+        provider: Some("openai".into()),
+        model: Some("selected-model".into()),
+        workspace_id: Some("ws_selected".into()),
+        idle: true,
+        target: None,
+        mode: Some(rupu_tools::PermissionMode::Readonly),
+        prompt: None,
+        into: None,
+        detach: true,
+        skills: Vec::new(),
+        preload_skills: Vec::new(),
+    }));
     let skill_sets = [skills(0), skills(1), skills(2)];
     for prompt in PROMPTS {
         for detach in [false, true] {
@@ -528,6 +548,10 @@ fn back(cli: Cli) -> RunArgv {
                 assert_eq!(s.prompt, None, "the prompt is never positional");
                 RunArgv::SessionStart(SessionStart {
                     agent: s.agent,
+                    provider: s.provider,
+                    model: s.model,
+                    workspace_id: s.workspace_id,
+                    idle: s.idle,
                     target: s.target,
                     mode: mode(s.mode),
                     prompt: s.prompt_flag,

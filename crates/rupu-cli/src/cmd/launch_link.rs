@@ -76,6 +76,13 @@ pub struct LaunchLinkArgs {
     /// Internal.
     #[arg(long = "launch-no-messaging", hide = true, requires = "launch_depth")]
     pub launch_no_messaging: bool,
+    /// Refuse Ask without an approval channel, inherited from the harness.
+    #[arg(
+        long = "launch-strict-approval",
+        hide = true,
+        requires = "launch_depth"
+    )]
+    pub launch_strict_approval: bool,
 }
 
 impl LaunchLinkArgs {
@@ -94,6 +101,7 @@ impl LaunchLinkArgs {
             workflows: self.launch_workflows.clone().unwrap_or_default().0,
             actions: self.launch_actions.clone().map(|n| n.0),
             no_messaging: self.launch_no_messaging,
+            strict_approval: self.launch_strict_approval,
         })
     }
 }

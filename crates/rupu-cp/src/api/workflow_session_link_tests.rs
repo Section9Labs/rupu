@@ -541,3 +541,510 @@ async fn session_workflow_link_monitor_loss_is_unknown_and_actual_run_metadata_w
     assert_eq!(link["status"], "completed");
     assert!(link["error"].is_null());
 }
+
+fn recorded_workflow(state: &AppState, project: &std::path::Path, id: &str) {
+    let mut record = run_record(id, "demo", "ws_a");
+    record.workspace_path = project.into();
+    record.codename = Some("cobalt-harbor".into());
+    state.run_store.create(record, VALID_YAML).unwrap();
+}
+
+#[tokio::test]
+async fn session_workflow_attach_preserves_recorded_history_without_launching() {
+    let (tmp, project, state, adapter) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_recorded");
+    let session_path = tmp.path().join("sessions/ses_test/session.json");
+    let run_path = tmp.path().join("runs/run_recorded/run.json");
+    let session_before = std::fs::read(&session_path).unwrap();
+    let run_before = std::fs::read(&run_path).unwrap();
+    // The recorded graph remains authoritative after source deletion.
+    std::fs::remove_file(project.path().join(".rupu/workflows/demo.yaml")).unwrap();
+    let (code, receipt) = session_workflow_request(
+        state.clone(),
+        "POST",
+        "/api/sessions/ses_test/workflows?host=local",
+        serde_json::json!({"run_id":"run_recorded"}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
+    let link = &receipt["association"];
+    assert_eq!(link["run_id"], "run_recorded");
+    assert_eq!(link["origin"], "attached");
+    assert!(link["source"].is_null(), "old revision must remain unknown");
+    assert!(link["attached_at"].is_string());
+    assert_eq!(link["status"], "completed");
+    assert_eq!(std::fs::read(&session_path).unwrap(), session_before);
+    assert_eq!(std::fs::read(&run_path).unwrap(), run_before);
+    assert!(adapter.calls.lock().unwrap().is_empty());
+    let (code, repeated) = session_workflow_request(
+        state.clone(),
+        "POST",
+        "/api/sessions/ses_test/workflows",
+        serde_json::json!({"run_id":"run_recorded"}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(repeated, receipt);
+    state.run_store.archive("run_recorded").unwrap();
+    assert_eq!(
+        crate::api::session_workflows::list_records(&state, "ses_test").unwrap()["workflows"][0]
+            ["status"],
+        "completed"
+    );
+    let (code, graph) = session_workflow_request(
+        state.clone(),
+        "GET",
+        "/api/runs/run_recorded/graph",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{graph}");
+    assert_eq!(graph["workflow"]["steps"][0]["id"], "one");
+}
+
+#[tokio::test]
+async fn session_workflow_attach_supports_archived_runs_and_marks_deleted_history_unavailable() {
+    let (tmp, project, state, adapter) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_archived");
+    state.run_store.archive("run_archived").unwrap();
+    let (code, receipt) = session_workflow_request(
+        state.clone(),
+        "POST",
+        "/api/sessions/ses_test/workflows",
+        serde_json::json!({"run_id":"run_archived"}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
+    std::fs::remove_dir_all(tmp.path().join("runs-archive/run_archived")).unwrap();
+    assert_eq!(
+        crate::api::session_workflows::list_records(&state, "ses_test").unwrap()["workflows"][0]
+            ["status"],
+        "unavailable"
+    );
+    assert!(adapter.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_workflow_attach_refuses_cross_project_and_workspace_path_mismatches() {
+    for mismatch in ["project", "path", "registered"] {
+        let (tmp, project, state, adapter) = session_workflow_fixture(false);
+        let other = tempfile::tempdir().unwrap();
+        let mut record = run_record("run_other", "demo", "ws_a");
+        record.workspace_path = project.path().into();
+        match mismatch {
+            "project" => {
+                record.workspace_id = "ws_other".into();
+                register_workspace(&tmp, "ws_other", project.path());
+            }
+            "path" => {
+                let path = tmp.path().join("sessions/ses_test/session.json");
+                let mut session: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                session["workspace_path"] = serde_json::json!(other.path());
+                std::fs::write(path, session.to_string()).unwrap();
+            }
+            _ => register_workspace(&tmp, "ws_a", other.path()),
+        }
+        state.run_store.create(record, VALID_YAML).unwrap();
+        let (code, receipt) = session_workflow_request(
+            state.clone(),
+            "POST",
+            "/api/sessions/ses_test/workflows",
+            serde_json::json!({"run_id":"run_other"}),
+        )
+        .await;
+        assert_eq!(
+            code,
+            axum::http::StatusCode::CONFLICT,
+            "{mismatch}: {receipt}"
+        );
+        assert!(!tmp.path().join("sessions/ses_test/workflow-runs").exists());
+        assert!(adapter.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn session_workflow_attach_refuses_remote_readonly_archived_and_unknown_request_fields() {
+    for scenario in [
+        "remote",
+        "readonly",
+        "archived",
+        "body",
+        "query",
+        "traversal",
+        "missing",
+    ] {
+        let (tmp, project, mut state, adapter) = session_workflow_fixture(false);
+        recorded_workflow(&state, project.path(), "run_recorded");
+        let (mut uri, mut body) = (
+            "/api/sessions/ses_test/workflows",
+            serde_json::json!({"run_id":"run_recorded"}),
+        );
+        let expected = match scenario {
+            "remote" => {
+                uri = "/api/sessions/ses_test/workflows?host=remote";
+                axum::http::StatusCode::NOT_IMPLEMENTED
+            }
+            "readonly" => {
+                state.launcher = None;
+                axum::http::StatusCode::NOT_IMPLEMENTED
+            }
+            "archived" => {
+                std::fs::create_dir_all(tmp.path().join("sessions-archive")).unwrap();
+                std::fs::rename(
+                    tmp.path().join("sessions/ses_test"),
+                    tmp.path().join("sessions-archive/ses_test"),
+                )
+                .unwrap();
+                axum::http::StatusCode::CONFLICT
+            }
+            "body" => {
+                body["workspace_id"] = serde_json::json!("ws_a");
+                axum::http::StatusCode::BAD_REQUEST
+            }
+            "query" => {
+                uri = "/api/sessions/ses_test/workflows?workspace_id=ws_a";
+                axum::http::StatusCode::BAD_REQUEST
+            }
+            "traversal" => {
+                body["run_id"] = serde_json::json!("../escape");
+                axum::http::StatusCode::BAD_REQUEST
+            }
+            _ => {
+                body["run_id"] = serde_json::json!("run_missing");
+                axum::http::StatusCode::NOT_FOUND
+            }
+        };
+        let (code, receipt) = session_workflow_request(state, "POST", uri, body).await;
+        assert_eq!(code, expected, "{scenario}: {receipt}");
+        assert!(adapter.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn session_workflow_history_scopes_paginates_and_includes_archives() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_active");
+    recorded_workflow(&state, project.path(), "run_archived");
+    state.run_store.archive("run_archived").unwrap();
+    state
+        .run_store
+        .create(
+            run_record("run_unrelated", "unrelated", "ws_other"),
+            VALID_YAML,
+        )
+        .unwrap();
+    let (code, first) = session_workflow_request(
+        state.clone(),
+        "GET",
+        "/api/projects/ws_a/workflow-history?limit=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{first}");
+    assert_eq!(first["workspace_id"], "ws_a");
+    assert_eq!(first["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(first["next_offset"], 1);
+    let (_, second) = session_workflow_request(
+        state.clone(),
+        "GET",
+        "/api/projects/ws_a/workflow-history?offset=1&limit=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_ne!(first["runs"][0]["run_id"], second["runs"][0]["run_id"]);
+    assert!(second["next_offset"].is_null());
+    let (_, searched) = session_workflow_request(
+        state,
+        "GET",
+        "/api/projects/ws_a/workflow-history?q=run_archived",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(searched["runs"][0]["archived"], true);
+    assert_eq!(searched["runs"][0]["codename"], "cobalt-harbor");
+}
+
+#[tokio::test]
+async fn session_workflow_attach_keeps_original_launch_provenance() {
+    let (_tmp, project, state, adapter) = session_workflow_fixture(false);
+    let original = launch_run(
+        State(state.clone()),
+        Path("demo".into()),
+        Some(Json(session_workflow_body())),
+    )
+    .await
+    .unwrap()
+    .0;
+    let id = original["run_id"].as_str().unwrap();
+    recorded_workflow(&state, project.path(), id);
+    let (code, receipt) = session_workflow_request(
+        state,
+        "POST",
+        "/api/sessions/ses_test/workflows",
+        serde_json::json!({"run_id":id}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
+    assert_eq!(
+        receipt["association"]["source"],
+        original["association"]["source"]
+    );
+    assert_eq!(receipt["association"]["origin"], "launched");
+    assert!(receipt["association"]["attached_at"].is_null());
+    assert_eq!(
+        adapter.calls.lock().unwrap().len(),
+        1,
+        "attachment never starts a second execution"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_workflow_attach_refuses_symlinked_run_storage() {
+    let (tmp, project, state, adapter) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_recorded");
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::rename(
+        tmp.path().join("runs/run_recorded"),
+        outside.path().join("run_recorded"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("run_recorded"),
+        tmp.path().join("runs/run_recorded"),
+    )
+    .unwrap();
+    let (code, _) = session_workflow_request(
+        state,
+        "POST",
+        "/api/sessions/ses_test/workflows",
+        serde_json::json!({"run_id":"run_recorded"}),
+    )
+    .await;
+    assert!(!code.is_success());
+    assert!(!tmp.path().join("sessions/ses_test/workflow-runs").exists());
+    assert!(adapter.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn builtin_session_workflow_link_keeps_real_permission_modes() {
+    for (stored, requested, expected) in [
+        ("readonly", None, Some("readonly")),
+        ("bypass", None, Some("bypass")),
+        ("readonly", Some("bypass"), Some("bypass")),
+        ("readonly", Some("ask"), None),
+        ("ask", None, None),
+        ("invalid", None, None),
+    ] {
+        let (tmp, _project, state, adapter) = session_workflow_fixture(false);
+        let path = tmp.path().join("sessions/ses_test/session.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record["builtin_harness"] = serde_json::json!(true);
+        record["permission_mode"] = serde_json::json!(stored);
+        std::fs::write(path, record.to_string()).unwrap();
+        let mut body = session_workflow_body();
+        body.mode = requested.map(str::to_string);
+        let result = launch_run(State(state), Path("demo".into()), Some(Json(body))).await;
+        if let Some(expected) = expected {
+            let _ = result.unwrap();
+            let calls = adapter.calls.lock().unwrap();
+            assert_eq!(calls[0].1.mode.as_deref(), Some(expected));
+            assert!(
+                rupu_runtime::strict_approval::workflow_required(tmp.path(), &calls[0].0).unwrap()
+            );
+        } else {
+            assert_eq!(result.unwrap_err().0, axum::http::StatusCode::BAD_REQUEST);
+            assert!(adapter.calls.lock().unwrap().is_empty());
+            assert!(!tmp.path().join("sessions/ses_test/workflow-runs").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_workflow_attach_accepts_recorded_path_from_before_a_project_move() {
+    let (_tmp, project, state, adapter) = session_workflow_fixture(false);
+    let mut record = run_record("run_before_move", "demo", "ws_a");
+    record.workspace_path = project.path().join("no-longer-present");
+    state.run_store.create(record, VALID_YAML).unwrap();
+    let (code, receipt) = session_workflow_request(
+        state,
+        "POST",
+        "/api/sessions/ses_test/workflows",
+        serde_json::json!({"run_id":"run_before_move"}),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{receipt}");
+    assert_eq!(receipt["association"]["run_id"], "run_before_move");
+    assert!(adapter.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn session_workflow_history_reads_archived_events_and_transcript_without_restoring() {
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    let (tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_archived_read");
+    let event = rupu_orchestrator::executor::Event::StepStarted {
+        run_id: "run_archived_read".into(),
+        step_id: "one".into(),
+        kind: rupu_orchestrator::runs::StepKind::Linear,
+        agent: None,
+        host: None,
+        codename: None,
+    };
+    std::fs::write(
+        state.run_store.events_path("run_archived_read"),
+        format!("{}\n", serde_json::to_string(&event).unwrap()),
+    )
+    .unwrap();
+    let path = state
+        .run_store
+        .root
+        .join("run_archived_read")
+        .join("agent.jsonl");
+    let transcript = concat!(
+        "{\"type\":\"assistant_message\",\"data\":{\"content\":\"Recorded answer\"}}\n",
+        "{\"type\":\"run_complete\",\"data\":{\"run_id\":\"run_agent\",\"status\":\"ok\",\"total_tokens\":1,\"duration_ms\":1}}\n"
+    );
+    std::fs::write(&path, transcript).unwrap();
+    state.run_store.archive("run_archived_read").unwrap();
+    let app = crate::api::events::routes()
+        .merge(crate::api::transcript::routes())
+        .with_state(state);
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/events/stream?host=local&run=run_archived_read")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let data = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        response.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8(data.to_vec()).unwrap();
+    assert!(text.contains("step_started"), "{text}");
+    assert!(
+        text.contains("event: end"),
+        "recorded SSE must settle: {text}"
+    );
+    let path_query: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("path", &path.to_string_lossy())
+        .append_pair("host", "local")
+        .append_pair("run", "run_agent")
+        .finish();
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/transcript?{path_query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let page: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["events"][0]["data"]["content"], "Recorded answer");
+    assert_eq!(page["events"].as_array().unwrap().len(), 2);
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/transcript/stream?{path_query}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let data = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        response.into_body().collect(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8(data.to_vec()).unwrap();
+    assert!(text.contains("Recorded answer"), "{text}");
+    assert!(text.contains("event: end"), "{text}");
+    assert!(!tmp.path().join("runs/run_archived_read").exists());
+    assert_eq!(
+        std::fs::read_to_string(
+            tmp.path()
+                .join("runs-archive/run_archived_read/agent.jsonl")
+        )
+        .unwrap(),
+        transcript
+    );
+}
+
+#[tokio::test]
+async fn builtin_session_workflow_link_refuses_remote_approval_policy_loss() {
+    let (tmp, project, state, adapter) = session_workflow_fixture(false);
+    let path = tmp.path().join("sessions/ses_test/session.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["builtin_harness"] = serde_json::json!(true);
+    record["permission_mode"] = serde_json::json!("bypass");
+    std::fs::write(path, record.to_string()).unwrap();
+    let source = VALID_YAML.replace("    prompt: hi", "    prompt: hi\n    host: worker-1");
+    std::fs::write(project.path().join(".rupu/workflows/demo.yaml"), &source).unwrap();
+    let mut body = session_workflow_body();
+    body.mode = None;
+    body.expected_revision = Some(revision(&source));
+    let error = launch_run(State(state), Path("demo".into()), Some(Json(body)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.0,
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        "{}",
+        error.1
+    );
+    assert!(error.1.contains("host/distribute"));
+    assert!(adapter.calls.lock().unwrap().is_empty());
+    assert!(!tmp.path().join("sessions/ses_test/workflow-runs").exists());
+}
+
+#[tokio::test]
+async fn session_workflow_history_capabilities_match_read_and_write_availability() {
+    let (_tmp, _project, mut state, _) = session_workflow_fixture(false);
+    let (_, writable) = session_workflow_request(
+        state.clone(),
+        "GET",
+        "/api/host/info",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert!(writable["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workflow.session_history")));
+    assert!(writable["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workflow.session_attach")));
+    state.launcher = None;
+    let (_, readonly) =
+        session_workflow_request(state, "GET", "/api/host/info", serde_json::Value::Null).await;
+    assert!(readonly["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workflow.session_history")));
+    assert!(!readonly["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workflow.session_attach")));
+}

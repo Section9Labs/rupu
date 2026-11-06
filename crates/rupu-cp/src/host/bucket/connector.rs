@@ -1361,6 +1361,10 @@ mod tests {
         let err = conn
             .start_session(SessionStartRequest {
                 agent: "a".into(),
+                provider: None,
+                model: None,
+                workspace_id: None,
+                idle: false,
                 prompt: None,
                 mode: None,
                 target: None,

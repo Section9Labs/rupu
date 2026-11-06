@@ -44,6 +44,8 @@ async fn projects_tools_are_listed_with_their_required_arguments() {
         ("projects.get", &["ws_id"]),
         ("projects.runs", &["ws_id"]),
         ("projects.sessions", &["ws_id"]),
+        ("projects.start_session", &["ws_id"]),
+        ("projects.workflow_history", &["id"]),
         ("projects.agents", &["ws_id"]),
         ("projects.workflows", &["ws_id"]),
         ("projects.autoflows", &["ws_id"]),

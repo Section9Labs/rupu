@@ -33,6 +33,8 @@ async fn sessions_tools_are_listed_with_their_required_arguments() {
         ("sessions.list", &[]),
         ("sessions.get", &["id"]),
         ("sessions.turns", &["id"]),
+        ("sessions.workflows", &["id"]),
+        ("sessions.attach_workflow", &["id", "run_id"]),
         ("sessions.usage_timeline", &["id"]),
         ("sessions.archive", &["id"]),
         ("sessions.restore", &["id"]),
