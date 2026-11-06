@@ -18,9 +18,10 @@ import { formatCost } from '../../lib/usage';
 import { relativeTime } from '../../lib/time';
 import SortableTable, { type Column } from '../../components/lists/SortableTable';
 import { Button } from '../../components/ui/Button';
+import { PageHeader } from '../../components/ui/PageHeader';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { ErrorBanner } from '../../components/ui/ErrorBanner';
-import { Spinner } from '../../components/ui/Spinner';
+import { ListSkeleton } from '../../components/lists/ListSkeleton';
 import { CustomerDot } from '../../components/customers/CustomerDot';
 import { CustomerFormDialog } from '../../components/customers/CustomerFormDialog';
 import { PricingErrorMark } from '../../components/customers/PricingErrorMark';
@@ -157,7 +158,7 @@ export default function Customers() {
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [creating, setCreating] = useState(false);
-  const headerRef = useRef<HTMLElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
 
   // One fetch per range: `archived=1` returns active AND archived customers,
   // and `is:` picks among them here.
@@ -250,17 +251,18 @@ export default function Customers() {
 
   return (
     <div className="p-8">
-      <header ref={headerRef} className="mb-6 flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold text-ink">Customers</h1>
-          <p className="mt-1 text-sm text-ink-dim">
-            Who your projects belong to — each customer has its own config layer, accounts and spend.
-          </p>
-        </div>
-        <Button onClick={() => setCreating(true)}>
-          New customer
-        </Button>
-      </header>
+      <div ref={headerRef}>
+        <PageHeader
+          className="mb-6"
+          title="Customers"
+          subtitle="Who your projects belong to — each customer has its own config layer, accounts and spend."
+          actions={
+            <Button variant="solid" onClick={() => setCreating(true)}>
+              New customer
+            </Button>
+          }
+        />
+      </div>
 
       {error && <ErrorBanner className="mb-4">{error}</ErrorBanner>}
 
@@ -278,11 +280,7 @@ export default function Customers() {
         />
       )}
 
-      {loading && (
-        <div className="py-16 flex items-center justify-center">
-          <Spinner label="Loading customers…" />
-        </div>
-      )}
+      {loading && <ListSkeleton label="Loading customers…" />}
 
       {!loading && rows !== null && (
         <>
@@ -328,7 +326,7 @@ export default function Customers() {
             <EmptyState
               title="No customers yet"
               hint="Create a customer, then assign projects to it to give them their own config layer, accounts and spend."
-              action={<Button onClick={() => setCreating(true)}>New customer</Button>}
+              action={<Button variant="solid" onClick={() => setCreating(true)}>New customer</Button>}
             />
           ) : visible.length === 0 ? (
             rest.trim() ? <NoMatches noun="customers" /> : <EmptyState title="No active customers" />

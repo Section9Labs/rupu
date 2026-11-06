@@ -24,6 +24,7 @@ import { Cpu, DollarSign, FileCode, GitBranch, Shield, SlidersHorizontal, Workfl
 import { api, ApiError, type ConfigView } from '../../lib/api';
 import { TabBar, TabButton } from '../../components/TabBar';
 import { Button } from '../../components/ui/Button';
+import { ErrorBanner } from '../../components/ui/ErrorBanner';
 import { LayerErrorBanner } from '../../components/settings/LayerErrorBanner';
 import {
   ConfigLayerContext,
@@ -378,15 +379,12 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
 
   if (view === null && loadError) {
     return (
-      <div
-        role="alert"
-        className="flex items-center justify-between gap-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
-      >
+      <ErrorBanner className="flex items-center justify-between gap-3">
         <span>{loadError}</span>
         <Button variant="secondary" size="sm" onClick={() => void reload()}>
           Retry
         </Button>
-      </div>
+      </ErrorBanner>
     );
   }
   if (view === null || layer === null) {
@@ -420,22 +418,19 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
               {dirtyCount} unsaved change{dirtyCount === 1 ? '' : 's'}
             </span>
           )}
-          <Button onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving || Boolean(view.layer_error)}>
+          <Button variant="solid" onClick={() => void handleSave()} disabled={dirtyCount === 0 || saving || Boolean(view.layer_error)}>
             {saving ? 'Saving…' : 'Save changes'}
           </Button>
         </div>
       </div>
 
       {reloadError && (
-        <div
-          role="alert"
-          className="flex items-center justify-between gap-3 rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err"
-        >
+        <ErrorBanner className="flex items-center justify-between gap-3">
           <span>Couldn&apos;t refresh this layer: {reloadError}</span>
           <Button variant="secondary" size="sm" onClick={() => void reload()}>
             Retry
           </Button>
-        </div>
+        </ErrorBanner>
       )}
       {view.layer_error && (
         <LayerErrorBanner
@@ -449,16 +444,8 @@ export default function CustomerConfigTab({ slug, name, projectCount, layerPath,
           This is a read-only deploy — editing config requires <code className="font-mono">rupu cp serve</code>.
         </div>
       )}
-      {saveError && (
-        <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {saveError}
-        </div>
-      )}
-      {lockError && (
-        <div role="alert" className="rounded-lg border border-err/30 bg-err-bg px-4 py-3 text-sm text-err">
-          {lockError}
-        </div>
-      )}
+      {saveError && <ErrorBanner>{saveError}</ErrorBanner>}
+      {lockError && <ErrorBanner>{lockError}</ErrorBanner>}
       {saveInfo && (
         <div className="rounded-lg border border-border bg-surface px-4 py-3 text-sm text-ink-dim">{saveInfo}</div>
       )}
