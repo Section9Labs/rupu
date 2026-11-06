@@ -142,17 +142,42 @@ The component checks below use the isolated checkout's target directory with
 | `cargo test -p rupu-runtime --lib strict_approval::` | 1 passed on the final durable-marker implementation |
 | `cargo test -p rupu-cp --no-default-features --lib project_session_start` | 7 passed |
 | `cargo test -p rupu-cp --no-default-features --lib session_workflow` | 23 passed |
+| `cargo test -p rupu-cli --no-default-features --lib session_harness_tests` | 6 passed |
+| `cargo test -p rupu-cli --no-default-features --lib workflow_context::tests` | 6 passed |
+| `cargo test -p rupu-cli --no-default-features --lib cp_session_starter` | 9 passed |
+| `cargo test -p rupu-cli --no-default-features --test it argv_roundtrip` | 4 passed |
+| `cargo test -p rupu-cp --no-default-features --test it mcp_ops_projects` | 4 passed |
+| `cargo test -p rupu-cp --no-default-features --test it mcp_ops_sessions` | 3 passed |
+| `cargo test -p rupu-cp --no-default-features --test it first_turn_session_selection` | 1 passed |
+| `cargo test -p rupu-cp --no-default-features --test it mcp_routes` | 5 passed; all 193 operator tools pinned, including the four new session/history operations |
+| `cargo test -p rupu-cp --no-default-features --lib scoped_revision` | 6 passed after the parent's test-only Clippy correction |
+| `cargo build -p rupu-cli --no-default-features --bin rupu` | Passed; resulting binary reports `rupu 0.87.0 (dev)` |
 
-The combined milestone also preserves the parent's provider model-discovery
-compatibility change. Its owner reports all 30 `openai_codex::fetch_models_tests`
-passing with local mock HTTP servers. Its contract, primary reference, and live
-catalog-refresh limitations are in
-`docs/harness-2026-11-06/provider-model-discovery.md`. This is catalog discovery
-evidence and does not establish a successful model completion.
+Provider discovery changed after the published snapshot: the initial public
+catalog fallback passed 30 mocked tests but failed the parent's live acceptance
+because the selected token lacked the required scope. Parent commit `cec4cefd`
+replaced that fallback with a current Codex catalog client version. Its owner
+reports all 27 corrected provider catalog tests passing. The updated contract,
+direct probe evidence, and remaining acceptance are in
+`docs/harness-2026-11-06/provider-model-discovery.md`. The binary build above
+predates this correction; the parent owns the rebuilt runtime, cache refresh,
+and deployment acceptance. Catalog discovery does not
+establish successful model completion.
 
-Combined CP/CLI checks are in progress. Their command logs and machine-readable
-results are under `target/harness-validation/`; final outcomes are recorded here
-before commit.
+Combined CP/CLI test logs and machine-readable results are under
+`target/harness-validation/`. The first operator-tool run stopped because the
+sandbox denied its `127.0.0.1:0` mock listener; the rerun with localhost networking
+allowed passed. Project creation was rerun successfully after the parent's
+provider discovery change settled. Apple's linker emitted a nonfatal
+compact-unwind size warning for the large integration-test binaries.
+
+The implementation snapshot is commit `1f3da72a`, published by the parent in
+draft Rupu PR #946. The MCP fixture/count correction and this completed validation
+record are a separate follow-up. Parent commit `cec4cefd` contains the provider
+correction, test-only Clippy changes, and the CLI newer-record fixture update
+from hardcoded version 4 to `SessionRecord::VERSION + 1`. The full `cli_session::` regression
+filter for that last update remains with the parent; it is not included in the
+focused results above. This workstream has released the isolated Cargo target.
 
 No real provider work, installation, control-plane restart, push, or merge is
 part of this backend workstream. Native UI integration, a successful live
