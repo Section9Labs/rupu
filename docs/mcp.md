@@ -363,3 +363,7 @@ HTTP URL as above (for a client that only speaks stdio, use `mcp-remote`).
 - [cp-api.md](cp-api.md) - the JSON the operator tools return
 - [scm.md](scm.md#mcp-tool-catalog) - the SCM and issue tools
 - [messaging.md](messaging.md) - message spaces behind `messages.*`
+
+### Native session controls
+
+The session client's command discovery/execution, model/provider/tool settings, and orchestration configuration endpoints are not exposed as MCP tools. Use the native client or their HTTP APIs on the owning host. Existing typed MCP session operations, including stop and compact, remain available.
