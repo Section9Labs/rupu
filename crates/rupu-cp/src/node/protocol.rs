@@ -430,6 +430,8 @@ pub const CAP_RUN_LIST: &str = "run.list";
 /// __message list|send` over SSH (spec F1b §3.6). A connector refuses to
 /// read or send messages through a peer that does not list it.
 pub const CAP_RUN_MESSAGES: &str = "run.messages";
+/// HTTP/local atomic recipient run precondition; SSH messaging does not implement it.
+pub const CAP_RUN_MESSAGES_EXPECTED_RUN: &str = "run.messages.expected_run";
 
 /// Host feature: this build serves a run's board — `GET
 /// /api/runs/:id/board` over HTTP, `rupu __board <id>` over SSH. A connector

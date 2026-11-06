@@ -183,6 +183,7 @@ fn send(global: &Path, args: &SendArgs, caps: rupu_fleet::BusCaps) -> anyhow::Re
         None => root.default_recipient(),
     };
     let msg = OperatorMessage {
+        expected_run_id: None,
         to: to.clone(),
         body: args.text.join(" "),
         urgent: args.urgent,
@@ -559,6 +560,7 @@ fn helper(global: &Path, action: HelperAction) -> Result<serde_json::Value, Mess
             };
             let caps = messaging_caps(global).map_err(|e| internal(&e))?;
             let msg = OperatorMessage {
+                expected_run_id: None,
                 to,
                 body,
                 urgent,

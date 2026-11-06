@@ -483,6 +483,7 @@ mod tests {
         let op = Bus::open(tmp.path(), "operator");
         let send = |to: &str, body: &str, urgent: bool| {
             op.operator_send(rupu_fleet::OperatorMessage {
+                expected_run_id: None,
                 to: Address::parse(to).unwrap(),
                 body: body.into(),
                 urgent,
@@ -551,6 +552,7 @@ mod tests {
         let body = "drop the scan and push your branch";
         Bus::open(tmp.path(), "operator")
             .operator_send(rupu_fleet::OperatorMessage {
+                expected_run_id: None,
                 to: Address::parse("otter").unwrap(),
                 body: body.into(),
                 urgent: false,

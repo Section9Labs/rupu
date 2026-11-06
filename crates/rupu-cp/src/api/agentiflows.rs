@@ -1282,6 +1282,7 @@ async fn steer_agentiflow(
     }
     if !req.stop {
         let body = crate::api::messages::PostBody {
+            expected_run_id: None,
             to: Some(rupu_fleet::Address::Lead.to_string()),
             body: req.message,
             urgent: req.now,

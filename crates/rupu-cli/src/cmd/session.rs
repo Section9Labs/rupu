@@ -11936,6 +11936,7 @@ mod tests {
         turn("run_unseen_1", ack).await.expect("turn 1");
         let sent = rupu_fleet::Bus::open(&space, rupu_fleet::address::OPERATOR)
             .operator_send(rupu_fleet::OperatorMessage {
+                expected_run_id: None,
                 to: rupu_fleet::Address::Broadcast,
                 body: "mind the auth module".into(),
                 urgent: false,

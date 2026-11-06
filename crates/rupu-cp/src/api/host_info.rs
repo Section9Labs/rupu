@@ -66,6 +66,11 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             scm_hosts: scm_hosts_vec,
             permission_modes: permission_modes_vec,
         },
-        features: crate::node::protocol::host_features(),
+        // HTTP supports the atomic recipient guard; the SSH helper does not.
+        features: {
+            let mut features = crate::node::protocol::host_features();
+            features.push(crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN.to_string());
+            features
+        },
     }))
 }
