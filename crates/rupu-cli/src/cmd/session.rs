@@ -13728,6 +13728,7 @@ mod tests {
             target: target.map(str::to_string),
             active_run_id: active_run_id.map(str::to_string),
             updated_at: updated_at.to_string(),
+            archived_at: None,
             customer: Some(rupu_cp::customers::RowCustomer::default()),
         }
     }
