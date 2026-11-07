@@ -322,6 +322,7 @@ pub enum WorkflowControl {
 /// `rupu session start <agent> …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
+    pub skill_preset: Option<String>,
     pub agent: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -620,6 +621,7 @@ impl RunArgv {
                 a.push("session");
                 a.push("start");
                 a.push(&s.agent);
+                a.opt_flag_value("--skill-preset", s.skill_preset.as_deref());
                 a.opt_flag_value("--provider", s.provider.as_deref());
                 a.opt_flag_value("--model", s.model.as_deref());
                 a.opt_flag_value("--workspace-id", s.workspace_id.as_deref());
@@ -1129,6 +1131,7 @@ mod tests {
             ]
         );
         let start = RunArgv::SessionStart(SessionStart {
+            skill_preset: None,
             agent: "triage".into(),
             provider: None,
             model: None,

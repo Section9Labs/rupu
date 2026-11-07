@@ -48,9 +48,11 @@ pub use wake::{
 };
 pub use worker::{WorkerCapabilities, WorkerKind, WorkerRecord};
 
-pub mod session_commands;
 pub mod session_cancel;
+pub mod session_commands;
 pub mod session_orchestration;
+pub mod session_readiness;
+pub mod session_skill_preset;
 
 /// Strict approval policy retained by session-linked workflows.
 pub mod strict_approval;

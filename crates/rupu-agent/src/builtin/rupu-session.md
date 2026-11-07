@@ -4,19 +4,49 @@ description: Rupu's built-in project coding session
 permissionMode: readonly
 fallbacks: []
 tools:
-  - core.*
-  - agents.*
+  - bash
+  - read_file
+  - write_file
+  - edit_file
+  - grep
+  - glob
+  - ast_grep
+  - agents.list
+  - agents.get
   - workflows.list
   - workflows.get
+  - workflows.generate
   - catalog.search
   - dispatch
   - join
-  - coverage.*
-  - findings.*
-  - scm.*
-  - issues.*
-  - github.*
-  - gitlab.*
+  - coverage.mark
+  - coverage.status
+  - coverage.remaining
+  - coverage.concerns.search
+  - coverage.concerns.detail
+  - findings.report
+  - findings.verify
+  - findings.query
+  - findings.tag
+  - assets.mark
+  - scm.repos.list
+  - scm.repos.get
+  - scm.branches.list
+  - scm.branches.create
+  - scm.files.read
+  - scm.prs.list
+  - scm.prs.get
+  - scm.prs.diff
+  - scm.prs.comment
+  - scm.prs.create
+  - issues.list
+  - issues.get
+  - issues.comments
+  - issues.comment
+  - issues.create
+  - issues.update_state
+  - github.workflows_dispatch
+  - gitlab.pipeline_trigger
 concerns:
   - id: session:correctness
     name: Correctness
