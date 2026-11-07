@@ -7,7 +7,7 @@
 use super::mcp::{
     assert_required_args, call_tool, json_of, rpc, spawn_operator_with, text_of, OP_RUN,
 };
-use rupu_orchestrator::runs::{RunStatus, RunStore};
+use rupu_orchestrator::runs::{AttemptRecord, RunStatus, RunStore};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
@@ -52,6 +52,7 @@ async fn runs_tools_are_listed_with_their_required_arguments() {
     let table: &[(&str, &[&str])] = &[
         ("runs.list_all", &[]),
         ("runs.archived", &[]),
+        ("runs.attempts", &["id"]),
         ("runs.delete", &["id"]),
         ("runs.archive", &["id"]),
         ("runs.restore", &["id"]),
@@ -75,6 +76,107 @@ async fn runs_tools_are_listed_with_their_required_arguments() {
         ("autoflow_runs.events", &[]),
     ];
     assert_required_args(addr, table).await;
+    let list = rpc(addr, "tools/list", json!({})).await["result"]["tools"].clone();
+    let attempts = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "runs.attempts")
+        .unwrap();
+    let properties = attempts["inputSchema"]["properties"].as_object().unwrap();
+    let keys: std::collections::BTreeSet<_> = properties.keys().map(String::as_str).collect();
+    assert_eq!(
+        keys,
+        [
+            "id",
+            "host",
+            "step_id",
+            "unit_index",
+            "sub_id",
+            "limit",
+            "cursor"
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(attempts["annotations"]["readOnlyHint"], true);
+    assert_eq!(attempts["annotations"]["idempotentHint"], true);
+    assert_eq!(attempts["annotations"]["destructiveHint"], false);
+    assert_eq!(attempts["annotations"]["openWorldHint"], false);
+}
+
+#[tokio::test]
+async fn attempts_mcp_preserves_filters_and_immutable_cursor_pages() {
+    let (addr, tmp) = spawn_operator_with(|_| {}, None).await;
+    let store = RunStore::new(tmp.path().join("runs"));
+    let row = |id: &str, unit: usize, sub: &str| AttemptRecord {
+        v: 1,
+        step_id: "review + evidence".into(),
+        unit_index: Some(unit),
+        sub_id: Some(sub.into()),
+        agent_run_id: id.into(),
+        transcript_path: format!("/nonexistent/{id}.jsonl").into(),
+        host: Some("worker-a".into()),
+        continued_from: None,
+        started_at: "2026-11-06T10:00:01Z".parse().unwrap(),
+    };
+    for record in [
+        row("run_first", 2, "check / headers"),
+        row("run_wrong_unit", 3, "check / headers"),
+        row("run_wrong_sub", 2, "other"),
+        row("run_second", 2, "check / headers"),
+    ] {
+        store.append_attempt(OP_RUN, &record).unwrap();
+    }
+    let mut args = json!({
+        "id": OP_RUN, "host":"local", "step_id":"review + evidence",
+        "unit_index":2, "sub_id":"check / headers", "limit":1
+    });
+    let first_result = call_tool(addr, "runs.attempts", args.clone()).await;
+    assert_ne!(first_result["isError"], true, "{first_result}");
+    let first = json_of(&first_result);
+    assert_eq!(first["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(first["rows"][0]["agent_run_id"], "run_first");
+    assert_eq!(first["rows"][0]["host"], "worker-a");
+    assert_eq!(first["recorded_matching_total"], 2);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    args["cursor"] = cursor.into();
+    // A later append cannot change an existing snapshot's pages.
+    store
+        .append_attempt(OP_RUN, &row("run_later", 2, "check / headers"))
+        .unwrap();
+    let next_result = call_tool(addr, "runs.attempts", args.clone()).await;
+    assert_ne!(next_result["isError"], true, "{next_result}");
+    let next = json_of(&next_result);
+    assert_eq!(next["snapshot"], first["snapshot"]);
+    assert_eq!(next["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(next["rows"][0]["agent_run_id"], "run_second");
+    assert!(next["next_cursor"].is_null());
+    let path = format!(
+        "/api/runs/{OP_RUN}/attempts?host=local&step_id=review%20%2B%20evidence&unit_index=2&sub_id=check%20%2F%20headers&limit=1&cursor={cursor}"
+    );
+    let (status, same_page) = http_get(addr, &path).await;
+    assert_eq!(status, 200);
+    assert_eq!(next, same_page);
+    args["unit_index"] = 3.into();
+    let mismatched = call_tool(addr, "runs.attempts", args).await;
+    assert_eq!(mismatched["isError"], true, "{mismatched}");
+    assert!(text_of(&mismatched).starts_with("HTTP 400"));
+}
+
+#[tokio::test]
+async fn attempts_mcp_preserves_missing_evidence_and_refuses_remote_owners() {
+    let (addr, tmp) = spawn_operator_with(|_| {}, None).await;
+    std::fs::remove_file(tmp.path().join("runs").join(OP_RUN).join("attempts.jsonl")).unwrap();
+    let result = call_tool(addr, "runs.attempts", json!({"id":OP_RUN})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let page = json_of(&result);
+    assert_eq!(page["evidence"]["ledger"], "missing");
+    assert!(page["recorded_matching_total"].is_null());
+    assert!(page["rows"].as_array().unwrap().is_empty());
+    let remote = call_tool(addr, "runs.attempts", json!({"id":OP_RUN,"host":"remote"})).await;
+    assert_eq!(remote["isError"], true, "{remote}");
+    assert!(text_of(&remote).starts_with("HTTP 501"));
 }
 
 #[tokio::test]
