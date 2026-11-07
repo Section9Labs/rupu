@@ -42,6 +42,7 @@ pub mod runs;
 pub mod scm;
 pub mod sessions;
 pub mod session_commands;
+pub(crate) mod session_workflows;
 pub mod skills;
 pub mod source;
 pub mod tools;

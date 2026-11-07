@@ -49,11 +49,37 @@ pub enum LaunchError {
     Spawn(String),
 }
 
+/// Observe the exact detached process for a session-linked launch. The callback
+/// records startup failure when the child exits before writing run metadata.
+pub struct LaunchWatch {
+    pub stderr: std::path::PathBuf,
+    pub on_exit: std::sync::Arc<dyn Fn(Result<std::process::ExitStatus, String>) + Send + Sync>,
+}
+
 /// Port: starts runs. rupu-cp defines it; rupu-cli's `cp serve` provides the
 /// subprocess-spawning adapter. Returns the new run id.
 #[async_trait::async_trait]
 pub trait RunLauncher: Send + Sync {
     async fn launch(&self, req: LaunchRequest) -> Result<String, LaunchError>;
+
+    /// Whether the adapter can honor an ID durably reserved by the session
+    /// workflow API. Older adapters must refuse before an association is saved.
+    fn supports_session_workflows(&self) -> bool {
+        false
+    }
+
+    /// Launch exactly this server-reserved ID, after its session association
+    /// has been synced. Never mint a replacement ID or retry a spawn here.
+    async fn launch_identified(
+        &self,
+        _req: LaunchRequest,
+        _run_id: &str,
+        _watch: LaunchWatch,
+    ) -> Result<(), LaunchError> {
+        Err(LaunchError::Invalid(
+            "session workflow launch is unavailable".into(),
+        ))
+    }
 
     /// Retry a failed, rejected or cancelled run: a detached `rupu workflow
     /// resume <run_id> [--restart-interrupted]`, which flips the run back to

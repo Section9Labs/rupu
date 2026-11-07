@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
         .merge(orchestration::routes())
+        .merge(super::session_workflows::routes())
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:id", get(get_session).delete(delete_session))
         .route(

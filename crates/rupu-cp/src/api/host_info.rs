@@ -1,13 +1,9 @@
 #![deny(clippy::all)]
 
-use crate::{
-    error::ApiResult,
-    host::connector::HostCapabilities,
-    state::AppState,
-};
+use crate::{error::ApiResult, host::connector::HostCapabilities, state::AppState};
 use axum::{extract::State, routing::get, Json, Router};
-use serde::Serialize;
 use rupu_workspace::worker_store::WorkerStore;
+use serde::Serialize;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/host/info", get(get_host_info))
@@ -71,6 +67,12 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             let mut features = crate::node::protocol::host_features();
             features.push(crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN.to_string());
             features.push("workflow.scoped_revision".to_string());
+            if s.launcher
+                .as_ref()
+                .is_some_and(|l| l.supports_session_workflows())
+            {
+                features.push("workflow.session_link".to_string());
+            }
             features
         },
     }))
