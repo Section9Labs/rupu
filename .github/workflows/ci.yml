@@ -146,6 +146,12 @@ jobs:
       - name: Idempotence regression test
         run: ./packaging/test-sync-community.sh
 
+      - name: Verify RPM signing with a disposable key
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y rpm createrepo-c
+          bash packaging/test-yum-signing.sh
+
       - name: Render the definitions with fabricated hashes
         run: |
           set -euo pipefail
