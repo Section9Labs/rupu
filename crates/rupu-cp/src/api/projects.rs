@@ -111,7 +111,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects", get(list_projects).post(register_project))
         .route("/api/projects/:ws_id", get(get_project))
         .route("/api/projects/:ws_id/runs", get(project_runs))
-        .route("/api/projects/:ws_id/sessions", get(project_sessions))
+        .route(
+            "/api/projects/:ws_id/sessions",
+            get(project_sessions).post(super::project_session_start::start),
+        )
         .route("/api/projects/:ws_id/coverage", get(project_coverage))
         .route(
             "/api/projects/:ws_id/coverage/assessed",
@@ -299,7 +302,10 @@ async fn list_projects(
 }
 
 /// Load a workspace by id; `Ok(None)` → 404, store error → 500.
-fn load_workspace(s: &AppState, ws_id: &str) -> Result<rupu_workspace::Workspace, ApiError> {
+pub(super) fn load_workspace(
+    s: &AppState,
+    ws_id: &str,
+) -> Result<rupu_workspace::Workspace, ApiError> {
     match store(s).load(ws_id) {
         Ok(Some(w)) => Ok(w),
         Ok(None) => Err(ApiError::not_found(format!("project {ws_id} not found"))),

@@ -15,9 +15,20 @@ const DEFAULT_API_URL: &str = "https://api.openai.com/v1/responses";
 const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// The Codex model catalog. The only OpenAI endpoint that carries
-/// per-model limits; the public `/v1/models` has ids only (spec 2026-09-30 §3).
-const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0";
+/// Codex catalog protocol baseline, verified against the released Codex 0.166.0
+/// client and the live endpoint on 2026-11-06. The server filters models by
+/// `minimal_client_version`: the old 0.50.0 value returned an empty catalog
+/// even for a valid login. This is protocol compatibility, not Rupu's version,
+/// and does not require a Codex installation on the control-plane host.
+/// https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-api/src/endpoint/models.rs
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.166.0";
+
+fn codex_models_url(responses_url: &str) -> String {
+    format!(
+        "{}?client_version={CODEX_MODELS_CLIENT_VERSION}",
+        responses_url.replace("/responses", "/models")
+    )
+}
 /// Bound on the API-key path's first attempt (the chatgpt.com catalog), so
 /// a hanging catalog still leaves the ids-only `/v1/models` fallback time to
 /// run inside the caller's overall listing timeout (10s, spec §3).
@@ -252,7 +263,7 @@ impl OpenAiCodexClient {
                     auth_json_path,
                     credential_store: None,
                     org_id: None,
-                    chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                    chatgpt_models_url: codex_models_url(CODEX_BACKEND_URL),
                     catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
                     token_url: OPENAI_TOKEN_URL.to_string(),
                     pending_refresh: None,
@@ -270,7 +281,7 @@ impl OpenAiCodexClient {
                 auth_json_path,
                 credential_store: None,
                 org_id: None,
-                chatgpt_models_url: CODEX_MODELS_URL.to_string(),
+                chatgpt_models_url: codex_models_url(CODEX_BACKEND_URL),
                 catalog_attempt_timeout: CODEX_CATALOG_ATTEMPT_TIMEOUT,
                 token_url: OPENAI_TOKEN_URL.to_string(),
                 pending_refresh: None,
@@ -846,10 +857,14 @@ impl OpenAiCodexClient {
     }
 
     async fn get_models_json(&self, url: &str) -> Result<serde_json::Value, ProviderError> {
-        let mut req = self.client.get(url).header(
-            reqwest::header::AUTHORIZATION,
-            format!("Bearer {}", self.access_token),
-        );
+        let mut req = self
+            .client
+            .get(url)
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", self.access_token),
+            )
+            .header(reqwest::header::ACCEPT, "application/json");
         if !self.account_id.is_empty() {
             req = req.header("chatgpt-account-id", &self.account_id);
         }
@@ -912,17 +927,9 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         // path suffix, not host — that way tests with localhost mocks
         // hit the same branch as the chatgpt.com production URL.
         let url = if self.api_url.contains("/backend-api/codex/responses") {
-            // The chatgpt.com `/codex/models` endpoint validates a
-            // mandatory `client_version` query string — without it
-            // the server returns 400 with
-            // `{'type': 'missing', 'loc': ('query', 'client_version')}`.
-            // Any non-empty value is accepted; we send a stable
-            // Codex-CLI-shaped version string so the request still
-            // fingerprints as the impersonated CLI.
-            format!(
-                "{}?client_version=0.50.0",
-                self.api_url.replace("/responses", "/models")
-            )
+            // The version is a compatibility gate, not a presence-only
+            // parameter. Share it with fetch_models and the API-key attempt.
+            codex_models_url(&self.api_url)
         } else {
             let base = self
                 .api_url
@@ -1016,10 +1023,10 @@ impl crate::provider::LlmProvider for OpenAiCodexClient {
         self.ensure_valid_token().await?;
         let pid = crate::provider_id::ProviderId::OpenaiCodex;
         if self.api_url.contains("/backend-api/codex/responses") {
-            let url = format!(
-                "{}?client_version=0.50.0",
-                self.api_url.replace("/responses", "/models")
-            );
+            let url = codex_models_url(&self.api_url);
+            // Codex OAuth and public ChatGPT plan-usage tokens have different
+            // scopes. Keep this credential on its selected Codex endpoint;
+            // /v1/models requires api.model.read, which this login may lack.
             return models_from_listing(&self.get_models_json(&url).await?, false, pid);
         }
         // API key: Codex metadata is only on the ChatGPT backend. Try it
@@ -1244,6 +1251,14 @@ pub(crate) fn extract_model_ids(parsed: &serde_json::Value) -> Vec<String> {
 /// The one order every listing path uses, so `list_models` and
 /// `fetch_models` can never name the same model differently.
 fn listing_entry_id(v: &serde_json::Value) -> Option<String> {
+    // Rich catalogs include hidden/internal entries. Missing visibility is
+    // retained for older listings, public API IDs, and custom gateways.
+    if v.get("visibility")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|visibility| visibility != "list")
+    {
+        return None;
+    }
     match v {
         // An empty string is no more an id than an empty object field is.
         serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
@@ -3900,6 +3915,85 @@ mod fetch_models_tests {
     use crate::provider_id::ProviderId;
 
     #[test]
+    fn listing_excludes_explicitly_hidden_models_and_keeps_legacy_entries() {
+        let raw = serde_json::json!({"models": [
+            {"slug": "second", "visibility": "list", "context_window": 1000},
+            {"slug": "hidden", "visibility": "hide"},
+            {"slug": "first", "visibility": "list"},
+            {"slug": "legacy"},
+            "legacy-string"
+        ]});
+        for api_key_mode in [false, true] {
+            let models = models_from_listing(&raw, api_key_mode, ProviderId::OpenaiCodex).unwrap();
+            assert_eq!(
+                models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                ["second", "first", "legacy", "legacy-string"]
+            );
+            assert_eq!(models[0].context_window, 950);
+        }
+        assert_eq!(
+            extract_model_ids(&raw),
+            ["second", "first", "legacy", "legacy-string"]
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_catalog_version_gate_keeps_the_selected_custom_endpoint() {
+        use httpmock::prelude::*;
+        let server = MockServer::start();
+        let obsolete = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.50.0");
+            then.status(200)
+                .json_body(serde_json::json!({"models": []}));
+        });
+        let current = server.mock(|when, then| {
+            when.method(GET)
+                .path("/backend-api/codex/models")
+                .query_param("client_version", "0.166.0")
+                .header("Authorization", "Bearer selected-token")
+                .header("chatgpt-account-id", "selected-account");
+            then.status(200).json_body(serde_json::json!({"models": [
+                {"slug": "current", "visibility": "list"},
+                {"slug": "hidden", "visibility": "hide"}
+            ]}));
+        });
+        let mut client = OpenAiCodexClient::new(
+            AuthCredentials::OAuth {
+                access: "selected-token".into(),
+                refresh: String::new(),
+                expires: u64::MAX,
+                extra: HashMap::from([
+                    ("account_id".into(), serde_json::json!("selected-account")),
+                    (
+                        "api_url".into(),
+                        serde_json::json!(server.url("/backend-api/codex/responses")),
+                    ),
+                ]),
+            },
+            None,
+            Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap();
+        let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
+            .await
+            .unwrap();
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["current"]
+        );
+        let listed =
+            <OpenAiCodexClient as crate::provider::LlmProvider>::list_models(&client).await;
+        assert_eq!(
+            listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["current"]
+        );
+        current.assert_hits(2);
+        obsolete.assert_hits(0);
+    }
+
+    #[test]
     fn codex_input_limit_applies_effective_percent() {
         let e = serde_json::json!({ "slug": "a", "context_window": 272000, "effective_context_window_percent": 95 });
         assert_eq!(codex_input_limit(&e), 258_400);
@@ -4003,7 +4097,11 @@ mod fetch_models_tests {
         )
         .unwrap();
         client.api_url = format!("{}/v1/responses", server.url(""));
-        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        client.chatgpt_models_url = format!(
+            "{}?{}",
+            server.url("/backend-api/codex/models"),
+            prod_catalog_query()
+        );
         let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap();
@@ -4035,7 +4133,11 @@ mod fetch_models_tests {
         )
         .unwrap();
         client.api_url = format!("{}/v1/responses", server.url(""));
-        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        client.chatgpt_models_url = format!(
+            "{}?{}",
+            server.url("/backend-api/codex/models"),
+            prod_catalog_query()
+        );
         let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
             .await
             .unwrap();
@@ -4071,7 +4173,11 @@ mod fetch_models_tests {
         )
         .unwrap();
         client.api_url = format!("{}/v1/responses", server.url(""));
-        client.chatgpt_models_url = server.url("/backend-api/codex/models?client_version=0.50.0");
+        client.chatgpt_models_url = format!(
+            "{}?{}",
+            server.url("/backend-api/codex/models"),
+            prod_catalog_query()
+        );
         client.catalog_attempt_timeout = std::time::Duration::from_millis(100);
         let started = std::time::Instant::now();
         let models = <OpenAiCodexClient as crate::provider::LlmProvider>::fetch_models(&mut client)
@@ -4351,11 +4457,8 @@ mod fetch_models_tests {
 
     /// The query string the production catalog URL carries — tests build
     /// their mock URLs from it so they track the real constant.
-    fn prod_catalog_query() -> &'static str {
-        CODEX_MODELS_URL
-            .split_once('?')
-            .expect("the production catalog URL carries a query")
-            .1
+    fn prod_catalog_query() -> String {
+        format!("client_version={CODEX_MODELS_CLIENT_VERSION}")
     }
 
     fn oauth_backend_client(server: &httpmock::MockServer) -> OpenAiCodexClient {
@@ -4389,8 +4492,8 @@ mod fetch_models_tests {
     #[test]
     fn production_catalog_url_and_default_carry_client_version() {
         assert_eq!(
-            CODEX_MODELS_URL,
-            "https://chatgpt.com/backend-api/codex/models?client_version=0.50.0"
+            codex_models_url(CODEX_BACKEND_URL),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.166.0"
         );
         let client = OpenAiCodexClient::new(
             AuthCredentials::ApiKey { key: "sk-k".into() },
@@ -4398,7 +4501,10 @@ mod fetch_models_tests {
             Arc::new(rupu_netflow::NullSink),
         )
         .unwrap();
-        assert_eq!(client.chatgpt_models_url, CODEX_MODELS_URL);
+        assert_eq!(
+            client.chatgpt_models_url,
+            codex_models_url(CODEX_BACKEND_URL)
+        );
     }
 
     #[tokio::test]
@@ -4409,7 +4515,7 @@ mod fetch_models_tests {
         let oauth = server.mock(|when, then| {
             when.method(GET)
                 .path("/backend-api/codex/models")
-                .query_param("client_version", "0.50.0");
+                .query_param("client_version", "0.166.0");
             then.status(200).json_body(
                 serde_json::json!({ "models": [{ "slug": "gpt-q", "context_window": 1000 }] }),
             );
@@ -4427,7 +4533,7 @@ mod fetch_models_tests {
         let backend = server.mock(|when, then| {
             when.method(GET)
                 .path("/backend-api/codex/models")
-                .query_param("client_version", "0.50.0");
+                .query_param("client_version", "0.166.0");
             then.status(200).json_body(
                 serde_json::json!({ "models": [{ "slug": "gpt-r", "context_window": 1000 }] }),
             );

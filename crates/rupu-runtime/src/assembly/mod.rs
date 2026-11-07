@@ -16,11 +16,11 @@ mod origin;
 mod pins;
 mod spec;
 
+pub use messaging::{MessagingGrant, OffReason};
 pub use origin::{
     defaults_for, CoverageStream, NetflowStreamRoot, Origin, OriginDefaults, ParentRun, UnitKey,
     UsageRoot,
 };
-pub use messaging::{MessagingGrant, OffReason};
 pub use pins::PinRule;
 pub use spec::{LaunchServices, LaunchSpec, Overrides, WorkspaceBinding};
 
@@ -111,6 +111,11 @@ pub enum AssembleError {
         #[source]
         source: FactoryError,
     },
+    /// A headless harness or delegated child cannot obtain required approval.
+    #[error("ask permission mode requires an approval channel; this headless session or child has none (select readonly, or explicitly authorize bypass)")]
+    ApprovalUnavailable,
+    #[error("cannot read workflow approval policy: {0}")]
+    ApprovalPolicy(#[source] std::io::Error),
     #[error("tool grant: {0}")]
     Grant(#[from] GrantError),
     /// The run's skills (the agent's and the launch's) don't resolve, or
@@ -140,7 +145,9 @@ impl AssembleError {
     pub fn into_run_error(self) -> rupu_agent::RunError {
         match self {
             AssembleError::Grant(e) => rupu_agent::RunError::ToolGrant(e.to_string()),
-            AssembleError::Skills { .. } => rupu_agent::RunError::Preflight(self.to_string()),
+            AssembleError::Skills { .. }
+            | AssembleError::ApprovalUnavailable
+            | AssembleError::ApprovalPolicy(_) => rupu_agent::RunError::Preflight(self.to_string()),
             other => rupu_agent::RunError::Provider(other.to_string()),
         }
     }
@@ -164,7 +171,10 @@ impl AssembleError {
             AssembleError::AgentLoad { .. } => ProviderError::Preflight(format!(
                 "{self}\n  Checked the project agents dir (.rupu/agents/) and the global agents dir."
             )),
-            AssembleError::UnknownProvider(_) | AssembleError::Skills { .. } => {
+            AssembleError::UnknownProvider(_)
+            | AssembleError::Skills { .. }
+            | AssembleError::ApprovalUnavailable
+            | AssembleError::ApprovalPolicy(_) => {
                 ProviderError::Preflight(self.to_string())
             }
             AssembleError::ProviderBuild {
@@ -569,6 +579,48 @@ impl RunAssembler {
 
     /// Build the run `spec` describes.
     pub async fn assemble(&self, mut spec: LaunchSpec) -> Result<AssembledRun, AssembleError> {
+        let workflow_strict = match &spec.origin {
+            Origin::WorkflowStep {
+                workflow_run_id, ..
+            } if !workflow_run_id.is_empty() => {
+                crate::strict_approval::workflow_required(&self.ctx.global, workflow_run_id)
+                    .map_err(AssembleError::ApprovalPolicy)?
+            }
+            _ => false,
+        };
+        // An operator-launched harness workflow has no fabricated parent link.
+        // Its mode is still a ceiling: each step keeps its stricter declaration.
+        let ceiling = spec
+            .ceiling
+            .or(spec.link.as_ref().map(|l| l.ceiling))
+            .or(workflow_strict.then_some(spec.mode));
+        let permission = match ceiling {
+            Some(ceiling) => PermissionPolicy::for_child(
+                ceiling,
+                declared_mode(&spec.agent),
+                spec.prompter.clone(),
+            ),
+            None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
+        };
+        let builtin_session = spec.services.builtin_session_harness
+            && matches!(spec.origin, Origin::SessionTurn { .. })
+            && spec.agent.name == rupu_agent::builtin::SESSION_AGENT_NAME;
+        // Fail before provider construction or any run resources are opened.
+        // A process boundary cannot carry a TTY prompter, and an in-process
+        // child without one must not upgrade its own Ask policy to bypass.
+        let strict_approval = builtin_session
+            || workflow_strict
+            || spec.link.as_ref().is_some_and(|link| link.strict_approval)
+            || matches!(&spec.origin, Origin::SubAgent { parent } if parent.identity.launch.strict_approval);
+        if strict_approval
+            && permission.mode() == PermissionMode::Ask
+            && permission.prompter().is_none()
+        {
+            return Err(AssembleError::ApprovalUnavailable);
+        }
+        if builtin_session {
+            self.bind_session_catalog(&mut spec).await;
+        }
         let mut d = defaults_for(&spec.origin);
         if matches!(spec.origin, Origin::SessionTurn { .. }) && spec.services.session_orchestration
         {
@@ -707,6 +759,7 @@ impl RunAssembler {
             &spec,
             ledger.as_ref().map(|l| l.path().to_path_buf()),
             !messaging.takes_part(),
+            strict_approval,
         );
         // A process child (or a run under one) also copies each call to the
         // launch tree's root ledger, for a budget over the tree (L5); its own
@@ -727,14 +780,6 @@ impl RunAssembler {
             launch_skills: spec.overrides.skills.clone(),
             launch_preload_skills: spec.overrides.preload_skills.clone(),
             launch_args: spec.overrides.launch_args.clone(),
-        };
-
-        let ceiling = spec.ceiling.or(spec.link.as_ref().map(|l| l.ceiling));
-        let permission = match ceiling {
-            Some(ceiling) => {
-                PermissionPolicy::for_child(ceiling, declared_mode(agent), spec.prompter.clone())
-            }
-            None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
         };
 
         let message_bus = self.message_space(&spec);
@@ -884,7 +929,11 @@ impl RunAssembler {
 
         let system_prompt = system_prompt_for(agent, &spec.overrides, skills.as_deref());
         let parent_run_id = spec.origin.parent_run_id().map(str::to_string);
-        let parent_run_id_for_space = tool_context.identity.parent.as_ref().map(|p| p.run_id.clone());
+        let parent_run_id_for_space = tool_context
+            .identity
+            .parent
+            .as_ref()
+            .map(|p| p.run_id.clone());
         let launched = spec.link.is_some();
         let spec_origin = spec.origin.clone();
         let LaunchSpec {
@@ -1027,6 +1076,36 @@ impl RunAssembler {
         Some(Arc::new(bus))
     }
 
+    /// The built-in root may dispatch catalog entries without a project-local
+    /// allowlist. Resolve actual installed names at the start of each turn;
+    /// normal launch caps, child checks and permissions still apply. A broken
+    /// agent catalog does not prevent the root from helping repair that project.
+    async fn bind_session_catalog(&self, spec: &mut LaunchSpec) {
+        let catalog = spec
+            .services
+            .catalog
+            .clone()
+            .or_else(|| self.ctx.catalog.clone());
+        let (agents, workflows) = match catalog {
+            Some(catalog) => tokio::task::spawn_blocking(move || {
+                let agents = catalog.agents().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "session agent catalog unavailable; agent dispatch disabled");
+                    Vec::new()
+                });
+                let agents = agents.into_iter()
+                    .filter(|a| a.name != rupu_agent::builtin::SESSION_AGENT_NAME)
+                    .map(|a| a.name).collect();
+                let workflows = catalog.workflows().into_iter()
+                    .filter(|w| w.parse_error.is_none())
+                    .map(|w| w.id).collect();
+                (agents, workflows)
+            }).await.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic())),
+            None => (Vec::new(), Vec::new()),
+        };
+        spec.agent.dispatchable_agents = Some(agents);
+        spec.agent.dispatchable_workflows = Some(workflows);
+    }
+
     /// What the run `spec` may launch and where its children are recorded
     /// (W7 §3.4), and the connector cap its grant is narrowed by. A child's
     /// caps are what its parent may launch — in process the parent's own
@@ -1037,6 +1116,7 @@ impl RunAssembler {
         spec: &LaunchSpec,
         usage_root: Option<PathBuf>,
         messaging_off: bool,
+        strict_approval: bool,
     ) -> (LaunchScope, Option<Vec<String>>) {
         let flow_dir = match &spec.origin {
             Origin::FlowLead { flow_dir, .. } | Origin::FlowUnit { flow_dir, .. } => {
@@ -1103,6 +1183,7 @@ impl RunAssembler {
                 rollup_root,
                 flow,
                 messaging_off,
+                strict_approval,
             },
             connector_cap,
         )

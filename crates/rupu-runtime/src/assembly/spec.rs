@@ -98,6 +98,9 @@ pub struct Overrides {
 /// Services the site provides (they belong to the root run, not this one).
 #[derive(Default)]
 pub struct LaunchServices {
+    /// Durable identity from a session created with the bundled harness.
+    /// False for legacy sessions, even if their custom agent used its name.
+    pub builtin_session_harness: bool,
     /// Frozen session configuration; only meaningful for SessionTurn.
     pub session_orchestration: bool,
     /// The launcher behind `dispatch` / `join` (`rupu_launch::RunLauncher`),

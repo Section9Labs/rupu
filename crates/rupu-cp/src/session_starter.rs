@@ -2,6 +2,12 @@
 #[derive(Debug, Clone)]
 pub struct SessionStartRequest {
     pub agent: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Expected registered workspace identity; checked before creating the session.
+    pub workspace_id: Option<String>,
+    /// Persist an idle session without creating a turn or spawning a worker.
+    pub idle: bool,
     pub prompt: Option<String>,
     pub mode: Option<String>,
     pub target: Option<String>,
@@ -28,5 +34,15 @@ pub enum SessionStartError {
 /// provides the subprocess-spawning adapter. Returns the new session id.
 #[async_trait::async_trait]
 pub trait SessionStarter: Send + Sync {
+    /// The adapter preserves project identity and first-turn model selection.
+    fn supports_builtin_harness(&self) -> bool {
+        false
+    }
+
+    /// The adapter can create a zero-turn session without implicit execution.
+    fn supports_idle_harness(&self) -> bool {
+        false
+    }
+
     async fn start(&self, req: SessionStartRequest) -> Result<String, SessionStartError>;
 }

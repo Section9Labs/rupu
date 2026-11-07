@@ -89,6 +89,10 @@ pub struct SessionRecord {
     pub version: u32,
     pub session_id: String,
     pub agent_name: String,
+    /// True only for sessions created from the reserved shipped harness.
+    /// Old sessions keep their frozen agent behavior even on a name collision.
+    #[serde(default)]
+    pub builtin_harness: bool,
     /// `crew/role` — one identity across every turn (spec §3). `None` for
     /// sessions created before codenames; readers use `derive_legacy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,16 +279,19 @@ pub struct SessionRecord {
 impl SessionRecord {
     /// The newest record version this rupu reads. A record is written at
     /// [`Self::written_version`].
-    pub const VERSION: u32 = 3;
+    pub const VERSION: u32 = 4;
 
     /// The lowest version a rupu must understand to keep the record whole on
-    /// its next write: 3 for an agent's `messaging: false`, 2 for skills,
-    /// else 1, so older rupus keep reading what they can't damage.
+    /// its next write: 4 for a bundled harness, 3 for an agent's
+    /// `messaging: false`, 2 for skills, else 1. Older runtimes must not
+    /// erase the marker that distinguishes the bundled launch policy.
     pub fn written_version(&self) -> u32 {
         let skills = !self.skill_index.is_empty()
             || self.skill_prompt.is_some()
             || !self.loaded_skills.is_empty();
-        if self.messaging == Some(false) {
+        if self.builtin_harness {
+            4
+        } else if self.messaging == Some(false) {
             3
         } else if skills {
             2

@@ -421,6 +421,7 @@ async fn a_continued_child_runs_no_wider_than_it_was_launched() {
     let home = kinds_home();
     let l1 = home.launcher_with(home.assembler(config()), interruptible(&home), None);
     let mut ctx1 = attempt(&home, "parent_run_1");
+    Arc::make_mut(&mut ctx1.identity).launch.strict_approval = true;
     ctx1.call.spawn_ceiling = Some(PermissionMode::Ask);
     ctx1.services.prompter = Some(Arc::new(Allow));
     Arc::make_mut(&mut ctx1.identity).launch.agents = vec!["probe".into()];
@@ -448,6 +449,10 @@ async fn a_continued_child_runs_no_wider_than_it_was_launched() {
     let resumed = rupu_orchestrator::RunStore::new(home.runs())
         .read_launch_link(&wf.run_id)
         .expect("the resumed workflow's link");
+    assert!(
+        resumed.strict_approval,
+        "continuation cannot drop the harness approval requirement"
+    );
     assert!(after.spawned().iter().any(|l| matches!(
         &l.argv,
         RunArgv::WorkflowControl(WorkflowControl::Resume {
@@ -476,6 +481,7 @@ async fn a_continued_child_runs_no_wider_than_it_was_launched() {
         })
         .expect("the continued agent child");
     let link = run.launch.as_ref().expect("a link");
+    assert!(link.strict_approval);
     assert_eq!(
         (
             run.mode,

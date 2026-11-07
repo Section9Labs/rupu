@@ -124,6 +124,38 @@ pub struct AutoflowRunContext {
 
 // ── Resolver ───────────────────────────────────────────────────────────────
 
+/// Resolve a directly connected run for read-only history. This does not
+/// restore an archived execution or feed a mutation path. No remote probe is
+/// involved; callers that explicitly chose a host retain that host boundary.
+pub(crate) fn local_recorded_store(
+    s: &AppState,
+    id: &str,
+) -> crate::error::ApiResult<Option<std::sync::Arc<RunStore>>> {
+    super::runs::validate_id(id)?;
+    for store in [
+        std::sync::Arc::clone(&s.run_store),
+        std::sync::Arc::new(RunStore::new(s.run_store.archive_root())),
+    ] {
+        let path = store.root.join(id).join("run.json");
+        if !path.exists() {
+            continue;
+        }
+        super::fs_safety::validate_within(&path, &store.root)?;
+        let record = match store.load(id) {
+            Ok(record) => record,
+            Err(RunStoreError::NotFound(_)) => continue, // archive raced the read
+            Err(e) => return Err(super::runs::run_not_found_or_internal(id, e)),
+        };
+        if record.id != id {
+            return Err(crate::error::ApiError::conflict(
+                "recorded run identity mismatch",
+            ));
+        }
+        return Ok(Some(store));
+    }
+    Ok(None)
+}
+
 /// How long a resolved [`RunLocation`] is reused for the same `run_id`
 /// without re-resolving. A single RunDetail page load hits ~4 resolving
 /// endpoints (`get_run`, `run_graph`, the log tail, the usage timeline) in

@@ -18,6 +18,9 @@ pub(crate) fn session_start_argv(
     req: &SessionStartRequest,
     clone_dir: Option<&str>,
 ) -> Result<RunArgv, String> {
+    if req.idle && (req.prompt.is_some() || req.target.is_some()) {
+        return Err("idle session creation cannot include a prompt or target".into());
+    }
     let mode = req
         .mode
         .as_deref()
@@ -26,6 +29,10 @@ pub(crate) fn session_start_argv(
         .map_err(|e| e.to_string())?;
     Ok(RunArgv::SessionStart(SessionStart {
         agent: req.agent.clone(),
+        provider: req.provider.clone(),
+        model: req.model.clone(),
+        workspace_id: req.workspace_id.clone(),
+        idle: req.idle,
         target: req.target.clone(),
         mode,
         prompt: req.prompt.clone(),
@@ -56,6 +63,14 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl SessionStarter for SubprocessSessionStarter {
+    fn supports_builtin_harness(&self) -> bool {
+        true
+    }
+
+    fn supports_idle_harness(&self) -> bool {
+        true
+    }
+
     async fn start(&self, req: SessionStartRequest) -> Result<String, SessionStartError> {
         // A repo target with no explicit working_dir needs a persistent clone
         // dir (the session lives on after start). Create it under the global
@@ -65,8 +80,7 @@ impl SessionStarter for SubprocessSessionStarter {
                 .map_err(|e| SessionStartError::Spawn(e.to_string()))?
                 .join("clones")
                 .join(ulid::Ulid::new().to_string());
-            std::fs::create_dir_all(&base)
-                .map_err(|e| SessionStartError::Spawn(e.to_string()))?;
+            std::fs::create_dir_all(&base).map_err(|e| SessionStartError::Spawn(e.to_string()))?;
             Some(base.to_string_lossy().into_owned())
         } else {
             None
@@ -97,8 +111,9 @@ impl SessionStarter for SubprocessSessionStarter {
             });
         }
 
-        parse_session_id(&String::from_utf8_lossy(&out.stdout))
-            .ok_or_else(|| SessionStartError::Spawn("could not determine session id from output".into()))
+        parse_session_id(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+            SessionStartError::Spawn("could not determine session id from output".into())
+        })
     }
 }
 
@@ -115,6 +130,10 @@ mod tests {
     ) -> SessionStartRequest {
         SessionStartRequest {
             agent: "triage".into(),
+            provider: None,
+            model: None,
+            workspace_id: None,
+            idle: false,
             prompt: prompt.map(Into::into),
             mode: mode.map(Into::into),
             target: target.map(Into::into),
@@ -172,6 +191,18 @@ mod tests {
             argv(&req(None, None, None, None), Some("/clones/x")),
             ["session", "start", "triage", "--detach"]
         );
+    }
+
+    #[test]
+    fn idle_creation_is_explicit_and_rejects_implicit_work() {
+        let mut r = req(None, None, Some("readonly"), None);
+        r.idle = true;
+        assert!(argv(&r, None).iter().any(|flag| flag == "--idle"));
+        r.prompt = Some("go".into());
+        assert!(session_start_argv(&r, None).is_err());
+        r.prompt = None;
+        r.target = Some("github:o/r".into());
+        assert!(session_start_argv(&r, None).is_err());
     }
 
     #[test]
@@ -251,6 +282,38 @@ mod tests {
     #[test]
     fn an_unknown_mode_is_refused() {
         assert!(session_start_argv(&req(None, None, Some("yolo"), None), None).is_err());
+    }
+
+    #[test]
+    fn argv_preserves_first_turn_model_and_project_identity() {
+        let mut request = req(
+            None,
+            Some("inspect"),
+            Some("readonly"),
+            Some("/selected/project"),
+        );
+        request.agent = "rupu-session".into();
+        request.provider = Some("named-account".into());
+        request.model = Some("deliberate-model".into());
+        request.workspace_id = Some("ws_selected".into());
+        assert_eq!(
+            argv(&request, None),
+            [
+                "session",
+                "start",
+                "rupu-session",
+                "--provider",
+                "named-account",
+                "--model",
+                "deliberate-model",
+                "--workspace-id",
+                "ws_selected",
+                "--detach",
+                "--mode",
+                "readonly",
+                "--prompt=inspect",
+            ]
+        );
     }
 
     #[test]

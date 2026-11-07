@@ -71,6 +71,12 @@ pub trait LauncherFactory: Send + Sync {
 /// Why a workflow run can't be built.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowRuntimeError {
+    #[error("cannot read workflow approval policy: {0}")]
+    ApprovalPolicy(#[source] std::io::Error),
+    #[error("this harness workflow requires an approval channel for ask mode; use readonly or an explicitly authorized bypass policy")]
+    ApprovalUnavailable,
+    #[error("host/distribute placement is unavailable for a harness workflow because strict approval policy cannot be transported to remote units")]
+    StrictRemotePlacement,
     /// A launched workflow (`--launch-*`) runs agents its parent may not
     /// dispatch. The parent vets this before it starts the child; the child
     /// checks again, against the workflow it actually loaded.
@@ -129,6 +135,27 @@ impl WorkflowRuntime {
                 });
             }
         }
+        // In-memory/no-store workflow origins have no durable identity and no
+        // marker. A strict parent link still applies to their execution.
+        let marker_required = if run_id.is_empty() {
+            false
+        } else {
+            rupu_runtime::strict_approval::workflow_required(&context.global, &run_id)
+                .map_err(WorkflowRuntimeError::ApprovalPolicy)?
+        };
+        let strict_approval =
+            marker_required || link.as_ref().is_some_and(|link| link.strict_approval);
+        let mode = link.as_ref().map_or(mode, |link| mode.min(link.ceiling));
+        // Action and run steps do not pass through agent assembly. Validate
+        // before constructing their services, on initial launch and resume.
+        if strict_approval {
+            if mode == PermissionMode::Ask {
+                return Err(WorkflowRuntimeError::ApprovalUnavailable);
+            }
+            if workflow.has_placed_step() {
+                return Err(WorkflowRuntimeError::StrictRemotePlacement);
+            }
+        }
         // Every run of the workflow can read the agent/workflow catalog.
         let mut context = context;
         if context.catalog.is_none() {
@@ -150,12 +177,17 @@ impl WorkflowRuntime {
             &run_id,
             naming.crew(),
             &workspace,
-            link.as_ref().map_or(mode, |l| mode.min(l.ceiling)),
+            mode,
             scope_name_override.as_deref(),
         );
         if let Some(link) = &link {
             action_services.context.identity_mut().launch.connector_cap = link.actions.clone();
         }
+        action_services
+            .context
+            .identity_mut()
+            .launch
+            .strict_approval = strict_approval;
         let (launcher, workflow_generator) = match launcher {
             Some(f) => {
                 let (l, g) = f.for_workflow(WorkflowLauncherInputs {
@@ -171,7 +203,6 @@ impl WorkflowRuntime {
             None => (None, None),
         };
         // A process child's ceiling caps every step (D7 across the boundary).
-        let mode = link.as_ref().map_or(mode, |l| mode.min(l.ceiling));
         let factory = Arc::new(DefaultStepFactory {
             workflow,
             assembler: Arc::clone(&assembler),

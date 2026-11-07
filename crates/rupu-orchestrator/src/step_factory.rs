@@ -398,6 +398,7 @@ steps:
             workflows: vec![],
             actions: None,
             no_messaging,
+            strict_approval: false,
         };
         let mut f = factory_with(WF, context(tmp.path()));
         assert!(!f.messaging_capped());
