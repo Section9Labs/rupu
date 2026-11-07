@@ -222,6 +222,7 @@ async fn messages_wait_returns_new_operator_lines_and_skips_seen() {
     bus.send(&Address::Broadcast, "status").unwrap();
     let op = bus
         .operator_send(OperatorMessage {
+            expected_run_id: None,
             to: Address::Broadcast,
             body: "focus".into(),
             urgent: false,
@@ -308,6 +309,7 @@ async fn a_parked_gate_does_not_starve_a_message_watch() {
     store(g).update(&rec).unwrap();
     let op = bus
         .operator_send(OperatorMessage {
+            expected_run_id: None,
             to: Address::Broadcast,
             body: "while you wait".into(),
             urgent: false,
@@ -1375,6 +1377,7 @@ async fn remote_messages_poll_with_a_string_cursor() {
     let bus = super::messages::workflow_run(remote.path(), RUN, RunStatus::Running);
     let op = bus
         .operator_send(OperatorMessage {
+            expected_run_id: None,
             to: Address::Broadcast,
             body: "focus".into(),
             urgent: false,

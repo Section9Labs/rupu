@@ -3649,6 +3649,9 @@ impl HostConnector for SshHostConnector {
         id: &str,
         msg: OperatorMessageRequest,
     ) -> Result<OperatorSendReply, HostConnectorError> {
+        if msg.expected_run_id.is_some() {
+            return Err(HostConnectorError::Unsupported("run-bound operator messages are not supported over SSH; use an HTTP control plane connection".into()));
+        }
         self.message_call(message_send_argv(id, &msg)).await
     }
 
@@ -11835,6 +11838,7 @@ mod tests {
             .send_operator_message(
                 "run_01MSG",
                 OperatorMessageRequest {
+                    expected_run_id: None,
                     to: Some("lynx#1".into()),
                     body: body.into(),
                     urgent: true,
@@ -11908,6 +11912,7 @@ mod tests {
     #[tokio::test]
     async fn messages_run_only_on_a_remote_advertising_them() {
         let request = || OperatorMessageRequest {
+            expected_run_id: None,
             to: None,
             body: "x".into(),
             urgent: false,
@@ -11954,6 +11959,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn expected_run_messages_refuse_ssh_without_executing() {
+        let (conn, _store, _tmp) =
+            make_conn(std::sync::Arc::new(FakeExec::offline("must not execute")));
+        let request = OperatorMessageRequest {
+            expected_run_id: Some("sub_one".into()),
+            to: Some("lynx#1".into()),
+            body: "guarded".into(),
+            urgent: false,
+            viewer: None,
+            client: None,
+        };
+        assert!(matches!(
+            conn.send_operator_message("run_01MSG", request).await,
+            Err(HostConnectorError::Unsupported(_))
+        ));
+    }
+
     /// The helper's `{"error": …}` reply (exit 3) keeps its code's status;
     /// an ssh that never reached the remote is `Unreachable`.
     #[tokio::test]
@@ -11969,6 +11992,7 @@ mod tests {
             (conn, tmp, bin)
         };
         let send = OperatorMessageRequest {
+            expected_run_id: None,
             to: None,
             body: "x".into(),
             urgent: false,

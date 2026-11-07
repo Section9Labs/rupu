@@ -363,6 +363,7 @@ async fn steer_alias_parity() {
         .operator_send(
             g,
             OperatorMessage {
+                expected_run_id: None,
                 to: Address::Lead,
                 body: "focus on auth".into(),
                 urgent: true,
@@ -612,4 +613,79 @@ async fn http_host_without_run_messages_is_501() {
         1,
         "the features it read are remembered"
     );
+}
+
+#[tokio::test]
+async fn expected_run_guard_survives_http_proxy_and_refuses_before_recording() {
+    let peer_dir = tempfile::tempdir().unwrap();
+    let bus = workflow_run(peer_dir.path(), RUN, RunStatus::Running);
+    bus.join(Member {
+        agent: "review".into(),
+        run_id: "sub_replacement".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let peer = spawn(peer_dir.path(), true).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let coordinator = state(tmp.path(), true);
+    let host = coordinator
+        .hosts
+        .add_host("peer", &format!("http://{peer}"), None)
+        .unwrap()
+        .id;
+    let addr = serve(coordinator).await;
+    let path = format!("/api/runs/{RUN}/messages?host={host}");
+    let (status, body) = post(
+        addr,
+        &path,
+        json!({"to":"lynx#1", "body":"stale", "expected_run_id":format!("{RUN}_a")}),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let (_, page) = get(peer, &format!("/api/runs/{RUN}/messages")).await;
+    assert_eq!(page["messages"], json!([]));
+    assert!(bus.mailbox.drain("lynx#1").unwrap().is_empty());
+    let (status, body) = post(
+        addr,
+        &path,
+        json!({"to":"lynx#1", "body":"current", "expected_run_id":"sub_replacement"}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["delivery"]["resolved"], json!(["lynx#1"]));
+    assert_eq!(bus.mailbox.drain("lynx#1").unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn expected_run_is_not_forwarded_to_legacy_http_peer() {
+    let mock = httpmock::MockServer::start_async().await;
+    mock.mock_async(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(json!({"version":"0.86.0","features":["run.messages"]}));
+    })
+    .await;
+    let sends = mock
+        .mock_async(|when, then| {
+            when.method("POST")
+                .path(format!("/api/runs/{RUN}/messages"));
+            then.status(202).json_body(json!({}));
+        })
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let coordinator = state(tmp.path(), true);
+    let host = coordinator
+        .hosts
+        .add_host("old", &mock.base_url(), None)
+        .unwrap()
+        .id;
+    let addr = serve(coordinator).await;
+    let (status, body) = post(
+        addr,
+        &format!("/api/runs/{RUN}/messages?host={host}"),
+        json!({"to":"lynx#1","body":"guarded","expected_run_id":"sub_one"}),
+    )
+    .await;
+    assert_eq!(status, 501, "{body}");
+    assert_eq!(sends.hits_async().await, 0);
 }

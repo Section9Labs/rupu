@@ -996,6 +996,7 @@ mod arg_parse_tests {
         let send = rupu_cp::host::ssh::message_send_argv(
             "run_01ABC",
             &rupu_cp::host::connector::OperatorMessageRequest {
+                expected_run_id: None,
                 to: Some("step:scan".into()),
                 body: body.into(),
                 urgent: true,

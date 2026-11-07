@@ -351,6 +351,7 @@ impl Envelope {
     /// `rupu agentiflow send` now does, through the flow's message space.
     fn resend_steering(&self, ts: &str, body: String, urgent: bool, warnings: &mut Vec<String>) {
         let msg = rupu_fleet::OperatorMessage {
+            expected_run_id: None,
             to: Address::Lead,
             body,
             urgent,
@@ -655,6 +656,7 @@ mod tests {
     fn operator_send(dir: &std::path::Path, to: Address, body: &str) {
         Bus::open(dir, address::OPERATOR)
             .operator_send(rupu_fleet::OperatorMessage {
+                expected_run_id: None,
                 to,
                 body: body.into(),
                 urgent: false,

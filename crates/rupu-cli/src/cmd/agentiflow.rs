@@ -1398,6 +1398,7 @@ fn send(
     let id = resolve_run_id(global, fragment)?;
     let root = MessageRoot::resolve(global, &id)?;
     let msg = rupu_fleet::OperatorMessage {
+        expected_run_id: None,
         to: rupu_fleet::Address::Lead,
         body: message.to_string(),
         urgent: now,

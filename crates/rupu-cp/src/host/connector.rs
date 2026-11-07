@@ -93,6 +93,7 @@ pub struct RunListQuery {
 /// body of `POST …/messages`, plus who sent it when the CP knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorMessageRequest {
+    pub expected_run_id: Option<String>,
     /// A participant, codename, `role:<agent>`, `step:<id>`, `lead` or
     /// `broadcast`; `None` is the root's default recipient (an agentiflow's
     /// lead, everyone elsewhere).

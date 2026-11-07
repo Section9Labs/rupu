@@ -428,6 +428,7 @@ impl From<&OperatorSendError> for MessageError {
         let code = match e {
             OperatorSendError::Invalid(_) => MessageErrorCode::Invalid,
             OperatorSendError::NotLive(_) => MessageErrorCode::NotLive,
+            OperatorSendError::Bus(FleetError::RecipientChanged) => MessageErrorCode::NotLive,
             OperatorSendError::Bus(FleetError::LogFull { .. }) => MessageErrorCode::LogFull,
             OperatorSendError::Bus(FleetError::Refused(_) | FleetError::Address(_)) => {
                 MessageErrorCode::Invalid
@@ -642,6 +643,7 @@ mod tests {
 
     fn to(s: &str, body: &str) -> OperatorMessage {
         OperatorMessage {
+            expected_run_id: None,
             to: Address::parse(s).unwrap(),
             body: body.into(),
             urgent: false,

@@ -76,6 +76,8 @@ impl ClaimTable {
 /// A message from the operator (spec F1b §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorMessage {
+    /// Require the current recipient to be this live run, atomically with enqueue.
+    pub expected_run_id: Option<String>,
     pub to: Address,
     pub body: String,
     pub urgent: bool,
@@ -377,6 +379,7 @@ impl Bus {
                 via: Some(msg.via),
                 viewer: msg.viewer.clone(),
                 client: msg.client.clone(),
+                expected_run_id: msg.expected_run_id.as_deref(),
             },
             |m| self.deliver(m, broadcast),
         )
@@ -537,6 +540,20 @@ impl Bus {
                     },
                     &|name| self.mailbox.has_mailbox(name),
                 );
+                if let Some(expected) = draft.expected_run_id {
+                    // The same lock protects join/leave, resolution, log append and delivery.
+                    // Require an exact address, not a role, codename alias or group selector.
+                    let exact = matches!(to, Address::Named(name) if name == &resolution.to);
+                    let valid = exact
+                        && resolution.recipients.len() == 1
+                        && resolution.recipients[0] == resolution.to
+                        && roster
+                            .get(&resolution.to)
+                            .is_some_and(|p| p.live && p.member.run_id == expected);
+                    if !valid {
+                        return Err(FleetError::RecipientChanged);
+                    }
+                }
                 let to_string = resolution.to.clone();
                 (
                     Some(to_string),
@@ -655,6 +672,7 @@ impl Bus {
 }
 
 struct Draft<'a> {
+    expected_run_id: Option<&'a str>,
     kind: MessageKind,
     to: Option<&'a Address>,
     post_kind: Option<PostKind>,
@@ -671,6 +689,7 @@ impl Draft<'_> {
     fn plain() -> Self {
         Draft {
             kind: MessageKind::Post,
+            expected_run_id: None,
             to: None,
             post_kind: None,
             body: "",

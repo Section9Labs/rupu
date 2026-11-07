@@ -129,6 +129,7 @@ pub fn send(
         None => root.default_recipient(),
     };
     let msg = OperatorMessage {
+        expected_run_id: req.expected_run_id,
         to,
         body: req.body,
         urgent: req.urgent,
