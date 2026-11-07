@@ -185,7 +185,7 @@ The operator can message any participant of a live run: a workflow step, a unit,
 agentiflow's lead, a role, or everyone.
 
 ```bash
-rupu message send <run-id> [--to <address>] [--urgent] <text…>
+rupu message send <run-id> [--to <address>] [--expected-run-id <recipient-run-id>] [--urgent] <text…>
 rupu message list <run-id> [--after <msg-id>] [--follow] [--kind direct,operator,…] [--json]
 rupu message participants <run-id>
 ```
@@ -210,7 +210,7 @@ An operator message is a `kind: operator` log line from `operator`, with `via` (
 lead's round early. It never interrupts a tool call in progress.
 
 A run that isn't running takes no message: the send fails with the reason (the CP answers
-409). A recipient that has left is logged `participant_left`, and the send still succeeds.
+409). A recipient that has left is logged `participant_left`, and an unguarded send still succeeds.
 
 Only the operator's surfaces write `from: operator`: the messaging tools can't, and a run
 can't take the address `operator`. An agent that runs `bash` in `bypass` mode could still
@@ -220,6 +220,34 @@ grants arbitrary code execution.
 The control plane serves the same thing as `GET/POST /api/{runs,sessions,agentiflows}/:id/messages`
 and a local SSE stream ([cp-api.md](cp-api.md)). Remote hosts answer over HTTP and SSH when
 their rupu advertises `run.messages`. Tunnel and bucket hosts answer 501.
+
+### Addressing the selected run
+
+A participant address can be reused by a later run. A client messaging a selected
+participant should send the `run_id` it observed in the participant list as
+`expected_run_id` in the POST body (CLI: `--expected-run-id`). It must also supply
+an explicit `to` containing that exact registered address, including `lead` when
+the selected participant is the lead. A codename alias, role, step, parent,
+operator, or broadcast cannot substitute for an exact participant.
+
+The owning message space checks the live occupant's run ID while holding the
+same lock as participant joins, departures, message logging, and mailbox enqueue.
+A missing, departed, or changed occupant produces HTTP 409 without recording or
+enqueueing the message. Invalid run IDs, group selectors, and an omitted `to`
+produce HTTP 400. The guard accepts nonempty run IDs of at most 128 ASCII letters,
+digits, underscores, or hyphens. Refresh the roster after a conflict; never retry
+automatically without the guard or substitute a broadcast.
+
+HTTP and SSH hosts advertise `run.messages.expected_run` in `/api/host/info` and
+`rupu __features`. A connector refuses guarded sends to peers lacking the feature
+with HTTP 501; it does not drop the precondition. The MCP `messages.send` tool uses
+the same body and owner checks. Existing callers that omit the guard retain their
+previous behavior.
+
+Successful HTTP 202 still means accepted with the returned delivery result. The
+guard establishes the occupant at enqueue time; it does not keep that run alive
+or prove the model read the message. A full inbox and later participant transitions
+remain visible through delivery and receipt evidence.
 
 ## The claim journal
 

@@ -114,7 +114,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "messages.send",
             Method::POST,
             "/api/{root}/:id/messages",
-            "Send an operator message to a live run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `body` is the text, `to` the recipient (default: the root's default), `urgent` interrupts a running turn. Returns the message id and its delivery.",
+            "Send an operator message to a live run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `body` is the text, `to` the recipient (default: the root's default), `urgent` interrupts a running turn. Optional `expected_run_id` requires an explicit exact participant address or lead; the owning host atomically refuses a changed or departed occupant with HTTP 409 and no enqueue. Guarded sends require run.messages.expected_run on remote peers. Returns the message id and its delivery; acceptance does not prove the agent read it.",
         )
         .query::<messages::HostQuery>()
         .body::<messages::PostBody>(),

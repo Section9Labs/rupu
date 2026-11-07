@@ -123,6 +123,12 @@ pub fn send(
     caps: BusCaps,
 ) -> Result<OperatorSendReply, MessageError> {
     let (_, root) = root(global, id)?;
+    if req.expected_run_id.is_some() && req.to.is_none() {
+        return Err(MessageError::new(
+            MessageErrorCode::Invalid,
+            "expected_run_id requires an explicit participant address in to",
+        ));
+    }
     let to = match req.to.as_deref() {
         Some(to) => Address::parse(to)
             .map_err(|e| MessageError::new(MessageErrorCode::Invalid, e.to_string()))?,

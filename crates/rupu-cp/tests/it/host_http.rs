@@ -2364,6 +2364,104 @@ fn host_info_with(features: &[&str]) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn operator_message_guard_is_forwarded_exactly_for_every_root_family() {
+    use rupu_cp::host::connector::OperatorMessageRequest;
+    use serde_json::json;
+    for (root, id) in [
+        ("runs", "run_one"),
+        ("sessions", "ses_one"),
+        ("agentiflows", "af_one"),
+    ] {
+        for expected_run_id in [None, Some("sub_exact")] {
+            let server = httpmock::MockServer::start_async().await;
+            let features = if expected_run_id.is_some() {
+                vec!["run.messages", "run.messages.expected_run"]
+            } else {
+                vec!["run.messages"]
+            };
+            server.mock(|when, then| {
+                when.method("GET").path("/api/host/info");
+                then.status(200).json_body(host_info_with(&features));
+            });
+            let mut body = json!({"to":"lynx#1", "body":"keep this exact\nmessage", "urgent":true});
+            if let Some(expected) = expected_run_id {
+                body["expected_run_id"] = expected.into();
+            }
+            let sent = server.mock(|when, then| {
+                when.method("POST")
+                    .path(format!("/api/{root}/{id}/messages"))
+                    .header("authorization", "Bearer peer-token")
+                    .json_body(body);
+                then.status(202)
+                    .json_body(json!({"id":"msg_sent", "delivery":{"resolved":["lynx#1"]}}));
+            });
+            let connector = HttpHostConnector::new(server.base_url(), Some("peer-token".into()));
+            let reply = connector
+                .send_operator_message(
+                    id,
+                    OperatorMessageRequest {
+                        expected_run_id: expected_run_id.map(str::to_string),
+                        to: Some("lynx#1".into()),
+                        body: "keep this exact\nmessage".into(),
+                        urgent: true,
+                        viewer: Some("must-not-forward-viewer".into()),
+                        client: Some("must-not-forward-client".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(reply.id, "msg_sent");
+            sent.assert_hits(1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn guarded_message_rechecks_a_cached_peer_after_a_downgrade() {
+    use rupu_cp::host::connector::OperatorMessageRequest;
+    use serde_json::json;
+    let server = httpmock::MockServer::start_async().await;
+    let info = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200).json_body(host_info_with(&[
+            "run.messages",
+            "run.messages.expected_run",
+        ]));
+    });
+    let sent = server.mock(|when, then| {
+        when.method("POST").path("/api/runs/run_one/messages");
+        then.status(202)
+            .json_body(json!({"id":"msg_sent", "delivery":{"resolved":["lynx#1"]}}));
+    });
+    let connector = HttpHostConnector::new(server.base_url(), None);
+    let request = OperatorMessageRequest {
+        expected_run_id: Some("sub_exact".into()),
+        to: Some("lynx#1".into()),
+        body: "one message".into(),
+        urgent: false,
+        viewer: None,
+        client: None,
+    };
+    connector
+        .send_operator_message("run_one", request.clone())
+        .await
+        .unwrap();
+    info.assert_hits(1);
+    info.delete_async().await;
+    let legacy = server.mock(|when, then| {
+        when.method("GET").path("/api/host/info");
+        then.status(200)
+            .json_body(host_info_with(&["run.messages"]));
+    });
+    assert!(matches!(
+        connector.send_operator_message("run_one", request).await,
+        Err(HostConnectorError::Unsupported(_))
+    ));
+    legacy.assert_hits(1);
+    sent.assert_hits(1);
+}
+
+#[tokio::test]
 async fn ship_skills_downgrades_when_the_peer_lacks_the_feature() {
     let tmp = tempfile::tempdir().unwrap();
     let server = httpmock::MockServer::start_async().await;

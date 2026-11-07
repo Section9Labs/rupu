@@ -62,10 +62,9 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             scm_hosts: scm_hosts_vec,
             permission_modes: permission_modes_vec,
         },
-        // HTTP supports the atomic recipient guard; the SSH helper does not.
+        // Shared host features apply to both HTTP and the SSH helper.
         features: {
             let mut features = crate::node::protocol::host_features();
-            features.push(crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN.to_string());
             features.push("workflow.scoped_revision".to_string());
             features.push("project.scm_context.v1".to_string());
             features.push("workflow.session_history".to_string());
