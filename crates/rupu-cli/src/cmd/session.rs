@@ -152,6 +152,9 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StartArgs {
+    /// Installed Rupu skill preset for a new builtin session, or `none`.
+    #[arg(long, value_parser = ["rupu-session-v1", "none"])]
+    pub skill_preset: Option<String>,
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
     /// Provider account for the first and later turns (requires --model).
@@ -1447,11 +1450,30 @@ async fn prepare_start(
     };
     initial_settings.validate()?;
     initial_settings.apply(&mut spec);
+    let builtin = spec.name == rupu_agent::builtin::SESSION_AGENT_NAME;
+    anyhow::ensure!(
+        builtin || args.skill_preset.is_none(),
+        "skill presets apply only to rupu-session"
+    );
+    let skill_plan = if builtin {
+        Some(rupu_runtime::session_skill_preset::plan(
+            &skill_dirs(&global, project_root.as_deref()),
+            args.skill_preset.as_deref() != Some("none"),
+            &args.skills,
+            &args.preload_skills,
+        )?)
+    } else {
+        None
+    };
+    let mut selected_skills = args.skills.clone();
+    if let Some(plan) = &skill_plan {
+        selected_skills.extend(plan.selection());
+    }
     let (skill_index, skill_prompt) = freeze_session_skills(
         &global,
         project_root.as_deref(),
         &spec,
-        args.skills.clone(),
+        selected_skills,
         args.preload_skills.clone(),
     )
     .await?;
@@ -1460,7 +1482,11 @@ async fn prepare_start(
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     let parse = |s: &str| PermissionMode::parse(s).ok();
-    let cli_mode = args.mode.as_deref().map(PermissionMode::parse).transpose()?;
+    let cli_mode = args
+        .mode
+        .as_deref()
+        .map(PermissionMode::parse)
+        .transpose()?;
     let agent_mode = spec.permission_mode.as_deref().and_then(parse);
     let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
@@ -1601,6 +1627,11 @@ async fn prepare_start(
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
         builtin_harness: spec.name == rupu_agent::builtin::SESSION_AGENT_NAME,
+        skill_preset_diagnostics: skill_plan
+            .as_ref()
+            .map(|plan| plan.diagnostics.clone())
+            .unwrap_or_default(),
+        skill_preset: skill_plan.map(|plan| plan.preset),
         codename: Some(
             rupu_codename::Codename::crew_only(rupu_codename::crew_for(&session_id))
                 .child(rupu_codename::role_word(&spec.name), None)
@@ -8389,6 +8420,22 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             }
             None => match assembler.assemble(launch).await {
                 Ok(run) => {
+                    // Observed assembly evidence, not a speculative configuration
+                    // preview. Old snapshots remain explicitly scoped to their turn.
+                    let snapshot = serde_json::json!({
+                        "schema_version": 1, "session_id": session.session_id,
+                        "workspace_id": session.workspace_id,
+                        "settings_revision": settings.revision,
+                        "orchestration_revision": orchestration.revision,
+                        "effective": rupu_runtime::session_readiness::inspect(&run.opts),
+                    });
+                    if let Err(error) = rupu_runtime::session_orchestration::atomic_json(
+                        &session_dir(&global, scope, &session.session_id),
+                        "capabilities.json",
+                        &snapshot,
+                    ) {
+                        tracing::warn!(%error, "could not record assembled session capabilities");
+                    }
                     if orchestration.enabled {
                         Box::pin(rupu_launch::session::run(
                             run,
@@ -11033,6 +11080,8 @@ mod tests {
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
             builtin_harness: false,
+            skill_preset: None,
+            skill_preset_diagnostics: Vec::new(),
             codename: None,
             description: Some("Persistent issue reader".into()),
             provider_name: "anthropic".into(),
@@ -13937,3 +13986,7 @@ mod tests {
         assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
     }
 }
+
+#[cfg(test)]
+#[path = "session_skill_preset_tests.rs"]
+mod session_skill_preset_tests;

@@ -29,6 +29,11 @@ pub(crate) struct StartBody {
     provider: Option<String>,
     model: Option<String>,
     mode: Option<String>,
+    skill_preset: Option<String>,
+    #[serde(default)]
+    skills: Vec<String>,
+    #[serde(default)]
+    preload_skills: Vec<String>,
 }
 
 #[derive(Default, Deserialize, schemars::JsonSchema)]
@@ -68,6 +73,21 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
         return Err(ApiError::bad_request(
             "prompt must contain a message unless idle is true",
         ));
+    }
+    if let Some(preset) = body.skill_preset.as_deref() {
+        if !matches!(preset, "rupu-session-v1" | "none") {
+            return Err(ApiError::bad_request(
+                "skill_preset must be rupu-session-v1 or none",
+            ));
+        }
+    }
+    for entry in body.skills.iter().chain(&body.preload_skills) {
+        if !matches!(
+            entry.parse::<rupu_skills::SkillGrant>(),
+            Ok(rupu_skills::SkillGrant::Qualified(..))
+        ) {
+            return Err(ApiError::bad_request("session skills require exact global:name or project:name entries; wildcards are not accepted"));
+        }
     }
     let settings = SessionSettings {
         provider: body.provider,
@@ -116,6 +136,7 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
             .map(|p| p.default_model.as_str()),
     );
     Ok(SessionStartRequest {
+        skill_preset: body.skill_preset,
         agent: SESSION_AGENT_NAME.into(),
         provider: Some(provider),
         model: Some(model),
@@ -125,8 +146,8 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
         mode: Some(mode.as_str().into()),
         target: None,
         working_dir: Some(path.to_string_lossy().into_owned()),
-        skills: vec![],
-        preload_skills: vec![],
+        skills: body.skills,
+        preload_skills: body.preload_skills,
     })
 }
 
@@ -152,6 +173,13 @@ pub(crate) async fn start(
     if body.idle && !starter.supports_idle_harness() {
         return Err(ApiError::not_available(
             "this session starter cannot create idle sessions",
+        ));
+    }
+    if (body.skill_preset.is_some() || !body.skills.is_empty() || !body.preload_skills.is_empty())
+        && !starter.supports_session_capabilities()
+    {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply session skill selections",
         ));
     }
     let request = super::runs::blocking(move || prepare(&s, &id, body)).await?;

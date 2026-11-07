@@ -1232,6 +1232,7 @@ async fn serve_session_cp(
 
 fn skilled_session_start() -> rupu_cp::session_starter::SessionStartRequest {
     rupu_cp::session_starter::SessionStartRequest {
+        skill_preset: None,
         agent: "triage".into(),
         provider: None,
         model: None,
@@ -2534,11 +2535,13 @@ async fn launch_agent_refuses_a_skill_bundle_the_remote_does_not_advertise() {
 #[tokio::test]
 async fn first_turn_session_selection_is_never_discarded_by_legacy_remote_transport() {
     let connector = HttpHostConnector::new("http://unreachable.invalid".into(), None);
-    for field in ["provider", "model", "workspace"] {
+    for field in ["provider", "model", "workspace", "skill_preset", "idle"] {
         let mut request = skilled_session_start();
         match field {
             "provider" => request.provider = Some("openai".into()),
             "model" => request.model = Some("deliberate-model".into()),
+            "skill_preset" => request.skill_preset = Some("none".into()),
+            "idle" => request.idle = true,
             _ => request.workspace_id = Some("ws_selected".into()),
         }
         let error = connector.start_session(request).await.unwrap_err();

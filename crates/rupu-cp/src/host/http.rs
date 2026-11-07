@@ -25,8 +25,7 @@ use crate::{
     node::protocol::{
         messaging_capability, CAP_AGENT_ENGAGEMENT_PROFILE, CAP_AGENT_FINDINGS_PROFILE,
         CAP_AGENT_SKILLS, CAP_AGENT_SKILL_BUNDLE, CAP_RUN_MESSAGES, CAP_RUN_NETFLOW_STREAM,
-        CAP_RUN_SUPPLIED_RUN_ID,
-        CAP_SESSION_SKILLS,
+        CAP_RUN_SUPPLIED_RUN_ID, CAP_SESSION_SKILLS,
     },
     session_sender::SendMessageRequest,
     session_starter::SessionStartRequest,
@@ -651,9 +650,14 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
-        if req.idle || req.provider.is_some() || req.model.is_some() || req.workspace_id.is_some() {
+        if req.idle
+            || req.provider.is_some()
+            || req.model.is_some()
+            || req.workspace_id.is_some()
+            || req.skill_preset.is_some()
+        {
             return Err(HostConnectorError::Unsupported(
-                "idle creation, first-turn model selection and project-owned sessions require a direct connection to the owning host".into(),
+                "skill presets, idle creation, first-turn model selection and project-owned sessions require a direct connection to the owning host".into(),
             ));
         }
         if !req.skills.is_empty() || !req.preload_skills.is_empty() {
@@ -953,7 +957,9 @@ impl HostConnector for HttpHostConnector {
         let (runs_root, run_id, host) = (
             runs_root.to_path_buf(),
             run_id.to_string(),
-            self.host_id.clone().unwrap_or_else(|| self.base_url.clone()),
+            self.host_id
+                .clone()
+                .unwrap_or_else(|| self.base_url.clone()),
         );
         let rec = tokio::task::spawn_blocking(move || match fetched {
             Ok(bytes) => rupu_netflow::land::land_and_record(
@@ -1785,7 +1791,11 @@ mod tests {
             body.extend_from_slice(&chunk.unwrap());
         }
         assert_eq!(body, b"abcdefgh");
-        assert!(t.elapsed() > Duration::from_millis(1500), "{:?}", t.elapsed());
+        assert!(
+            t.elapsed() > Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     /// The idle bound is per gap, not per transfer, and the pull's own

@@ -321,6 +321,7 @@ fn sessions() -> Vec<RunArgv> {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
+            skill_preset: None,
             agent: "triage".into(),
             provider: on(4).then(|| "named-account".into()),
             model: on(4).then(|| "deliberate-model".into()),
@@ -339,6 +340,7 @@ fn sessions() -> Vec<RunArgv> {
         }));
     }
     out.push(RunArgv::SessionStart(SessionStart {
+        skill_preset: Some("none".into()),
         agent: "rupu-session".into(),
         provider: Some("openai".into()),
         model: Some("selected-model".into()),
@@ -547,6 +549,7 @@ fn back(cli: Cli) -> RunArgv {
             cmd::session::Action::Start(s) => {
                 assert_eq!(s.prompt, None, "the prompt is never positional");
                 RunArgv::SessionStart(SessionStart {
+                    skill_preset: s.skill_preset,
                     agent: s.agent,
                     provider: s.provider,
                     model: s.model,

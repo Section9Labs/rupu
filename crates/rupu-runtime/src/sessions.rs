@@ -261,6 +261,12 @@ pub struct SessionRecord {
     /// predates skills.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skill_index: Vec<rupu_skills::FrozenSkill>,
+    /// New sessions retain the preset selection; later installs never expand it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_preset: Option<crate::session_skill_preset::PresetMetadata>,
+    /// Why optional preset members were omitted when this session was created.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_preset_diagnostics: Vec<crate::session_skill_preset::SkillDiagnostic>,
     /// The skills section `session start` rendered: sent as it is on every
     /// turn, so each turn's system prompt is the first's. `None` when the
     /// session has no skills section.
