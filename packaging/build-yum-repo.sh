@@ -28,13 +28,24 @@ RPMMACROS
 
 rpmsign --addsign "$REPO"/*.rpm
 
-# Verify the signature took. rpmsign can exit 0 having signed nothing
-# useful if the macro is wrong; an unsigned rpm in a gpgcheck=1 repo
-# fails on the user's machine, not here.
+# Verify cryptographically against only the release public key. Human-readable
+# rpm -qpi metadata varies between RPM versions and is not a signature check.
+verify_dir=$(mktemp -d)
+trap 'rm -rf "$verify_dir"' EXIT
+gpg --batch --armor --export "$GPG_KEY_ID" > "$verify_dir/release-key.asc"
+rpmkeys --dbpath "$verify_dir/rpmdb" --import "$verify_dir/release-key.asc"
 for f in "$REPO"/*.rpm; do
-  info=$(rpm -qpi "$f" 2>/dev/null)
-  echo "$info" | grep -qiE "Signature *:.*Key ID" \
-    || { echo "rpm not signed: $f" >&2; exit 1; }
+  if ! info=$(LC_ALL=C rpmkeys --dbpath "$verify_dir/rpmdb" --checksig --verbose "$f" 2>&1); then
+    printf '%s\n' "$info" >&2
+    echo "rpm signature verification failed: $f" >&2
+    exit 1
+  fi
+  # Unsigned RPMs can pass digest verification. Require an actual valid signature.
+  if ! printf '%s\n' "$info" | grep -qiE 'signature.*: OK$'; then
+    printf '%s\n' "$info" >&2
+    echo "rpm has no verified signature: $f" >&2
+    exit 1
+  fi
 done
 
 createrepo_c "$REPO"
