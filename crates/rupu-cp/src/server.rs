@@ -66,6 +66,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
         .merge(crate::api::graph::routes())
+        .merge(crate::api::attempt_history::routes())
         .merge(crate::api::netflow::routes())
         .merge(crate::api::run_streams::routes())
         .merge(crate::api::autoflow_runs::routes())

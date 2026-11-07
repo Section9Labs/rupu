@@ -2,7 +2,8 @@
 
 use super::{op, OpSpec};
 use crate::api::{
-    autoflow_runs, board, events, run_streams, runs, source, transcript, transcripts,
+    attempt_history, autoflow_runs, board, events, run_streams, runs, source, transcript,
+    transcripts,
 };
 use http::Method;
 
@@ -22,6 +23,13 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Get one workflow run's full record.\n\n`id` is the run id; `host` picks a remote host. Returns the run detail: status, inputs, steps, any parked gate.",
         )
         .query::<runs::RunDetailQuery>(),
+        op(
+            "runs.attempts",
+            Method::GET,
+            "/api/runs/:id/attempts",
+            "Read recorded workflow attempts from an immutable, paginated ledger snapshot.\n\n`id` is an active or archived workflow run on the directly connected owner; omit `host` or use `local`. Optional exact `step_id`, `unit_index`, and `sub_id` filters apply before paging. `limit` defaults to 50 and is clamped to 1–200; return `next_cursor` as `cursor` with the same filters to continue the snapshot. Returns {workflow_run_id,owner_host_id,snapshot,rows,next_cursor,recorded_matching_total,evidence}. Rows retain agent-run IDs, continuation links, execution hosts, and transcript locators. Missing or partial ledgers are explicit evidence limits, never proof of no execution or inferred completion. Reading starts no work and reads no transcript bodies.",
+        )
+        .query::<attempt_history::AttemptsQuery>(),
         op(
             "runs.approve",
             Method::POST,
