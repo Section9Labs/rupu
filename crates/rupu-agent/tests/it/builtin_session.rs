@@ -14,15 +14,27 @@ fn bundled_session_resolves_without_any_agent_files_or_provider_pins() {
     spec.validate_tools().unwrap();
     let tools = spec.tools.unwrap();
     for tool in [
-        "core.*",
+        "read_file",
         "catalog.search",
         "dispatch",
         "join",
-        "coverage.*",
-        "findings.*",
-        "scm.*",
+        "coverage.mark",
+        "findings.report",
+        "scm.prs.diff",
     ] {
         assert!(tools.iter().any(|t| t == tool), "missing {tool}");
+    }
+    assert!(tools.iter().all(|name| !name.contains('*')));
+    for excluded in [
+        "board.directive",
+        "board.retract",
+        "goal.status",
+        "budget.status",
+    ] {
+        assert!(!tools.iter().any(|name| name == excluded));
+    }
+    for name in ["workflows.generate", "assets.mark"] {
+        assert!(tools.iter().any(|tool| tool == name));
     }
     let concerns = spec.concerns.unwrap();
     assert!(!concerns.entries.is_empty());

@@ -2,11 +2,23 @@
 //! agentiflow has.
 
 use super::{op, OpSpec};
-use crate::api::{agents, messages, session_workflows, sessions};
+use crate::api::{agents, messages, session_capabilities, session_workflows, sessions};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
     vec![
+        op(
+            "projects.session_capabilities",
+            Method::GET,
+            "/api/projects/:id/session-capabilities",
+            "Inspect a project's installed skill preset and declared session tools without starting work.\n\n`id` is the registered project ID; `host` is local only. `skill_preset` is rupu-session-v1 (default) or none. Returns frozen skill selections, preload defaults and diagnostics. `effective` is null because no turn is assembled. This read does not resolve credentials or verify provider or connector access.",
+        ).query::<session_capabilities::ProjectQuery>(),
+        op(
+            "sessions.capabilities",
+            Method::GET,
+            "/api/sessions/:id/capabilities",
+            "Inspect a session's frozen skills and its last observed assembled-turn capabilities.\n\n`id` is an active or archived session ID; `host` is local only. Returns skill health, declared tools, settings and orchestration revisions, and effective turn evidence when recorded. `effective_current` distinguishes current evidence from historical observations. Missing evidence stays null; connector accounts do not imply authenticated target access.",
+        ).query::<session_capabilities::SessionQuery>(),
         op(
             "sessions.workflows",
             Method::GET,

@@ -1545,6 +1545,7 @@ impl SessionStartBody {
     /// The request for agent `name`, its skill entries checked.
     fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
         Ok(SessionStartRequest {
+            skill_preset: None,
             agent: name.to_string(),
             provider: None,
             model: None,

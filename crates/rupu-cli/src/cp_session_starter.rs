@@ -21,6 +21,13 @@ pub(crate) fn session_start_argv(
     if req.idle && (req.prompt.is_some() || req.target.is_some()) {
         return Err("idle session creation cannot include a prompt or target".into());
     }
+    if let Some(preset) = req.skill_preset.as_deref() {
+        if req.agent != rupu_agent::builtin::SESSION_AGENT_NAME
+            || !matches!(preset, "rupu-session-v1" | "none")
+        {
+            return Err("skill presets require rupu-session and rupu-session-v1 or none".into());
+        }
+    }
     let mode = req
         .mode
         .as_deref()
@@ -28,6 +35,7 @@ pub(crate) fn session_start_argv(
         .transpose()
         .map_err(|e| e.to_string())?;
     Ok(RunArgv::SessionStart(SessionStart {
+        skill_preset: req.skill_preset.clone(),
         agent: req.agent.clone(),
         provider: req.provider.clone(),
         model: req.model.clone(),
@@ -63,6 +71,9 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl SessionStarter for SubprocessSessionStarter {
+    fn supports_session_capabilities(&self) -> bool {
+        true
+    }
     fn supports_builtin_harness(&self) -> bool {
         true
     }
@@ -129,6 +140,7 @@ mod tests {
         wd: Option<&str>,
     ) -> SessionStartRequest {
         SessionStartRequest {
+            skill_preset: None,
             agent: "triage".into(),
             provider: None,
             model: None,
@@ -323,5 +335,17 @@ mod tests {
             Some("ses_01XYZ".into())
         );
         assert_eq!(parse_session_id("run: run_1\n"), None);
+    }
+    #[test]
+    fn preset_selection_is_preserved_and_never_applied_to_another_agent() {
+        let mut request = req(None, Some("inspect"), Some("readonly"), None);
+        request.skill_preset = Some("none".into());
+        assert!(session_start_argv(&request, None).is_err());
+        request.agent = rupu_agent::builtin::SESSION_AGENT_NAME.into();
+        assert!(argv(&request, None)
+            .windows(2)
+            .any(|pair| pair == ["--skill-preset", "none"]));
+        request.skill_preset = Some("future-preset".into());
+        assert!(session_start_argv(&request, None).is_err());
     }
 }

@@ -68,6 +68,7 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             features.push(crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN.to_string());
             features.push("workflow.scoped_revision".to_string());
             features.push("workflow.session_history".to_string());
+            features.push(super::session_capabilities::FEATURE.to_string());
             if s.launcher.is_some() {
                 features.push("workflow.session_attach".to_string());
             }
@@ -82,6 +83,12 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
                 .is_some_and(|l| l.supports_session_workflows())
             {
                 features.push("workflow.session_link".to_string());
+            }
+            if s.session_starter
+                .as_ref()
+                .is_some_and(|starter| starter.supports_session_capabilities())
+            {
+                features.push("session.skill_preset.v1".to_string());
             }
             features
         },

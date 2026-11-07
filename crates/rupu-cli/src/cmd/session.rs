@@ -71,7 +71,7 @@ use ulid::Ulid;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Start a persistent agent session.
-    Start(StartArgs),
+    Start(Box<StartArgs>),
     /// List persistent agent sessions.
     List(ListArgs),
     /// Show session details.
@@ -152,6 +152,9 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StartArgs {
+    /// Installed Rupu skill preset for a new builtin session, or `none`.
+    #[arg(long, value_parser = ["rupu-session-v1", "none"])]
+    pub skill_preset: Option<String>,
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
     /// Provider account for the first and later turns (requires --model).
@@ -1005,7 +1008,7 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let result = match action {
-        Action::Start(args) => start(args).await,
+        Action::Start(args) => start(*args).await,
         Action::List(args) => list(args, global_format, absolute, all_columns).await,
         Action::Show {
             session_id,
@@ -1447,12 +1450,33 @@ async fn prepare_start(
     };
     initial_settings.validate()?;
     initial_settings.apply(&mut spec);
+    let builtin = spec.name == rupu_agent::builtin::SESSION_AGENT_NAME;
+    anyhow::ensure!(
+        builtin || args.skill_preset.is_none(),
+        "skill presets apply only to rupu-session"
+    );
+    let skill_plan = if builtin {
+        Some(rupu_runtime::session_skill_preset::plan(
+            &skill_dirs(&global, project_root.as_deref()),
+            args.skill_preset.as_deref() != Some("none"),
+            &args.skills,
+            &args.preload_skills,
+        )?)
+    } else {
+        None
+    };
+    let mut selected_skills = args.skills.clone();
+    let mut preload_skills = args.preload_skills.clone();
+    if let Some(plan) = &skill_plan {
+        selected_skills.extend(plan.selection());
+        preload_skills.extend(plan.preload_defaults.clone());
+    }
     let (skill_index, skill_prompt) = freeze_session_skills(
         &global,
         project_root.as_deref(),
         &spec,
-        args.skills.clone(),
-        args.preload_skills.clone(),
+        selected_skills,
+        preload_skills,
     )
     .await?;
 
@@ -1460,7 +1484,11 @@ async fn prepare_start(
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     let parse = |s: &str| PermissionMode::parse(s).ok();
-    let cli_mode = args.mode.as_deref().map(PermissionMode::parse).transpose()?;
+    let cli_mode = args
+        .mode
+        .as_deref()
+        .map(PermissionMode::parse)
+        .transpose()?;
     let agent_mode = spec.permission_mode.as_deref().and_then(parse);
     let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
@@ -1601,6 +1629,11 @@ async fn prepare_start(
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
         builtin_harness: spec.name == rupu_agent::builtin::SESSION_AGENT_NAME,
+        skill_preset_diagnostics: skill_plan
+            .as_ref()
+            .map(|plan| plan.diagnostics.clone())
+            .unwrap_or_default(),
+        skill_preset: skill_plan.map(|plan| plan.preset),
         codename: Some(
             rupu_codename::Codename::crew_only(rupu_codename::crew_for(&session_id))
                 .child(rupu_codename::role_word(&spec.name), None)
@@ -8389,6 +8422,22 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             }
             None => match assembler.assemble(launch).await {
                 Ok(run) => {
+                    // Observed assembly evidence, not a speculative configuration
+                    // preview. Old snapshots remain explicitly scoped to their turn.
+                    let snapshot = serde_json::json!({
+                        "schema_version": 1, "session_id": session.session_id,
+                        "workspace_id": session.workspace_id,
+                        "settings_revision": settings.revision,
+                        "orchestration_revision": orchestration.revision,
+                        "effective": rupu_runtime::session_readiness::inspect(&run.opts),
+                    });
+                    if let Err(error) = rupu_runtime::session_orchestration::atomic_json(
+                        &session_dir(&global, scope, &session.session_id),
+                        "capabilities.json",
+                        &snapshot,
+                    ) {
+                        tracing::warn!(%error, "could not record assembled session capabilities");
+                    }
                     if orchestration.enabled {
                         Box::pin(rupu_launch::session::run(
                             run,
@@ -11033,6 +11082,8 @@ mod tests {
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
             builtin_harness: false,
+            skill_preset: None,
+            skill_preset_diagnostics: Vec::new(),
             codename: None,
             description: Some("Persistent issue reader".into()),
             provider_name: "anthropic".into(),
@@ -12285,11 +12336,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (global, mut record) = idle_dense_session(&tmp, "ses_settings_turn");
         record.message_history.clear();
+        record.agent_system_prompt = "CAPABILITIES_SYSTEM_PRIVATE_FIXTURE".into();
         record.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
             123_456, 7_890,
         ));
         write_session(&global, SessionScope::Active, &record).unwrap();
-        rupu_runtime::session_settings::SessionSettings {
+        let saved_settings = rupu_runtime::session_settings::SessionSettings {
             provider: Some("openai".into()),
             model: Some("session-override-model".into()),
             tools: Some(vec!["agents.list".into()]),
@@ -12301,6 +12353,14 @@ mod tests {
             &record.session_id,
         ))
         .unwrap();
+        let saved_orchestration =
+            rupu_runtime::session_orchestration::SessionOrchestration::default()
+                .save(&session_dir(
+                    &global,
+                    SessionScope::Active,
+                    &record.session_id,
+                ))
+                .unwrap();
         let request_id = "req_settings";
         enqueue_session_turn_request(
             &global,
@@ -12310,7 +12370,7 @@ mod tests {
                 version: 1,
                 request_id: request_id.into(),
                 run_id: "run_settings".into(),
-                prompt: "go".into(),
+                prompt: "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE".into(),
                 transcript_path: record.transcripts_dir.join("run_settings.jsonl"),
                 enqueued_at: Utc::now(),
                 compact: false,
@@ -12329,16 +12389,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            queued["version"], 3,
-            "older workers must refuse configured turns"
+            queued["version"], 4,
+            "older workers must refuse turns with settings and orchestration revisions"
         );
         with_mock_home(
             &global,
-            r#"[{ "AssistantText": { "text": "configured", "stop": "end_turn" } }]"#,
+            r#"[{ "AssistantText": { "text": "CAPABILITIES_ASSISTANT_PRIVATE_FIXTURE", "stop": "end_turn" } }]"#,
             run_turn(RunTurnArgs {
                 session_id: record.session_id.clone(),
                 run_id: "run_settings".into(),
-                prompt: "go".into(),
+                prompt: "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE".into(),
                 operator_skills: Vec::new(),
             }),
         )
@@ -12358,6 +12418,53 @@ mod tests {
             .expect("effective tool grant recorded");
         assert!(grants.iter().any(|entry| entry.tool == "agents.list"));
         assert!(!grants.iter().any(|entry| entry.tool == "read_file"));
+        // The persisted evidence must describe this assembled turn's exact
+        // offered grant and revisions without copying its private conversation.
+        let snapshot_text = fs::read_to_string(
+            session_dir(&global, SessionScope::Active, &record.session_id)
+                .join("capabilities.json"),
+        )
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot_text).unwrap();
+        let effective: rupu_runtime::session_readiness::RunReadiness =
+            serde_json::from_value(snapshot["effective"].clone()).unwrap();
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(snapshot["session_id"], record.session_id);
+        assert_eq!(snapshot["workspace_id"], record.workspace_id);
+        assert_eq!(snapshot["settings_revision"], saved_settings.revision);
+        assert_eq!(
+            snapshot["orchestration_revision"],
+            saved_orchestration.revision
+        );
+        assert_eq!(effective.run_id, "run_settings");
+        assert_eq!(effective.applies, "assembled_turn");
+        assert_eq!(
+            effective
+                .tools
+                .iter()
+                .filter(|tool| tool.offered)
+                .map(|tool| tool.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            grants
+                .iter()
+                .map(|entry| entry.tool.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let transcript_text = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "CAPABILITIES_SYSTEM_PRIVATE_FIXTURE",
+            "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE",
+            "CAPABILITIES_ASSISTANT_PRIVATE_FIXTURE",
+        ] {
+            assert!(
+                transcript_text.contains(secret),
+                "fixture must reach the actual turn"
+            );
+            assert!(
+                !snapshot_text.contains(secret),
+                "capabilities leaked conversation text"
+            );
+        }
         let after = read_session(&global, &record.session_id).unwrap().0;
         assert_eq!(after.model, record.model);
         assert_eq!(after.provider_name, record.provider_name);
@@ -13938,3 +14045,7 @@ mod tests {
         assert!(out.contains("not-a-timestamp"), "row was dropped: {out}");
     }
 }
+
+#[cfg(test)]
+#[path = "session_skill_preset_tests.rs"]
+mod session_skill_preset_tests;

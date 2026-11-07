@@ -10,6 +10,9 @@ use tower::ServiceExt;
 struct Starter(Mutex<Vec<SessionStartRequest>>);
 #[async_trait::async_trait]
 impl crate::session_starter::SessionStarter for Starter {
+    fn supports_session_capabilities(&self) -> bool {
+        true
+    }
     fn supports_builtin_harness(&self) -> bool {
         true
     }
@@ -228,6 +231,19 @@ async fn host_info_advertises_builtin_creation_only_when_the_route_can_execute()
                 .any(|f| f == CAP_IDLE_HARNESS),
             expected
         );
+        assert_eq!(
+            response["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "session.skill_preset.v1"),
+            expected
+        );
+        assert!(response["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == super::super::session_capabilities::FEATURE));
     }
 }
 
@@ -278,4 +294,60 @@ async fn idle_creation_refuses_an_adapter_that_only_supports_first_turn_creation
         post(state, &id, "", json!({"idle":true})).await.0,
         StatusCode::NOT_IMPLEMENTED
     );
+}
+
+#[tokio::test]
+async fn preset_selection_is_exact_and_preserved() {
+    let (_tmp, state, id, starter) = setup();
+    let body = json!({"idle":true,"skill_preset":"none","skills":["global:work-units"],"preload_skills":["project:notes"]});
+    let (status, response) = post(state.clone(), &id, "", body).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    {
+        let calls = starter.0.lock().unwrap();
+        assert_eq!(calls[0].skill_preset.as_deref(), Some("none"));
+        assert_eq!(calls[0].skills, ["global:work-units"]);
+        assert_eq!(calls[0].preload_skills, ["project:notes"]);
+    }
+    for body in [
+        json!({"idle":true,"skill_preset":"all"}),
+        json!({"idle":true,"skills":["*"]}),
+        json!({"idle":true,"skills":["global:*"]}),
+        json!({"idle":true,"skills":["bare-name"]}),
+        json!({"idle":true,"preload_skills":["project:*"]}),
+        json!({"idle":true,"preload_skills":["global:../escape"]}),
+    ] {
+        assert_eq!(
+            post(state.clone(), &id, "", body).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(starter.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn skill_options_cannot_be_silently_ignored_by_old_starters() {
+    struct OldStarter;
+    #[async_trait::async_trait]
+    impl crate::session_starter::SessionStarter for OldStarter {
+        fn supports_builtin_harness(&self) -> bool {
+            true
+        }
+        fn supports_idle_harness(&self) -> bool {
+            true
+        }
+        async fn start(&self, _: SessionStartRequest) -> Result<String, SessionStartError> {
+            panic!("unsupported selection must be refused before starting");
+        }
+    }
+    let (_tmp, state, id, _) = setup();
+    let state = state.with_session_starter(Some(Arc::new(OldStarter)));
+    for body in [
+        json!({"idle":true,"skill_preset":"none"}),
+        json!({"idle":true,"skills":["global:work-units"]}),
+    ] {
+        assert_eq!(
+            post(state.clone(), &id, "", body).await.0,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
 }
