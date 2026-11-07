@@ -1546,6 +1546,10 @@ impl SessionStartBody {
     fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
         Ok(SessionStartRequest {
             agent: name.to_string(),
+            provider: None,
+            model: None,
+            workspace_id: None,
+            idle: false,
             prompt: self.prompt,
             mode: self.mode,
             target: self.target,

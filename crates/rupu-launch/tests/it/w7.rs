@@ -140,6 +140,35 @@ async fn dispatch_kinds_matrix() {
     }
 }
 
+/// The harness's approval requirement reaches both local process kinds.
+#[tokio::test]
+#[serial]
+async fn strict_approval_reaches_agent_and_workflow_process_children() {
+    let home = kinds_home();
+    let backend = Arc::new(ScriptedProcesses::done("done"));
+    let launcher = home.launcher_with(home.assembler(config()), backend.clone(), None);
+    let mut ctx = parent_ctx(&home, PermissionMode::Bypass);
+    Arc::make_mut(&mut ctx.identity).launch.strict_approval = true;
+    run(
+        &launcher,
+        &ctx,
+        request(ChildKind::Agent, "probe", Some("go")),
+    )
+    .await;
+    run(&launcher, &ctx, request(ChildKind::Workflow, "sweep", None)).await;
+    let spawned = backend.spawned();
+    assert_eq!(spawned.len(), 2);
+    for spawned in spawned {
+        let link = match spawned.argv {
+            RunArgv::Agent(run) => run.launch,
+            RunArgv::Workflow(run) => run.launch,
+            other => panic!("unexpected child {other:?}"),
+        }
+        .unwrap();
+        assert!(link.strict_approval);
+    }
+}
+
 /// §6.2: `dispatch` of a sub-agent returns before the child's first model
 /// call. Children run on a runtime nobody drives yet: the launch returns a
 /// handle, the child has not started (its transcript is still empty); only

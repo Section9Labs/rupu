@@ -2,11 +2,29 @@
 //! agentiflow has.
 
 use super::{op, OpSpec};
-use crate::api::{agents, messages, sessions};
+use crate::api::{agents, messages, session_workflows, sessions};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
     vec![
+        op(
+            "sessions.workflows",
+            Method::GET,
+            "/api/sessions/:id/workflows",
+            "Read a session's linked workflow executions with their current recorded state.\n\n`id` is the active or archived session ID; only the directly connected local host is supported. Returns {session_id,host_id,workflows}. Each link retains the original run ID and launch time; attached history has origin=attached and unknown source provenance stays null. Reading never executes work.",
+        ).query::<session_workflows::HostQuery>(),
+        op(
+            "sessions.attach_workflow",
+            Method::POST,
+            "/api/sessions/:id/workflows",
+            "Attach an existing workflow execution to a session without executing it again.\n\n`id` is an active session; `run_id` is an active or archived workflow run from the same project on this CP. Only local host is supported. Returns {session_id,host_id,association}; repeated attachment keeps the original link. The source run, transcripts and graph remain unchanged. A removed original definition or moved historical project path does not fabricate a replacement source revision.",
+        ).query::<session_workflows::HostQuery>().body::<session_workflows::AttachBody>(),
+        op(
+            "projects.workflow_history",
+            Method::GET,
+            "/api/projects/:id/workflow-history",
+            "List a project's recorded workflow executions, including archived runs.\n\n`id` is the registered project ID, on the directly connected local host. `offset` and `limit` (1–100, default 50) page newest-first. `q` is plain case-insensitive text over workflow name, run ID and codename. Returns {workspace_id,host_id,runs,next_offset}; rows include canonical run IDs, recorded names, states, dates and archived flags. Unknown project is HTTP 404.",
+        ).query::<session_workflows::HistoryQuery>(),
         op(
             "sessions.list",
             Method::GET,

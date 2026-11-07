@@ -21,6 +21,7 @@ fn link(agents: &[&str]) -> LaunchLink {
         workflows: Vec::new(),
         actions: None,
         no_messaging: false,
+        strict_approval: false,
     }
 }
 
@@ -53,4 +54,83 @@ fn inputs(dir: &std::path::Path, link: Option<LaunchLink>) -> WorkflowRuntimeInp
         scope_name_override: None,
         codename: None,
     }
+}
+
+#[test]
+fn harness_workflow_refuses_headless_ask_and_remote_placement_on_launch_or_resume() {
+    for use_marker in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut policy_link = link(&["probe", "outsider"]);
+        policy_link.strict_approval = !use_marker;
+        if use_marker {
+            rupu_runtime::strict_approval::require_workflow(
+                &dir.path().join("global/runs/run_child"),
+            )
+            .unwrap();
+        }
+        let mut request = inputs(dir.path(), (!use_marker).then_some(policy_link.clone()));
+        request.mode = PermissionMode::Ask;
+        assert!(matches!(
+            WorkflowRuntime::new(request),
+            Err(rupu_orchestrator::WorkflowRuntimeError::ApprovalUnavailable)
+        ));
+
+        let mut request = inputs(dir.path(), (!use_marker).then_some(policy_link.clone()));
+        request.workflow = Workflow::parse("name: placed\nsteps:\n  - id: scan\n    agent: probe\n    prompt: go\n    host: worker-1\n").unwrap();
+        assert!(matches!(
+            WorkflowRuntime::new(request),
+            Err(rupu_orchestrator::WorkflowRuntimeError::StrictRemotePlacement)
+        ));
+
+        let request = inputs(dir.path(), (!use_marker).then_some(policy_link));
+        let runtime = WorkflowRuntime::new(request).unwrap();
+        assert!(
+            runtime
+                .action_services
+                .context
+                .identity
+                .launch
+                .strict_approval
+        );
+    }
+}
+
+#[test]
+fn ordinary_headless_ask_workflow_keeps_legacy_behavior_and_policy_corruption_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut request = inputs(dir.path(), None);
+    request.mode = PermissionMode::Ask;
+    let runtime = WorkflowRuntime::new(request).unwrap();
+    assert!(
+        !runtime
+            .action_services
+            .context
+            .identity
+            .launch
+            .strict_approval
+    );
+    let run_dir = dir.path().join("global/runs/run_child");
+    rupu_runtime::strict_approval::require_workflow(&run_dir).unwrap();
+    std::fs::write(run_dir.join("strict-approval"), "corrupt").unwrap();
+    assert!(matches!(
+        WorkflowRuntime::new(inputs(dir.path(), None)),
+        Err(rupu_orchestrator::WorkflowRuntimeError::ApprovalPolicy(_))
+    ));
+}
+
+#[test]
+fn in_memory_workflow_without_durable_identity_remains_supported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut request = inputs(dir.path(), None);
+    request.run_id.clear();
+    request.mode = PermissionMode::Ask;
+    let runtime = WorkflowRuntime::new(request).unwrap();
+    assert!(
+        !runtime
+            .action_services
+            .context
+            .identity
+            .launch
+            .strict_approval
+    );
 }

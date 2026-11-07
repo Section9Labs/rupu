@@ -651,6 +651,11 @@ impl HostConnector for HttpHostConnector {
     }
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
+        if req.idle || req.provider.is_some() || req.model.is_some() || req.workspace_id.is_some() {
+            return Err(HostConnectorError::Unsupported(
+                "idle creation, first-turn model selection and project-owned sessions require a direct connection to the owning host".into(),
+            ));
+        }
         if !req.skills.is_empty() || !req.preload_skills.is_empty() {
             self.require_feature(
                 CAP_SESSION_SKILLS,

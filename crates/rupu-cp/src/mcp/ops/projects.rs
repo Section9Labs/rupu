@@ -44,6 +44,14 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .query::<projects::ProjectListQuery>(),
         op(
+            "projects.start_session",
+            Method::POST,
+            "/api/projects/:ws_id/sessions",
+            "Start a project-owned conversation with the bundled rupu-session coding harness.\n\nNo agent setup is required. `prompt` is required unless `idle:true` creates a zero-turn session without a provider worker; idle and prompt cannot be combined. Optional `provider` requires `model`, and both are applied before the first turn. `mode` defaults to readonly; bypass is explicit and ask is refused because detached workers have no approval channel. The directly connected host owns execution. Returns {session_id, host_id, agent, provider, model}; acceptance is not provider completion.",
+        )
+        .query::<crate::api::project_session_start::StartQuery>()
+        .body::<crate::api::project_session_start::StartBody>(),
+        op(
             "projects.agents",
             Method::GET,
             "/api/projects/:ws_id/agents",

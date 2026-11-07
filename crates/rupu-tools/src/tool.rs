@@ -183,6 +183,10 @@ pub struct LaunchScope {
     /// child never has more than its parent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub messaging_off: bool,
+    /// This launch tree requires an actual approval channel for Ask mode.
+    /// Set by the bundled harness and inherited by every child.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict_approval: bool,
 }
 
 /// An agentiflow's pool: the agents and workflows its runs may launch.

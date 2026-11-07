@@ -637,6 +637,7 @@ async fn a_launch_link_carries_depth_ceiling_caps_and_the_usage_root() {
         workflows: vec![],
         actions: Some(vec!["issues.get".into()]),
         no_messaging: false,
+        strict_approval: false,
     });
     let _m = MockScript::set(DONE);
     let run = assembler.assemble(l).await.unwrap();
@@ -974,6 +975,7 @@ async fn a_process_child_of_an_opted_out_run_has_messaging_off() {
         workflows: vec![],
         actions: None,
         no_messaging,
+        strict_approval: false,
     };
     let mut l = launch(&home, spec.clone(), Origin::Standalone, "run_child_off");
     l.link = Some(link(true));
@@ -1169,6 +1171,7 @@ async fn agentiflow_messaging_off_reaches_lead_and_units() {
         workflows: vec![],
         actions: None,
         no_messaging: lead.opts.identity().launch.messaging_off,
+        strict_approval: false,
     });
     let unit = assembler.assemble(u).await.unwrap();
     assert_eq!(messaging_of(&unit), (true, false, false));

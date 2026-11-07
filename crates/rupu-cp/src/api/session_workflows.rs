@@ -19,7 +19,9 @@ use std::{
 };
 
 pub(crate) fn routes() -> Router<AppState> {
-    Router::new().route("/api/sessions/:id/workflows", get(list))
+    Router::new()
+        .route("/api/sessions/:id/workflows", get(list).post(attach))
+        .route("/api/projects/:id/workflow-history", get(history))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,7 +40,11 @@ pub(crate) struct Association {
     pub workspace_id: String,
     pub host_id: String,
     pub workflow_name: String,
-    pub source: Source,
+    pub source: Option<Source>,
+    #[serde(default = "launched_origin")]
+    pub origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_at: Option<String>,
     pub launched_at: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +77,10 @@ fn outcome_path(s: &AppState, run_id: &str) -> PathBuf {
 struct SessionIdentity {
     session_id: String,
     #[serde(default)]
+    builtin_harness: bool,
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
     workspace_id: String,
     #[serde(default)]
     workspace_path: PathBuf,
@@ -99,6 +109,7 @@ pub(crate) fn validate_attachment(
     super::runs::validate_id(id)?;
     super::sessions::active_session(s, id, "launch workflow")?;
     let dir = s.global_dir.join("sessions").join(id);
+    super::fs_safety::validate_within(&dir, &s.global_dir.join("sessions"))?;
     let record = identity(&dir, id)?;
     let session_path = record
         .workspace_path
@@ -124,7 +135,7 @@ pub(crate) async fn launch(
     session_id: &str,
     workspace_id: &str,
     source: Source,
-    request: LaunchRequest,
+    mut request: LaunchRequest,
 ) -> ApiResult<Association> {
     let dir = validate_attachment(
         s,
@@ -134,6 +145,35 @@ pub(crate) async fn launch(
             ApiError::bad_request("session workflow requires an execution workspace")
         })?),
     )?;
+    let session = identity(&dir, session_id)?;
+    if session.builtin_harness {
+        // This explicit operator action has no parent launch ceiling. Keep
+        // an omitted mode within the session policy instead of inheriting
+        // the standalone workflow runner's unattended Ask default.
+        let mode = rupu_tools::PermissionMode::parse(
+            request
+                .mode
+                .as_deref()
+                .or(session.permission_mode.as_deref())
+                .unwrap_or("readonly"),
+        )
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if mode == rupu_tools::PermissionMode::Ask {
+            return Err(ApiError::bad_request(
+                "ask mode is unavailable for a detached session workflow; choose readonly or explicitly choose bypass",
+            ));
+        }
+        request.mode = Some(mode.as_str().into());
+        let file = request.file.as_ref().ok_or_else(|| {
+            ApiError::bad_request("a session workflow requires its pinned source")
+        })?;
+        let text = fs::read_to_string(file).map_err(|e| ApiError::internal(e.to_string()))?;
+        let workflow = rupu_orchestrator::Workflow::parse(&text)
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        if workflow.has_placed_step() {
+            return Err(ApiError::not_available("built-in session workflows require local execution; strict approval policy is not supported by host/distribute transport"));
+        }
+    }
     let links = create_association_dir(&dir)?;
     let record = Association {
         session_id: session_id.into(),
@@ -141,7 +181,9 @@ pub(crate) async fn launch(
         workspace_id: workspace_id.into(),
         host_id: "local".into(),
         workflow_name: request.workflow.clone(),
-        source,
+        source: Some(source),
+        origin: launched_origin(),
+        attached_at: None,
         launched_at: chrono::Utc::now().to_rfc3339(),
         status: "starting".into(),
         error: None,
@@ -155,6 +197,10 @@ pub(crate) async fn launch(
     let run_dir = s.global_dir.join("runs").join(&stored.association.run_id);
     // Refuse a known tracking-storage failure before publishing a launch.
     fs::create_dir_all(&run_dir).map_err(|e| ApiError::internal(e.to_string()))?;
+    if session.builtin_harness {
+        rupu_runtime::strict_approval::require_workflow(&run_dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
     save_record(&path, &stored, false)
         .and_then(|_| fs::File::open(&dir)?.sync_all())
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -311,8 +357,9 @@ fn save_record(path: &FsPath, record: &impl Serialize, replace: bool) -> std::io
     result
 }
 
-#[derive(Default, Deserialize)]
-struct HostQuery {
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HostQuery {
     host: Option<String>,
 }
 
@@ -336,6 +383,7 @@ pub(crate) fn list_records(s: &AppState, id: &str) -> ApiResult<serde_json::Valu
     } else {
         return Err(ApiError::not_found("session not found"));
     };
+    super::fs_safety::validate_within(&dir, &s.global_dir)?;
     let owner = identity(&dir, id)?;
     let links = dir.join("workflow-runs");
     let mut records = Vec::new();
@@ -380,6 +428,15 @@ pub(crate) fn list_records(s: &AppState, id: &str) -> ApiResult<serde_json::Valu
                     record.status = run.status.as_str().to_string();
                     record.error = run.error_message;
                 }
+                Err(rupu_orchestrator::RunStoreError::NotFound(_))
+                    if record.origin == "attached" =>
+                {
+                    record.status = "unavailable".into();
+                    record.error = Some(
+                        "the attached workflow run is no longer available on this Rupu instance"
+                            .into(),
+                    );
+                }
                 Err(rupu_orchestrator::RunStoreError::NotFound(_)) => {
                     match fs::read(outcome_path(s, &record.run_id)) {
                         Ok(bytes) => {
@@ -418,4 +475,140 @@ pub(crate) fn list_records(s: &AppState, id: &str) -> ApiResult<serde_json::Valu
             .then(a.run_id.cmp(&b.run_id))
     });
     Ok(serde_json::json!({"session_id":id,"host_id":"local","workflows":records}))
+}
+
+fn launched_origin() -> String {
+    "launched".into()
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AttachBody {
+    run_id: String,
+}
+
+/// Attach an existing execution without creating a turn, launching work, or
+/// rewriting the run. Unknown historical definition provenance stays unknown.
+async fn attach(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<HostQuery>, axum::extract::rejection::QueryRejection>,
+    body: Result<Json<AttachBody>, axum::extract::rejection::JsonRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Query(q) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    super::fleet::require_local(q.host.as_deref(), "attaching an existing workflow run")?;
+    super::config::require_writable_to(&s, "attaching an existing workflow run")?;
+    super::runs::blocking(move || attach_record(&s, &id, &body.run_id).map(Json)).await
+}
+
+fn attach_record(s: &AppState, id: &str, run_id: &str) -> ApiResult<serde_json::Value> {
+    super::runs::validate_id(id)?;
+    super::runs::validate_id(run_id)?;
+    let run = load_existing_run(s, run_id)?;
+    if run.id != run_id || run.workspace_id.is_empty() {
+        return Err(ApiError::conflict(
+            "workflow run identity does not name a project",
+        ));
+    }
+    let project = super::projects::load_workspace(s, &run.workspace_id)?;
+    let project_path = FsPath::new(&project.path).canonicalize().map_err(|e| {
+        ApiError::conflict(format!("registered project directory is unavailable: {e}"))
+    })?;
+    // Old execution paths can have moved or disappeared. This link grants no
+    // execution or filesystem access: the recorded project ID is authoritative,
+    // while the target session must still bind to the current registered path.
+    let dir = validate_attachment(s, id, &run.workspace_id, &project_path)?;
+    let links = create_association_dir(&dir)?;
+    let path = links.join(format!("{run_id}.json"));
+    let association = Association {
+        session_id: id.into(),
+        run_id: run_id.into(),
+        workspace_id: run.workspace_id,
+        host_id: "local".into(),
+        workflow_name: run.workflow_name,
+        source: None,
+        origin: "attached".into(),
+        attached_at: Some(chrono::Utc::now().to_rfc3339()),
+        launched_at: run.started_at.to_rfc3339(),
+        status: run.status.as_str().into(),
+        error: run.error_message,
+    };
+    let stored = StoredAssociation {
+        association,
+        monitor_pid: 0,
+        monitor_start: None,
+    };
+    match save_record(&path, &stored, false) {
+        Ok(()) => {}
+        // Reopening the same run is idempotent. Never replace an original
+        // launch association or its known source revision with an attachment.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    }
+    // Reload through the normal reader: validates stored identities (including
+    // a concurrent creator) and follows an archive racing this write.
+    let list = list_records(s, id)?;
+    let association = list["workflows"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["run_id"] == run_id))
+        .ok_or_else(|| {
+            ApiError::conflict("workflow association disappeared before it could be confirmed")
+        })?;
+    Ok(serde_json::json!({"session_id":id,"host_id":"local","association":association}))
+}
+
+fn load_existing_run(s: &AppState, run_id: &str) -> ApiResult<rupu_orchestrator::RunRecord> {
+    let store = super::run_resolve::local_recorded_store(s, run_id)?
+        .ok_or_else(|| ApiError::not_found("workflow run not found on this Rupu instance"))?;
+    store
+        .load(run_id)
+        .map_err(|e| super::runs::run_not_found_or_internal(run_id, e))
+}
+
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryQuery {
+    host: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    q: Option<String>,
+}
+
+/// Project-scoped history, including archives. Results are recorded executions,
+/// never today's same-named definition and never another host's mirrored run.
+async fn history(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let Query(q) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    super::fleet::require_local(q.host.as_deref(), "project workflow history")?;
+    let limit = q.limit.unwrap_or(50);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError::bad_request("limit must be between 1 and 100"));
+    }
+    super::runs::blocking(move || {
+        super::projects::load_workspace(&s, &id)?;
+        let query = q.q.unwrap_or_default().trim().to_lowercase();
+        let mut records = s.run_store.list().map_err(|e| ApiError::internal(e.to_string()))?
+            .into_iter().map(|run| (run, false)).collect::<Vec<_>>();
+        records.extend(s.run_store.list_archived().map_err(|e| ApiError::internal(e.to_string()))?
+            .into_iter().map(|run| (run, true)));
+        records.retain(|(run, _)| run.workspace_id == id && (query.is_empty()
+            || format!("{} {} {}", run.id, run.workflow_name, run.codename.as_deref().unwrap_or_default()).to_lowercase().contains(&query)));
+        records.sort_by(|(a, aa), (b, ba)| b.started_at.cmp(&a.started_at).then(a.id.cmp(&b.id)).then(aa.cmp(ba)));
+        // In an archive race the same ID can be observed on both reads; active
+        // wins so one execution is never presented twice.
+        let mut seen = std::collections::HashSet::new();
+        records.retain(|(run, _)| seen.insert(run.id.clone()));
+        let offset = q.offset.unwrap_or(0);
+        let end = offset.saturating_add(limit);
+        let next_offset = (end < records.len()).then_some(end);
+        let runs: Vec<_> = records.into_iter().skip(offset).take(limit).map(|(run, archived)| {
+            serde_json::json!({"run_id":run.id,"workflow_name":run.workflow_name,"codename":run.codename,
+                "status":run.status.as_str(),"started_at":run.started_at,"finished_at":run.finished_at,"archived":archived})
+        }).collect();
+        Ok(Json(serde_json::json!({"workspace_id":id,"host_id":"local","runs":runs,"next_offset":next_offset})))
+    }).await
 }

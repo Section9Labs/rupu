@@ -1,6 +1,8 @@
 //! Agent loader. Walks `<global>/agents/*.md` and (if provided)
 //! `<project>/agents/*.md`. Project-local agents shadow globals by
 //! name (no merging — same `name:` means project replaces global).
+//! Reserved bundled identities resolve before either layer in single-agent
+//! lookups; the disk listing remains the installed agent catalog.
 //!
 //! [`load_agent`] is what a run loads its agent with: it also checks the
 //! agent's `tools:` against the tool catalog ([`AgentSpec::validate_tools`])
@@ -271,12 +273,16 @@ fn check_names(
 }
 
 /// Look up a single agent by name without checking its `tools:` — for
-/// showing an agent (and its errors), never for running one.
+/// showing an agent (and its errors), never for running one. Reserved bundled
+/// identities resolve before the disk catalog, including broken files.
 pub fn find_agent(
     global: &Path,
     project: Option<&Path>,
     name: &str,
 ) -> Result<AgentSpec, AgentLoadError> {
+    if let Some(spec) = crate::builtin::find(name) {
+        return Ok(spec);
+    }
     let agents = load_agents(global, project)?;
     agents
         .into_iter()
@@ -296,6 +302,9 @@ pub fn find_agent_tolerant(
     project: Option<&Path>,
     name: &str,
 ) -> Result<AgentSpec, AgentLoadError> {
+    if let Some(spec) = crate::builtin::find(name) {
+        return Ok(spec);
+    }
     for root in project.into_iter().chain(std::iter::once(global)) {
         if let Some(found) = find_in_dir_tolerant(&root.join("agents"), name)? {
             return found;

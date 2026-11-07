@@ -217,7 +217,36 @@ fn map_conn_err(host_id: &str, e: HostConnectorError) -> ApiError {
 /// path is never found under the local roots, so this simply 400s "outside
 /// the allowed roots" — exactly what happens on `main` for those host types.
 fn validate_local(s: &AppState, raw: &str) -> ApiResult<PathBuf> {
-    validate_transcript_path(raw, &allowed_roots(s)).map_err(ApiError::bad_request)
+    let roots = allowed_roots(s);
+    let path = validate_transcript_path(raw, &roots).map_err(ApiError::bad_request)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    // A workflow archive moves its run directory, but its immutable step and
+    // event records keep their original transcript path. Resolve only this
+    // exact local prefix; never rewrite the recorded path or copy artifacts.
+    let active_root =
+        canonicalize_existing_prefix(&s.run_store.root).unwrap_or_else(|| s.run_store.root.clone());
+    if let Ok(relative) = path.strip_prefix(active_root) {
+        let mut parts = relative.components();
+        if let Some(std::path::Component::Normal(id)) = parts.next() {
+            if let Some(id) = id
+                .to_str()
+                .filter(|id| super::runs::validate_id(id).is_ok())
+            {
+                if !parts.as_path().as_os_str().is_empty() {
+                    if let Some(store) = super::run_resolve::local_recorded_store(s, id)? {
+                        if store.root == s.run_store.archive_root() {
+                            let archived = store.root.join(id).join(parts.as_path());
+                            return validate_transcript_path(&archived.to_string_lossy(), &roots)
+                                .map_err(ApiError::bad_request);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(path)
 }
 
 /// Classifies the outcome of `HostConnector::pull_transcript` for

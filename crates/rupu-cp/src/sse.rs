@@ -313,17 +313,22 @@ pub async fn run_frames_with_idle(
         store: Arc<RunStore>,
         run_id: String,
         idle: Duration,
-        /// The last line read (sent or not) was a terminal event.
+        /// An archive is immutable history. Legacy files can be missing the
+        /// final event; the terminal run record still lets EOF close safely.
+        recorded_archive: bool,
+        /// The last line read (sent or not) was terminal, or came from archive.
         at_terminal: bool,
         done: bool,
     }
+    let recorded_archive = store.root == store.archive_root();
     let st = St {
         source: Box::pin(source),
         namers,
         store,
         run_id: run_id.to_string(),
         idle,
-        at_terminal: false,
+        recorded_archive,
+        at_terminal: recorded_archive,
         done: false,
     };
     Ok(futures_util::stream::unfold(st, |mut st| async move {
@@ -353,10 +358,11 @@ pub async fn run_frames_with_idle(
             // doesn't parse, or a newer rupu's event type (`Unknown`), is
             // just not sent.
             let Some(ev) = line.event else {
-                st.at_terminal = false;
+                st.at_terminal = st.recorded_archive;
                 continue;
             };
-            st.at_terminal = matches!(ev, Event::RunCompleted { .. } | Event::RunFailed { .. });
+            st.at_terminal = st.recorded_archive
+                || matches!(ev, Event::RunCompleted { .. } | Event::RunFailed { .. });
             if !line.send || matches!(ev, Event::Unknown) {
                 continue;
             }

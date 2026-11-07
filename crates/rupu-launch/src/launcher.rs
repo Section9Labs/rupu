@@ -400,6 +400,7 @@ impl Caller {
             workflows: id.launch.workflows.clone(),
             actions: id.launch.connector_cap.clone(),
             no_messaging: id.launch.messaging_off,
+            strict_approval: id.launch.strict_approval,
         }
     }
 
@@ -430,6 +431,7 @@ impl Caller {
                     (a, b) => a.or_else(|| b.clone()),
                 },
                 no_messaging: now.no_messaging || then.no_messaging,
+                strict_approval: now.strict_approval || then.strict_approval,
                 ..now
             }),
             (link, _) => link,

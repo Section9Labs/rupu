@@ -247,6 +247,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
                 launch_workflows,
                 launch_actions,
                 launch_no_messaging,
+                launch_strict_approval,
             },
         explicit: _,
     } = args;
@@ -304,6 +305,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         ("tmp", tmp),
         ("no-messaging", no_messaging),
         ("launch-no-messaging", launch_no_messaging),
+        ("launch-strict-approval", launch_strict_approval),
     ] {
         if *on {
             out.push(format!("--{flag}"));
@@ -375,6 +377,7 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         "launch_workflows",
         "launch_actions",
         "launch_no_messaging",
+        "launch_strict_approval",
     ]
     .into_iter()
     .any(given);

@@ -13,12 +13,13 @@
 //! never cleared and would make every other run here abort as terminating.
 
 mod agent_skills;
+mod builtin_session;
 mod coverage_integration;
 mod engagement_e2e;
 mod findings_full_profile;
 mod findings_tags;
-mod injected_replay;
 mod findings_without_coverage;
+mod injected_replay;
 mod loader;
 mod mcp_attach;
 mod mock_provider_outcomes;

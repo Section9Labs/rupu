@@ -9,6 +9,8 @@
 //! Agent files are markdown with YAML frontmatter (Okesu/Claude
 //! convention). See [`spec::AgentSpec`].
 
+pub mod builtin;
+
 // Continue an interrupted agent run from its transcript (recover-on-interrupt).
 pub mod continuation;
 // Pre-turn collector pipeline: TurnCollector port + data-never-authority
