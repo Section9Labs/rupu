@@ -39,13 +39,19 @@ impl Filters {
     }
 }
 
-#[derive(Default, Deserialize)]
-struct AttemptsQuery {
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AttemptsQuery {
+    /// Omit or use `local`; connect directly to the owning control plane.
     host: Option<String>,
+    /// Exact step ID; when supplied, must contain 1..1024 bytes.
     step_id: Option<String>,
+    /// Exact fan-out unit index.
     unit_index: Option<usize>,
+    /// Exact parallel sub-step ID; when supplied, must contain 1..1024 bytes.
     sub_id: Option<String>,
+    /// Page size, default 50; clamped to 1..200.
     limit: Option<usize>,
+    /// Opaque continuation from this owner, run, and unchanged filters.
     cursor: Option<String>,
 }
 
