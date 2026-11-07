@@ -3,7 +3,7 @@
 //! file list).
 
 use super::{op, OpSpec};
-use crate::api::{code, fleet, projects};
+use crate::api::{code, fleet, project_scm, projects};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
@@ -29,6 +29,14 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "/api/projects/:ws_id",
             "Get one project's rollup of runs, sessions and coverage.\n\n`ws_id` is the project id. Returns an object `{project, runs, sessions, coverage, recent_runs, usage}`: `project` is the row `projects.list` gives, `runs` counts total, running, by status and by surface, and `recent_runs` holds the ten newest run rows; `HTTP 404` for an unknown project.",
         ),
+        op(
+            "projects.scm",
+            Method::GET,
+            "/api/projects/:ws_id/scm",
+            "Inspect a registered checkout's branch, changes and optional current-branch reviews.\n\n`ws_id` is the project ID on the directly connected instance; omit `host` or use local. Returns bounded staged and working diffs, checkout provenance, limits and observed state. The default performs local inspection only. `include_review:true` additionally makes a bounded read through the owning instance's configured GitHub/GitLab account; failures remain unavailable, and unknown checks are not success. No checkout, branch, review or merge mutation is performed.",
+        )
+        .query::<project_scm::ContextQuery>()
+        .open_world(),
         op(
             "projects.runs",
             Method::GET,

@@ -36,6 +36,7 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true, features = ["io"] }
 object_store = { workspace = true }
 url = { workspace = true }
+git2.workspace = true
 reqwest = { workspace = true, features = ["json", "stream"] }
 reqwest-middleware.workspace = true
 rupu-netflow = { workspace = true, features = ["http"] }
@@ -86,7 +87,6 @@ chrono.workspace = true
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 serial_test.workspace = true
-git2.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
 httpmock.workspace = true

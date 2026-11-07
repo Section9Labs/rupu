@@ -119,6 +119,7 @@
   "projects.list",
   "projects.register",
   "projects.runs",
+  "projects.scm",
   "projects.session_capabilities",
   "projects.sessions",
   "projects.source",
