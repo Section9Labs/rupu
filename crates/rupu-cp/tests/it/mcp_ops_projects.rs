@@ -3,7 +3,7 @@
 // In-process test server client, not rupu egress (see sse.rs).
 #![allow(clippy::disallowed_methods)]
 
-use super::mcp::{assert_required_args, call_tool, json_of, spawn_operator_with};
+use super::mcp::{assert_required_args, call_tool, json_of, rpc, spawn_operator_with, text_of};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
@@ -42,6 +42,7 @@ async fn projects_tools_are_listed_with_their_required_arguments() {
     let table: &[(&str, &[&str])] = &[
         ("projects.list", &[]),
         ("projects.get", &["ws_id"]),
+        ("projects.scm", &["ws_id"]),
         ("projects.runs", &["ws_id"]),
         ("projects.sessions", &["ws_id"]),
         ("projects.start_session", &["ws_id"]),
@@ -56,6 +57,86 @@ async fn projects_tools_are_listed_with_their_required_arguments() {
         ("projects.files", &["ws_id"]),
     ];
     assert_required_args(addr, table).await;
+}
+
+#[tokio::test]
+async fn project_scm_schema_preserves_optional_review_and_read_only_hints() {
+    let (addr, _tmp) = spawn_operator_with(|_| {}, None).await;
+    let listed = rpc(addr, "tools/list", json!({})).await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "projects.scm")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["include_review"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["include_review"]["default"],
+        false
+    );
+    assert!(tool["inputSchema"]["properties"].get("host").is_some());
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool["annotations"]["idempotentHint"], true);
+    assert_eq!(tool["annotations"]["destructiveHint"], false);
+    assert_eq!(tool["annotations"]["openWorldHint"], true);
+}
+
+#[tokio::test]
+async fn project_scm_tool_forwards_review_opt_in_and_owning_host_guards() {
+    let (addr, tmp) = spawn_operator_with(
+        |global| {
+            seed_project(global);
+            let repo = git2::Repository::init(global.join("proj-root")).unwrap();
+            repo.remote("origin", "https://github.com/example/project.git")
+                .unwrap();
+        },
+        None,
+    )
+    .await;
+    for include_review in [false, true] {
+        let r = call_tool(
+            addr,
+            "projects.scm",
+            json!({"ws_id": WS, "host": "local", "include_review": include_review}),
+        )
+        .await;
+        assert!(!is_error(&r), "{r}");
+        let mut got = json_of(&r);
+        let (status, mut want) = http_get(
+            addr,
+            &format!("/api/projects/{WS}/scm?host=local&include_review={include_review}"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(got["state"], "ready");
+        assert!(got["observed_at"].is_string());
+        got.as_object_mut().unwrap().remove("observed_at");
+        want.as_object_mut().unwrap().remove("observed_at");
+        assert_eq!(got, want);
+        assert_eq!(
+            got["pull_request"]["state"],
+            if include_review {
+                "unavailable"
+            } else {
+                "not_queried"
+            }
+        );
+    }
+    let remote = call_tool(
+        addr,
+        "projects.scm",
+        json!({"ws_id": WS, "host": "elsewhere"}),
+    )
+    .await;
+    assert!(is_error(&remote), "{remote}");
+    assert!(text_of(&remote).starts_with("HTTP 501"), "{remote}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("proj-root/README.md")).unwrap(),
+        "# hi\nsecond line\n"
+    );
 }
 
 #[tokio::test]

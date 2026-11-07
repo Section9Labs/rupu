@@ -24,9 +24,12 @@ const MAX_CHANGES: usize = 200;
 const MAX_DIFF: usize = 256 * 1024;
 static READERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 pub struct ContextQuery {
+    /// Owning instance only: omit or use `local`; remote selectors are refused.
     pub host: Option<String>,
+    /// Query current branch reviews through the owning instance's SCM account.
+    /// False by default; local checkout inspection does not contact the forge.
     #[serde(default)]
     pub include_review: bool,
 }
