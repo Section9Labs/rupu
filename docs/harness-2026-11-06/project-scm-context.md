@@ -4,6 +4,12 @@
 It reads the registered checkout on the owning control-plane instance. Remote host
 selectors are refused; it does not inspect a similarly named path on the client Mac.
 
+The same handler is exposed as the MCP operator tool `projects.scm`, with required
+`ws_id` and optional `host` and `include_review`. Its hints are read-only,
+idempotent and non-destructive. `openWorldHint` is true because the explicitly
+requested review lookup can contact the owning instance's configured forge;
+omitting `include_review` still performs local inspection only.
+
 The response preserves `ws_id`, `host_id`, `source: local_checkout`, `checkout_path`,
 `observed_at`, and `state` (`ready`, `not_repository`, or `unavailable`). A ready
 checkout contains current `branch`, `head`, `detached`, a credential-free recognized
