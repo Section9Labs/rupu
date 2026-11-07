@@ -212,18 +212,23 @@ const MESSAGES_UNSUPPORTED: &str = "rupu-message: unsupported";
 
 /// The one remote command an SSH messages call sends: `rupu <argv>`
 /// ([`message_list_argv`] / [`message_send_argv`]) behind [`feature_gate`]
-/// on [`CAP_RUN_MESSAGES`] — the remote decides in the same session, so a
+/// on [`CAP_RUN_MESSAGES`] and, for guarded sends, `run.messages.expected_run`
+/// — the remote decides in the same session, so a
 /// call costs it no extra connection. Every word is quoted on its own; a
 /// value rides as one `--flag=value` word, so a body with quotes, newlines or
 /// a leading `-` arrives intact.
-fn message_command(argv: &[String]) -> String {
+fn message_command(argv: &[String], expected_run: bool) -> String {
     let cmd: Vec<String> = std::iter::once("rupu".to_string())
         .chain(argv.iter().cloned())
         .collect();
-    feature_gate(
-        &[(CAP_RUN_MESSAGES, MESSAGES_UNSUPPORTED)],
-        &build_remote_command(&cmd),
-    )
+    let mut gates = vec![(CAP_RUN_MESSAGES, MESSAGES_UNSUPPORTED)];
+    if expected_run {
+        gates.push((
+            crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN,
+            MESSAGES_UNSUPPORTED,
+        ));
+    }
+    feature_gate(&gates, &build_remote_command(&cmd))
 }
 
 /// Printed, instead of running `rupu __board`, by [`board_command`]'s gate
@@ -281,6 +286,9 @@ pub fn message_send_argv(id: &str, msg: &OperatorMessageRequest) -> Vec<String> 
     ];
     if let Some(to) = &msg.to {
         argv.push(format!("--to={to}"));
+    }
+    if let Some(expected_run_id) = &msg.expected_run_id {
+        argv.push(format!("--expected-run-id={expected_run_id}"));
     }
     if msg.urgent {
         argv.push("--urgent".to_string());
@@ -2350,11 +2358,16 @@ impl SshHostConnector {
     async fn message_call<T: serde::de::DeserializeOwned>(
         &self,
         argv: Vec<String>,
+        expected_run: bool,
     ) -> Result<T, HostConnectorError> {
         self.helper_call(
-            &message_command(&argv),
+            &message_command(&argv, expected_run),
             "__message",
-            CAP_RUN_MESSAGES,
+            if expected_run {
+                crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN
+            } else {
+                CAP_RUN_MESSAGES
+            },
             MESSAGES_UNSUPPORTED,
         )
         .await
@@ -3639,7 +3652,7 @@ impl HostConnector for SshHostConnector {
         id: &str,
         q: ViewQuery,
     ) -> Result<MessagesView, HostConnectorError> {
-        self.message_call(message_list_argv(id, &q)).await
+        self.message_call(message_list_argv(id, &q), false).await
     }
 
     /// Shells `rupu __message send`. A message changes nothing the listing
@@ -3649,10 +3662,8 @@ impl HostConnector for SshHostConnector {
         id: &str,
         msg: OperatorMessageRequest,
     ) -> Result<OperatorSendReply, HostConnectorError> {
-        if msg.expected_run_id.is_some() {
-            return Err(HostConnectorError::Unsupported("run-bound operator messages are not supported over SSH; use an HTTP control plane connection".into()));
-        }
-        self.message_call(message_send_argv(id, &msg)).await
+        self.message_call(message_send_argv(id, &msg), msg.expected_run_id.is_some())
+            .await
     }
 
     /// Shells `rupu __board <id>` (no listing cache: a board is read when
@@ -11960,9 +11971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expected_run_messages_refuse_ssh_without_executing() {
-        let (conn, _store, _tmp) =
-            make_conn(std::sync::Arc::new(FakeExec::offline("must not execute")));
+    async fn expected_run_messages_require_the_remote_guard_and_keep_the_exact_argv() {
         let request = OperatorMessageRequest {
             expected_run_id: Some("sub_one".into()),
             to: Some("lynx#1".into()),
@@ -11971,10 +11980,59 @@ mod tests {
             viewer: None,
             client: None,
         };
-        assert!(matches!(
-            conn.send_operator_message("run_01MSG", request).await,
-            Err(HostConnectorError::Unsupported(_))
-        ));
+        for features in [
+            vec!["run.messages"],
+            vec!["run.messages.expected_run"],
+            vec![],
+        ] {
+            let report = serde_json::json!({"features":features});
+            let bin = fake_message_rupu(&format!("echo '{report}'"), "echo '{}'");
+            let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+            assert!(matches!(
+                conn.send_operator_message("run_01MSG", request.clone())
+                    .await,
+                Err(HostConnectorError::Unsupported(_))
+            ));
+            assert_eq!(
+                recorded_argv(&bin),
+                None,
+                "a missing guard never runs the send helper"
+            );
+        }
+        let report =
+            serde_json::to_string(&crate::node::protocol::FeaturesReport::current()).unwrap();
+        let reply = r#"{"id":"msg_guarded","delivery":{"resolved":["lynx#1"]}}"#;
+        let bin = fake_message_rupu(&format!("echo '{report}'"), &format!("echo '{reply}'"));
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        let sent = conn
+            .send_operator_message("ses_01MSG", request.clone())
+            .await
+            .unwrap();
+        assert_eq!(sent.id, "msg_guarded");
+        assert_eq!(
+            recorded_argv(&bin).unwrap(),
+            [
+                "__message",
+                "send",
+                "ses_01MSG",
+                "--body=guarded",
+                "--to=lynx#1",
+                "--expected-run-id=sub_one"
+            ]
+        );
+
+        let bin = fake_message_rupu(
+            &format!("echo '{report}'"),
+            r#"echo '{"error":{"code":"not_live","message":"recipient changed"}}'; exit 3"#,
+        );
+        let (conn, _tmp) = shell_conn(format!("{}:/usr/bin:/bin", bin.path().display()));
+        assert!(
+            matches!(conn.send_operator_message("af_01MSG", request).await,
+            Err(HostConnectorError::Remote(409, message)) if message == "recipient changed")
+        );
+        assert!(recorded_argv(&bin)
+            .unwrap()
+            .contains(&"--expected-run-id=sub_one".into()));
     }
 
     /// The helper's `{"error": …}` reply (exit 3) keeps its code's status;

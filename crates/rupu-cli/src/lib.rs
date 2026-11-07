@@ -1011,6 +1011,7 @@ mod arg_parse_tests {
                         id,
                         body: got,
                         to,
+                        expected_run_id,
                         urgent,
                         viewer,
                     },
@@ -1018,6 +1019,7 @@ mod arg_parse_tests {
                 assert_eq!(id, "run_01ABC");
                 assert_eq!(got, body);
                 assert_eq!(to.as_deref(), Some("step:scan"));
+                assert_eq!(expected_run_id, None);
                 assert!(urgent);
                 assert_eq!(viewer.as_deref(), Some("matt"));
             }

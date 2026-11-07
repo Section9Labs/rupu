@@ -87,6 +87,9 @@ pub struct SendArgs {
     /// `step:<id>`, `lead` or `broadcast`.
     #[arg(long, value_name = "ADDRESS")]
     pub to: Option<String>,
+    /// Enqueue only if this participant still belongs to the exact live run.
+    #[arg(long, value_name = "RUN_ID", requires = "to")]
+    pub expected_run_id: Option<String>,
     /// Put the message first; an agentiflow lead ends its round early.
     #[arg(long)]
     pub urgent: bool,
@@ -177,13 +180,16 @@ fn undelivered_line(u: &Undelivered) -> String {
 // ---- `send` -----------------------------------------------------------------
 
 fn send(global: &Path, args: &SendArgs, caps: rupu_fleet::BusCaps) -> anyhow::Result<String> {
+    if args.expected_run_id.is_some() && args.to.is_none() {
+        anyhow::bail!("expected_run_id requires an explicit recipient (--to)");
+    }
     let root = resolve_root(global, &args.id)?;
     let to = match &args.to {
         Some(to) => Address::parse(to)?,
         None => root.default_recipient(),
     };
     let msg = OperatorMessage {
-        expected_run_id: None,
+        expected_run_id: args.expected_run_id.clone(),
         to: to.clone(),
         body: args.text.join(" "),
         urgent: args.urgent,
@@ -476,6 +482,8 @@ pub enum HelperAction {
         body: String,
         #[arg(long)]
         to: Option<String>,
+        #[arg(long, requires = "to")]
+        expected_run_id: Option<String>,
         #[arg(long)]
         urgent: bool,
         #[arg(long)]
@@ -550,9 +558,16 @@ fn helper(global: &Path, action: HelperAction) -> Result<serde_json::Value, Mess
             id,
             body,
             to,
+            expected_run_id,
             urgent,
             viewer,
         } => {
+            if expected_run_id.is_some() && to.is_none() {
+                return Err(MessageError::new(
+                    MessageErrorCode::Invalid,
+                    "expected_run_id requires an explicit recipient (--to)",
+                ));
+            }
             let root = MessageRoot::resolve(global, &id).map_err(|e| MessageError::from(&e))?;
             let to = match to {
                 Some(to) => Address::parse(&to).map_err(|e| invalid(&e))?,
@@ -560,7 +575,7 @@ fn helper(global: &Path, action: HelperAction) -> Result<serde_json::Value, Mess
             };
             let caps = messaging_caps(global).map_err(|e| internal(&e))?;
             let msg = OperatorMessage {
-                expected_run_id: None,
+                expected_run_id,
                 to,
                 body,
                 urgent,
@@ -613,6 +628,7 @@ mod tests {
         SendArgs {
             id: id.into(),
             to: to.map(str::to_string),
+            expected_run_id: None,
             urgent: false,
             text: text.iter().map(|t| t.to_string()).collect(),
         }
@@ -773,6 +789,122 @@ mod tests {
     }
 
     #[test]
+    fn expected_run_guard_reaches_both_cli_paths_and_requires_an_explicit_recipient() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = live_run(tmp.path(), ID);
+        let guarded = |to: Option<&str>, expected: &str| HelperAction::Send {
+            id: ID.into(),
+            body: "guarded".into(),
+            to: to.map(str::to_string),
+            expected_run_id: Some(expected.into()),
+            urgent: true,
+            viewer: None,
+        };
+        let current = format!("{ID}_a");
+        assert_eq!(
+            helper(tmp.path(), guarded(Some("lynx#1"), "sub_stale"))
+                .unwrap_err()
+                .code,
+            MessageErrorCode::NotLive
+        );
+        assert_eq!(
+            helper(tmp.path(), guarded(None, &current))
+                .unwrap_err()
+                .code,
+            MessageErrorCode::Invalid
+        );
+        assert!(!bus.log_path().exists());
+        assert!(bus.mailbox.drain("lynx#1").unwrap().is_empty());
+        helper(tmp.path(), guarded(Some("lynx#1"), &current)).unwrap();
+        assert_eq!(bus.mailbox.drain("lynx#1").unwrap().len(), 1);
+
+        let mut public = args(ID, Some("lynx#1"), &["guarded"]);
+        public.expected_run_id = Some("sub_stale".into());
+        assert!(send(tmp.path(), &public, Default::default()).is_err());
+        public.expected_run_id = Some(current);
+        public.to = None;
+        assert!(send(tmp.path(), &public, Default::default())
+            .unwrap_err()
+            .to_string()
+            .contains("explicit recipient"));
+        assert_eq!(bus.read_log(None, usize::MAX).unwrap().lines.len(), 1);
+        public.to = Some("lynx#1".into());
+        send(tmp.path(), &public, Default::default()).unwrap();
+        assert_eq!(bus.mailbox.drain("lynx#1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expected_run_parser_requires_to_and_preserves_the_condition() {
+        use clap::Parser;
+        for command in [
+            vec![
+                "rupu",
+                "message",
+                "send",
+                ID,
+                "--expected-run-id=sub_exact",
+                "hello",
+            ],
+            vec![
+                "rupu",
+                "__message",
+                "send",
+                ID,
+                "--expected-run-id=sub_exact",
+                "--body=hello",
+            ],
+        ] {
+            assert!(crate::Cli::try_parse_from(command).is_err());
+        }
+        let parsed = crate::Cli::try_parse_from([
+            "rupu",
+            "message",
+            "send",
+            ID,
+            "--to=lynx#1",
+            "--expected-run-id=sub_exact",
+            "hello",
+        ])
+        .unwrap();
+        let crate::Cmd::Message {
+            action: Action::Send(args),
+        } = parsed.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(args.expected_run_id.as_deref(), Some("sub_exact"));
+        let argv = crate::Cli::try_parse_from(std::iter::once("rupu".to_owned()).chain(
+            rupu_cp::host::ssh::message_send_argv(
+                ID,
+                &rupu_cp::host::connector::OperatorMessageRequest {
+                    expected_run_id: Some("sub_exact".into()),
+                    to: Some("lynx#1".into()),
+                    body: "-it's \"quoted\"\n$HOME".into(),
+                    urgent: true,
+                    viewer: None,
+                    client: None,
+                },
+            ),
+        ))
+        .unwrap();
+        let crate::Cmd::MessageHelper {
+            action:
+                HelperAction::Send {
+                    expected_run_id,
+                    to,
+                    body,
+                    ..
+                },
+        } = argv.command
+        else {
+            panic!("wrong helper")
+        };
+        assert_eq!(expected_run_id.as_deref(), Some("sub_exact"));
+        assert_eq!(to.as_deref(), Some("lynx#1"));
+        assert_eq!(body, "-it's \"quoted\"\n$HOME");
+    }
+
+    #[test]
     fn the_helper_sends_lists_and_answers_failures_with_a_code() {
         let tmp = tempfile::tempdir().unwrap();
         let g = tmp.path();
@@ -783,6 +915,7 @@ mod tests {
                 id: ID.into(),
                 body: "-hi".into(),
                 to: Some("step:scan".into()),
+                expected_run_id: None,
                 urgent: true,
                 viewer: Some("matt".into()),
             },
@@ -814,6 +947,7 @@ mod tests {
             id: id.into(),
             body: body.into(),
             to: to.map(str::to_string),
+            expected_run_id: None,
             urgent: false,
             viewer: None,
         };
