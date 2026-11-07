@@ -8899,9 +8899,9 @@ fn write_session_live_usage(
     let dir = session_dir(global, scope, &record.session_id);
     fs::create_dir_all(&dir)?;
     let path = session_live_usage_path(global, scope, &record.session_id);
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(record)?)?;
-    fs::rename(&tmp, &path)?;
+    let tmp = tempfile::NamedTempFile::new_in(&dir)?;
+    fs::write(tmp.path(), serde_json::to_vec_pretty(record)?)?;
+    tmp.persist(&path)?;
     Ok(())
 }
 
@@ -9072,7 +9072,9 @@ fn write_session(
     let dir = session_dir(global, scope, &session.session_id);
     fs::create_dir_all(&dir)?;
     let path = session_record_path(global, scope, &session.session_id);
-    let tmp = path.with_extension("tmp");
+    // A worker and an operator command can save concurrently. Each writer must
+    // own its temporary file so another writer cannot rename it away.
+    let tmp = tempfile::NamedTempFile::new_in(&dir)?;
     let version = session.written_version();
     let bytes = if session.version == version {
         serde_json::to_vec_pretty(session)?
@@ -9082,8 +9084,8 @@ fn write_session(
             ..session.clone()
         })?
     };
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, &path)?;
+    fs::write(tmp.path(), bytes)?;
+    tmp.persist(&path)?;
     Ok(())
 }
 
@@ -9316,6 +9318,35 @@ mod tests {
     use super::*;
     use clap::Parser;
     use rupu_providers::model_tier::ThinkingLevel;
+
+    #[test]
+    fn concurrent_session_writes_publish_complete_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let global = tmp.path();
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let mut record = test_session_record();
+                    record.session_id = "ses_concurrent".into();
+                    record.last_error = Some(format!("writer {writer}"));
+                    barrier.wait();
+                    for _ in 0..30 {
+                        write_session(global, SessionScope::Active, &record).unwrap();
+                        let (saved, _) = read_session(global, &record.session_id).unwrap();
+                        assert!(saved.last_error.unwrap().starts_with("writer "));
+                    }
+                });
+            }
+        });
+        let dir = session_dir(tmp.path(), SessionScope::Active, "ses_concurrent");
+        assert_eq!(
+            fs::read_dir(dir).unwrap().count(),
+            1,
+            "no temporary files remain"
+        );
+    }
 
     /// Write a session whose runs point at transcripts carrying `usage`
     /// events, and return `(global_dir, session_id)`.
