@@ -752,6 +752,10 @@ async fn delete_workflow(
 /// bodyless POST launches the workflow with no inputs in its default mode.
 #[derive(Deserialize, Default, schemars::JsonSchema)]
 pub(crate) struct LaunchBody {
+    /// Associate this exact-revision operator launch with its actual session.
+    /// This does not create an agent turn or dispatch-parent relationship.
+    #[serde(default)]
+    session_id: Option<String>,
     /// Guarded launches may execute a global definition in this registered project.
     #[serde(default)]
     workspace_id: Option<String>,
@@ -927,7 +931,7 @@ async fn launch_run(
     let engagement_profiles =
         crate::api::agents::parse_engagement_profiles(std::mem::take(&mut b.engagement_profiles))?;
     if host != "local" {
-        if b.expected_revision.is_some() || b.workspace_id.is_some() {
+        if b.expected_revision.is_some() || b.workspace_id.is_some() || b.session_id.is_some() {
             return Err(ApiError::not_available("revision-guarded workflow launch is local-only; connect directly to the owning HTTP control plane"));
         }
         // Remote: scope fields, if present, are silently ignored — see this
@@ -1007,6 +1011,29 @@ async fn launch_run(
         .launcher
         .as_ref()
         .ok_or_else(|| ApiError::not_available("launching runs requires `rupu cp serve`"))?;
+    if let Some(session_id) = b.session_id.as_deref() {
+        if b.target.is_some() {
+            return Err(ApiError::bad_request(
+                "session workflow cannot override its execution target",
+            ));
+        }
+        if b.expected_revision.is_none() || b.scope_kind.is_none() || b.workspace_id.is_none() {
+            return Err(ApiError::bad_request(
+                "session_id requires expected_revision, explicit source scope and workspace_id",
+            ));
+        }
+        if !launcher.supports_session_workflows() {
+            return Err(ApiError::not_available(
+                "this launcher does not support session workflow links",
+            ));
+        }
+        super::session_workflows::validate_attachment(
+            &s,
+            session_id,
+            b.workspace_id.as_deref().unwrap(),
+            std::path::Path::new(b.working_dir.as_deref().unwrap()),
+        )?;
+    }
     let pinned_file = if let Some(expected) = b.expected_revision.as_deref() {
         let kind = b
             .scope_kind
@@ -1082,12 +1109,40 @@ async fn launch_run(
         target: b.target,
         working_dir: b.working_dir,
     };
-    match launcher.launch(req).await {
+    let association = if let Some(session_id) = b.session_id.as_deref() {
+        Some(
+            super::session_workflows::launch(
+                &s,
+                launcher.as_ref(),
+                session_id,
+                execution_workspace.as_deref().unwrap(),
+                super::session_workflows::Source {
+                    scope_kind: b.scope_kind.clone().unwrap(),
+                    scope_id: b.scope_id.clone(),
+                    revision: b.expected_revision.clone().unwrap(),
+                },
+                req.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let result = match &association {
+        Some(link) => Ok(link.run_id.clone()),
+        None => launcher.launch(req).await,
+    };
+    match result {
         Ok(run_id) => {
             let mut reply = serde_json::json!({ "run_id": run_id, "host_id": "local" });
             if let Some(source) = source {
                 reply["source"] = source;
                 reply["workspace_id"] = serde_json::json!(execution_workspace);
+            }
+            if let Some(association) = association {
+                reply["session_id"] = serde_json::json!(association.session_id);
+                reply["association"] = serde_json::to_value(association)
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
             }
             Ok(Json(reply))
         }
@@ -1206,6 +1261,7 @@ mod tests {
         let mut inputs = std::collections::BTreeMap::new();
         inputs.insert("repo".to_string(), "acme/widgets".to_string());
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1239,6 +1295,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1291,6 +1348,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1332,6 +1390,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1366,6 +1425,7 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1400,6 +1460,7 @@ mod tests {
         let s = test_state(&tmp).with_launcher(Some(mock.clone()));
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1447,6 +1508,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1489,6 +1551,7 @@ mod tests {
         std::fs::write(workflows_dir(&s).join("nightly.yaml"), VALID_NIGHTLY_YAML).unwrap();
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1526,6 +1589,7 @@ mod tests {
         register_workspace(&tmp, "ws_a", proj.path());
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -1564,6 +1628,7 @@ mod tests {
             .expect("add_host should succeed");
 
         let body = LaunchBody {
+            session_id: None,
             workspace_id: None,
             expected_revision: None,
             engagement_profiles: Vec::new(),
@@ -3141,4 +3206,5 @@ mod tests {
         assert!(mock.last.lock().unwrap().is_none());
         assert!(!yaml_launch_dir(&s).exists());
     }
+    include!("workflow_session_link_tests.rs");
 }

@@ -5,7 +5,7 @@
 //! (and passed via `--run-id`) so the web UI can navigate to the run
 //! immediately.
 
-use rupu_cp::launcher::{LaunchError, LaunchRequest, RetryRequest, RunLauncher};
+use rupu_cp::launcher::{LaunchError, LaunchRequest, LaunchWatch, RetryRequest, RunLauncher};
 use rupu_runtime::argv::RunArgv;
 use rupu_runtime::spawn::{spawn_detached, SpawnSpec, SpawnStdio};
 use std::path::PathBuf;
@@ -37,6 +37,44 @@ impl RunLauncher for SubprocessLauncher {
         spawn_detached(spawn_spec(&self.exe, &req, &run_id)?)
             .map_err(|e| LaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
+    }
+
+    fn supports_session_workflows(&self) -> bool {
+        true
+    }
+
+    async fn launch_identified(
+        &self,
+        req: LaunchRequest,
+        run_id: &str,
+        watch: LaunchWatch,
+    ) -> Result<(), LaunchError> {
+        let mut spec = spawn_spec(&self.exe, &req, run_id)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options
+            .open(&watch.stderr)
+            .map_err(|e| LaunchError::Spawn(e.to_string()))?;
+        spec.stdio = SpawnStdio::Log(watch.stderr);
+        spec.keep_child = true;
+        let mut spawned = spawn_detached(spec).map_err(|e| LaunchError::Spawn(e.to_string()))?;
+        let mut child = spawned.child.take().expect("requested retained child");
+        let callback = watch.on_exit;
+        let failed = callback.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("session-workflow-{}", spawned.pid))
+            .spawn(move || {
+                callback(child.wait().map_err(|e| e.to_string()));
+            })
+        {
+            failed(Err(format!("could not observe workflow process: {error}")));
+        }
+        Ok(())
     }
 
     /// `rupu workflow resume <id> [--restart-interrupted]`, detached like a
@@ -181,5 +219,47 @@ mod tests {
             spawn_spec("/bin/rupu".as_ref(), &req, "run_X"),
             Err(LaunchError::Invalid(_))
         ));
+    }
+    #[tokio::test]
+    async fn session_workflow_child_exit_reports_reserved_identity_and_startup_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("early-exit");
+        std::fs::write(&executable, "#!/bin/sh\nprintf '%s\\n' \"$@\" >&2\nprintf 'invalid startup fixture\\n' >&2\nexit 7\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let stderr = temp.path().join("startup.log");
+        let adapter = SubprocessLauncher { exe: executable };
+        adapter
+            .launch_identified(
+                LaunchRequest {
+                    workflow: "demo".into(),
+                    ..Default::default()
+                },
+                "run_reserved",
+                LaunchWatch {
+                    stderr: stderr.clone(),
+                    on_exit: std::sync::Arc::new(move |result| {
+                        sender.send(result).unwrap();
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        let result = tokio::task::spawn_blocking(move || {
+            receiver.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.code(), Some(7));
+        let log = std::fs::read_to_string(&stderr).unwrap();
+        assert!(log.contains("--run-id\nrun_reserved\n"), "{log}");
+        assert!(log.contains("invalid startup fixture"));
+        assert_eq!(
+            std::fs::metadata(stderr).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
