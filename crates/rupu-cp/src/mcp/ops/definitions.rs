@@ -76,20 +76,20 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "workflows.get",
             Method::GET,
             "/api/workflows/:name",
-            "Read one workflow definition.\n\n`name` is the workflow's file stem. Returns `{workflow, yaml, usage, scope, scope_kind, scope_id}`: the parsed workflow, its raw YAML and its usage rollup.",
-        ),
+            "Read one workflow definition.\n\n`name` is the workflow's file stem. Returns `{workflow, yaml, usage, scope, scope_kind, scope_id, revision}`: the parsed workflow, its raw YAML and its usage rollup. Optional scope_kind/scope_id strictly select the definition layer.",
+        ).query::<ScopeQuery>(),
         op(
             "workflows.create",
             Method::POST,
             "/api/workflows",
-            "Create a new workflow definition in the global layer.\n\n`raw` is the whole `.yaml` file; the name comes from its `name:`. Returns the new workflow as `workflows.get` does. 400 if the file does not parse, 409 if a workflow of that name already exists in any layer.",
+            "Create a new workflow definition in the global layer or an explicitly selected project.\n\n`raw` is the whole `.yaml` file; the name comes from its `name:`. Returns the new workflow as `workflows.get` does. 400 if the file does not parse, 409 if the target already exists. `scope_kind: project` with `scope_id` selects the registered project; omitted scope preserves global creation.",
         )
-        .body::<workflows::WorkflowWriteBody>(),
+        .body::<workflows::WorkflowCreateBody>(),
         op(
             "workflows.save",
             Method::PUT,
             "/api/workflows/:name",
-            "Overwrite a workflow definition with a new file.\n\n`raw` is the whole `.yaml` file and its `name:` must equal `name`. `scope_kind` (global|project) with `scope_id` (the project's workspace id) picks the layer; without them the project-first match is overwritten, or a new global file is made. Returns the saved workflow as `workflows.get` does.",
+            "Overwrite a workflow definition with a new file.\n\n`raw` is the whole `.yaml` file and its `name:` must equal `name`. `scope_kind` (global|project) with `scope_id` (the project's workspace id) picks the layer; without them the project-first match is overwritten, or a new global file is made. Optional `expected_revision` requires explicit scope and returns 409 on stale content before writing. Returns the saved workflow as `workflows.get` does.",
         )
         .query::<ScopeQuery>()
         .body::<workflows::WorkflowWriteBody>(),
