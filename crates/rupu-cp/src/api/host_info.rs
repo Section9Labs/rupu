@@ -68,6 +68,7 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             features.push("project.scm_context.v1".to_string());
             features.push("workflow.session_history".to_string());
             features.push(super::session_capabilities::FEATURE.to_string());
+            features.push(super::attempt_history::CAPABILITY.to_string());
             if s.launcher.is_some() {
                 features.push("workflow.session_attach".to_string());
             }
