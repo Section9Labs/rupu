@@ -136,6 +136,7 @@
   "runs.archive",
   "runs.archived",
   "runs.ast",
+  "runs.attempts",
   "runs.autoflow",
   "runs.board",
   "runs.cancel",

@@ -16,6 +16,12 @@ The workflow graph groups logical step/unit slots. The children view collapses c
 
 `GET /api/runs/:id/attempts?host=local&step_id=...&unit_index=...&sub_id=...&limit=50&cursor=...`
 
+The read-only MCP operator tool `runs.attempts` calls this same route. Its
+required `id` and optional `host`, `step_id`, `unit_index`, `sub_id`, `limit`,
+and `cursor` arguments use the handler's query schema. It has no execution
+or external-network side effects; all ownership, filter, and cursor checks
+remain in the API handler.
+
 - Feature: `workflow.attempt_history.v1` in `GET /api/host/info.features`.
 - Version 1 serves the directly connected host's active/archive RunStore. An explicit non-local host returns 501 and requires a direct connection to that owner. No remote probing, mirror fallback, or inferred ownership.
 - Filters are optional, combined with AND, and must be repeated unchanged with a cursor. String filters contain 1–1024 bytes. The unit index is a nonnegative integer. Omitted optional filters match all values, including null.
