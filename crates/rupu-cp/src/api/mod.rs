@@ -2,6 +2,7 @@ pub mod agentiflow_defs;
 pub mod agentiflows;
 pub mod agents;
 pub mod assets;
+pub mod attempt_history;
 pub mod auth_status;
 pub mod autoflow_claims;
 pub mod autoflow_runs;
