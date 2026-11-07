@@ -152,6 +152,7 @@ async fn operator_reaches_any_participant() {
         root.operator_send(
             &g,
             OperatorMessage {
+                expected_run_id: None,
                 to: Address::parse("step:b").unwrap(),
                 body: BODY.into(),
                 urgent: false,

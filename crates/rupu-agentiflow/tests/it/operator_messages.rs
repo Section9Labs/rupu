@@ -87,6 +87,7 @@ fn send(global: &Path, id: &str, body: &str, urgent: bool) {
         .operator_send(
             global,
             OperatorMessage {
+                expected_run_id: None,
                 to: Address::Lead,
                 body: body.into(),
                 urgent,

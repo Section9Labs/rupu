@@ -383,6 +383,7 @@ fn a_failed_delivery_after_the_log_line_says_so() {
 
 fn operator(to: &str, body: &str, urgent: bool) -> OperatorMessage {
     OperatorMessage {
+        expected_run_id: None,
         to: Address::parse(to).unwrap(),
         body: body.into(),
         urgent,
@@ -905,4 +906,58 @@ fn an_end_matches_its_own_grant_not_the_owners_newer_one() {
         .unwrap();
     assert!(held.acquired_at >= released.acquired_at);
     drop(second);
+}
+
+#[test]
+fn expected_run_rejects_rebound_before_logging_or_delivery() {
+    let tmp = tempfile::tempdir().unwrap();
+    let recipient = joined(
+        tmp.path(),
+        "lynx#1",
+        member("review", "sub_old", None, None),
+    );
+    recipient
+        .join(member("review", "sub_new", None, None))
+        .unwrap();
+    let op = Bus::open(tmp.path(), address::OPERATOR);
+    let mut msg = operator("lynx#1", "review this", false);
+    msg.expected_run_id = Some("sub_old".into());
+    assert!(matches!(
+        op.operator_send(msg.clone()),
+        Err(FleetError::RecipientChanged)
+    ));
+    assert!(messages(&op).is_empty());
+    assert!(recipient.mailbox.drain("lynx#1").unwrap().is_empty());
+    msg.expected_run_id = Some("sub_new".into());
+    let receipt = op.operator_send(msg).unwrap();
+    assert_eq!(receipt.message.delivery.resolved, vec!["lynx#1"]);
+    assert_eq!(messages(&op).len(), 1);
+    assert_eq!(recipient.mailbox.drain("lynx#1").unwrap().len(), 1);
+}
+
+#[test]
+fn expected_run_rejects_groups_missing_and_departed_recipients() {
+    let tmp = tempfile::tempdir().unwrap();
+    let recipient = joined(
+        tmp.path(),
+        "lynx#1",
+        member("review", "sub_one", None, None),
+    );
+    let op = Bus::open(tmp.path(), address::OPERATOR);
+    for to in ["broadcast", "role:review", "missing"] {
+        let mut msg = operator(to, "no delivery", false);
+        msg.expected_run_id = Some("sub_one".into());
+        assert!(matches!(
+            op.operator_send(msg),
+            Err(FleetError::RecipientChanged)
+        ));
+    }
+    recipient.leave("done").unwrap();
+    let mut msg = operator("lynx#1", "no delivery", false);
+    msg.expected_run_id = Some("sub_one".into());
+    assert!(matches!(
+        op.operator_send(msg),
+        Err(FleetError::RecipientChanged)
+    ));
+    assert!(messages(&op).is_empty());
 }

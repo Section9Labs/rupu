@@ -99,6 +99,11 @@ pub(crate) struct HostQuery {
 /// The body of `POST …/messages`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PostBody {
+    /// Optional atomic enqueue precondition: `to` must be one exact live address
+    /// currently owned by this run. A mismatch is 409 without recording a message.
+    /// Requires the destination HTTP host feature `run.messages.expected_run`.
+    #[serde(default)]
+    pub expected_run_id: Option<String>,
     /// The recipient; the root's default (an agentiflow's lead, everyone
     /// elsewhere) when absent.
     #[serde(default)]
@@ -195,6 +200,7 @@ pub(crate) async fn post(
     // only: a remote host keeps its own attribution.
     let client = (remote(host).is_none() && via.is_some()).then(|| "mcp".to_string());
     let msg = OperatorMessageRequest {
+        expected_run_id: body.expected_run_id,
         to: body.to,
         body: body.body,
         urgent: body.urgent,

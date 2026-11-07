@@ -2,6 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum FleetError {
+    #[error(
+        "the recipient no longer names the expected live run; refresh the recipient before sending"
+    )]
+    RecipientChanged,
     #[error("fleet io error during {action}: {source}")]
     Io {
         action: String,

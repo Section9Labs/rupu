@@ -1709,6 +1709,7 @@ mod tests {
     fn operator_send(dir: &std::path::Path, to: Address, body: &str, urgent: bool) -> String {
         Bus::open(dir, address::OPERATOR)
             .operator_send(rupu_fleet::OperatorMessage {
+                expected_run_id: None,
                 to,
                 body: body.into(),
                 urgent,
