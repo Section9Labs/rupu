@@ -15,7 +15,7 @@ fn args(extra: &[&str]) -> StartArgs {
     match crate::Cli::try_parse_from(argv).unwrap().command {
         crate::Cmd::Session {
             action: Action::Start(args),
-        } => args,
+        } => *args,
         _ => panic!("expected session start"),
     }
 }
@@ -163,7 +163,7 @@ fn idle_args(extra: &[&str]) -> Result<StartArgs, clap::Error> {
     match crate::Cli::try_parse_from(argv)?.command {
         crate::Cmd::Session {
             action: Action::Start(args),
-        } => Ok(args),
+        } => Ok(*args),
         _ => panic!("expected session start"),
     }
 }

@@ -23,7 +23,7 @@ fn args(extra: &[&str]) -> StartArgs {
     match crate::Cli::try_parse_from(argv).unwrap().command {
         crate::Cmd::Session {
             action: Action::Start(args),
-        } => args,
+        } => *args,
         _ => panic!("expected session start"),
     }
 }

@@ -71,7 +71,7 @@ use ulid::Ulid;
 #[derive(Subcommand, Debug)]
 pub enum Action {
     /// Start a persistent agent session.
-    Start(StartArgs),
+    Start(Box<StartArgs>),
     /// List persistent agent sessions.
     List(ListArgs),
     /// Show session details.
@@ -1008,7 +1008,7 @@ pub async fn handle(
     all_columns: bool,
 ) -> ExitCode {
     let result = match action {
-        Action::Start(args) => start(args).await,
+        Action::Start(args) => start(*args).await,
         Action::List(args) => list(args, global_format, absolute, all_columns).await,
         Action::Show {
             session_id,
@@ -12388,8 +12388,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            queued["version"], 3,
-            "older workers must refuse configured turns"
+            queued["version"], 4,
+            "older workers must refuse turns with settings and orchestration revisions"
         );
         with_mock_home(
             &global,

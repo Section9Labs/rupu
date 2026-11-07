@@ -43,7 +43,7 @@ This is **illustrative JSON**, not a captured runtime or UI acceptance result:
         "name": "rupu-session-operations",
         "layer": "global",
         "preload": true,
-        "indexed": true,
+        "indexed": false,
         "reason": "session",
         "stamp": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -84,7 +84,8 @@ preload: only `global:rupu-session-operations` when eligible and not already
 explicitly selected. Clients must accept an absent `preload_defaults` as an
 empty list for compatibility with earlier v1 responses. The frozen
 `selected` entries remain authoritative for each skill's actual `preload`
-flag and optional `content_hash`. With `skill_preset=none`, both default lists
+flag and optional `content_hash`. Preloaded skills have `indexed: false` because
+their instructions are already present in the prompt. With `skill_preset=none`, both default lists
 are empty.
 
 ## Existing session response
