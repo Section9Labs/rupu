@@ -73,7 +73,7 @@ fn assert_unstarted(global: &Path, record: &SessionRecord) {
 }
 
 #[tokio::test]
-async fn builtin_start_freezes_actual_installed_defaults_without_preloading_or_all_grants() {
+async fn builtin_start_freezes_installed_defaults_and_preloads_only_operations() {
     let (_temp, global, project) = fixture();
     install_preset(&global);
     install(&global, "unrelated");
@@ -92,16 +92,20 @@ async fn builtin_start_freezes_actual_installed_defaults_without_preloading_or_a
     assert_eq!(preset.id, PRESET_ID);
     assert_eq!(preset.version, PRESET_VERSION);
     assert!(record.skill_index.iter().all(|skill| {
+        let operations = skill.name == "rupu-session-operations";
         skill.layer == Layer::Global
-            && skill.indexed
-            && !skill.preload
-            && skill.content_hash.is_none()
+            && skill.indexed != operations
+            && skill.preload == operations
+            && skill.content_hash.is_some() == operations
             && rupu_skills::Stamp::from_hex(&skill.stamp).is_some()
     }));
     let prompt = record.skill_prompt.as_deref().unwrap();
     assert!(prompt.contains("rupu-session-operations"));
     assert!(!prompt.contains("unrelated"));
-    assert!(!prompt.contains("PRIVATE_FIXTURE_BODY_"));
+    assert!(prompt.contains("PRIVATE_FIXTURE_BODY_rupu-session-operations"));
+    for indexed in ["coverage-assets", "finding-report", "work-units"] {
+        assert!(!prompt.contains(&format!("PRIVATE_FIXTURE_BODY_{indexed}")));
+    }
     assert_unstarted(&global, &record);
     assert!(!session_dir(&global, SessionScope::Active, &record.session_id).exists());
 }
@@ -114,6 +118,8 @@ async fn builtin_start_skips_absent_optional_preset_members() {
         .await
         .unwrap();
     assert_eq!(selections(&record), vec!["global:rupu-session-operations"]);
+    assert!(record.skill_index[0].preload);
+    assert!(record.skill_index[0].content_hash.is_some());
     assert!(record.skill_preset.as_ref().unwrap().enabled);
     assert_eq!(record.skill_preset_diagnostics.len(), 3);
     assert!(record
@@ -161,6 +167,7 @@ async fn explicit_project_skill_replaces_same_name_default_without_hiding_ambigu
         .await
         .unwrap();
     assert_eq!(selections(&default), vec!["global:rupu-session-operations"]);
+    assert!(default.skill_index[0].preload);
     let (explicit, _) = prepare_start(
         &args(&["--skill", "project:rupu-session-operations"]),
         global.clone(),
@@ -172,6 +179,14 @@ async fn explicit_project_skill_replaces_same_name_default_without_hiding_ambigu
         selections(&explicit),
         vec!["project:rupu-session-operations"]
     );
+    assert!(explicit.skill_index[0].indexed);
+    assert!(!explicit.skill_index[0].preload);
+    assert!(explicit.skill_index[0].content_hash.is_none());
+    assert!(!explicit
+        .skill_prompt
+        .as_deref()
+        .unwrap()
+        .contains("PRIVATE_FIXTURE_BODY_"));
     let ambiguous = prepare_start(
         &args(&["--skill", "rupu-session-operations"]),
         global.clone(),
@@ -190,6 +205,8 @@ async fn persisted_session_does_not_expand_when_more_preset_skills_are_installed
     let (record, _) = prepare_start(&args(&[]), global.clone(), project)
         .await
         .unwrap();
+    assert!(record.skill_index[0].preload);
+    assert!(record.skill_index[0].content_hash.is_some());
     write_session(&global, SessionScope::Active, &record).unwrap();
     install_preset(&global);
     install(&global, "unrelated");

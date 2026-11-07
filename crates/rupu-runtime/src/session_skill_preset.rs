@@ -51,14 +51,19 @@ pub struct SkillPlan {
     pub preset: PresetMetadata,
     /// The actual combined explicit, preload, and preset selections.
     pub selected: Vec<FrozenSkill>,
-    /// Qualified preset additions only; these never contain a wildcard or preload.
+    /// All qualified preset grant additions; these never contain a wildcard.
     pub defaults: Vec<String>,
+    /// Default additions whose bodies should accompany the first turn.
+    /// Only the operations instructions are preloaded; the others stay indexed.
+    #[serde(default)]
+    pub preload_defaults: Vec<String>,
     pub diagnostics: Vec<SkillDiagnostic>,
 }
 
 impl SkillPlan {
     /// Add these defaults to the original explicit grants before the existing
-    /// session freeze. The caller must also retain its original preload grants.
+    /// session freeze. Also merge `preload_defaults` with the original preload
+    /// grants so operations instructions are present without a model load.
     pub fn selection(&self) -> Vec<String> {
         self.defaults.clone()
     }
@@ -93,6 +98,7 @@ pub fn plan(
         },
         selected: Vec::new(),
         defaults: Vec::new(),
+        preload_defaults: Vec::new(),
         diagnostics: Vec::new(),
     };
     // Match the existing no-skills path: an opted-out, empty request need
@@ -140,7 +146,19 @@ pub fn plan(
                             format!("optional preset skill {qualified} disables model invocation"),
                         ));
                     }
-                    Ok(_) => out.defaults.push(qualified.into()),
+                    Ok(skill) => {
+                        if qualified == "global:rupu-session-operations" {
+                            if let Err(error) = skill.content_hash() {
+                                out.diagnostics.push(diagnostic(
+                                    SkillDiagnosticCode::Invalid,
+                                    format!("optional preset skill {qualified} cannot be preloaded: {error}"),
+                                ));
+                                continue;
+                            }
+                            out.preload_defaults.push(qualified.into());
+                        }
+                        out.defaults.push(qualified.into());
+                    }
                 },
             }
         }
@@ -156,7 +174,7 @@ pub fn plan(
             SkillRequest {
                 reason: SkillReason::Session,
                 grants: &out.defaults,
-                preload: &[],
+                preload: &out.preload_defaults,
             },
         ],
     )?
@@ -302,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn preset_selects_only_exact_global_members_and_never_preloads() {
+    fn preset_selects_exact_members_and_preloads_only_operations() {
         let temp = tempfile::tempdir().unwrap();
         let dirs = dirs(temp.path());
         let global = dirs.global.as_deref().unwrap();
@@ -320,10 +338,17 @@ mod tests {
         assert_eq!(plan.selection(), strings(PRESET_ENTRIES));
         assert_eq!(plan.selected.len(), 4);
         assert!(plan.selection().iter().all(|entry| !entry.contains('*')));
-        assert!(plan
-            .selected
-            .iter()
-            .all(|skill| { skill.layer == Layer::Global && skill.indexed && !skill.preload }));
+        assert_eq!(
+            plan.preload_defaults,
+            strings(&["global:rupu-session-operations"])
+        );
+        assert!(plan.selected.iter().all(|skill| {
+            let operations = skill.name == "rupu-session-operations";
+            skill.layer == Layer::Global
+                && skill.preload == operations
+                && skill.indexed != operations
+                && skill.content_hash.is_some() == operations
+        }));
         assert!(plan.diagnostics.is_empty());
         assert_eq!(
             serde_json::from_str::<SkillPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
@@ -337,6 +362,7 @@ mod tests {
         let dirs = dirs(temp.path());
         let planned = plan(&dirs, true, &[], &[]).unwrap();
         assert!(planned.selected.is_empty());
+        assert!(planned.preload_defaults.is_empty());
         assert_eq!(planned.diagnostics.len(), PRESET_ENTRIES.len());
         assert!(planned
             .diagnostics
@@ -345,6 +371,7 @@ mod tests {
         let disabled = plan(&dirs, false, &[], &[]).unwrap();
         assert!(!disabled.preset.enabled);
         assert!(disabled.selection().is_empty());
+        assert!(disabled.preload_defaults.is_empty());
         assert!(disabled.diagnostics.is_empty());
         assert!(frozen(&dirs, &planned.selected).ready);
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
@@ -397,6 +424,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_operations_selections_keep_the_requested_preload_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let dirs = dirs(temp.path());
+        for root in [
+            dirs.global.as_deref().unwrap(),
+            dirs.project.as_deref().unwrap(),
+        ] {
+            install(root, "rupu-session-operations", "");
+        }
+        for entry in [
+            "global:rupu-session-operations",
+            "project:rupu-session-operations",
+        ] {
+            let entries = strings(&[entry]);
+            let indexed = plan(&dirs, true, &entries, &[]).unwrap();
+            assert!(indexed.defaults.is_empty());
+            assert!(indexed.preload_defaults.is_empty());
+            assert_eq!(indexed.selected.len(), 1);
+            assert!(indexed.selected[0].indexed);
+            assert!(!indexed.selected[0].preload);
+            assert!(indexed.selected[0].content_hash.is_none());
+            let preloaded = plan(&dirs, true, &[], &entries).unwrap();
+            assert!(preloaded.defaults.is_empty());
+            assert!(preloaded.preload_defaults.is_empty());
+            assert_eq!(preloaded.selected.len(), 1);
+            assert!(preloaded.selected[0].preload);
+            assert!(!preloaded.selected[0].indexed);
+            assert!(preloaded.selected[0].content_hash.is_some());
+        }
+    }
+
+    #[test]
     fn project_only_installation_is_not_an_implicit_fallback() {
         let temp = tempfile::tempdir().unwrap();
         let dirs = dirs(temp.path());
@@ -407,6 +466,7 @@ mod tests {
         );
         let planned = plan(&dirs, true, &[], &[]).unwrap();
         assert!(planned.selected.is_empty());
+        assert!(planned.preload_defaults.is_empty());
         assert!(planned.diagnostics.iter().any(|diagnostic| {
             diagnostic.entry.as_deref() == Some("global:rupu-session-operations")
                 && diagnostic.code == SkillDiagnosticCode::NotInstalled
@@ -432,6 +492,7 @@ mod tests {
         install(global, "coverage-assets", "");
         let planned = plan(&dirs, true, &[], &[]).unwrap();
         install(global, "work-units", "");
+        install(global, "rupu-session-operations", "");
         let source = global.join("coverage-assets/SKILL.md");
         let before_bytes = fs::read(&source).unwrap();
         let before_modified = fs::metadata(&source).unwrap().modified().unwrap();

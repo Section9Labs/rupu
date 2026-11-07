@@ -173,6 +173,7 @@ async fn planning_is_readonly_explicit_and_unassembled_on_a_readonly_deployment(
             response["skills"]["defaults"],
             json!(["global:coverage-assets"])
         );
+        assert_eq!(response["skills"]["preload_defaults"], json!([]));
         assert_eq!(response["skills"]["selected"].as_array().unwrap().len(), 1);
         assert_eq!(
             response["declared_tools"],
@@ -195,6 +196,8 @@ async fn planning_opt_out_and_missing_skills_do_not_initialize_state() {
     let (status, response) = get(state.clone(), &path).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["skills"]["selected"], json!([]));
+    assert_eq!(response["skills"]["defaults"], json!([]));
+    assert_eq!(response["skills"]["preload_defaults"], json!([]));
     assert_eq!(
         response["skills"]["diagnostics"].as_array().unwrap().len(),
         4
@@ -202,7 +205,65 @@ async fn planning_opt_out_and_missing_skills_do_not_initialize_state() {
     let (status, response) = get(state, &format!("{path}?skill_preset=none")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["preset"]["enabled"], false);
+    assert_eq!(response["skills"]["selected"], json!([]));
+    assert_eq!(response["skills"]["defaults"], json!([]));
+    assert_eq!(response["skills"]["preload_defaults"], json!([]));
     assert_eq!(response["skills"]["diagnostics"], json!([]));
+    assert_eq!(tree(tmp.path()), before);
+}
+
+#[tokio::test]
+async fn planning_preloads_only_operating_instructions_without_granting_tools() {
+    let (tmp, state, workspace) = fixture();
+    for name in [
+        "coverage-assets",
+        "finding-report",
+        "rupu-session-operations",
+        "work-units",
+    ] {
+        install(&state.global_dir, name);
+    }
+    let before = tree(tmp.path());
+    let path = format!("/api/projects/{workspace}/session-capabilities");
+    let (status, response) = get(state.clone(), &path).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["skills"]["defaults"],
+        json!([
+            "global:coverage-assets",
+            "global:finding-report",
+            "global:rupu-session-operations",
+            "global:work-units"
+        ])
+    );
+    assert_eq!(
+        response["skills"]["preload_defaults"],
+        json!(["global:rupu-session-operations"])
+    );
+    let selected = response["skills"]["selected"].as_array().unwrap();
+    assert_eq!(selected.len(), 4);
+    for skill in selected {
+        assert_eq!(skill["indexed"], true);
+        assert_eq!(skill["layer"], "global");
+        if skill["name"] == "rupu-session-operations" {
+            assert_eq!(skill["preload"], true);
+            assert_eq!(skill["content_hash"].as_str().unwrap().len(), 64);
+        } else {
+            assert_eq!(skill["preload"], false);
+            assert!(skill.get("content_hash").is_none());
+        }
+    }
+    assert_eq!(
+        response["declared_tools"],
+        json!(rupu_agent::builtin::session_agent().tools)
+    );
+    assert!(response["effective"].is_null());
+    let (status, disabled) = get(state, &format!("{path}?skill_preset=none")).await;
+    assert_eq!(status, StatusCode::OK, "{disabled}");
+    assert_eq!(disabled["skills"]["selected"], json!([]));
+    assert_eq!(disabled["skills"]["defaults"], json!([]));
+    assert_eq!(disabled["skills"]["preload_defaults"], json!([]));
+    assert_eq!(disabled["declared_tools"], response["declared_tools"]);
     assert_eq!(tree(tmp.path()), before);
 }
 

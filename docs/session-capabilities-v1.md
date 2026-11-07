@@ -38,9 +38,19 @@ This is **illustrative JSON**, not a captured runtime or UI acceptance result:
         "indexed": true,
         "reason": "session",
         "stamp": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      },
+      {
+        "name": "rupu-session-operations",
+        "layer": "global",
+        "preload": true,
+        "indexed": true,
+        "reason": "session",
+        "stamp": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "content_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       }
     ],
-    "defaults": ["global:coverage-assets"],
+    "defaults": ["global:coverage-assets", "global:rupu-session-operations"],
+    "preload_defaults": ["global:rupu-session-operations"],
     "diagnostics": [
       {
         "entry": "global:finding-report",
@@ -62,8 +72,20 @@ The illustrative tool list, selected skills, and diagnostics are abbreviated.
 The actual tool list comes from `rupu_agent::builtin::session_agent().tools`.
 The exact preset members are `global:coverage-assets`, `global:finding-report`,
 `global:rupu-session-operations`, and `global:work-units`. Only installed,
-valid, model-loadable members are selected. Defaults never preload or add a
-tool grant. The response uses `effective: null` because no turn was assembled.
+valid, model-loadable members are selected. The operations skill is preloaded
+by default so its operating instructions are present from the first turn.
+The other three skill bodies stay indexed and load on demand, keeping their
+larger instructions out of the initial prompt. Skills never add tool grants.
+The response uses `effective: null` because no turn was assembled.
+
+`skills.defaults` contains every added preset grant, including the operations
+skill. The additive `skills.preload_defaults` field lists the subset to
+preload: only `global:rupu-session-operations` when eligible and not already
+explicitly selected. Clients must accept an absent `preload_defaults` as an
+empty list for compatibility with earlier v1 responses. The frozen
+`selected` entries remain authoritative for each skill's actual `preload`
+flag and optional `content_hash`. With `skill_preset=none`, both default lists
+are empty.
 
 ## Existing session response
 
@@ -224,7 +246,11 @@ The project-owned session creation body accepts optional `skill_preset`,
 `skill_preset` accepts `rupu-session-v1` (the default) or `none`. API skill
 entries must be exact qualified `global:name` or `project:name` selections;
 wildcards are rejected. `skills` selects indexed skills and `preload_skills`
-explicitly requests preload. These selections are frozen at creation. The
+explicitly requests preload. An explicit same-name selection preserves its
+own layer and preload flags; the preset does not upgrade an explicit indexed
+operations skill to preload. Opting out removes preset additions, including
+the default operations preload, while preserving explicit selections. These
+selections are frozen at creation. The
 capability planning GET has no explicit-selection query fields; its preview
 describes only the chosen default preset for the bundled harness.
 

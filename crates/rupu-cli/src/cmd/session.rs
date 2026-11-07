@@ -1466,15 +1466,17 @@ async fn prepare_start(
         None
     };
     let mut selected_skills = args.skills.clone();
+    let mut preload_skills = args.preload_skills.clone();
     if let Some(plan) = &skill_plan {
         selected_skills.extend(plan.selection());
+        preload_skills.extend(plan.preload_defaults.clone());
     }
     let (skill_index, skill_prompt) = freeze_session_skills(
         &global,
         project_root.as_deref(),
         &spec,
         selected_skills,
-        args.preload_skills.clone(),
+        preload_skills,
     )
     .await?;
 
