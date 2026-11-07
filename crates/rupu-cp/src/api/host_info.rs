@@ -65,6 +65,7 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
         features: {
             let mut features = crate::node::protocol::host_features();
             features.push("workflow.scoped_revision".to_string());
+            features.push("project.scm_context.v1".to_string());
             features.push("workflow.session_history".to_string());
             if s.launcher.is_some() {
                 features.push("workflow.session_attach".to_string());
