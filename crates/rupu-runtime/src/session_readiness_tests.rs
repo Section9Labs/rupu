@@ -6,6 +6,8 @@ use rupu_tools::{
     Prompter, ToolContext, ToolServices,
 };
 
+// Explicitly test-only for the workspace's source-level assembly guard.
+#[cfg(test)]
 fn options(services: ToolServices, permission: PermissionPolicy) -> AgentRunOpts {
     let mut context = ToolContext::default();
     context.identity_mut().run_id = "run_readiness".into();

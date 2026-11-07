@@ -8,6 +8,10 @@ does not provide equivalent evidence through an inferred tool list.
 
 ## Project planning response
 
+The MCP operator tools `projects.session_capabilities` and
+`sessions.capabilities` call these same read-only routes and accept their
+query arguments. They neither assemble turns nor bypass the local-owner checks.
+
 `GET /api/projects/:id/session-capabilities?host=local&skill_preset=rupu-session-v1`
 
 `host` may be omitted or `local`. `skill_preset` may be omitted (the default

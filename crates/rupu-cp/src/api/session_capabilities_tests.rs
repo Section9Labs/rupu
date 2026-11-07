@@ -9,6 +9,63 @@ use tower::ServiceExt;
 
 const SESSION: &str = "ses_capabilities";
 
+#[tokio::test]
+async fn mcp_capabilities_use_the_same_readonly_routes_and_forward_query_guards() {
+    use rupu_mcp::{CallCx, ToolResult, ToolSource};
+
+    let (tmp, state, workspace) = fixture();
+    install(&state.global_dir, "rupu-session-operations");
+    let before = tree(tmp.path());
+    let source = crate::mcp::operator_source::OperatorSource::new(crate::mcp::guarded(
+        routes().with_state(state.clone()),
+    ));
+    for (name, id, path) in [
+        (
+            "projects.session_capabilities",
+            workspace.as_str(),
+            format!("/api/projects/{workspace}/session-capabilities?host=local&skill_preset=none"),
+        ),
+        (
+            "sessions.capabilities",
+            SESSION,
+            format!("/api/sessions/{SESSION}/capabilities?host=local"),
+        ),
+    ] {
+        let mut args = json!({"id": id, "host": "local"});
+        if name.starts_with("projects.") {
+            args["skill_preset"] = json!("none");
+        }
+        let result = source.call(name, args, &CallCx::default()).await.unwrap();
+        let ToolResult::Json(value) = result else {
+            panic!("{name}: {result:?}");
+        };
+        let (status, direct) = get(state.clone(), &path).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, direct);
+        assert!(value["effective"].is_null());
+
+        let refused = source
+            .call(
+                name,
+                json!({"id": id, "host": "remote"}),
+                &CallCx::default(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(refused, ToolResult::Error(_)), "{refused:?}");
+    }
+    let invalid = source
+        .call(
+            "projects.session_capabilities",
+            json!({"id": workspace, "skill_preset": "unknown"}),
+            &CallCx::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(invalid, ToolResult::Error(_)), "{invalid:?}");
+    assert_eq!(tree(tmp.path()), before);
+}
+
 struct NoLaunch;
 #[async_trait::async_trait]
 impl crate::launcher::RunLauncher for NoLaunch {

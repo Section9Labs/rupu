@@ -24,16 +24,19 @@ use std::{fs, path::PathBuf};
 
 pub(super) const FEATURE: &str = "session.capabilities.v1";
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct ProjectQuery {
+pub(crate) struct ProjectQuery {
+    /// Only the directly connected local instance is supported.
     host: Option<String>,
+    /// Use rupu-session-v1 (default), or none to inspect without defaults.
     skill_preset: Option<String>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-struct SessionQuery {
+pub(crate) struct SessionQuery {
+    /// Only the directly connected local instance is supported.
     host: Option<String>,
 }
 
