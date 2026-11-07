@@ -243,12 +243,13 @@ async fn planning_preloads_only_operating_instructions_without_granting_tools() 
     let selected = response["skills"]["selected"].as_array().unwrap();
     assert_eq!(selected.len(), 4);
     for skill in selected {
-        assert_eq!(skill["indexed"], true);
         assert_eq!(skill["layer"], "global");
         if skill["name"] == "rupu-session-operations" {
+            assert_eq!(skill["indexed"], false);
             assert_eq!(skill["preload"], true);
             assert_eq!(skill["content_hash"].as_str().unwrap().len(), 64);
         } else {
+            assert_eq!(skill["indexed"], true);
             assert_eq!(skill["preload"], false);
             assert!(skill.get("content_hash").is_none());
         }
