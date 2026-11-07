@@ -27,6 +27,8 @@ static READERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::
 #[derive(Default, Deserialize)]
 pub struct ContextQuery {
     pub host: Option<String>,
+    #[serde(default)]
+    pub include_review: bool,
 }
 
 pub async fn context(
@@ -35,6 +37,7 @@ pub async fn context(
     Query(q): Query<ContextQuery>,
 ) -> ApiResult<Json<Value>> {
     super::fleet::require_local(q.host.as_deref(), "project SCM context")?;
+    let reviews = s.repos.clone();
     // Do not queue an unbounded number of large repository scans. Timed-out
     // scans retain their permit until libgit2 returns; no detached scan storm.
     let permit = READERS.clone().try_acquire_owned().map_err(|_| {
@@ -48,9 +51,13 @@ pub async fn context(
         .load(&ws_id)
         .map_err(|_| ApiError::internal("unable to read project registration"))?
         .ok_or_else(|| ApiError::not_found("registered project not found"))?;
-        observe(&ws_id, FsPath::new(&workspace.path))
+        let config_path = s.global_dir.join("config.toml");
+        let hosts = rupu_config::resolve(rupu_config::LayerPaths::global_only(&config_path))
+            .map(|r| rupu_scm::weburl::WebHosts::from_scm(&r.config.scm))
+            .unwrap_or_default();
+        observe_with_hosts(&ws_id, FsPath::new(&workspace.path), &hosts)
     });
-    tokio::time::timeout(Duration::from_secs(10), task)
+    let mut value = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .map_err(|_| {
             ApiError(
@@ -58,11 +65,72 @@ pub async fn context(
                 "SCM observation deadline exceeded; no project files were changed".into(),
             )
         })?
-        .map_err(|_| ApiError::internal("SCM observation failed"))?
-        .map(Json)
+        .map_err(|_| ApiError::internal("SCM observation failed"))??;
+    if q.include_review {
+        value["pull_request"] = review_context(reviews, &value).await;
+    }
+    Ok(Json(value))
 }
 
+async fn review_context(port: Option<Arc<dyn crate::repos::RepoLister>>, value: &Value) -> Value {
+    let unavailable = |reason: &str| json!({"state":"unavailable","reason":reason,"reviews":[],"truncated":false});
+    let Some(port) = port else {
+        return unavailable("This control plane has no SCM review adapter");
+    };
+    let Some(branch) = value["branch"].as_str().filter(|b| !b.is_empty()) else {
+        return unavailable("The checkout has no current branch");
+    };
+    let Some(platform) = value["repository"]["forge"]
+        .as_str()
+        .and_then(|p| p.parse().ok())
+    else {
+        return unavailable("The checkout origin is not a recognized SCM repository");
+    };
+    let (Some(owner), Some(repo), Some(cwd)) = (
+        value["repository"]["owner"].as_str(),
+        value["repository"]["name"].as_str(),
+        value["checkout_path"].as_str(),
+    ) else {
+        return unavailable("Repository identity is unavailable");
+    };
+    let Some(origin_host) = value["repository"]["home_url"]
+        .as_str()
+        .and_then(|url| url::Url::parse(url).ok())
+        .and_then(|url| url.host_str().map(str::to_owned))
+    else {
+        return unavailable("Origin authority is unavailable");
+    };
+    let repo = rupu_scm::RepoRef {
+        platform,
+        owner: owner.into(),
+        repo: repo.into(),
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(15),
+        port.reviews(&repo, FsPath::new(cwd), branch, &origin_host),
+    )
+    .await
+    {
+        Ok(Ok(value)) => value,
+        // Upstream error bodies/URLs may contain server or account data. Keep
+        // failure explicit without forwarding transport diagnostics to clients.
+        Ok(Err(_)) => {
+            unavailable("Review query failed or no unambiguous authorized account is configured")
+        }
+        Err(_) => unavailable("Review query deadline exceeded; refresh to try again"),
+    }
+}
+
+#[cfg(test)]
 fn observe(ws_id: &str, path: &FsPath) -> ApiResult<Value> {
+    observe_with_hosts(ws_id, path, &rupu_scm::weburl::WebHosts::default())
+}
+
+fn observe_with_hosts(
+    ws_id: &str,
+    path: &FsPath,
+    hosts: &rupu_scm::weburl::WebHosts,
+) -> ApiResult<Value> {
     let path = path
         .canonicalize()
         .map_err(|_| ApiError::not_found("registered project directory is unavailable"))?;
@@ -105,7 +173,10 @@ fn observe(ws_id: &str, path: &FsPath) -> ApiResult<Value> {
     // Emit only parsed known-forge identity, never a raw origin URL (which may
     // contain credentials). Unknown forges remain unknown rather than guessed.
     if let Ok(remote) = repo.find_remote("origin") {
-        if let Some(web) = remote.url().and_then(rupu_scm::weburl::parse_repo_remote) {
+        if let Some(web) = remote
+            .url()
+            .and_then(|url| rupu_scm::weburl::parse_repo_remote_with(url, hosts))
+        {
             let url = web.home_url();
             if safe_web_identity(&url) {
                 result["repository"] = json!({"forge":web.platform.to_string(),"home_url":url,"owner":web.owner,"name":web.repo});
@@ -234,6 +305,65 @@ fn worktree_status(s: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct ReviewSpy(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::repos::RepoLister for ReviewSpy {
+        async fn list(&self) -> Result<Vec<crate::repos::RepoEntry>, crate::repos::RepoListError> {
+            panic!("SCM inspection must not enumerate all repositories");
+        }
+        async fn reviews(
+            &self,
+            repo: &rupu_scm::RepoRef,
+            cwd: &FsPath,
+            branch: &str,
+            origin_host: &str,
+        ) -> Result<Value, crate::repos::RepoListError> {
+            assert_eq!(repo.owner, "example");
+            assert_eq!(origin_host, "github.com");
+            assert!(cwd.is_absolute());
+            assert!(!branch.is_empty());
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({"state":"queried","reviews":[],"truncated":false}))
+        }
+    }
+    #[tokio::test]
+    async fn remote_review_requires_explicit_query() {
+        let home = tempfile::tempdir().unwrap();
+        let (project, repo) = committed();
+        repo.remote("origin", "https://github.com/example/repo.git")
+            .unwrap();
+        let spy = Arc::new(ReviewSpy(std::sync::atomic::AtomicUsize::new(0)));
+        let state = AppState::new(home.path().into(), rupu_config::PricingConfig::default())
+            .with_repos(Some(spy.clone()));
+        let ws = rupu_workspace::register(
+            &rupu_workspace::WorkspaceStore {
+                root: home.path().join("workspaces"),
+            },
+            project.path(),
+        )
+        .unwrap();
+        let Json(value) = context(
+            State(state.clone()),
+            Path(ws.id.clone()),
+            Query(ContextQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["pull_request"]["state"], "not_queried");
+        assert_eq!(spy.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let Json(value) = context(
+            State(state),
+            Path(ws.id),
+            Query(ContextQuery {
+                include_review: true,
+                ..ContextQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["pull_request"]["state"], "queried");
+        assert_eq!(spy.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     #[tokio::test]
     async fn endpoint_requires_registered_owner_and_refuses_remote() {
         let home = tempfile::tempdir().unwrap();
@@ -264,7 +394,8 @@ mod tests {
             State(state),
             Path(ws.id),
             Query(ContextQuery {
-                host: Some("remote".into())
+                host: Some("remote".into()),
+                ..ContextQuery::default()
             })
         )
         .await

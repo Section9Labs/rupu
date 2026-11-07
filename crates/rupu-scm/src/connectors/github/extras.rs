@@ -15,6 +15,14 @@ impl GithubExtras {
         Self { client }
     }
 
+    /// Compare origin authority without exposing a credential or configured URL.
+    pub fn matches_web_host(&self, host: &str) -> bool {
+        self.client
+            .enterprise_host()
+            .unwrap_or("github.com")
+            .eq_ignore_ascii_case(host)
+    }
+
     /// Diagnostic helper — exposes [`GithubClient::fetch_token_scopes`]
     /// without making the whole client `pub`. Used by `rupu repos list`
     /// to surface a missing-`repo`-scope warning when private repos
