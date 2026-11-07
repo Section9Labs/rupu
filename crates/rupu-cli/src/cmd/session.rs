@@ -12333,11 +12333,12 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (global, mut record) = idle_dense_session(&tmp, "ses_settings_turn");
         record.message_history.clear();
+        record.agent_system_prompt = "CAPABILITIES_SYSTEM_PRIVATE_FIXTURE".into();
         record.model_limits = Some(rupu_providers::model_limits::ModelLimits::fixed(
             123_456, 7_890,
         ));
         write_session(&global, SessionScope::Active, &record).unwrap();
-        rupu_runtime::session_settings::SessionSettings {
+        let saved_settings = rupu_runtime::session_settings::SessionSettings {
             provider: Some("openai".into()),
             model: Some("session-override-model".into()),
             tools: Some(vec!["agents.list".into()]),
@@ -12349,6 +12350,14 @@ mod tests {
             &record.session_id,
         ))
         .unwrap();
+        let saved_orchestration =
+            rupu_runtime::session_orchestration::SessionOrchestration::default()
+                .save(&session_dir(
+                    &global,
+                    SessionScope::Active,
+                    &record.session_id,
+                ))
+                .unwrap();
         let request_id = "req_settings";
         enqueue_session_turn_request(
             &global,
@@ -12358,7 +12367,7 @@ mod tests {
                 version: 1,
                 request_id: request_id.into(),
                 run_id: "run_settings".into(),
-                prompt: "go".into(),
+                prompt: "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE".into(),
                 transcript_path: record.transcripts_dir.join("run_settings.jsonl"),
                 enqueued_at: Utc::now(),
                 compact: false,
@@ -12382,11 +12391,11 @@ mod tests {
         );
         with_mock_home(
             &global,
-            r#"[{ "AssistantText": { "text": "configured", "stop": "end_turn" } }]"#,
+            r#"[{ "AssistantText": { "text": "CAPABILITIES_ASSISTANT_PRIVATE_FIXTURE", "stop": "end_turn" } }]"#,
             run_turn(RunTurnArgs {
                 session_id: record.session_id.clone(),
                 run_id: "run_settings".into(),
-                prompt: "go".into(),
+                prompt: "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE".into(),
                 operator_skills: Vec::new(),
             }),
         )
@@ -12406,6 +12415,53 @@ mod tests {
             .expect("effective tool grant recorded");
         assert!(grants.iter().any(|entry| entry.tool == "agents.list"));
         assert!(!grants.iter().any(|entry| entry.tool == "read_file"));
+        // The persisted evidence must describe this assembled turn's exact
+        // offered grant and revisions without copying its private conversation.
+        let snapshot_text = fs::read_to_string(
+            session_dir(&global, SessionScope::Active, &record.session_id)
+                .join("capabilities.json"),
+        )
+        .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot_text).unwrap();
+        let effective: rupu_runtime::session_readiness::RunReadiness =
+            serde_json::from_value(snapshot["effective"].clone()).unwrap();
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(snapshot["session_id"], record.session_id);
+        assert_eq!(snapshot["workspace_id"], record.workspace_id);
+        assert_eq!(snapshot["settings_revision"], saved_settings.revision);
+        assert_eq!(
+            snapshot["orchestration_revision"],
+            saved_orchestration.revision
+        );
+        assert_eq!(effective.run_id, "run_settings");
+        assert_eq!(effective.applies, "assembled_turn");
+        assert_eq!(
+            effective
+                .tools
+                .iter()
+                .filter(|tool| tool.offered)
+                .map(|tool| tool.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            grants
+                .iter()
+                .map(|entry| entry.tool.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let transcript_text = serde_json::to_string(&events).unwrap();
+        for secret in [
+            "CAPABILITIES_SYSTEM_PRIVATE_FIXTURE",
+            "CAPABILITIES_MESSAGE_PRIVATE_FIXTURE",
+            "CAPABILITIES_ASSISTANT_PRIVATE_FIXTURE",
+        ] {
+            assert!(
+                transcript_text.contains(secret),
+                "fixture must reach the actual turn"
+            );
+            assert!(
+                !snapshot_text.contains(secret),
+                "capabilities leaked conversation text"
+            );
+        }
         let after = read_session(&global, &record.session_id).unwrap().0;
         assert_eq!(after.model, record.model);
         assert_eq!(after.provider_name, record.provider_name);
