@@ -464,6 +464,8 @@ async fn set_autoflow_enabled(
         None => super::workflows::resolve_workflow_path(s, name)
             .ok_or_else(|| ApiError::not_found(format!("autoflow {name} not found")))?,
     };
+    let dir = path.parent().ok_or_else(|| ApiError::internal("workflow has no parent directory"))?;
+    let _lock = super::workflows::definition_lock(dir).await?;
     let existing = std::fs::read_to_string(&path).map_err(|e| ApiError::internal(e.to_string()))?;
 
     // The file must already be an autoflow (not just any workflow) — mirrors
