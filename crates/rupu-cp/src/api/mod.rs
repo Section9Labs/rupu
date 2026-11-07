@@ -32,6 +32,7 @@ pub mod maintenance;
 pub mod messages;
 pub mod models;
 pub mod netflow;
+pub mod project_scm;
 pub(crate) mod project_session_start;
 pub mod projects;
 pub mod query;
