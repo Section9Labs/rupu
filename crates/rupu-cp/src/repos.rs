@@ -27,4 +27,17 @@ pub enum RepoListError {
 #[async_trait::async_trait]
 pub trait RepoLister: Send + Sync {
     async fn list(&self) -> Result<Vec<RepoEntry>, RepoListError>;
+
+    /// Explicit read-only query through this CP's owning account-selection rules.
+    /// Kept optional for older/read-only adapters; never infer authorization from
+    /// the presence of account configuration or a local checkout.
+    async fn reviews(
+        &self,
+        _repo: &rupu_scm::RepoRef,
+        _cwd: &std::path::Path,
+        _branch: &str,
+        _origin_host: &str,
+    ) -> Result<serde_json::Value, RepoListError> {
+        Err(RepoListError::Backend("review adapter unavailable".into()))
+    }
 }
