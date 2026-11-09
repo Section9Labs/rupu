@@ -6,7 +6,7 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 
 | Provider           | API key | SSO  | Device | SSO flow         | Notes                                                                                      |
 | ------------------ | :-----: | :--: | :----: | ---------------- | ------------------------------------------------------------------------------------------ |
-| anthropic          |   ✓     |  ✓   |   —    | Browser callback | Console API key OR Claude.ai SSO.                                                          |
+| anthropic          |   ✓     |  ✓   | ✓ (paste the code) | Browser callback | Console API key OR Claude.ai SSO.                                                          |
 | openai             |   ✓     |  ✓   | ✓ (Codex device auth) | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
 | gemini             |   ✓     |  ✓   |   —    | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
 | copilot            |   ✓     |  ✓   |   ✓    | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
@@ -92,10 +92,29 @@ For a machine with no browser (a server, a VM, an SSH session): rupu prints what
 
 Vendors with a device login:
 
+- **anthropic**: Claude Code's paste-the-code login (see below).
 - **openai**: Codex CLI's device auth (see below).
 - **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
 
 Any other vendor refuses with `<kind> has no device login; use --mode api-key`.
+
+#### Anthropic
+
+```sh
+rupu auth login --account anthropic --mode device
+# Open this URL in any browser and sign in:
+#
+#   https://claude.ai/oauth/authorize?…
+#
+# Paste the code the page shows: <paste, then Enter>
+# rupu: stored anthropic sso credential
+```
+
+1. Open the URL rupu prints in a browser on any machine and sign in with your Claude account (the login Claude Code runs when it can't reach a browser).
+2. The page (`platform.claude.com/oauth/code/callback`) shows a code of the form `code#state`. Copy all of it and paste it at the prompt of the run that printed the URL (each run makes a new one); the page's full address, or the code alone, is accepted too.
+3. rupu exchanges the code for tokens and stores them as `--mode sso` does.
+
+A pasted state that isn't this login's ends it with `pasted state does not match this login; start again`. The code expires within minutes and works once: if the exchange fails, rupu shows Anthropic's message and stores nothing — run the command again for a new URL.
 
 #### OpenAI
 

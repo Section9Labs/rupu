@@ -22,6 +22,16 @@ A browser opens to `claude.ai/oauth/authorize`. Sign in with your Claude account
 
 The access token expires in ~1 hour. rupu auto-refreshes ~60 seconds before expiry using the stored refresh token. Refresh failures surface a clear error pointing at this same command.
 
+## Device login
+
+On a machine with no browser (a server, a VM, an SSH session):
+
+```sh
+rupu auth login --account anthropic --mode device
+```
+
+rupu prints a `claude.ai/oauth/authorize` URL and waits at `Paste the code the page shows:`. Open the URL in a browser on any machine and sign in with your Claude account; the page it lands on (`platform.claude.com/oauth/code/callback`) shows a code of the form `code#state`. Paste all of it, and rupu stores the same credential as `--mode sso`, in the account's `sso` entry. This is the login Claude Code runs when it can't open a browser. The code expires within minutes and works once; if the login fails, run the command again for a new URL.
+
 ## Example agent files
 
 `~/.rupu/agents/explain.md` — API-key auth:

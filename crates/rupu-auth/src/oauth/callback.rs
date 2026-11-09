@@ -10,8 +10,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use rand::RngCore;
 use tracing::{debug, info};
 
 use crate::backend::ProviderId;
@@ -25,12 +23,6 @@ const CALLBACK_TIMEOUT_SECS: u64 = 300;
 /// Branded post-callback landing page served once the redirect lands.
 /// Inlined at compile time so the OAuth flow has no external file deps.
 const LANDING_PAGE: &str = include_str!("landing.html");
-
-fn random_state() -> String {
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
 
 pub async fn run(provider: ProviderId) -> Result<StoredCredential> {
     run_with_client(provider, None).await
@@ -82,7 +74,7 @@ pub async fn run_with_client(
     let state = if oauth.state_is_verifier {
         pkce.verifier.clone()
     } else {
-        random_state()
+        common::random_state()
     };
 
     // For tests, expose the state so the test driver can craft the redirect:

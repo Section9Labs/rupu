@@ -514,7 +514,8 @@ async fn login(
             let stored = match headless {
                 Some(HeadlessFlow::DeviceCode) => rupu_auth::oauth::device::run(pid).await?,
                 Some(HeadlessFlow::PasteCode { .. }) => {
-                    anyhow::bail!("{kind} device login is not available in this build")
+                    let app = sso_client(&cfg, account, pid)?;
+                    rupu_auth::oauth::paste::run(pid, app).await?
                 }
                 Some(HeadlessFlow::OpenAiDeviceAuth) => {
                     rupu_auth::oauth::openai_device::run().await?

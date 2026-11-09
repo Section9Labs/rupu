@@ -130,6 +130,16 @@ pub(crate) fn http_client() -> Result<ClientWithMiddleware> {
     )?)
 }
 
+/// A fresh `state` nonce, for a provider whose state is not its PKCE
+/// verifier (`ProviderOAuth::state_is_verifier`).
+pub(crate) fn random_state() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// The browser flow's authorize URL for `app`, with `extra` appended after
 /// `oauth.extra_authorize_params`.
 pub(crate) fn build_authorize_url(
@@ -199,15 +209,25 @@ pub(crate) async fn exchange_code(
         }
     };
 
-    request
-        .send()
-        .await
-        .context("token exchange request")?
-        .error_for_status()
-        .context("token exchange status")?
-        .json()
-        .await
-        .context("token exchange json")
+    let resp = request.send().await.context("token exchange request")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("{}", exchange_failure(status, &body));
+    }
+    resp.json().await.context("token exchange json")
+}
+
+/// What a refused exchange reports: the vendor's own message when the body
+/// carries one as `error.message` (Anthropic's error shape), else the status.
+fn exchange_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned));
+    match message {
+        Some(m) => format!("token exchange failed ({status}): {m}"),
+        None => format!("token exchange failed with status {status}"),
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +315,23 @@ mod tests {
         assert_eq!(q["redirect_uri"], "http://localhost:7171/auth/redirect");
         assert_eq!(q["scope"], "openid profile read_user write_repository api");
         assert_eq!(q["code_challenge_method"], "S256");
+    }
+
+    #[test]
+    fn a_refused_exchange_reports_the_vendor_message_else_the_status() {
+        let bad = reqwest::StatusCode::BAD_REQUEST;
+        let body = r#"{"type":"error","error":{"type":"invalid_grant","message":"Invalid code"}}"#;
+        assert_eq!(
+            exchange_failure(bad, body),
+            "token exchange failed (400 Bad Request): Invalid code"
+        );
+        for body in ["", "not json", r#"{"error":"invalid_grant"}"#] {
+            assert_eq!(
+                exchange_failure(bad, body),
+                "token exchange failed with status 400 Bad Request",
+                "{body:?}"
+            );
+        }
     }
 
     /// A flow's own parameters follow the provider's fixed ones.

@@ -184,7 +184,12 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
-            headless: None,
+            // Claude Code's headless login: the hosted page shows
+            // `code#state` for the operator to paste back (`oauth::paste`).
+            headless: Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://platform.claude.com/oauth/code/callback",
+                extra_authorize_params: &[],
+            }),
         }),
         ProviderId::Openai => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -377,13 +382,20 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_headless_is_the_paste_flow() {
+        assert_eq!(
+            provider_oauth(ProviderId::Anthropic).unwrap().headless,
+            Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://platform.claude.com/oauth/code/callback",
+                extra_authorize_params: &[],
+            })
+        );
+    }
+
+    #[test]
     fn vendors_without_a_headless_flow_yet_say_so() {
-        // Filled in by later tasks: Anthropic (3), GitLab (4), Gemini (5).
-        for p in [
-            ProviderId::Anthropic,
-            ProviderId::Gemini,
-            ProviderId::Gitlab,
-        ] {
+        // Filled in by later tasks: GitLab (4), Gemini (5).
+        for p in [ProviderId::Gemini, ProviderId::Gitlab] {
             assert_eq!(provider_oauth(p).unwrap().headless, None, "{p}");
         }
     }

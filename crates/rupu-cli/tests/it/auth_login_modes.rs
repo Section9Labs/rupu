@@ -112,6 +112,46 @@ fn login_device_for_a_vendor_without_a_headless_flow_refuses() {
         .env_remove("RUPU_AUTH_FILE")
         .env_remove("RUPU_AUTH_BACKEND")
         .timeout(std::time::Duration::from_secs(30))
+        .args(["auth", "login", "--account", "gemini", "--mode", "device"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "gemini has no device login; use --mode api-key",
+        ));
+    assert!(!tmp.path().join("auth.json").exists());
+}
+
+#[test]
+fn login_device_for_anthropic_reads_the_code_from_a_pipe() {
+    let server = httpmock::MockServer::start();
+    // A bare code: the test can't see the login's state, so the exchange is
+    // matched on everything else.
+    let exchange = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/token")
+            .json_body_partial(r#"{"grant_type": "authorization_code"}"#)
+            .json_body_partial(r#"{"code": "abc"}"#)
+            .json_body_partial(
+                r#"{"redirect_uri": "https://platform.claude.com/oauth/code/callback"}"#,
+            );
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "sk-ant-oat01-x",
+            "refresh_token": "rt",
+            "expires_in": 28800,
+            "account": { "uuid": "acc" },
+            "organization": { "uuid": "org" },
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .env("RUPU_OAUTH_TOKEN_URL_OVERRIDE", server.url("/token"))
+        .write_stdin("abc\n")
+        .timeout(std::time::Duration::from_secs(30))
         .args([
             "auth",
             "login",
@@ -121,13 +161,17 @@ fn login_device_for_a_vendor_without_a_headless_flow_refuses() {
             "device",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "anthropic has no device login; use --mode api-key",
-        ));
-    assert!(!tmp.path().join("auth.json").exists());
+        .success()
+        .stderr(
+            predicate::str::contains("claude.ai/oauth/authorize")
+                .and(predicate::str::contains("Paste the code"))
+                .and(predicate::str::contains("sk-ant-oat01-x").not()),
+        )
+        .stdout(predicate::str::contains("stored anthropic sso credential"));
+
+    exchange.assert_hits(1);
+    assert_eq!(stored_keys(tmp.path()), ["anthropic/sso"]);
 }
-// NOTE for Task 3: this test flips to a success test when Anthropic gains its paste flow; Task 3 rewrites it.
 
 #[test]
 fn login_device_for_github_runs_the_device_code_flow_and_stores_sso() {
