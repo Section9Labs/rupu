@@ -19,6 +19,20 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Get one agentiflow's record.\n\n`id` is the agentiflow id (`af_...`). Returns its status, goals, rounds, units and spend.",
         ),
         op(
+            "agentiflows.snapshot",
+            Method::GET,
+            "/api/agentiflows/:id/snapshot",
+            "Capture a bounded Agentiflow observation for paged browsing.\n\n`id` is the flow id; `host` can only be local. `refresh` captures anew instead of reusing a view for five seconds. Returns owner, snapshot token, source generation, capture/expiry times, record, definition, budget, latest lead and section totals. Histories are read with agentiflows.snapshot_pages. This is a finite read-time observation, not an atomic coordinator transaction. 413 refuses capture budgets; 429 means another capture is busy.",
+        )
+        .query::<agentiflows::observation::SnapshotQuery>(),
+        op(
+            "agentiflows.snapshot_pages",
+            Method::GET,
+            "/api/agentiflows/:id/snapshot/pages",
+            "Read a finite page from a captured Agentiflow observation.\n\n`id`, `snapshot` and `section` (units|events|board|leads) identify the captured data. Omit `cursor` for Start or use the returned next_cursor; `limit` is 1 through 100, with a 1MiB response limit. Returns owner/token/generation, offset, total, records with id/source/value, next_cursor and evidence. 409 means an expired/evicted capture or a mismatched cursor. Pages never reread live sources; events are coordinator records only and project identity still requires lead transcript verification.",
+        )
+        .query::<agentiflows::observation::PageQuery>(),
+        op(
             "agentiflows.events",
             Method::GET,
             "/api/agentiflows/:id/events",

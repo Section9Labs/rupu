@@ -30,6 +30,8 @@
 //! Remote hosts and SSE are a later pass; this module reads
 //! `AppState::global_dir` directly.
 
+pub(crate) mod observation;
+
 use crate::{
     error::{ApiError, ApiResult},
     host::messages::MessageRoute,
@@ -64,6 +66,8 @@ pub fn routes() -> Router<AppState> {
             get(list_agentiflows).post(launch_agentiflow),
         )
         .route("/api/agentiflows/:id", get(get_agentiflow))
+        .route("/api/agentiflows/:id/snapshot", get(observation::snapshot))
+        .route("/api/agentiflows/:id/snapshot/pages", get(observation::page))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route(
             "/api/agentiflows/:id/usage-timeline",

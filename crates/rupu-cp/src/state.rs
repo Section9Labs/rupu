@@ -6,6 +6,8 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AppState {
+    /// Bounded immutable, read-time Agentiflow observations.
+    pub agentiflow_observations: Arc<crate::api::agentiflows::observation::ObservationCache>,
     pub global_dir: PathBuf,
     /// Workspace dir — used for coverage data that lives under
     /// `<workspace>/.rupu/coverage/`. Defaults to `std::env::current_dir()`
@@ -192,6 +194,7 @@ impl AppState {
             agentiflow_launcher: None,
             skill_installer: None,
             admin_ops: None,
+            agentiflow_observations: Arc::default(),
         }
     }
 

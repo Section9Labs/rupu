@@ -14,6 +14,8 @@
   "agentiflows.get",
   "agentiflows.list",
   "agentiflows.run",
+  "agentiflows.snapshot",
+  "agentiflows.snapshot_pages",
   "agentiflows.steer",
   "agentiflows.stop",
   "agentiflows.unit_output",

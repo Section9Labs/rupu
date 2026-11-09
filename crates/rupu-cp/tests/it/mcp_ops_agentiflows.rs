@@ -56,6 +56,8 @@ async fn agentiflows_tools_are_listed_with_their_required_arguments() {
     let table: &[(&str, &[&str])] = &[
         ("agentiflows.list", &[]),
         ("agentiflows.get", &["id"]),
+        ("agentiflows.snapshot", &["id"]),
+        ("agentiflows.snapshot_pages", &["id", "snapshot", "section"]),
         ("agentiflows.events", &["id"]),
         ("agentiflows.children", &["id"]),
         ("agentiflows.unit_output", &["id", "unit_id"]),
@@ -320,4 +322,27 @@ async fn agentiflow_tool_hints() {
     );
     assert_eq!(hint("agentiflow_defs.list", "readOnlyHint"), json!(true));
     assert_ne!(hint("agentiflow_defs.save", "destructiveHint"), json!(true));
+}
+
+
+#[tokio::test]
+async fn captured_observation_pages_match_http_without_reloading_sources() {
+    let (addr, tmp) = spawn_operator_with(seed_live_flow, None).await;
+    let r = call_tool(addr, "agentiflows.snapshot", json!({"id": FLOW})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let snapshot = json_of(&r);
+    assert_eq!(snapshot["flow_id"], FLOW);
+    assert_eq!(snapshot["host_id"], "local");
+    assert!(snapshot.get("events").is_none());
+    let token = snapshot["snapshot"].as_str().unwrap();
+    // The capture remains readable after its source has disappeared.
+    std::fs::remove_dir_all(agentiflow_dir(tmp.path()).join(FLOW)).unwrap();
+    let args = json!({"id":FLOW,"snapshot":token,"section":"events","limit":1});
+    let page = call_tool(addr, "agentiflows.snapshot_pages", args).await;
+    assert_ne!(page["isError"], json!(true), "{page}");
+    let (status, body) = http_get(addr, &format!("/api/agentiflows/{FLOW}/snapshot/pages?snapshot={token}&section=events&limit=1")).await;
+    assert_eq!(status, 200);
+    assert_eq!(json_of(&page), body);
+    let bad = call_tool(addr, "agentiflows.snapshot_pages", json!({"id":FLOW,"snapshot":token,"section":"events","host":"remote"})).await;
+    assert_eq!(bad["isError"], json!(true));
 }

@@ -295,6 +295,6 @@ fn excluded_is_exactly_the_spec_list() {
 
 #[test]
 fn the_operator_tool_count_is_pinned() {
-    assert_eq!(ops().len(), 198);
-    assert_eq!(pinned_tool_names().len(), 198);
+    assert_eq!(ops().len(), 200);
+    assert_eq!(pinned_tool_names().len(), 200);
 }

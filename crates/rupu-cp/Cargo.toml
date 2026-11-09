@@ -17,6 +17,7 @@ default = ["pdf"]
 pdf = ["rupu-findings-report/pdf"]
 
 [dependencies]
+tempfile.workspace = true
 axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
 tokio = { workspace = true }
@@ -85,7 +86,6 @@ rupu-fleet = { path = "../rupu-fleet" }
 [dev-dependencies]
 chrono.workspace = true
 tracing-subscriber.workspace = true
-tempfile.workspace = true
 serial_test.workspace = true
 rupu-config = { path = "../rupu-config" }
 rupu-transcript = { path = "../rupu-transcript" }
