@@ -150,6 +150,36 @@ pub fn ops() -> &'static [OpSpec] {
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
     (
         "GET",
+        "/api/mcp/servers/:id/credential",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "PUT",
+        "/api/mcp/servers/:id/credential",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "DELETE",
+        "/api/mcp/servers/:id/credential",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "GET",
+        "/api/mcp/credential-operations/:id",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "GET",
+        "/api/mcp/credential-orphans",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "DELETE",
+        "/api/mcp/credential-orphans/:generation",
+        "authenticated operator HTTP credential management; never an agent tool",
+    ),
+    (
+        "GET",
         "/api/projects/:ws_id/scm/reviews/:number",
         "HTTP-only native review inspector with captured checkout/account/head expectations; runtime SCM tools remain separate",
     ),

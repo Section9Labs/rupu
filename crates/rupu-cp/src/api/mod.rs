@@ -32,6 +32,7 @@ pub mod launch_preview;
 pub(crate) mod local_only;
 pub mod maintenance;
 pub(crate) mod mcp_servers;
+pub(crate) mod mcp_credentials;
 pub mod messages;
 pub mod models;
 pub mod netflow;

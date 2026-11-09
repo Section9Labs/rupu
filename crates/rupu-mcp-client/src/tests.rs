@@ -693,3 +693,80 @@ async fn capture_uses_each_run_sink_and_never_records_headers_or_payloads() {
         .iter()
         .all(|r| r.ctx.run_id.as_deref() == Some("run_fixture_b")));
 }
+
+#[tokio::test]
+async fn host_store_resolves_exact_binding_and_never_falls_back() {
+    let fixture = Fixture::start(vec![init(), Reply::Status(202)]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let generation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let operation = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let mut registry = fixture.registry(false);
+    registry.servers.get_mut("fixture").unwrap().bearer_store = Some(generation.into());
+    let owner = rupu_auth::mcp_credentials::Binding {
+        server_id: "fixture".into(),
+        url: fixture.url.clone(),
+        generation: generation.into(),
+    };
+    let credentials = HostCredentials::for_global(tmp.path());
+    assert!(matches!(
+        HttpToolsClient::connect(
+            &registry,
+            "fixture",
+            &credentials,
+            Deadlines::default(),
+            uncaptured()
+        )
+        .await,
+        Err(Error::Credential)
+    ));
+    assert!(matches!(
+        HttpToolsClient::connect(
+            &registry,
+            "fixture",
+            &EnvironmentCredentials,
+            Deadlines::default(),
+            uncaptured()
+        )
+        .await,
+        Err(Error::Credential)
+    ));
+    assert_eq!(fixture.calls("initialize"), 0);
+    let store = rupu_auth::mcp_credentials::Store::for_global(tmp.path());
+    let receipt = store
+        .mutate(&owner, "absent", operation, Some("fixture-host-token"))
+        .unwrap();
+    let client = HttpToolsClient::connect(
+        &registry,
+        "fixture",
+        &credentials,
+        Deadlines::default(),
+        uncaptured(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.state.seen.lock().unwrap()[0].headers[AUTHORIZATION],
+        "Bearer fixture-host-token"
+    );
+    assert!(!format!("{client:?} {registry:?}").contains("fixture-host-token"));
+    let wrong = rupu_auth::mcp_credentials::Binding {
+        server_id: "other".into(),
+        ..owner.clone()
+    };
+    assert!(matches!(
+        credentials.host_bearer(&wrong),
+        Err(Error::Credential)
+    ));
+    store
+        .mutate(
+            &owner,
+            &receipt.credential_revision,
+            "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+            None,
+        )
+        .unwrap();
+    assert!(matches!(
+        credentials.host_bearer(&owner),
+        Err(Error::Credential)
+    ));
+}

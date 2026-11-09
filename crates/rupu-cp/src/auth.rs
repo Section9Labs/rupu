@@ -150,9 +150,20 @@ fn unauthorized() -> Response {
 /// The `/api/*` guard: a matching bearer header, or a matching token cookie
 /// (plus a same-origin `Origin` on a state-changing method). Anything else is
 /// a `401` in the standard `{"error": ...}` envelope.
-pub async fn require_token(State(token): State<Arc<Token>>, req: Request, next: Next) -> Response {
+#[derive(Clone, Copy)]
+pub(crate) struct VerifiedControlPlaneAuth {
+    _verified: (),
+}
+
+pub async fn require_token(
+    State(token): State<Arc<Token>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let headers = req.headers();
     if bearer(headers).is_some_and(|p| token.matches(p)) {
+        req.extensions_mut()
+            .insert(VerifiedControlPlaneAuth { _verified: () });
         return next.run(req).await;
     }
     let name = cookie_name(headers);
@@ -167,6 +178,8 @@ pub async fn require_token(State(token): State<Arc<Token>>, req: Request, next: 
             )
             .into_response();
         }
+        req.extensions_mut()
+            .insert(VerifiedControlPlaneAuth { _verified: () });
         return next.run(req).await;
     }
     unauthorized()

@@ -1662,7 +1662,7 @@ async fn prepare_start(
         let registry = rupu_config::mcp::Registry::load(&global)?;
         rupu_runtime::session_mcp::freeze(
             &registry,
-            &rupu_mcp_client::EnvironmentCredentials,
+            &rupu_mcp_client::HostCredentials::for_global(&global),
             requested_mcp.as_deref(),
             args.mcp_catalog_revision.as_deref(),
         )
@@ -8226,7 +8226,7 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         };
         let mcp_tools = rupu_runtime::session_mcp::assemble(
             &mcp_registry,
-            &rupu_mcp_client::EnvironmentCredentials,
+            &rupu_mcp_client::HostCredentials::for_global(&global),
             &mcp_selection,
             rupu_runtime::session_mcp::Owner {
                 run_id: args.run_id.clone(),

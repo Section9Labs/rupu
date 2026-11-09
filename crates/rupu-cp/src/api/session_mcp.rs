@@ -67,9 +67,12 @@ pub(crate) fn error(error: session_mcp::Error) -> ApiError {
 pub(crate) async fn discover(s: &AppState) -> ApiResult<session_mcp::CatalogSnapshot> {
     let registry = rupu_config::mcp::Registry::load(&s.global_dir)
         .map_err(|e| ApiError::bad_gateway(e.to_string()))?;
-    session_mcp::discover(&registry, &rupu_mcp_client::EnvironmentCredentials)
-        .await
-        .map_err(error)
+    session_mcp::discover(
+        &registry,
+        &rupu_mcp_client::HostCredentials::for_global(&s.global_dir),
+    )
+    .await
+    .map_err(error)
 }
 async fn catalog(State(s): State<AppState>, Query(q): Query<LocalQuery>) -> ApiResult<Json<Value>> {
     gate(&s, q.host.as_deref())?;

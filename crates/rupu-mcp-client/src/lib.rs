@@ -59,11 +59,35 @@ pub enum Error {
 /// never enter registry serialization, tool metadata, Debug or error strings.
 pub trait Credentials: Send + Sync {
     fn bearer(&self, reference: &str) -> Result<String, Error>;
+    /// Explicit host-store identity; environment-only/test resolvers fail closed.
+    fn host_bearer(&self, _binding: &rupu_auth::mcp_credentials::Binding) -> Result<String, Error> {
+        Err(Error::Credential)
+    }
 }
 pub struct EnvironmentCredentials;
 impl Credentials for EnvironmentCredentials {
     fn bearer(&self, reference: &str) -> Result<String, Error> {
         std::env::var(reference).map_err(|_| Error::Credential)
+    }
+}
+/// Resolves MCP-only credentials in the trusted host root. Never consults
+/// provider accounts, auth_file, another instance, or a native app keychain.
+pub struct HostCredentials {
+    store: rupu_auth::mcp_credentials::Store,
+}
+impl HostCredentials {
+    pub fn for_global(global: &std::path::Path) -> Self {
+        Self {
+            store: rupu_auth::mcp_credentials::Store::for_global(global),
+        }
+    }
+}
+impl Credentials for HostCredentials {
+    fn bearer(&self, reference: &str) -> Result<String, Error> {
+        EnvironmentCredentials.bearer(reference)
+    }
+    fn host_bearer(&self, binding: &rupu_auth::mcp_credentials::Binding) -> Result<String, Error> {
+        self.store.resolve(binding).map_err(|_| Error::Credential)
     }
 }
 #[derive(Clone, Copy, Debug)]
@@ -191,18 +215,28 @@ impl HttpToolsClient {
         let config = registry
             .enabled_server(server_id)
             .map_err(|_| Error::Configuration)?;
-        // A host-store binding must never silently fall back to anonymous
-        // transport before the dedicated identity-aware resolver is installed.
-        if config.bearer_store.is_some() {
-            return Err(Error::Credential);
-        }
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
             HeaderValue::from_static("application/json, text/event-stream"),
         );
-        if let Some(reference) = &config.bearer_env {
-            let secret = credentials.bearer(reference)?;
+        let secret = if let Some(generation) = &config.bearer_store {
+            let url = url::Url::parse(&config.url)
+                .map_err(|_| Error::Configuration)?
+                .to_string();
+            Some(
+                credentials.host_bearer(&rupu_auth::mcp_credentials::Binding {
+                    server_id: server_id.into(),
+                    url,
+                    generation: generation.clone(),
+                })?,
+            )
+        } else if let Some(reference) = &config.bearer_env {
+            Some(credentials.bearer(reference)?)
+        } else {
+            None
+        };
+        if let Some(secret) = secret {
             if secret.is_empty() || secret.len() > 8192 {
                 return Err(Error::Credential);
             }

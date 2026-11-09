@@ -33,7 +33,7 @@ fn revision(bytes: Option<&[u8]>) -> String {
     }
     format!("sha256:{:x}", digest.finalize())
 }
-pub(super) fn read(global: &Path) -> ApiResult<Snapshot> {
+pub(crate) fn read(global: &Path) -> ApiResult<Snapshot> {
     let path = global.join("mcp.toml");
     if !ordinary_file(&path)? {
         return Ok(Snapshot {
