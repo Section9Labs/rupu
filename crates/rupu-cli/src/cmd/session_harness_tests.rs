@@ -272,7 +272,7 @@ async fn first_turn_tool_selection_is_frozen_before_the_worker_and_keeps_readonl
                 policy.decide(
                     entry.descriptor,
                     &serde_json::json!({}),
-                    &rupu_tools::AllowAlways::default()
+                    &mut rupu_tools::AllowAlways::default()
                 ),
                 rupu_tools::Decision::Deny { .. }
             ));
@@ -282,7 +282,7 @@ async fn first_turn_tool_selection_is_frozen_before_the_worker_and_keeps_readonl
                 policy.decide(
                     entry.descriptor,
                     &serde_json::json!({}),
-                    &rupu_tools::AllowAlways::default()
+                    &mut rupu_tools::AllowAlways::default()
                 ),
                 rupu_tools::Decision::Spawn {
                     ceiling: rupu_tools::PermissionMode::Readonly
