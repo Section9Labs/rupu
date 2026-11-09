@@ -257,9 +257,7 @@ async fn a_gemini_reply_without_a_refresh_token_is_refused() {
     let err =
         gemini_login_with_reply(serde_json::json!({"access_token": "ya29", "expires_in": 3599}))
             .await;
-    assert!(err.contains("Google returned no refresh token"), "{err}");
-    assert!(err.contains("myaccount.google.com/permissions"), "{err}");
-    assert!(!err.contains("ya29"), "{err}");
+    assert_eq!(err, "Google returned no refresh token. Revoke \"Gemini CLI\" at https://myaccount.google.com/permissions and log in again, or use --mode api-key");
 }
 
 #[tokio::test]
@@ -269,6 +267,6 @@ async fn a_gemini_reply_with_an_empty_refresh_token_is_refused() {
         serde_json::json!({"access_token": "ya29", "refresh_token": "", "expires_in": 3599}),
     )
     .await;
-    assert!(err.contains("Google returned no refresh token"), "{err}");
-    assert!(err.contains("myaccount.google.com/permissions"), "{err}");
+    assert_eq!(err, "Google returned no refresh token. Revoke \"Gemini CLI\" at https://myaccount.google.com/permissions and log in again, or use --mode api-key");
+    assert!(!err.contains("ya29"), "{err}");
 }

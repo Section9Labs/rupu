@@ -67,7 +67,7 @@ default_model = "gemini-2.5-pro"
 for a Vertex AI regional endpoint, and none of rupu's Gemini paths (AI Studio,
 Gemini CLI, Antigravity) is region-scoped. See `docs/providers.md`.
 
-For headless setups where you can't run the browser SSO flow, use `rupu auth login --account gemini --mode device` (see below) or the AI Studio API-key path.
+For headless setups where you can't run the browser SSO flow, use `rupu auth login --account gemini --mode device` (see [Device login](#device-login)) or the AI Studio API-key path.
 
 ## Example agent file
 

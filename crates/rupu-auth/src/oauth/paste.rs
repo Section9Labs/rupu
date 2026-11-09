@@ -165,7 +165,12 @@ pub async fn run_with_input(
 
     // Google issues a refresh token only on a consent it shows; without one
     // the login would die in an hour. Anthropic's flow tolerates its absence.
-    if provider == ProviderId::Gemini && token.refresh_token.as_deref().is_none_or(str::is_empty) {
+    if provider == ProviderId::Gemini
+        && token
+            .refresh_token
+            .as_deref()
+            .is_none_or(|r| r.trim().is_empty())
+    {
         bail!(
             "Google returned no refresh token. Revoke \"Gemini CLI\" at \
              https://myaccount.google.com/permissions and log in again, or use --mode api-key"

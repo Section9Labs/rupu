@@ -106,6 +106,24 @@ fn github_device_login(home: &std::path::Path, server: &httpmock::MockServer) ->
 #[test]
 fn login_device_for_a_vendor_without_a_headless_flow_refuses() {
     let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["auth", "login", "--account", "linear", "--mode", "device"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "linear has no device login; use --mode api-key",
+        ));
+    assert!(!tmp.path().join("auth.json").exists());
+}
+
+#[test]
+fn login_device_for_an_openai_compatible_account_refuses_before_any_device_flow() {
+    let tmp = assert_fs::TempDir::new().unwrap();
     std::fs::write(
         tmp.path().join("config.toml"),
         "[providers.oai-local]\nkind = \"openai-compatible\"\n\

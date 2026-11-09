@@ -179,10 +179,13 @@ fn a_gemini_device_login_reads_the_code_and_stores_the_code_assist_project() {
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains("accounts.google.com"), "{stderr}");
     assert!(stderr.contains("Paste the code"), "{stderr}");
-    assert!(
-        !stderr.contains("g-access") && !stderr.contains("4/0Acode"),
-        "{stderr}"
-    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for secret in ["g-access", "g-refresh", "4/0Acode"] {
+        assert!(
+            !stderr.contains(secret) && !stdout.contains(secret),
+            "{secret} leaked"
+        );
+    }
     assert!(
         stderr.contains("Gemini Code Assist project: managed-cli"),
         "{stderr}"
