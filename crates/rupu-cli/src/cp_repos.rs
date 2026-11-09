@@ -20,6 +20,10 @@ pub(crate) fn to_entry(p: Platform, account: &AccountId, r: &rupu_scm::Repo) -> 
 
 #[async_trait::async_trait]
 impl RepoLister for CpRepoLister {
+    fn forge_writer(&self) -> Option<&dyn rupu_cp::forge_writer::ForgeWriter> { Some(self) }
+    fn issue_reader(&self) -> Option<&dyn rupu_cp::issue_reader::IssueReader> {
+        Some(self)
+    }
     async fn list(&self) -> Result<Vec<RepoEntry>, RepoListError> {
         let mut out = Vec::new();
         for p in [Platform::Github, Platform::Gitlab] {
@@ -37,6 +41,56 @@ impl RepoLister for CpRepoLister {
             }
         }
         Ok(out)
+    }
+
+    fn supports_review_pages(&self) -> bool {
+        true
+    }
+
+    async fn review_page_identity(
+        &self,
+        repo: &rupu_scm::RepoRef,
+        cwd: &std::path::Path,
+        origin: &str,
+        number: u32,
+        selection: &rupu_cp::repos::ReviewSelection,
+    ) -> Result<rupu_cp::repos::review_pages::Identity, RepoListError> {
+        crate::cp_review_pages::read_identity(&self.registry, repo, cwd, origin, number, selection)
+            .await
+    }
+    async fn review_page(
+        &self,
+        repo: &rupu_scm::RepoRef,
+        cwd: &std::path::Path,
+        origin: &str,
+        number: u32,
+        selection: &rupu_cp::repos::ReviewSelection,
+        expected: Option<&rupu_cp::repos::review_pages::Identity>,
+        request: &rupu_cp::repos::review_pages::Request,
+    ) -> Result<rupu_cp::repos::review_pages::Page, RepoListError> {
+        crate::cp_review_pages::read(
+            &self.registry,
+            repo,
+            cwd,
+            origin,
+            number,
+            selection,
+            expected,
+            request,
+        )
+        .await
+    }
+
+    async fn review_detail(
+        &self,
+        repo: &rupu_scm::RepoRef,
+        cwd: &std::path::Path,
+        origin_host: &str,
+        number: u32,
+        selection: &rupu_cp::repos::ReviewSelection,
+    ) -> Result<serde_json::Value, RepoListError> {
+        crate::cp_review_detail::read(&self.registry, repo, cwd, origin_host, number, selection)
+            .await
     }
 
     async fn reviews(

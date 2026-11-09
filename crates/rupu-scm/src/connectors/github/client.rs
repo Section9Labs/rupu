@@ -31,6 +31,8 @@ pub struct GithubClient {
     pub(crate) inner: Octocrab,
     pub(crate) token: String,
     graphql_url: String,
+    operator_read_origin: Option<String>,
+    review: crate::review_transport::ReviewTransport,
     semaphore: Arc<Semaphore>,
     cache: Arc<Mutex<LruCache<String, CacheEntry>>>,
     /// `[scm.github].timeout_ms` (ISSUES.md I-17). Applied to octocrab AND to
@@ -60,6 +62,121 @@ struct CacheEntry {
 }
 
 impl GithubClient {
+    pub(crate) fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        use crate::forge_write::ForgeError;
+        let origin = self
+            .operator_read_origin()
+            .ok_or_else(ForgeError::unsupported)?;
+        let http = crate::forge_write::http("github", self.sink.clone())
+            .map_err(|_| ForgeError::upstream())?;
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .map_err(|_| ForgeError::unsupported())?,
+        );
+        auth.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+        );
+        let review = self.review.clone();
+        crate::forge_write::ForgeSession::new(
+            crate::IssueTracker::Github,
+            origin,
+            self.review_identity_epoch(),
+            http,
+            auth,
+            Arc::new(move || review.identity_epoch(0)),
+        )
+    }
+
+    pub(crate) fn discussion_session(&self) -> Result<crate::issue_discussion::Session, ScmError> {
+        let origin = self
+            .operator_read_origin()
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))
+                .map_err(|_| crate::issue_discussion::unsupported())?,
+        );
+        auth.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+        );
+        let review = self.review.clone();
+        crate::issue_discussion::Session::new(
+            crate::IssueTracker::Github,
+            origin,
+            self.graphql_url.clone(),
+            self.review_identity_epoch(),
+            crate::issue_discussion::http("github", self.sink.clone())
+                .map_err(|_| crate::issue_discussion::failed())?,
+            auth,
+            Arc::new(move || review.identity_epoch(0)),
+        )
+    }
+
+    pub fn review_identity_epoch(&self) -> String {
+        self.review.identity_epoch(0)
+    }
+    pub fn review_api_profile(&self) -> String {
+        self.review.api_profile()
+    }
+    pub fn review_matches_origin(&self, origin: &str) -> bool {
+        self.review.matches_origin(origin)
+    }
+    pub async fn review_get(
+        &self,
+        path: &str,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.review_get_bounded(path, crate::review_transport::MAX_REVIEW_BODY)
+            .await
+    }
+    pub async fn review_get_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        crate::review_transport::validate_budget(max_bytes)?;
+        let (request, url) = self.review.get_request(path)?;
+        let _permit = self.permit().await;
+        let token = self.token.clone();
+        let response = request
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| crate::review_transport::transport_failure())?;
+        self.review.finish(response, &url, max_bytes).await
+    }
+
+    pub async fn review_graphql(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.review_graphql_bounded(query, variables, crate::review_transport::MAX_REVIEW_BODY)
+            .await
+    }
+    pub async fn review_graphql_bounded(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+        max_bytes: usize,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        crate::review_transport::validate_budget(max_bytes)?;
+        let (request, url) = self.review.graphql_request(query, variables)?;
+        let _permit = self.permit().await;
+        let response = request
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| crate::review_transport::transport_failure())?;
+        self.review.finish(response, &url, max_bytes).await
+    }
+
     /// Convenience constructor with default `[scm.github]` options.
     pub fn new(
         token: String,
@@ -104,10 +221,20 @@ impl GithubClient {
         let cache = Arc::new(Mutex::new(LruCache::new(
             NonZeroUsize::new(CACHE_CAP).unwrap(),
         )));
+        let review = crate::review_transport::ReviewTransport::new(
+            Platform::Github,
+            opts.base_url.as_deref().unwrap_or("https://api.github.com"),
+            opts.timeout,
+            sink.clone(),
+        );
         Self {
+            review,
             inner,
             token,
             graphql_url,
+            operator_read_origin: crate::operator_issues::safe_origin(
+                opts.base_url.as_deref().unwrap_or("https://api.github.com"),
+            ),
             semaphore,
             cache,
             timeout: opts.timeout,
@@ -116,6 +243,27 @@ impl GithubClient {
             enterprise_host,
             sink,
         }
+    }
+
+    pub(crate) async fn operator_json(&self, path: &str) -> Result<serde_json::Value, ScmError> {
+        let origin = self
+            .operator_read_origin
+            .as_deref()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let http = crate::operator_issues::http("github", self.sink.clone())
+            .map_err(|_| crate::operator_issues::rejected())?;
+        let response = http
+            .get(format!("{origin}{path}"))
+            .bearer_auth(&self.token)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|_| crate::operator_issues::rejected())?;
+        crate::operator_issues::json(response).await
+    }
+
+    pub(crate) fn operator_read_origin(&self) -> Option<String> {
+        self.operator_read_origin.clone()
     }
 
     /// The host this client talks to (e.g. `api.github.com`, or a GitHub

@@ -24,7 +24,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/maintenance/prune", post(prune))
+    let router = Router::new().route("/api/maintenance/prune", post(prune));
+    #[cfg(unix)]
+    let router = router.merge(super::retention_policy::routes());
+    router
 }
 
 /// What `POST /api/maintenance/prune` removes.

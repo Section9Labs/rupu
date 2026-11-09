@@ -37,9 +37,13 @@ pub struct SpawnSpec {
     /// (`cp serve`) never collects zombies — which `kill(pid, 0)` would read
     /// as live runners.
     pub keep_child: bool,
+    /// Private session broker socket, explicitly passed only to a worker.
+    #[cfg(unix)]
+    pub private_stdin: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
-/// Where the child's standard streams go. stdin is always null.
+/// Where the child's output streams go. stdin is null except for an explicitly
+/// supplied private session-worker handoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnStdio {
     /// stdout and stderr to `/dev/null`.
@@ -71,6 +75,8 @@ impl SpawnSpec {
             env: Vec::new(),
             stdio: SpawnStdio::Null,
             keep_child: false,
+            #[cfg(unix)]
+            private_stdin: None,
         }
     }
 
@@ -85,6 +91,10 @@ impl SpawnSpec {
             cmd.current_dir(dir);
         }
         cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        #[cfg(unix)]
+        if let Some(fd) = &self.private_stdin {
+            cmd.stdin(Stdio::from(fd.try_clone()?));
+        }
         match &self.stdio {
             SpawnStdio::Null => cmd.stderr(Stdio::null()),
             SpawnStdio::Log(path) => cmd.stderr(Stdio::from(std::fs::File::create(path)?)),

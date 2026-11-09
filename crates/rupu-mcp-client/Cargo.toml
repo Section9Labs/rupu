@@ -1,0 +1,26 @@
+[package]
+name = "rupu-mcp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rupu-auth = { path = "../rupu-auth" }
+rupu-config = { path = "../rupu-config" }
+reqwest.workspace = true
+reqwest-middleware.workspace = true
+rupu-netflow = { workspace = true, features = ["http"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true

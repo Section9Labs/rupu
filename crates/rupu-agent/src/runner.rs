@@ -23,7 +23,7 @@ use rupu_providers::types::{
 use rupu_skills::render::REATTACH_MARKER;
 use rupu_tools::{
     AliasScope, AllowAlways, Decision, DenyReason, DerivedEvent, PermissionMode, PermissionPolicy,
-    ResolvedGrant, RunIdentity, Service, Surface, Tool, ToolContext,
+    ResolvedGrant, RunIdentity, Service, Surface, ToolContext,
 };
 use rupu_transcript::{
     Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
@@ -741,6 +741,8 @@ pub enum RunError {
     /// run (a bug: the grant and the runner disagree).
     #[error("tool grant: {0}")]
     ToolGrant(String),
+    #[error("tool approval: {0}")]
+    Approval(String),
     /// The agent loop returned `Ok` — no transport/provider failure — but the
     /// run's own terminal [`RunStatus`] was not `Ok`: a `max_turns` bust, or
     /// a response outcome the recovery ladder could not fix (both
@@ -1788,6 +1790,7 @@ impl Run {
         } = opts;
         // A child run a tool call starts asks the run's own operator.
         tool_context.services.prompter = permission.prompter().cloned();
+        tool_context.services.authorizer = permission.authorizer().cloned();
         let id = Arc::clone(&tool_context.identity);
         let loaded_skills = prompt.loaded_skills.clone();
         let unseen_messages = prompt.unseen_messages.clone();
@@ -2146,7 +2149,7 @@ async fn run_agent_inner(
     // The ledger the findings/coverage tools write: ensured once, up front,
     // so a run's first record never races its directory.
     if grant.entries.values().any(|e| {
-        let n = e.descriptor.needs;
+        let n = &e.descriptor.needs;
         n.contains(&Service::Findings) || n.contains(&Service::Coverage)
     }) && coverage.is_none()
     {
@@ -2155,13 +2158,13 @@ async fn run_agent_inner(
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
     }
 
-    // The run's tool registry: one loop over the grant, each body from the
-    // catalog (`rupu_tools::bodies`).
+    // The run's tool registry: one loop over the grant and its exact catalog
+    // snapshot, binding metadata and bodies before provider work.
     let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
     for entry in grant.entries.values() {
-        let name = entry.canonical;
-        match rupu_tools::bodies::body(name, &opts.tool_context) {
-            Some(t) => registry.insert(t),
+        let name = entry.canonical.as_str();
+        match grant.catalog.body(name, &opts.tool_context) {
+            Some(t) => registry.insert_bound(t),
             None => {
                 // The grant offered a tool whose services this run
                 // provides, yet nothing here can build it: the service
@@ -3195,11 +3198,11 @@ async fn run_agent_inner(
 
             // Dispatch tool calls in order.
             let mut tool_results: Vec<(String, String, Option<String>)> = Vec::new();
-            for (call_id, tool_name, input) in tool_uses {
+            for (call_sequence, (call_id, tool_name, input)) in tool_uses.into_iter().enumerate() {
                 // Resolve the name the model used (canonical or a legacy
                 // alias) to the tool and its descriptor. The transcript's
                 // `ToolCall` keeps the name the model actually used.
-                let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
+                let tool = match registry.get(&tool_name) {
                     Some(t) => t,
                     None => {
                         // Not in the grant: a genuinely unknown name, or a
@@ -3215,9 +3218,8 @@ async fn run_agent_inner(
                             duration_ms: 0,
                             structured: None,
                         })?;
-                        let canonical = rupu_tools::ToolCatalog::builtin()
-                            .resolve_name(&tool_name, opts.alias_scope)
-                            .map(|d| d.name);
+                        let definition = grant.catalog.resolve_definition(&tool_name, opts.alias_scope);
+                        let canonical = definition.as_ref().map(|d| d.name.as_str());
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
@@ -3238,7 +3240,44 @@ async fn run_agent_inner(
                 // run's mode (W1). The operator is asked only for a
                 // write/external call under `ask` with a prompter.
                 let mut spawn_ceiling = None;
-                match opts.permission.decide(descriptor, &input, &mut allow_always) {
+                let mut approval_permit: Option<Box<dyn rupu_tools::approval::ApprovalPermit>> = None;
+                let mut approval_record: Option<rupu_transcript::ToolApprovalRecord> = None;
+                let decision = if opts.permission.mode() == PermissionMode::Ask
+                    && matches!(descriptor.effect, rupu_tools::Effect::Write | rupu_tools::Effect::External)
+                    && opts.permission.authorizer().is_some()
+                {
+                    let authorizer = opts.permission.authorizer().expect("checked above");
+                    let request = approval_request(authorizer.as_ref(), &opts.tool_context, &grant,
+                        &descriptor, &input, &call_id, &tool_name, turn_idx, call_sequence as u64)?;
+                    let mut observe = |value| {
+                        let record: rupu_transcript::ToolApprovalRecord = serde_json::from_value(value)
+                            .map_err(|_| rupu_tools::approval::ApprovalError("invalid broker event".into()))?;
+                        writer.write(&Event::ToolApproval { record: record.clone() })
+                            .and_then(|_| writer.flush())
+                            .map_err(|_| rupu_tools::approval::ApprovalError("approval transcript unavailable".into()))?;
+                        approval_record = Some(record);
+                        Ok(())
+                    };
+                    let outcome = tokio::select! {
+                        result = authorizer.authorize(request, &mut observe) => result,
+                        _ = wait_pause(&pause) => Err(rupu_tools::approval::ApprovalError("approval cancelled with run".into())),
+                    }.map_err(|e| RunError::Approval(e.to_string()))?;
+                    match outcome {
+                        rupu_tools::approval::ApprovalOutcome::Denied { .. } => Decision::Deny { reason: DenyReason::OperatorDenied },
+                        rupu_tools::approval::ApprovalOutcome::Permitted(permit) => {
+                            if let Some(record) = &mut approval_record {
+                                record.state = "dispatch_reserved".into();
+                                writer.write(&Event::ToolApproval { record: record.clone() })?;
+                                writer.flush()?;
+                            }
+                            approval_permit = Some(permit);
+                            Decision::Allow
+                        }
+                    }
+                } else {
+                    opts.permission.decide_call(&descriptor.name, descriptor.effect, &input, &mut allow_always)
+                };
+                match decision {
                     Decision::Allow => {}
                     Decision::AllowDegraded => {
                         if !degraded_noticed {
@@ -3261,7 +3300,7 @@ async fn run_agent_inner(
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
-                            Some(descriptor.name),
+                            Some(descriptor.name.as_str()),
                             denied(reason),
                         ))?;
                         tool_results.push((
@@ -3279,7 +3318,7 @@ async fn run_agent_inner(
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
-                            Some(descriptor.name),
+                            Some(descriptor.name.as_str()),
                             "denied:operator_stop".into(),
                         ))?;
                         writer.write(&Event::RunComplete {
@@ -3301,6 +3340,12 @@ async fn run_agent_inner(
                 // PermissionDenied`), so `blocked` is derived from the actual
                 // outcome below (spec §4a/§4b; a denial MUST show `blocked:
                 // true`). Exactly one callback invocation per call.
+                // Both select arms may be ready when a permit arrives.
+                // Recheck immediately before dispatch; dropping a reserved
+                // permit closes the channel and preserves unknown evidence.
+                if approval_permit.is_some() && is_paused(&pause) {
+                    return Err(RunError::Approval("approved call cancelled before dispatch".into()));
+                }
                 // No new tool dispatch once SIGTERM has arrived.
                 if rupu_providers::credential_writes::terminating() {
                     return Err(terminated(
@@ -3322,6 +3367,29 @@ async fn run_agent_inner(
                     called_as: Some(tool_name.clone()),
                 };
                 let invoke_result = tool.invoke(input.clone(), &call_ctx).await;
+                if let Some(permit) = approval_permit.take() {
+                    let success = invoke_result.as_ref().is_ok_and(|out| out.error.is_none());
+                    let outcome = rupu_tools::approval::ApprovalCompletion {
+                        success,
+                        error: (!success).then(|| "tool_returned_error".into()),
+                        result_fingerprint: None,
+                    };
+                    if permit.complete(outcome).await.is_err() {
+                        // A handler already ran. Preserve its observed result,
+                        // stop this run, and never retry a side effect because
+                        // its approval receipt could not be confirmed.
+                        let (output, error, structured) = match &invoke_result {
+                            Ok(out) => (clamp_tool_result_text(&out.stdout), out.error.clone(), out.structured.clone()),
+                            Err(_) => (String::new(), Some("tool_returned_error".into()), None),
+                        };
+                        writer.write(&Event::ToolResult { call_id: call_id.clone(), output, error,
+                            duration_ms: started_tool.elapsed().as_millis() as u64, structured })?;
+                        if let Some(record) = &mut approval_record { record.state = "unknown".into(); writer.write(&Event::ToolApproval { record: record.clone() })?; }
+                        writer.flush()?;
+                        return Err(RunError::Approval("outcome receipt unconfirmed; inspect the run before any new attempt".into()));
+                    }
+                    if let Some(record) = &mut approval_record { record.state = "completed".into(); writer.write(&Event::ToolApproval { record: record.clone() })?; }
+                }
                 let blocked = matches!(invoke_result, Err(rupu_tools::ToolError::PermissionDenied));
                 match invoke_result {
                     Ok(out) => {
@@ -3418,7 +3486,7 @@ async fn run_agent_inner(
                 writer.write(&tool_audit(
                     &grant,
                     &tool_name,
-                    Some(descriptor.name),
+                    Some(descriptor.name.as_str()),
                     decision,
                 ))?;
                 if let Some(cb) = opts.hooks.on_tool_call.as_ref() {
@@ -3850,6 +3918,105 @@ fn record_injection(
 }
 
 /// The transcript's record of a run's permission mode.
+fn approval_fingerprint(value: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let ordered: std::collections::BTreeMap<_, _> = map.iter().collect();
+                serde_json::Value::Object(
+                    ordered
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), canonical(value)))
+                        .collect(),
+                )
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(canonical).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&canonical(value)).expect("JSON value"))
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn approval_request(
+    authorizer: &dyn rupu_tools::approval::CallAuthorizer,
+    ctx: &ToolContext,
+    grant: &ResolvedGrant,
+    descriptor: &rupu_tools::ToolDefinition,
+    input: &serde_json::Value,
+    call_id: &str,
+    called_as: &str,
+    turn_index: u32,
+    call_sequence: u64,
+) -> Result<rupu_tools::approval::CallApprovalRequest, RunError> {
+    use rupu_tools::approval::{ApprovalEffect, ApprovalRemote, CallApprovalRequest};
+    let mut owner = authorizer.root_owner();
+    if owner.workspace_id != ctx.workspace.id
+        || owner.workspace_path != ctx.workspace.path.to_string_lossy()
+    {
+        return Err(RunError::Approval("call workspace changed".into()));
+    }
+    owner.run_id = ctx.identity.run_id.clone();
+    owner.parent_run_id = ctx.identity.parent.as_ref().map(|p| p.run_id.clone());
+    owner.root_run_id = ctx
+        .identity
+        .parent
+        .as_ref()
+        .map(|p| p.root_run_id.clone())
+        .unwrap_or_else(|| ctx.identity.run_id.clone());
+    let remote = descriptor.remote_identity().map(|id| ApprovalRemote {
+        server_id: id.server.clone(),
+        tool: id.tool.clone(),
+    });
+    let metadata = serde_json::json!({"name": descriptor.name, "effect": descriptor.effect,
+        "schema": descriptor.input_schema(), "description": descriptor.description,
+        "remote": remote});
+    let entries: Vec<_> = grant
+        .entries
+        .iter()
+        .map(|(name, entry)| {
+            serde_json::json!({
+                "name": name, "effect": entry.descriptor.effect, "reasons": entry.reasons_string(),
+                "schema": entry.descriptor.input_schema()
+            })
+        })
+        .collect();
+    if serde_json::to_vec(input)
+        .map_err(|_| RunError::Approval("invalid tool input".into()))?
+        .len()
+        > 256 * 1024
+    {
+        return Err(RunError::Approval("tool input exceeds review bound".into()));
+    }
+    Ok(CallApprovalRequest {
+        owner,
+        turn_index: turn_index.into(),
+        tool_call_id: call_id.into(),
+        call_sequence,
+        tool: descriptor.name.clone(),
+        called_as: called_as.into(),
+        effect: match descriptor.effect {
+            rupu_tools::Effect::Write => ApprovalEffect::Write,
+            rupu_tools::Effect::External => ApprovalEffect::External,
+            _ => {
+                return Err(RunError::Approval(
+                    "effect does not require approval".into(),
+                ))
+            }
+        },
+        descriptor_fingerprint: approval_fingerprint(&metadata),
+        grant_fingerprint: approval_fingerprint(&serde_json::json!(entries)),
+        remote,
+        input: input.clone(),
+    })
+}
+
 fn run_mode(mode: PermissionMode) -> RunMode {
     match mode {
         PermissionMode::Bypass => RunMode::Bypass,
@@ -3874,6 +4041,12 @@ fn write_tool_grant(writer: &mut JsonlWriter, grant: &ResolvedGrant) -> Result<(
             .entries
             .values()
             .map(|e| rupu_transcript::ToolGrantEntry {
+                remote: e.descriptor.remote_identity().map(|id| {
+                    rupu_transcript::RemoteToolIdentity {
+                        server: id.server.clone(),
+                        tool: id.tool.clone(),
+                    }
+                }),
                 tool: e.canonical.to_string(),
                 reasons: e.reasons.iter().map(ToString::to_string).collect(),
             })
@@ -7228,3 +7401,7 @@ mod skill_load_tests {
         assert_eq!(loaded, vec![entry("b", "h2"), entry("a", "h3")]);
     }
 }
+
+#[cfg(test)]
+#[path = "approval_tests.rs"]
+mod approval_tests;

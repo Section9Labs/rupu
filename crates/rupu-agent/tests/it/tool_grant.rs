@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 struct Run {
+    tool_ceiling: Option<Vec<String>>,
     agent_tools: Option<Vec<String>>,
     step_actions: Vec<String>,
     concerns: Option<ConcernsBlock>,
@@ -25,6 +26,7 @@ struct Run {
 impl Default for Run {
     fn default() -> Self {
         Self {
+            tool_ceiling: None,
             agent_tools: None,
             step_actions: Vec::new(),
             concerns: None,
@@ -65,7 +67,7 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
     let provider = CapturingMockProvider::new(r.script);
     let captured = provider.captured.clone();
     let transcript: PathBuf = workspace.join("run.jsonl");
-    let opts = rupu_agent::grant::with_grant(
+    let mut opts = rupu_agent::grant::with_grant(
         AgentRunOpts {
             system_prompt: "test".into(),
             prompt: rupu_agent::UserTurn::new("go"),
@@ -110,10 +112,19 @@ async fn run(workspace: &Path, r: Run) -> (Vec<String>, Vec<Event>) {
         &r.step_actions,
     )
     .expect("grant");
+    rupu_tools::tool_ceiling::apply(&mut opts.grant, r.tool_ceiling.as_deref()).unwrap();
     let _ = run_agent(opts).await;
-    let offered = captured
-        .lock()
-        .unwrap()
+    let requests = captured.lock().unwrap();
+    if let Some(ceiling) = &r.tool_ceiling {
+        assert!(
+            requests.iter().all(|request| request
+                .tools
+                .iter()
+                .all(|tool| ceiling.contains(&tool.name))),
+            "every provider request retains the ceiling, including after skill loads"
+        );
+    }
+    let offered = requests
         .first()
         .map(|req| req.tools.iter().map(|t| t.name.clone()).collect())
         .unwrap_or_default();
@@ -503,4 +514,67 @@ fn messaging_off_with_a_messaging_tool_fails_load() {
         let spec = rupu_agent::load_agent(tmp.path(), None, name).unwrap();
         assert!(!spec.messaging_off(), "{name}");
     }
+}
+
+#[tokio::test]
+async fn session_ceiling_excludes_ambient_from_provider_and_denies_fabricated_call() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    let (offered, events) = run(
+        tmp.path(),
+        Run {
+            tool_ceiling: Some(strs(&["skills.load"])),
+            agent_tools: Some(strs(&["write_file"])),
+            skills: Some(one_skill(global.path())),
+            concerns: rupu_agent::builtin::session_agent().concerns,
+            script: vec![
+                call("load", "skills.load", json!({"name":"pdf"})),
+                call(
+                    "forged",
+                    "write_file",
+                    json!({"path":"must-not-exist","content":"not allowed"}),
+                ),
+                done(),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(offered, ["skills.load"]);
+    assert_eq!(
+        audits(&events),
+        [
+            ("skills.load".into(), "allowed".into()),
+            ("write_file".into(), "not_granted".into())
+        ]
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, Event::SkillLoad { .. })));
+    assert!(!tmp.path().join("must-not-exist").exists());
+    assert!(!reasons_for(&events, "skills.load").is_empty());
+}
+
+#[tokio::test]
+async fn empty_session_ceiling_blocks_even_fabricated_skill_loader_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    let (offered, events) = run(
+        tmp.path(),
+        Run {
+            tool_ceiling: Some(vec![]),
+            skills: Some(one_skill(global.path())),
+            script: vec![call("forged", "skill_load", json!({"name":"pdf"})), done()],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(offered.is_empty());
+    assert_eq!(
+        audits(&events),
+        [("skill_load".into(), "not_granted".into())]
+    );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, Event::SkillLoad { .. })));
 }

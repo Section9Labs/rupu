@@ -152,8 +152,32 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StartArgs {
+    /// Immutable exact tool ceiling as a JSON array; [] denies all tools.
+    #[arg(long)]
+    pub tool_ceiling: Option<String>,
+    /// Exact global definition/project proof; separate from ordinary name lookup.
+    #[arg(long, hide = true)]
+    pub exact_agent_definition: Option<String>,
+    /// Private authenticated CP handoff; not an operator/model option.
+    #[arg(long, hide = true)]
+    pub approval_channel: bool,
+    /// Exact configured MCP tool identities as a JSON array; omit for host defaults.
+    #[arg(long)]
+    pub mcp_tools: Option<String>,
+    /// Opaque discovery revision required with a nonempty explicit MCP selection.
+    #[arg(long)]
+    pub mcp_catalog_revision: Option<String>,
+    /// Declared runtime tool grant for every turn, replacing the agent's list. Repeatable.
+    #[arg(long = "tool", value_name = "TOOL", conflicts_with = "no_tools")]
+    pub tools: Vec<String>,
+    /// Declare no tools; context-owned ambient and origin grants still apply.
+    #[arg(long, conflicts_with = "tools")]
+    pub no_tools: bool,
+    /// Reasoning depth for an explicit provider and model.
+    #[arg(long, requires_all = ["provider", "model"], value_parser = ["auto", "low", "medium", "high", "max"])]
+    pub effort: Option<String>,
     /// Installed Rupu skill preset for a new builtin session, or `none`.
-    #[arg(long, value_parser = ["rupu-session-v1", "none"])]
+    #[arg(long, value_parser = ["rupu-session-v1", "rupu-session-full-v1", "none"])]
     pub skill_preset: Option<String>,
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
@@ -227,6 +251,9 @@ pub struct ListArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct SendArgs {
+    /// Private authenticated CP handoff; not an operator/model option.
+    #[arg(long, hide = true)]
+    pub approval_channel: bool,
     /// Session id (`ses_<ULID>`), a unique prefix, or a codename.
     #[arg(add = ArgValueCompleter::new(active_session_ids))]
     pub session_id: String,
@@ -286,6 +313,9 @@ pub struct RunTurnArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct RunWorkerArgs {
+    /// Private authenticated CP handoff; not an operator/model option.
+    #[arg(long, hide = true)]
+    pub approval_channel: bool,
     #[arg(long)]
     pub session_id: String,
 }
@@ -1044,6 +1074,15 @@ pub async fn handle(
     };
     match result {
         Ok(()) => ExitCode::from(0),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<rupu_runtime::session_mcp::Error>(),
+                Some(rupu_runtime::session_mcp::Error::Stale)
+            ) =>
+        {
+            let _ = crate::output::diag::fail(e);
+            ExitCode::from(75)
+        }
         Err(e) => crate::output::diag::fail(e),
     }
 }
@@ -1372,20 +1411,36 @@ fn usage_timeline(session_id: &str, global_format: Option<OutputFormat>) -> anyh
     report::emit_collection(global_format, &output)
 }
 
+fn has_approval_start_channel() -> bool {
+    #[cfg(unix)]
+    {
+        crate::session_approval_channel::has_start()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 async fn start(args: StartArgs) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if args.approval_channel {
+        crate::session_approval_channel::accept_start()?;
+    }
     start_in(args, paths::global_dir()?, std::env::current_dir()?).await
 }
 
 async fn start_in(args: StartArgs, global: PathBuf, pwd: PathBuf) -> anyhow::Result<()> {
     let (session, first_turn) = prepare_start(&args, global.clone(), pwd).await?;
     write_session(&global, SessionScope::Active, &session)?;
-    if args.provider.is_some() || args.model.is_some() {
+    if args.provider.is_some() || args.model.is_some() || args.effort.is_some() {
         // Persist selection before the worker can read the record. Besides
         // freezing identity, this suppresses a definition/config fallback
         // chain for an explicit selection on the first and later turns.
         rupu_runtime::session_settings::SessionSettings {
             provider: args.provider.clone(),
             model: args.model.clone(),
+            effort: args.effort.clone(),
             ..Default::default()
         }
         .save(&session_dir(
@@ -1417,6 +1472,50 @@ async fn prepare_start(
     global: PathBuf,
     pwd: PathBuf,
 ) -> anyhow::Result<(SessionRecord, rupu_skills::SlashTurn)> {
+    prepare_start_with_approval(args, global, pwd, has_approval_start_channel()).await
+}
+
+// The production caller obtains this bit only from the already-detached
+// private socket. Keeping preparation pure makes the first-turn gate testable.
+fn requested_tool_ceiling(args: &StartArgs) -> anyhow::Result<Option<Vec<String>>> {
+    let ceiling = args
+        .tool_ceiling
+        .as_deref()
+        .map(|raw| -> anyhow::Result<Vec<String>> {
+            anyhow::ensure!(raw.len() <= 65536, "tool_ceiling is too large");
+            Ok(serde_json::from_str(raw)?)
+        })
+        .transpose()?;
+    if let Some(names) = &ceiling {
+        let remote: Vec<rupu_runtime::session_mcp::ToolRef> = args
+            .mcp_tools
+            .as_deref()
+            .map(|raw| -> anyhow::Result<_> {
+                anyhow::ensure!(raw.len() <= 65536, "MCP selection is too large");
+                Ok(serde_json::from_str(raw)?)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        rupu_runtime::session_mcp::validate_request(
+            Some(&remote),
+            args.mcp_catalog_revision.as_deref(),
+        )?;
+        rupu_tools::tool_ceiling::validate_names(
+            names,
+            &rupu_tools::ToolCatalog::builtin(),
+            remote.iter().map(|tool| tool.local_name()),
+        )?;
+    }
+    Ok(ceiling)
+}
+
+async fn prepare_start_with_approval(
+    args: &StartArgs,
+    global: PathBuf,
+    pwd: PathBuf,
+    approval_available: bool,
+) -> anyhow::Result<(SessionRecord, rupu_skills::SlashTurn)> {
+    let tool_ceiling = requested_tool_ceiling(args)?;
     anyhow::ensure!(
         !args.idle
             || (args.prompt.is_none()
@@ -1425,11 +1524,18 @@ async fn prepare_start(
                 && args.into.is_none()),
         "idle session creation cannot include a prompt, target, or clone directory"
     );
-    if args.mode.as_deref() == Some("ask") {
+    if args.mode.as_deref() == Some("ask") && !approval_available {
         anyhow::bail!(
             "session start does not support `ask` mode; use `--mode bypass` or `--mode readonly`"
         );
     }
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        args.exact_agent_definition.is_none(),
+        "exact global conversation unsupported on this platform"
+    );
+    #[cfg(unix)]
+    let exact = session_exact_agent::load_start(args, &global, &pwd)?;
     paths::ensure_dir(&global)?;
     paths::ensure_dir(&paths::sessions_dir(&global))?;
 
@@ -1442,10 +1548,29 @@ async fn prepare_start(
             paths::project_root_for(&pwd)?
         };
     let project_agents_parent = project_root.as_ref().map(|p| p.join(".rupu"));
+    #[cfg(unix)]
+    let mut spec = if let Some(loaded) = &exact {
+        rupu_agent::loader::validate_loaded_agent_in(
+            &loaded.spec,
+            &global,
+            project_agents_parent.as_deref(),
+            &[],
+        )?;
+        loaded.spec.clone()
+    } else {
+        load_agent(&global, project_agents_parent.as_deref(), &args.agent)?
+    };
+    #[cfg(not(unix))]
     let mut spec = load_agent(&global, project_agents_parent.as_deref(), &args.agent)?;
     let initial_settings = rupu_runtime::session_settings::SessionSettings {
         provider: args.provider.clone(),
         model: args.model.clone(),
+        tools: if args.no_tools || !args.tools.is_empty() {
+            Some(args.tools.clone())
+        } else {
+            None
+        },
+        effort: args.effort.clone(),
         ..Default::default()
     };
     initial_settings.validate()?;
@@ -1456,9 +1581,9 @@ async fn prepare_start(
         "skill presets apply only to rupu-session"
     );
     let skill_plan = if builtin {
-        Some(rupu_runtime::session_skill_preset::plan(
+        Some(rupu_runtime::session_skill_preset::plan_for(
             &skill_dirs(&global, project_root.as_deref()),
-            args.skill_preset.as_deref() != Some("none"),
+            args.skill_preset.as_deref(),
             &args.skills,
             &args.preload_skills,
         )?)
@@ -1492,7 +1617,7 @@ async fn prepare_start(
     let agent_mode = spec.permission_mode.as_deref().and_then(parse);
     let global_mode = cfg.permission_mode.as_deref().and_then(parse);
     let mode = resolve_mode(cli_mode, agent_mode, None, global_mode);
-    if matches!(mode, PermissionMode::Ask) {
+    if matches!(mode, PermissionMode::Ask) && !approval_available {
         anyhow::bail!(
             "sessions require a non-interactive permission mode; use `--mode bypass` or `--mode readonly`"
         );
@@ -1587,6 +1712,14 @@ async fn prepare_start(
             "registered project path changed; reload before starting the session"
         );
     }
+    #[cfg(unix)]
+    let ws = if let Some(loaded) = &exact {
+        // Do not update or path-deduplicate the reviewed registration.
+        toml::from_str::<rupu_workspace::Workspace>(&loaded.registration_raw)?
+    } else {
+        rupu_workspace::upsert(&ws_store, &workspace_path)?
+    };
+    #[cfg(not(unix))]
     let ws = rupu_workspace::upsert(&ws_store, &workspace_path)?;
     anyhow::ensure!(
         args.workspace_id.as_ref().is_none_or(|id| id == &ws.id),
@@ -1614,6 +1747,46 @@ async fn prepare_start(
         );
     }
 
+    // Freeze before writing a session or starting a provider worker. Explicit
+    // empty performs no registry reads or metadata/credential requests.
+    let requested_mcp = args
+        .mcp_tools
+        .as_deref()
+        .map(
+            |text| -> anyhow::Result<Vec<rupu_runtime::session_mcp::ToolRef>> {
+                anyhow::ensure!(text.len() <= 65536, "MCP selection is too large");
+                Ok(serde_json::from_str(text)?)
+            },
+        )
+        .transpose()?;
+    rupu_runtime::session_mcp::validate_request(
+        requested_mcp.as_deref(),
+        args.mcp_catalog_revision.as_deref(),
+    )?;
+    let mcp_tools = if requested_mcp.as_ref().is_some_and(Vec::is_empty) {
+        rupu_runtime::session_mcp::FrozenSelection::default()
+    } else {
+        let registry = rupu_config::mcp::Registry::load(&global)?;
+        rupu_runtime::session_mcp::freeze(
+            &registry,
+            &rupu_mcp_client::HostCredentials::for_global(&global),
+            requested_mcp.as_deref(),
+            args.mcp_catalog_revision.as_deref(),
+        )
+        .await?
+    };
+
+    if let Some(ceiling) = &tool_ceiling {
+        rupu_tools::tool_ceiling::validate_names(
+            ceiling,
+            &rupu_tools::ToolCatalog::builtin(),
+            mcp_tools
+                .tools
+                .iter()
+                .map(|tool| tool.identity.local_name()),
+        )?;
+    }
+
     let mode_str = mode.as_str().to_string();
 
     let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
@@ -1624,11 +1797,29 @@ async fn prepare_start(
     let transcripts_dir = paths::transcripts_dir(&global, project_root.as_deref());
     paths::ensure_dir(&transcripts_dir)?;
     let now = Utc::now();
+    #[cfg(unix)]
+    let exact_global_agent = if let Some(loaded) = &exact {
+        // Last observation before persisting the fully assembled session. The
+        // captured AgentSpec stays authoritative; no subsequent name lookup.
+        rupu_runtime::exact_agent::load(&global, &loaded.review.binding, &pwd)?;
+        Some(rupu_runtime::sessions::ExactSessionAgent {
+            binding: serde_json::to_string(&loaded.review.binding)?,
+            fallbacks: loaded.spec.fallbacks.clone(),
+        })
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let exact_global_agent = None;
     let session = SessionRecord {
+        exact_global_agent,
         version: SessionRecord::VERSION,
         session_id: session_id.clone(),
         agent_name: spec.name.clone(),
         builtin_harness: spec.name == rupu_agent::builtin::SESSION_AGENT_NAME,
+        scoped_reads_version: builtin.then_some(1),
+        builtin_tools_preset: (builtin && initial_settings.tools.is_none())
+            .then(|| rupu_agent::builtin::SESSION_TOOLS_PRESET.to_owned()),
         skill_preset_diagnostics: skill_plan
             .as_ref()
             .map(|plan| plan.diagnostics.clone())
@@ -1645,6 +1836,8 @@ async fn prepare_start(
         model,
         agent_system_prompt,
         agent_tools: spec.tools.clone(),
+        tool_ceiling,
+        mcp_tools: Some(mcp_tools),
         messaging: spec.messaging,
         max_turns: spec.max_turns.unwrap_or(50),
         permission_mode: mode_str,
@@ -1711,6 +1904,10 @@ async fn prepare_start(
 }
 
 async fn send(args: SendArgs) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if args.approval_channel {
+        crate::session_approval_channel::accept_start()?;
+    }
     let global = paths::global_dir()?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_active_scope(scope, "session send")?;
@@ -1985,10 +2182,26 @@ fn ensure_session_worker(
     // at the terminal that started or attached to the session reaches only
     // the CLI, never the worker the session's later turns run on.
     let exe = std::env::current_exe()?;
+    #[cfg(unix)]
+    let approval_channel = crate::session_approval_channel::take_start()?;
+    #[cfg(not(unix))]
+    let has_approval_channel = false;
+    #[cfg(unix)]
+    let has_approval_channel = approval_channel.is_some();
+    anyhow::ensure!(
+        session.permission_mode != "ask" || has_approval_channel,
+        "Ask session worker requires a fresh authenticated approval handoff"
+    );
     let worker = RunArgv::SessionWorker(SessionWorker {
         session_id: session.session_id.clone(),
+        approval_channel: has_approval_channel,
     });
-    let pid = spawn_detached(SpawnSpec::new(exe, worker))
+    let mut spawn = SpawnSpec::new(exe, worker);
+    #[cfg(unix)]
+    if let Some(channel) = approval_channel {
+        spawn.private_stdin = Some(Arc::new(std::os::fd::OwnedFd::from(channel)));
+    }
+    let pid = spawn_detached(spawn)
         .with_context(|| format!("spawn warm session worker for {}", session.session_id))?
         .pid;
     session.worker_pid = Some(pid);
@@ -2987,6 +3200,7 @@ impl SessionInteractiveState {
             TranscriptEvent::Outcome { .. }
             | TranscriptEvent::Recovery { .. }
             | TranscriptEvent::AssistantBlock { .. }
+            | TranscriptEvent::ToolApproval { .. }
             | TranscriptEvent::Unknown { .. } => {
                 if let Some((status, label, text)) =
                     crate::output::outcome_row::outcome_event_row(event)
@@ -5620,7 +5834,7 @@ fn transcript_event_lines(
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
         | TranscriptEvent::AssistantBlock { .. }
-        | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
+        | TranscriptEvent::ToolApproval { .. } | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| SessionViewLine {
                 status,
@@ -6664,6 +6878,7 @@ impl Drop for RawModeGuard {
 
 async fn archive(session_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
+    let _retention_lease = rupu_runtime::retention_lease::RetentionLease::for_legacy(&global)?;
     let (mut session, scope) = read_session(&global, session_id)?;
     if scope == SessionScope::Archived {
         anyhow::bail!("session {session_id} is already archived");
@@ -6689,6 +6904,7 @@ async fn archive(session_id: &str) -> anyhow::Result<()> {
 
 async fn restore(session_id: &str) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
+    let _retention_lease = rupu_runtime::retention_lease::RetentionLease::for_legacy(&global)?;
     let (mut session, scope) = read_session(&global, session_id)?;
     if scope == SessionScope::Active {
         anyhow::bail!("session {session_id} is already active");
@@ -6711,6 +6927,7 @@ async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
         anyhow::bail!("session delete requires --force");
     }
     let global = paths::global_dir()?;
+    let _retention_lease = rupu_runtime::retention_lease::RetentionLease::for_legacy(&global)?;
     let (mut session, scope) = read_session(&global, &args.session_id)?;
     ensure_not_compacting(&global, scope, &session.session_id)?;
     if scope == SessionScope::Active && reconcile_stale_session(&mut session) {
@@ -7282,6 +7499,12 @@ fn cancel_active_turn_in_place(global: &Path, session_id: &str) -> anyhow::Resul
 }
 
 async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
+    // Detach approval authority from inherited stdin before configuration,
+    // logging, or any code that can spawn another process.
+    #[cfg(unix)]
+    if args.approval_channel {
+        crate::session_approval_channel::accept_start()?;
+    }
     // `log_level` from config is the `RUPU_LOG` fallback here too — a session
     // worker is a long-lived daemon whose log file is the only place its
     // internals surface (ISSUES.md I-14).
@@ -7304,6 +7527,11 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
         write_session(&global, scope, &session)?;
     }
 
+    #[cfg(unix)]
+    if args.approval_channel {
+        crate::session_approval_channel::bind_worker(&args.session_id).await?;
+    }
+
     loop {
         let (mut session, scope) = match read_session(&global, &args.session_id) {
             Ok(value) => value,
@@ -7314,6 +7542,14 @@ async fn run_worker(args: RunWorkerArgs) -> anyhow::Result<()> {
             write_session(&global, scope, &session)?;
         }
         if session.worker_pid != Some(worker_pid) {
+            break;
+        }
+        #[cfg(unix)]
+        if session.permission_mode == "ask" && !crate::session_approval_channel::worker_is_usable()
+        {
+            // The finished turn retains its failed/unknown evidence. Retire
+            // this private capability; only a later explicit send may start
+            // a new worker. Never requeue the already-claimed request.
             break;
         }
 
@@ -7927,6 +8163,46 @@ async fn reattach_session_skills(
     }))
 }
 
+/// Expand only this capability set, never the whole catalog. Legacy wildcard
+/// declarations remain frozen without new reader authority; an actual settings
+/// update can opt in exact new names, not implicitly expand another wildcard.
+fn selected_session_reads(
+    version: Option<u32>,
+    declared: Option<&[String]>,
+    settings: &rupu_runtime::session_settings::SessionSettings,
+) -> Vec<String> {
+    let names = [
+        "session.context",
+        "session.workflows",
+        "run.inspect",
+        "run.netflows",
+    ];
+    let selected = if version == Some(1) {
+        declared
+    } else if version.is_none() && settings.revision > 0 {
+        settings.tools.as_deref()
+    } else {
+        None
+    };
+    names
+        .into_iter()
+        .filter(|name| {
+            selected.is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.as_str() == *name
+                        || (version == Some(1)
+                            && (entry == "*"
+                                || entry.strip_suffix(".*").is_some_and(|namespace| {
+                                    name.strip_prefix(namespace)
+                                        .is_some_and(|rest| rest.starts_with('.'))
+                                })))
+                })
+            })
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The agent a session turn runs: the agent settings the session record
 /// snapshotted at `session start` (its prompt, tools, provider, model and
 /// pins), plus the fallback chain, which the record does not keep — each
@@ -7934,13 +8210,23 @@ async fn reattach_session_skills(
 /// start` loaded it from. An agent that no longer loads (renamed, deleted,
 /// broken frontmatter) gets no chain, and the turn uses the
 /// `[recovery].fallbacks` table, the same as an agent that declares none.
+/// Exact global conversations instead freeze their fallback chain at creation;
+/// they never reread a name after selection.
 /// Its skill keys are not read: the session's skills are the set `session
 /// start` froze (`SessionRecord::skill_index`).
 fn session_agent_spec(
     global: &Path,
     session: &SessionRecord,
 ) -> anyhow::Result<rupu_agent::AgentSpec> {
-    let file = session_agent_file(global, session);
+    let fallbacks = if let Some(exact) = &session.exact_global_agent {
+        #[cfg(unix)]
+        session_exact_agent::validate_record(session, exact)?;
+        #[cfg(not(unix))]
+        anyhow::bail!("exact global conversation unsupported on this platform");
+        exact.fallbacks.clone()
+    } else {
+        session_agent_file(global, session).and_then(|f| f.fallbacks)
+    };
     Ok(rupu_agent::AgentSpec {
         name: session.agent_name.clone(),
         description: session.description.clone(),
@@ -7971,7 +8257,7 @@ fn session_agent_spec(
         findings_profile: session.findings_profile,
         skills: None,
         preload_skills: None,
-        fallbacks: file.and_then(|f| f.fallbacks),
+        fallbacks,
         system_prompt: session.agent_system_prompt.clone(),
         raw: String::new(),
     })
@@ -8068,6 +8354,40 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
     ))?;
     settings.validate()?;
 
+    #[cfg(unix)]
+    let call_authorizer = if session.permission_mode == "ask" {
+        let selection = settings.mcp.as_ref().or(session.mcp_tools.as_ref());
+        let registry_fingerprint = if selection.is_some_and(|s| !s.tools.is_empty()) {
+            Some(rupu_runtime::session_approvals::authority::fingerprint(
+                &global,
+                &rupu_config::mcp::Registry::load(&global)?,
+            )?)
+        } else {
+            None
+        };
+        Some(crate::session_approval_channel::authorizer(
+            rupu_tools::approval::ApprovalOwner {
+                session_id: session.session_id.clone(),
+                root_turn_run_id: args.run_id.clone(),
+                run_id: args.run_id.clone(),
+                parent_run_id: None,
+                root_run_id: args.run_id.clone(),
+                workspace_id: session.workspace_id.clone(),
+                workspace_path: session.workspace_path.to_string_lossy().into_owned(),
+                settings_revision: settings.revision,
+                orchestration_revision: orchestration.revision,
+                host_mcp_registry_fingerprint: registry_fingerprint,
+            },
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let call_authorizer: Option<Arc<dyn rupu_tools::approval::CallAuthorizer>> = None;
+    if let Some(authorizer) = &call_authorizer {
+        authorizer.check_owner(&authorizer.root_owner()).await?;
+    }
+
     let cfg_paths = paths::config_paths(
         &global,
         session.project_root.as_deref(),
@@ -8119,6 +8439,8 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
     // may exit right after an early `?` return; without this, whatever
     // this turn's sink had buffered — including a `Dropped` accounting
     // line, which has no other way to reach disk — stays unflushed.
+    let mut mcp_cleanup = None;
+    let mcp_cleanup_slot = &mut mcp_cleanup;
     let body_result: anyhow::Result<()> = async move {
         let scm_registry = Arc::new(
             rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
@@ -8157,6 +8479,38 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         let mut agent = session_agent_spec(&global, &session)?;
         workflow_context::append(&mut agent, &global, scope, &session)?;
         let model_overridden = settings.apply(&mut agent);
+        let mcp_selection = settings
+            .mcp
+            .as_ref()
+            .or(session.mcp_tools.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let mcp_registry = if mcp_selection.tools.is_empty() {
+            rupu_config::mcp::Registry::default()
+        } else {
+            rupu_config::mcp::Registry::load(&global)?
+        };
+        let mcp_tools = rupu_runtime::session_mcp::assemble(
+            &mcp_registry,
+            &rupu_mcp_client::HostCredentials::for_global(&global),
+            &mcp_selection,
+            rupu_runtime::session_mcp::Owner {
+                run_id: args.run_id.clone(),
+                workspace_id: session.workspace_id.clone(),
+                workspace_path: session.workspace_path.clone(),
+            },
+            netflow_sink.clone(),
+        )
+        .await?;
+        *mcp_cleanup_slot = Some(mcp_tools.cleanup());
+        let tool_catalog = mcp_tools.catalog.clone();
+        // Credential metadata may have changed while the clients connected.
+        // Recheck the assembly-frozen authority before provider construction.
+        if let Some(authorizer) = &call_authorizer {
+            authorizer.check_owner(&authorizer.root_owner()).await?;
+        }
+        mcp_selection.append_to(&mut agent.tools);
+
         // The session's frozen skills as installed now, joined by the skills
         // the operator invoked in this turn (spec 2026-10-12 §5.2); one that
         // can't be given is reported and the turn runs without it. The skills
@@ -8216,6 +8570,13 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         // first-turn failure (timeout, network blip), not an answer: the
         // assembler resolves again, a cache read unless stale.
         let overrides = rupu_runtime::assembly::Overrides {
+            tool_ceiling: session.tool_ceiling.clone(),
+            tool_ceiling_frozen_remote_names: session
+                .mcp_tools
+                .iter()
+                .flat_map(|selection| &selection.tools)
+                .map(|tool| tool.identity.local_name())
+                .collect(),
             limits: if model_overridden {
                 None
             } else {
@@ -8332,6 +8693,47 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
                 None,
                 None,
             );
+        // Scope readers to this exact turn. The frozen declaration still decides
+        // whether any of these bodies are offered; providing a service adds no grant.
+        let allowed_reads = selected_session_reads(
+            session.scoped_reads_version,
+            agent.tools.as_deref(),
+            &settings,
+        );
+        let session_reads: Option<Arc<dyn rupu_tools::ports::SessionReadPort>> =
+            if session.builtin_harness && !allowed_reads.is_empty() {
+                let entries = skills.as_ref().map(|s| s.entries()).unwrap_or_default();
+                Some(Arc::new(rupu_runtime::session_reads::SessionReads::new(
+                    global.clone(),
+                    rupu_runtime::session_reads::Owner {
+                        session_id: session.session_id.clone(),
+                        run_id: args.run_id.clone(),
+                        workspace_id: session.workspace_id.clone(),
+                        workspace_path: session.workspace_path.clone(),
+                        project_root: session.project_root.clone(),
+                        transcript_path: transcript_path.clone(),
+                    },
+                    rupu_runtime::session_reads::ContextSnapshot {
+                        allowed_reads,
+                        builtin_tools_preset: session.builtin_tools_preset.clone(),
+                        permission_mode: mode.as_str().to_owned(),
+                        declared_tools: agent.tools.clone(),
+                        selected_skills: entries
+                            .iter()
+                            .map(|entry| format!("{}:{}", entry.skill.layer.as_str(), entry.name()))
+                            .collect(),
+                        preloaded_skills: entries
+                            .iter()
+                            .filter(|entry| entry.preload)
+                            .map(|entry| format!("{}:{}", entry.skill.layer.as_str(), entry.name()))
+                            .collect(),
+                        settings_revision: settings.revision,
+                        orchestration_revision: orchestration.revision,
+                    },
+                )?))
+            } else {
+                None
+            };
         let launch = rupu_runtime::assembly::LaunchSpec {
             agent,
             origin,
@@ -8362,8 +8764,11 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             hooks: Default::default(),
             pause: Some(cancellation.token.clone()),
             services: rupu_runtime::assembly::LaunchServices {
+                authorizer: call_authorizer,
                 session_orchestration: orchestration.enabled,
+                session_reads,
                 builtin_session_harness: session.builtin_harness,
+                tool_catalog,
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
@@ -8587,6 +8992,10 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+
+    if let Some(cleanup) = mcp_cleanup {
+        cleanup.close().await;
+    }
 
     // Flush this turn's ledger — including a `Dropped` line if the
     // writer channel overflowed — whether the block above succeeded or
@@ -9306,6 +9715,10 @@ use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
 mod session_command_tests;
 #[path = "session_workflow_context.rs"]
 mod workflow_context;
+
+#[cfg(test)]
+#[path = "session_mcp_tests.rs"]
+mod session_mcp_tests;
 
 #[cfg(test)]
 #[path = "session_harness_tests.rs"]
@@ -10234,6 +10647,7 @@ mod tests {
         );
         state.push_transcript_event(&TranscriptEvent::ToolGrant {
             entries: vec![rupu_transcript::ToolGrantEntry {
+                remote: None,
                 tool: "read_file".into(),
                 reasons: vec!["declared".into()],
             }],
@@ -11111,10 +11525,13 @@ mod tests {
 
     pub(super) fn test_session_record() -> SessionRecord {
         SessionRecord {
+            exact_global_agent: None,
             version: SessionRecord::VERSION,
             session_id: "ses_test01".into(),
             agent_name: "issue-reader".into(),
             builtin_harness: false,
+            builtin_tools_preset: None,
+            scoped_reads_version: None,
             skill_preset: None,
             skill_preset_diagnostics: Vec::new(),
             codename: None,
@@ -11124,6 +11541,8 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             agent_system_prompt: "You are a test agent.".into(),
             agent_tools: Some(vec!["read_file".into()]),
+            tool_ceiling: None,
+            mcp_tools: None,
             messaging: None,
             max_turns: 50,
             permission_mode: "bypass".into(),
@@ -14083,3 +14502,7 @@ mod tests {
 #[cfg(test)]
 #[path = "session_skill_preset_tests.rs"]
 mod session_skill_preset_tests;
+
+#[cfg(unix)]
+#[path = "session_exact_agent.rs"]
+mod session_exact_agent;

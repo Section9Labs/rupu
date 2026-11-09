@@ -52,6 +52,7 @@ base64.workspace = true
 # In-workspace
 rupu-agent = { path = "../rupu-agent" }
 rupu-orchestrator = { path = "../rupu-orchestrator" }
+rupu-mcp-client = { path = "../rupu-mcp-client" }
 rupu-runtime = { path = "../rupu-runtime" }
 rupu-config = { path = "../rupu-config" }
 rupu-netflow = { workspace = true, features = ["http"] }
@@ -83,6 +84,7 @@ tempfile.workspace = true
 syntect.workspace = true
 minijinja.workspace = true
 reqwest.workspace = true
+url.workspace = true
 reqwest-middleware.workspace = true
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }

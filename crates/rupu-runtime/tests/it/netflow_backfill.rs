@@ -198,3 +198,32 @@ fn a_backfill_tees_its_lines_into_the_runs_stream() {
     let ledger = std::fs::read_to_string(&paths.flows).unwrap();
     assert_eq!(ledger.trim_end(), teed[0]);
 }
+
+#[cfg(unix)]
+#[test]
+fn backfill_never_recreates_ledger_while_exact_cleanup_holds_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = NetflowPaths::for_run(temp.path(), "run_fixture");
+    let transcript = temp.path().join("transcript.jsonl");
+    append_to_transcript(
+        &transcript,
+        flow(FlowId::from_parts(7, 9), "fixture.example"),
+    );
+    let held = rupu_netflow::ledger::lease::LedgerLease::exclusive(&paths.flows).unwrap();
+    assert_eq!(
+        rupu_runtime::netflow::backfill_ledger(&paths, &transcript)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(!paths.flows.exists());
+    drop(held);
+    assert_eq!(
+        rupu_runtime::netflow::backfill_ledger(&paths, &transcript).unwrap(),
+        1
+    );
+    assert_eq!(
+        rupu_runtime::netflow::backfill_ledger(&paths, &transcript).unwrap(),
+        0
+    );
+}

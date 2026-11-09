@@ -474,3 +474,34 @@ async fn events_poll_treats_base_url_as_api_root() {
     m.assert_hits(1);
     assert!(result.expect("poll against the mock").events.is_empty());
 }
+
+#[tokio::test]
+async fn operator_issue_rejects_actual_project_id_mismatch() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start_async().await;
+    let project = server.mock(|when, then| {
+        when.method(GET).path("/projects/org%2Frepo");
+        then.status(200)
+            .json_body(serde_json::json!({"id":12,"path_with_namespace":"org/repo"}));
+    });
+    let mut value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/fixtures/gitlab/issue_get_happy.json").unwrap(),
+    )
+    .unwrap();
+    value["iid"] = serde_json::json!(42);
+    value["project_id"] = serde_json::json!(99);
+    let issue = server.mock(|when, then| {
+        when.method(GET).path("/projects/12/issues/42");
+        then.status(200).json_body(value);
+    });
+    assert!(common::gitlab_issue_connector_against(&server)
+        .operator_get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Gitlab,
+            project: "org/repo".into(),
+            number: 42
+        })
+        .await
+        .is_err());
+    project.assert();
+    issue.assert();
+}

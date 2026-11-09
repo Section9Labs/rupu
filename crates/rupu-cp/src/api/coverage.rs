@@ -32,6 +32,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/coverage/:target/diff", get(get_diff))
         .route("/api/coverage/:target/gap", get(get_gap))
         .route("/api/coverage/:target/rerun", post(rerun))
+        .route("/api/coverage/:target/rerun-preview", get(rerun_preview))
 }
 
 #[derive(Serialize)]
@@ -461,37 +462,77 @@ pub(crate) struct RerunBody {
     /// The run to replay: its full id, as `GET /api/coverage/:target/runs`
     /// lists it.
     run: String,
+    /// Opaque token from rerun-preview. A changed manifest returns 409 before
+    /// dispatch; absent preserves the existing replay behavior.
+    expected_manifest_fingerprint: Option<String>,
 }
 
-/// `POST /api/coverage/:target/rerun` — replay a recorded agent run on its
-/// target, what `rupu coverage rerun` launches: the run's agent, prompt,
-/// permission mode and launch skills, in the workspace it was recorded in,
-/// started detached through the agent launcher. `202 {run_id, host_id,
-/// agent, target_id, ws_id, replays}` once it is started; `404` for an
-/// unknown target or a run with no manifest; `409` for a run that continued
-/// another (rerun that one) or was recorded in another workspace; `501` for
-/// a session/workflow/autoflow run, a remote `host`, or a control plane that
-/// is not `rupu cp serve`.
-async fn rerun(
+#[derive(Deserialize, schemars::JsonSchema)]
+pub(crate) struct RerunPreviewQuery {
+    /// Exact workspace owning the target; required for an unambiguous preview.
+    ws_id: String,
+    /// Must be absent or `local`.
+    host: Option<String>,
+    /// Full original run id from the target's runs list.
+    run: String,
+}
+
+/// Recorded inputs only: no provider resolution, agent loading or launch.
+async fn rerun_preview(
     State(s): State<AppState>,
     Path(target): Path<String>,
-    Query(q): Query<RerunQuery>,
-    Json(body): Json<RerunBody>,
-) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    LocalOnlyQuery { host: q.host }.require_local("coverage rerun")?;
-    crate::api::config::require_writable_to(&s, "rerunning coverage")?;
-    let launcher = s
-        .agent_launcher
-        .clone()
-        .ok_or_else(|| ApiError::not_available("rerunning coverage requires `rupu cp serve`"))?;
-    let run = body.run.trim();
-    let Some((ws, paths)) = scoped_workspaces(&s, &q.ws_id).into_iter().find_map(|w| {
+    Query(q): Query<RerunPreviewQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    LocalOnlyQuery { host: q.host }.require_local("coverage rerun preview")?;
+    let (ws, manifest, _) = resolve_rerun(&s, &target, &Some(q.ws_id), q.run.trim())?;
+    let fingerprint = manifest_fingerprint(&manifest)?;
+    Ok(Json(serde_json::json!({
+        "target_id": target,
+        "ws_id": ws.id,
+        "host_id": "local",
+        "replays": manifest.run_id,
+        "manifest_fingerprint": fingerprint,
+        "recorded": {
+            "agent_name": manifest.agent_name,
+            "user_prompt": manifest.user_prompt,
+            "permission_mode": manifest.permission_mode,
+            "workspace_path": manifest.workspace_path,
+            "skills": manifest.skills,
+            "preload_skills": manifest.preload_skills,
+            "provider": manifest.provider,
+            "model": manifest.model,
+        },
+    })))
+}
+
+/// Fingerprint the complete parsed manifest, not filesystem metadata or the
+/// mutable agent definition. The token is an opaque optimistic precondition;
+/// the launch uses the same manifest snapshot that was checked.
+fn manifest_fingerprint(manifest: &rupu_coverage::RunManifest) -> ApiResult<String> {
+    let bytes = serde_json::to_vec(manifest)
+        .map_err(|e| ApiError::internal(format!("serializing manifest: {e}")))?;
+    rupu_coverage::report::sha256_reader(&mut bytes.as_slice())
+        .map_err(|e| ApiError::internal(format!("fingerprinting manifest: {e}")))
+}
+
+/// Shared authoritative target lookup and replay validation for read and write.
+fn resolve_rerun(
+    s: &AppState,
+    target: &str,
+    ws_id: &Option<String>,
+    run: &str,
+) -> ApiResult<(
+    rupu_workspace::Workspace,
+    rupu_coverage::RunManifest,
+    rupu_coverage::RerunInvocation,
+)> {
+    let Some((ws, paths)) = scoped_workspaces(s, ws_id).into_iter().find_map(|w| {
         let wp = std::path::Path::new(&w.path);
         discover_targets(wp)
             .unwrap_or_default()
             .into_iter()
             .any(|t| t.target_id == target)
-            .then(|| (w.clone(), CoveragePaths::new(wp, &target)))
+            .then(|| (w.clone(), CoveragePaths::new(wp, target)))
     }) else {
         return Err(ApiError::not_found(format!(
             "coverage target {target} not found"
@@ -525,6 +566,41 @@ async fn rerun(
             ws.path
         )));
     }
+    Ok((ws, manifest, invocation))
+}
+
+/// `POST /api/coverage/:target/rerun` — replay a recorded agent run on its
+/// target, what `rupu coverage rerun` launches: the run's agent, prompt,
+/// permission mode and launch skills, in the workspace it was recorded in,
+/// started detached through the agent launcher. `202 {run_id, host_id,
+/// agent, target_id, ws_id, replays}` once it is started; `404` for an
+/// unknown target or a run with no manifest; `409` for a run that continued
+/// another (rerun that one), was recorded in another workspace, or whose
+/// manifest no longer matches `expected_manifest_fingerprint`; `501` for
+/// a session/workflow/autoflow run, a remote `host`, or a control plane that
+/// is not `rupu cp serve`.
+async fn rerun(
+    State(s): State<AppState>,
+    Path(target): Path<String>,
+    Query(q): Query<RerunQuery>,
+    Json(body): Json<RerunBody>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    LocalOnlyQuery { host: q.host }.require_local("coverage rerun")?;
+    crate::api::config::require_writable_to(&s, "rerunning coverage")?;
+    let launcher = s
+        .agent_launcher
+        .clone()
+        .ok_or_else(|| ApiError::not_available("rerunning coverage requires `rupu cp serve`"))?;
+    let run = body.run.trim();
+    let (ws, manifest, invocation) = resolve_rerun(&s, &target, &q.ws_id, run)?;
+    if let Some(expected) = &body.expected_manifest_fingerprint {
+        if expected != &manifest_fingerprint(&manifest)? {
+            return Err(ApiError::conflict(
+                "coverage run manifest changed; refresh the rerun preview before launching",
+            ));
+        }
+    }
+    let recorded = &invocation.workspace_path;
     let req = crate::agent_launcher::AgentLaunchRequest {
         agent: invocation.agent_name.clone(),
         prompt: Some(invocation.user_prompt),

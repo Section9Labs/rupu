@@ -130,7 +130,7 @@ pub struct BoardPost {
 }
 
 /// A lead→fleet standing instruction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Directive {
     /// Stable identity, minted by `Board::put_directive` when left empty; what
     /// `Board::retract_directive` names. Empty on a directive written before

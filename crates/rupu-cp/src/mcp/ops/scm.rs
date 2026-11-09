@@ -8,6 +8,11 @@ use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
     vec![
+        op("issues.discussion", Method::GET, "/api/issues/:tracker/:number/discussion",
+            "Read a bounded current issue discussion page.\n\nRequire exact project, account and expected_origin. A returned cursor continues this owning observation. Provider pages are live; issued page replay is captured. No writes or runtime grants.").query::<crate::api::issues_discussion::DiscussionQuery>(),
+        op("issues.discussion_text", Method::GET, "/api/issues/:tracker/:number/discussion/text",
+            "Read the next captured comment text chunk.\n\nRepeat the exact issue project, account and expected_origin with the issued comment cursor. Text remains bound to its captured parent and revision; no new provider fetch or writes.").query::<crate::api::issues_discussion::DiscussionQuery>(),
+
         op(
             "scm_accounts.list",
             Method::GET,

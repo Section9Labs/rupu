@@ -470,6 +470,7 @@ async fn a_record_from_a_newer_rupu_is_refused() {
         &global,
         ACK,
         send(SendArgs {
+            approval_channel: false,
             session_id: record.session_id.clone(),
             prompt: Some("hi".into()),
             skills: Vec::new(),
@@ -794,6 +795,7 @@ async fn send_skill_typo_is_refused_before_enqueue() {
         &global,
         ACK,
         send(SendArgs {
+            approval_channel: false,
             session_id: record.session_id.clone(),
             prompt: Some("hi".into()),
             skills: vec!["pdff".into()],
@@ -1065,6 +1067,7 @@ async fn send_skill_queues_the_resolved_skills_for_the_worker() {
         &global,
         ACK,
         send(SendArgs {
+            approval_channel: false,
             session_id: record.session_id.clone(),
             prompt: None,
             skills: vec!["pdf".into()],

@@ -33,7 +33,11 @@ const MAX_RETRIES: u32 = 5;
 #[derive(Clone)]
 pub struct GitlabClient {
     pub(crate) http: reqwest_middleware::ClientWithMiddleware,
+    operator_http: reqwest_middleware::ClientWithMiddleware,
+    forge_http: reqwest_middleware::ClientWithMiddleware,
+    discussion_http: reqwest_middleware::ClientWithMiddleware,
     pub(crate) base_url: String,
+    review: crate::review_transport::ReviewTransport,
     /// Asked before every request: an OAuth token is refreshed through the
     /// credential store when it nears expiry (see [`TokenSource`]).
     token: Arc<TokenSource>,
@@ -50,6 +54,115 @@ struct CacheEntry {
 }
 
 impl GitlabClient {
+    pub(crate) async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        use crate::forge_write::ForgeError;
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(ForgeError::unsupported)?;
+        // Normal OAuth refresh is allowed here, before the durable dispatch marker.
+        // The frozen request never uses send_authed or a 401 replacement retry.
+        let (token, credential_epoch) = self.token.token_snapshot().await.map_err(|_| {
+            ForgeError::fixed(
+                "account_unavailable",
+                "The selected credential is unavailable",
+            )
+        })?;
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| ForgeError::unsupported())?,
+        );
+        let generation = self.review.identity_epoch(credential_epoch);
+        let review = self.review.clone();
+        let tokens = self.token.clone();
+        crate::forge_write::ForgeSession::new(
+            crate::IssueTracker::Gitlab,
+            origin,
+            generation,
+            self.forge_http.clone(),
+            auth,
+            Arc::new(move || review.identity_epoch(tokens.credential_epoch())),
+        )
+    }
+
+    pub(crate) async fn discussion_session(
+        &self,
+    ) -> Result<crate::issue_discussion::Session, ScmError> {
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let web = origin
+            .strip_suffix("/api/v4")
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let graphql = format!("{web}/api/graphql");
+        // Fail closed if preemptive or concurrent replacement occurs while
+        // acquiring auth. Never label old auth with a newly sampled epoch.
+        let epoch = self.review_identity_epoch();
+        let token = self
+            .token
+            .token()
+            .await
+            .map_err(|_| crate::issue_discussion::failed())?;
+        if epoch != self.review_identity_epoch() {
+            return Err(crate::issue_discussion::changed());
+        }
+        let mut auth = reqwest::header::HeaderMap::new();
+        auth.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| crate::issue_discussion::unsupported())?,
+        );
+        let review = self.review.clone();
+        let tokens = self.token.clone();
+        crate::issue_discussion::Session::new(
+            crate::IssueTracker::Gitlab,
+            origin,
+            graphql,
+            epoch,
+            self.discussion_http.clone(),
+            auth,
+            Arc::new(move || review.identity_epoch(tokens.credential_epoch())),
+        )
+    }
+
+    pub fn review_identity_epoch(&self) -> String {
+        self.review.identity_epoch(self.token.credential_epoch())
+    }
+    pub fn review_api_profile(&self) -> String {
+        self.review.api_profile()
+    }
+    pub fn review_matches_origin(&self, origin: &str) -> bool {
+        self.review.matches_origin(origin)
+    }
+    pub async fn review_get(
+        &self,
+        path: &str,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.review_get_bounded(path, crate::review_transport::MAX_REVIEW_BODY)
+            .await
+    }
+    pub async fn review_get_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        crate::review_transport::validate_budget(max_bytes)?;
+        let (request, url) = self.review.get_request(path)?;
+        let _permit = self.permit().await;
+        let token = self
+            .token
+            .token()
+            .await
+            .map_err(|_| crate::review_transport::sanitized_auth(Platform::Gitlab))?;
+        let response = request
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|_| crate::review_transport::transport_failure())?;
+        self.review.finish(response, &url, max_bytes).await
+    }
+
     /// Convenience constructor with default `[scm.gitlab]` options.
     pub fn new(
         token: String,
@@ -98,6 +211,18 @@ impl GitlabClient {
         // preserves the deleted `http::client()` fallback's panic-on-failure
         // behaviour rather than silently falling back to an uninstrumented
         // client (there is no such fallback any more).
+        let forge_http = crate::forge_write::http("gitlab", sink.clone())
+            .expect("gitlab operator write client build");
+        let discussion_http = crate::issue_discussion::http("gitlab", sink.clone())
+            .expect("gitlab discussion client build");
+        let operator_http = crate::operator_issues::http("gitlab", sink.clone())
+            .expect("gitlab operator client build");
+        let review = crate::review_transport::ReviewTransport::new(
+            Platform::Gitlab,
+            &base,
+            opts.timeout,
+            sink.clone(),
+        );
         let http = opts
             .netflow_client("gitlab", sink)
             .expect("gitlab netflow client build");
@@ -106,7 +231,11 @@ impl GitlabClient {
             NonZeroUsize::new(CACHE_CAP).unwrap(),
         )));
         Self {
+            review,
             http,
+            operator_http,
+            forge_http,
+            discussion_http,
             base_url: base,
             token,
             semaphore,
@@ -229,6 +358,15 @@ impl GitlabClient {
                 }
             }
         }
+    }
+
+    pub(crate) async fn operator_json(&self, path: &str) -> Result<serde_json::Value, ScmError> {
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let response = self
+            .send_authed(|| self.operator_http.get(format!("{origin}{path}")))
+            .await?;
+        crate::operator_issues::json(response).await
     }
 
     /// Issue an authenticated JSON GET against `<base_url><path>`

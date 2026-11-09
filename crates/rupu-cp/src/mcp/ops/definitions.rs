@@ -42,6 +42,16 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "/api/agents/:name",
             "Read one agent definition.\n\n`name` is the agent's file stem. Returns the agent object (name, description, provider, model, tools, scope, ...) plus `system_prompt` and `raw`, the whole definition file.",
         ),
+        #[cfg(unix)]
+        op(
+            "agents.source", Method::GET, "/api/agent-files/source",
+            "Read the exact selected agent file, including invalid or shadowed definitions.\n\nExplicit scope_kind, project scope_id when applicable, and diagnostic path are required. Returns bounded raw source, selected identity, revision and validation errors. No parsed-name lookup or layer fallback.",
+        ).query::<agents::source::SourceQuery>(),
+        #[cfg(unix)]
+        op(
+            "agents.repair", Method::PUT, "/api/agent-files/source",
+            "Repair one existing agent file under its exact captured revision.\n\nRepeat explicit source selectors and send raw, expected_revision and request_id. Existing authoring validation applies. Returns the exact selected source; no create, rename, launch or runtime grants. request_id is acknowledgement correlation, not replay authorization. Unknown transport outcomes require an exact source reread before another save.",
+        ).query::<agents::source::SourceQuery>().body::<agents::source::RepairBody>().destructive(),
         op(
             "agents.create",
             Method::POST,

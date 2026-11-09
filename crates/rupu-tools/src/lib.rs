@@ -13,7 +13,7 @@
 //!   catalog through the [`ports::CatalogPort`] port: [`roster`];
 //! - a run's granted skills: [`skills`].
 //!
-//! All tools implement the [`Tool`] trait and declare a
+//! Builtin tools implement the [`Tool`] trait and declare a
 //! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
 //! every descriptor rupu defines; [`bodies::body`] builds a run's tool from
 //! its [`ToolContext`]. Permission is [`PermissionPolicy`]: a pure function of
@@ -22,6 +22,7 @@
 //! steps ([`call`]) and the MCP endpoint (`rupu cp serve` /mcp, [`call`])
 //! are three callers of the same tools (spec W4).
 
+pub mod approval;
 pub mod assets;
 pub mod board;
 pub mod bodies;
@@ -42,11 +43,15 @@ pub mod launch;
 pub mod ledger;
 pub mod msg;
 pub mod output;
+pub mod owned;
+pub use owned::{BoundTool, CatalogError, RemoteToolIdentity, ToolDefinition, ToolInvoker};
 pub mod ports;
 pub mod roster;
 pub mod scm;
+pub mod session_reads;
 pub mod skills;
 pub mod tool;
+pub mod tool_ceiling;
 
 mod path_scope;
 mod proc_tree;

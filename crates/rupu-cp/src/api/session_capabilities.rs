@@ -29,7 +29,7 @@ pub(super) const FEATURE: &str = "session.capabilities.v1";
 pub(crate) struct ProjectQuery {
     /// Only the directly connected local instance is supported.
     host: Option<String>,
-    /// Use rupu-session-v1 (default), or none to inspect without defaults.
+    /// Use rupu-session-v1 (default), rupu-session-full-v1, or none.
     skill_preset: Option<String>,
 }
 
@@ -48,6 +48,9 @@ struct ProjectCapabilities {
     preset: PresetMetadata,
     skills: SkillPlan,
     declared_tools: Option<Vec<String>>,
+    /// Creation-time declaration provenance; not an effective grant.
+    builtin_tools_preset: Option<String>,
+    scoped_reads_version: Option<u32>,
     permission_mode: &'static str,
     applies: &'static str,
     effective: Option<RunReadiness>,
@@ -56,6 +59,7 @@ struct ProjectCapabilities {
 
 #[derive(Debug, Serialize)]
 struct SessionCapabilities {
+    tool_ceiling: Option<Vec<String>>,
     schema_version: u32,
     session_id: String,
     host_id: &'static str,
@@ -64,6 +68,9 @@ struct SessionCapabilities {
     preset: Option<PresetMetadata>,
     preset_diagnostics: Vec<SkillDiagnostic>,
     declared_tools: Option<Vec<String>>,
+    /// Creation-time declaration provenance; not an effective grant.
+    builtin_tools_preset: Option<String>,
+    scoped_reads_version: Option<u32>,
     settings_revision: u64,
     orchestration_revision: u64,
     permission_mode: String,
@@ -115,15 +122,15 @@ async fn get_session(
 fn project_response(s: &AppState, id: &str, query: ProjectQuery) -> ApiResult<ProjectCapabilities> {
     super::fleet::require_local(query.host.as_deref(), "session capability planning")?;
     super::runs::validate_id(id)?;
-    let enabled = match query.skill_preset.as_deref() {
-        None | Some(session_skill_preset::PRESET_ID) => true,
-        Some("none") => false,
-        Some(_) => {
-            return Err(ApiError::bad_request(
-                "skill_preset must be rupu-session-v1 or none",
-            ));
-        }
-    };
+    if query
+        .skill_preset
+        .as_deref()
+        .is_some_and(|p| !session_skill_preset::valid_preset(p))
+    {
+        return Err(ApiError::bad_request(
+            "skill_preset must be rupu-session-v1, rupu-session-full-v1 or none",
+        ));
+    }
     let workspace = super::projects::load_workspace(s, id)?;
     if workspace.id != id {
         return Err(ApiError::conflict(
@@ -139,7 +146,7 @@ fn project_response(s: &AppState, id: &str, query: ProjectQuery) -> ApiResult<Pr
         ));
     }
     let dirs = LayerDirs::for_layers(&s.global_dir, Some(&root.join(".rupu")));
-    let skills = session_skill_preset::plan(&dirs, enabled, &[], &[])
+    let skills = session_skill_preset::plan_for(&dirs, query.skill_preset.as_deref(), &[], &[])
         .map_err(|e| ApiError::conflict(format!("cannot plan session skills: {e}")))?;
     Ok(ProjectCapabilities {
         schema_version: 1,
@@ -148,6 +155,10 @@ fn project_response(s: &AppState, id: &str, query: ProjectQuery) -> ApiResult<Pr
         preset: skills.preset.clone(),
         skills,
         declared_tools: rupu_agent::builtin::session_agent().tools,
+        scoped_reads_version: s.session_starter.as_ref().filter(|starter| starter.supports_session_scoped_reads()).map(|_| 1),
+        builtin_tools_preset: s.session_starter.as_ref()
+            .filter(|starter| starter.supports_session_scoped_reads())
+            .map(|_| rupu_agent::builtin::SESSION_TOOLS_PRESET.to_owned()),
         permission_mode: "readonly",
         applies: "new_session",
         effective: None,
@@ -250,6 +261,7 @@ fn session_response(s: &AppState, id: &str, query: SessionQuery) -> ApiResult<Se
         current_run == Some(snapshot.effective.run_id.as_str())
             && settings.revision == snapshot.settings_revision
             && orchestration.revision == snapshot.orchestration_revision
+            && record.tool_ceiling == snapshot.effective.tool_ceiling
     });
     let notice = match &snapshot {
         None => "No assembled-turn capability snapshot has been recorded for this session; effective tools and services are unobserved.",
@@ -257,6 +269,7 @@ fn session_response(s: &AppState, id: &str, query: SessionQuery) -> ApiResult<Se
         Some(_) => "This snapshot describes the current recorded turn and revisions. It does not predict the next turn or verify credentials and target access.",
     };
     Ok(SessionCapabilities {
+        tool_ceiling: record.tool_ceiling,
         schema_version: 1,
         session_id: record.session_id,
         host_id: "local",
@@ -265,6 +278,8 @@ fn session_response(s: &AppState, id: &str, query: SessionQuery) -> ApiResult<Se
         preset: record.skill_preset,
         preset_diagnostics: record.skill_preset_diagnostics,
         declared_tools: settings.tools.or(record.agent_tools),
+        builtin_tools_preset: record.builtin_tools_preset,
+        scoped_reads_version: record.scoped_reads_version,
         settings_revision: settings.revision,
         orchestration_revision: orchestration.revision,
         permission_mode: mode.as_str().to_owned(),

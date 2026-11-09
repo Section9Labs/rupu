@@ -53,6 +53,10 @@ pub enum Action {
         /// Do not serve the MCP endpoint (`/mcp` is a 404).
         #[arg(long)]
         no_mcp: bool,
+        /// Opt in to per-call Ask approvals for authenticated local session workers.
+        /// Does not change session modes or enable the operator MCP endpoint.
+        #[arg(long, default_value_t = false)]
+        enable_session_tool_approvals: bool,
         /// Narrow the MCP to these tools (exact names, `ns.*`, `*`;
         /// comma-separated). Default: every tool.
         #[arg(long, value_delimiter = ',')]
@@ -69,6 +73,7 @@ pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
         no_open: true,
         no_web: true,
         no_mcp: false,
+        enable_session_tool_approvals: false,
         tools,
     })
     .await
@@ -282,6 +287,7 @@ pub async fn handle(action: Action) -> ExitCode {
             no_open,
             no_web,
             no_mcp,
+            enable_session_tool_approvals,
             tools,
         } => {
             if no_mcp && !tools.is_empty() {
@@ -347,7 +353,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 let served = rupu_cp::mcp::served_names(Some(&catalog));
                 let unserved: Vec<String> = unavailable
                     .iter()
-                    .filter(|u| !served.contains(u.tool))
+                    .filter(|u| !served.contains(u.tool.as_str()))
                     .map(|u| u.notice_message())
                     .collect();
                 if !unserved.is_empty() {
@@ -420,6 +426,32 @@ pub async fn handle(action: Action) -> ExitCode {
             let store = Arc::new(RunStore::new(global_dir.join("runs")));
             let worker_id = format!("cp-serve-{}", std::process::id());
             let gate_sweep_worker_id = format!("{worker_id}-gate-sweep");
+            // This separate opt-in remains off for normal/tokenless startup.
+            // The private broker never receives the CP bearer token value.
+            #[cfg(unix)]
+            let approval_broker = if enable_session_tool_approvals {
+                if token.is_none() {
+                    eprintln!("error: session tool approvals require authenticated CP startup");
+                    return ExitCode::FAILURE;
+                }
+                match rupu_runtime::session_approvals::broker::Broker::open(global_dir.clone()) {
+                    Ok(broker) => Some(broker),
+                    Err(_) => {
+                        eprintln!(
+                            "error: unable to initialize the private session approval broker"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(not(unix))]
+            if enable_session_tool_approvals {
+                eprintln!("error: private session tool approvals are unavailable on this host");
+                return ExitCode::FAILURE;
+            }
+
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tracing::info!(
                 worker_id = %worker_id,
@@ -490,18 +522,23 @@ pub async fn handle(action: Action) -> ExitCode {
                             // `POST /api/cron/tick`, a crontab `rupu cron
                             // tick` or another `cp serve` holds makes this
                             // turn a skip.
-                            let _lock = match rupu_orchestrator::cron_triggers::TickLock::try_acquire(&global) {
-                                Ok(Some(lock)) => lock,
-                                Ok(None) => {
-                                    tracing::info!("cp serve: cron tick skipped: a tick is already running");
-                                    return;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
-                                    return;
-                                }
-                            };
-                            if let Err(e) = crate::cmd::cron::tick(false, false, false, &mut |_| {}).await {
+                            let _lock =
+                                match rupu_orchestrator::cron_triggers::TickLock::try_acquire(
+                                    &global,
+                                ) {
+                                    Ok(Some(lock)) => lock,
+                                    Ok(None) => {
+                                        tracing::info!("cp serve: cron tick skipped: a tick is already running");
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
+                                        return;
+                                    }
+                                };
+                            if let Err(e) =
+                                crate::cmd::cron::tick(false, false, false, &mut |_| {}).await
+                            {
                                 tracing::warn!(error = %e, "cp serve: cron tick failed");
                             }
                         }
@@ -695,7 +732,11 @@ pub async fn handle(action: Action) -> ExitCode {
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
-                Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe: exe.clone() });
+                Arc::new(crate::cp_session_sender::SubprocessSessionSender {
+                    exe: exe.clone(),
+                    #[cfg(unix)]
+                    approval_broker: approval_broker.clone(),
+                });
 
             // Adapter for rupu-cp's SessionMutator port: shells
             // `rupu session archive|restore|delete <id>` using this same binary.
@@ -723,7 +764,11 @@ pub async fn handle(action: Action) -> ExitCode {
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
-                Arc::new(crate::cp_session_starter::SubprocessSessionStarter { exe }),
+                Arc::new(crate::cp_session_starter::SubprocessSessionStarter {
+                    exe,
+                    #[cfg(unix)]
+                    approval_broker,
+                }),
             );
 
             // Adapter for rupu-cp's SkillInstaller port: the git fetch behind

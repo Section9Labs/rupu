@@ -5,6 +5,7 @@ pub mod coverage_concerns_search;
 pub mod coverage_mark;
 pub mod coverage_remaining;
 pub mod coverage_status;
+pub mod prepared_import;
 pub mod report_finding;
 pub mod verify_finding;
 pub use asset_mark::{asset_mark, AssetMarkError, AssetMarkInput, AssetMarkOutput};
@@ -20,6 +21,12 @@ pub use coverage_mark::{coverage_mark, CoverageMarkError, CoverageMarkInput, Cov
 pub use coverage_remaining::{coverage_remaining, CoverageRemainingInput, RemainingItem};
 pub use coverage_status::{coverage_status, CoverageStatusInput};
 pub use report_finding::{
-    asset_schema_property, report_finding, AssetRef, ReportFindingError, ReportFindingInput, ReportFindingOutput,
+    asset_schema_property, report_finding, AssetRef, ReportFindingError, ReportFindingInput,
+    ReportFindingOutput,
 };
 pub use verify_finding::{verify_finding, VerifyError, VerifyInput};
+
+pub use prepared_import::{
+    attach_prepared_reports, capture_import_ledger, prepare_import_report, PreparedAttachItem,
+    PreparedImportBlob, PreparedImportError, PreparedImportReport, PreparedLedgerIdentity,
+};

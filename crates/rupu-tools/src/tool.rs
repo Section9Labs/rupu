@@ -259,6 +259,9 @@ impl Default for WorkspaceScope {
 /// and concern catalog it owns.
 #[derive(Clone, Default)]
 pub struct ToolServices {
+    /// Exact per-launch tool metadata and body snapshot; builtin by default.
+    /// Owned tools are never inherited implicitly by child launch assembly.
+    pub tool_catalog: crate::ToolCatalog,
     /// The launcher behind `dispatch` / `join`. `None` = this run can't
     /// start children.
     pub launcher: Option<Arc<dyn crate::ports::Launcher>>,
@@ -303,6 +306,8 @@ pub struct ToolServices {
     /// The run's operator prompter, when it has one: a child run started by
     /// a call asks the same operator.
     pub prompter: Option<Arc<dyn Prompter>>,
+    /// Private owner-bound native approval channel, never a tool or credential.
+    pub authorizer: Option<Arc<dyn crate::approval::CallAuthorizer>>,
     /// The run's bus on its message space, behind `board.*` / `msg.send`:
     /// set when the run takes part in the space (an agentiflow's lead or
     /// unit, a child sharing its parent's, a workflow with `messaging:`, an
@@ -324,6 +329,8 @@ pub struct ToolServices {
     /// `Service::Skills` is provided only when the model may load one of
     /// them.
     pub skills: Option<Arc<rupu_skills::ResolvedSkills>>,
+    /// Offered only by a root session worker, never an operator MCP context.
+    pub session_reads: Option<Arc<dyn crate::ports::SessionReadPort>>,
 }
 
 impl ToolServices {
@@ -370,6 +377,18 @@ impl ToolServices {
         if self.skills.as_ref().is_some_and(|s| s.has_loadable()) {
             s.insert(Service::Skills);
         }
+        if let Some(reads) = &self.session_reads {
+            for (name, service) in [
+                ("session.context", Service::SessionContext),
+                ("session.workflows", Service::SessionWorkflows),
+                ("run.inspect", Service::RunInspection),
+                ("run.netflows", Service::RunNetflows),
+            ] {
+                if reads.permits(name) {
+                    s.insert(service);
+                }
+            }
+        }
         s
     }
 }
@@ -410,6 +429,10 @@ impl std::fmt::Debug for ToolServices {
             )
             .field("catalog", &self.catalog.as_ref().map(|_| "<catalog>"))
             .field("skills", &self.skills.as_ref().map(|s| s.names()))
+            .field(
+                "session_reads",
+                &self.session_reads.as_ref().map(|_| "<session reads>"),
+            )
             .finish()
     }
 }

@@ -25,6 +25,7 @@ async fn findings_extra_tools_are_listed_with_their_required_arguments() {
         ("findings.schema", &[]),
         ("coverage.gap", &["target"]),
         ("coverage.rerun", &["run", "target"]),
+        ("coverage.rerun_preview", &["run", "target", "ws_id"]),
         ("query.fields", &["list"]),
         ("query.check", &["list", "q"]),
     ];
@@ -40,6 +41,7 @@ async fn findings_extra_tools_are_listed_with_their_required_arguments() {
     };
     assert_eq!(hints("findings.schema")["readOnlyHint"], json!(true));
     assert_eq!(hints("coverage.gap")["readOnlyHint"], json!(true));
+    assert_eq!(hints("coverage.rerun_preview")["readOnlyHint"], json!(true));
     assert_eq!(hints("query.fields")["readOnlyHint"], json!(true));
     // A check is a POST that changes nothing.
     assert_eq!(hints("query.check")["readOnlyHint"], json!(true));
@@ -56,8 +58,14 @@ async fn findings_extra_reads_answer_what_the_api_answers() {
     seed(tmp.path());
     let addr = serve(tmp.path(), false, None).await;
     let gap = format!("/api/coverage/{TARGET}/gap?ws_id=ws1");
+    let preview = format!("/api/coverage/{TARGET}/rerun-preview?ws_id=ws1&run={RUN}");
     let cases: &[(&str, Value, &str)] = &[
         ("findings.schema", json!({}), "/api/findings/schema"),
+        (
+            "coverage.rerun_preview",
+            json!({"target": TARGET, "ws_id": "ws1", "run": RUN}),
+            &preview,
+        ),
         (
             "findings.schema",
             json!({"advertised": true}),

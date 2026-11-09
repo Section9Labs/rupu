@@ -1,11 +1,11 @@
+use crate::ledger::lease::LedgerLease;
 use crate::ledger::paths::NetflowPaths;
 use crate::record::{FlowId, FlowRecord, LedgerLine};
 use crate::sink::FlowSink;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -101,6 +101,7 @@ impl FlowSink for NetflowWriter {
 pub struct NetflowWriterHandle {
     pub writer: Arc<NetflowWriter>,
     task: JoinHandle<()>,
+    lease: Arc<LedgerLease>,
 }
 
 impl NetflowWriterHandle {
@@ -122,14 +123,33 @@ impl NetflowWriterHandle {
         flush_interval: std::time::Duration,
     ) -> std::io::Result<Self> {
         paths.ensure_dir()?;
+        let lease = Arc::new(LedgerLease::shared(&paths.flows)?);
+        let mut paths = paths;
+        paths.root = lease.root().to_owned();
+        paths.flows = lease.path().to_owned();
         let (tx, rx) = mpsc::channel(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let writer = Arc::new(NetflowWriter {
             tx,
             dropped: dropped.clone(),
         });
-        let task = tokio::spawn(run_writer(paths, rx, dropped, flush_interval));
-        Ok(Self { writer, task })
+        let task = tokio::spawn(run_writer(
+            paths,
+            rx,
+            dropped,
+            flush_interval,
+            lease.clone(),
+        ));
+        Ok(Self {
+            writer,
+            task,
+            lease,
+        })
+    }
+
+    /// Retain coordination across shutdown into a final backfill task.
+    pub fn ledger_lease(&self) -> Arc<LedgerLease> {
+        self.lease.clone()
     }
 
     /// Flush pending writes, emit a final `Dropped` line if anything was
@@ -149,18 +169,57 @@ impl NetflowWriterHandle {
     }
 }
 
+/// Each actual filesystem operation owns both descriptors and coordination,
+/// even if its awaiting async task is cancelled. File drops before the lease.
+#[derive(Clone)]
+struct LeasedWriter {
+    file: Arc<std::fs::File>,
+    lease: Arc<LedgerLease>,
+}
+impl LeasedWriter {
+    async fn open(lease: Arc<LedgerLease>) -> std::io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let file = Arc::new(lease.append()?);
+            Ok(Self { file, lease })
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+    async fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        let bytes = bytes.to_vec();
+        self.run_io(move |held| held.write_blocking(&bytes)).await
+    }
+    fn write_blocking(&self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        self.lease.validate()?;
+        self.file.as_ref().write_all(bytes)
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+        self.run_io(Self::flush_blocking).await
+    }
+    async fn run_io(
+        &self,
+        action: impl FnOnce(&Self) -> std::io::Result<()> + Send + 'static,
+    ) -> std::io::Result<()> {
+        let held = self.clone();
+        tokio::task::spawn_blocking(move || action(&held))
+            .await
+            .map_err(std::io::Error::other)?
+    }
+    fn flush_blocking(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.as_ref().flush()
+    }
+}
+
 async fn run_writer(
     paths: NetflowPaths,
     mut rx: mpsc::Receiver<WriteRequest>,
     dropped_counter: Arc<AtomicU64>,
     flush_interval: std::time::Duration,
+    lease: Arc<LedgerLease>,
 ) {
-    let mut file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.flows)
-        .await
-    {
+    let mut file = match LeasedWriter::open(lease.clone()).await {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!(error = %e, path = ?paths.flows, "netflow ledger unavailable; flows will not be persisted");
@@ -323,7 +382,7 @@ impl Tee {
 /// Shared by the `Flush` request and the terminal drain so the accounting
 /// logic isn't duplicated.
 async fn flush_dropped(
-    file: &mut tokio::fs::File,
+    file: &mut LeasedWriter,
     tee: &mut Tee,
     dropped_counter: &AtomicU64,
     last_dropped: u64,
@@ -347,7 +406,7 @@ async fn flush_dropped(
 /// ledger now holds, so the caller tees exactly those bytes and nothing the
 /// ledger lost.
 async fn write_line(
-    file: &mut tokio::fs::File,
+    file: &mut LeasedWriter,
     line: &LedgerLine,
     dropped: &AtomicU64,
 ) -> Option<String> {
@@ -773,6 +832,70 @@ mod tests {
         assert!(
             !ledger.contains(r#""type":"dropped""#),
             "a stream failure is not ledger loss: {ledger}"
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_writer_and_shutdown_handoff_keep_cleanup_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = NetflowPaths::for_run(tmp.path(), "run_fixture");
+        let handle = NetflowWriterHandle::spawn(paths.clone()).unwrap();
+        // Spawn acquires before the writer task can run on this thread.
+        assert!(LedgerLease::exclusive(&paths.flows).is_err());
+        let handoff = handle.ledger_lease();
+        handle.shutdown().await;
+        assert!(LedgerLease::exclusive(&paths.flows).is_err());
+        drop(handoff);
+        LedgerLease::exclusive(&paths.flows).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_waiter_cannot_unlock_actual_queued_file_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run_cancelled.jsonl");
+        let writer = LeasedWriter::open(Arc::new(LedgerLease::shared(&path).unwrap()))
+            .await
+            .unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::sync_channel(1);
+        let task = tokio::spawn(async move {
+            writer
+                .run_io(move |held| {
+                    let _ = entered.send(());
+                    proceed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    held.write_blocking(b"finished actual write\n")
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            LedgerLease::exclusive(&path).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        release.send(()).unwrap();
+        let held = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match LedgerLease::exclusive(&path) {
+                    Ok(held) => break held,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(e) => panic!("unexpected lease error: {e}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(held.path()).unwrap(),
+            b"finished actual write\n"
         );
     }
 }

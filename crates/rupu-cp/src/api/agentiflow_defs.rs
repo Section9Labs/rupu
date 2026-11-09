@@ -35,6 +35,9 @@ use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
 
+mod validation_echo;
+pub(crate) use validation_echo::FEATURE as VALIDATION_DEFINITION_FEATURE;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agentiflow-defs", get(list_defs).post(create_def))
@@ -462,6 +465,10 @@ pub(crate) struct ValidateBody {
     /// there. Without it, the built-in and global profiles only.
     #[serde(default)]
     scope_id: Option<String>,
+    /// Return a bounded, exact JSON projection of the parsed definition for
+    /// structured authoring. Omit to retain the legacy validation response.
+    #[serde(default)]
+    include_definition: bool,
 }
 
 /// `POST /api/agentiflow-defs/validate` — what `rupu agentiflow run` checks
@@ -473,8 +480,11 @@ async fn validate_def(
     State(s): State<AppState>,
     Query(q): Query<LocalHostQuery>,
     Json(body): Json<ValidateBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> Result<Json<serde_json::Value>, validation_echo::ValidationError> {
     q.require_local("validating an agentiflow definition")?;
+    if body.include_definition {
+        validation_echo::check_source(&body.raw)?;
+    }
     let def = parse(&body.raw)?;
     let workspace = match body.scope_id.as_deref() {
         Some(id) => {
@@ -490,6 +500,9 @@ async fn validate_def(
     };
     def.check(&s.global_dir, workspace.as_deref())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if body.include_definition {
+        return validation_echo::response(&def, &body.raw, body.scope_id.as_deref()).map(Json);
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "name": def.name,

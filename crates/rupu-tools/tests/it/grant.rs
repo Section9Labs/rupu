@@ -60,8 +60,8 @@ fn resolve_with(
     })
 }
 
-fn offered(g: &ResolvedGrant) -> BTreeSet<&'static str> {
-    g.entries.keys().copied().collect()
+fn offered(g: &ResolvedGrant) -> BTreeSet<&str> {
+    g.entries.keys().map(String::as_str).collect()
 }
 
 fn set(v: &[&'static str]) -> BTreeSet<&'static str> {
@@ -181,20 +181,20 @@ fn star_means_catalog_everywhere() {
     let free = resolve(Some(&["*"]), &[]).unwrap();
     let narrowed = resolve(Some(&["*"]), &["issues.get"]).unwrap();
 
-    let non_connector = |g: &ResolvedGrant| -> BTreeSet<&'static str> {
+    fn non_connector(g: &ResolvedGrant) -> BTreeSet<&str> {
         g.entries
             .values()
             .filter(|e| !e.descriptor.is_connector())
-            .map(|e| e.canonical)
+            .map(|e| e.canonical.as_str())
             .collect()
-    };
-    let connector = |g: &ResolvedGrant| -> BTreeSet<&'static str> {
+    }
+    fn connector(g: &ResolvedGrant) -> BTreeSet<&str> {
         g.entries
             .values()
             .filter(|e| e.descriptor.is_connector())
-            .map(|e| e.canonical)
+            .map(|e| e.canonical.as_str())
             .collect()
-    };
+    }
     assert_eq!(non_connector(&free), non_connector(&narrowed));
     assert!(CORE.iter().all(|t| free.offers(t)));
     assert_eq!(connector(&free), connectors(""));
@@ -202,7 +202,11 @@ fn star_means_catalog_everywhere() {
     let mut dropped = connectors("");
     dropped.remove("issues.get");
     assert_eq!(
-        narrowed.narrowed.iter().copied().collect::<BTreeSet<_>>(),
+        narrowed
+            .narrowed
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
         dropped
     );
 }
@@ -364,7 +368,7 @@ fn a_connector_cap_narrows_connectors_and_is_passed_on() {
         })
         .unwrap();
     assert_eq!(offered(&g), set(&["issues.get", "read_file"]));
-    assert!(g.narrowed.contains(&"issues.create"));
+    assert!(g.narrowed.iter().any(|n| n == "issues.create"));
     assert_eq!(g.connector_cap, Some(set(&["issues.get"])));
     assert_eq!(g.actions, None, "a cap is not the step's own actions:");
 
@@ -459,7 +463,8 @@ fn messaging_grants_resolve_to_bus_tools_only() {
     let cat = ToolCatalog::builtin();
     let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     assert_eq!(
-        cat.resolve_messaging(&names(&["board.post", "msg.*"])).unwrap(),
+        cat.resolve_messaging(&names(&["board.post", "msg.*"]))
+            .unwrap(),
         vec!["board.post", "msg.send"]
     );
     for bad in ["read_file", "*", "agents.list"] {

@@ -63,6 +63,9 @@ pub enum RunArgv {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRun {
     pub agent: String,
+    /// Exact global file/project proof used by the local exact launch adapter.
+    /// Generic argv transformations preserve it rather than silently unpinning.
+    pub exact_agent_definition: Option<String>,
     /// A run target (`github:owner/repo#42`, …), positional.
     pub target: Option<String>,
     pub run_id: String,
@@ -99,6 +102,8 @@ pub struct AgentRun {
     /// of starting fresh. With `prompt` set too, the prompt (still ONE
     /// `--prompt=` element) is what the continuation is told next.
     pub continue_from: Option<String>,
+    /// Local explicit continuation list replacements; never forwarded by legacy adapters.
+    pub continue_options: Option<crate::continuation_options::ContinuationListOverrides>,
     /// `--model`: the model for this run, over the agent's `model:`.
     pub model: Option<String>,
     /// `--provider`: the provider for this run, over the agent's
@@ -114,6 +119,7 @@ impl AgentRun {
     pub fn new(agent: impl Into<String>, run_id: impl Into<String>) -> Self {
         Self {
             agent: agent.into(),
+            exact_agent_definition: None,
             target: None,
             run_id: run_id.into(),
             codename: None,
@@ -130,6 +136,7 @@ impl AgentRun {
             messaging: LaunchMessaging::Default,
             message_space: None,
             continue_from: None,
+            continue_options: None,
             model: None,
             provider: None,
             launch: None,
@@ -328,6 +335,12 @@ pub enum WorkflowControl {
 /// `rupu session start <agent> …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
+    pub tool_ceiling: Option<Vec<String>>,
+    pub mcp_tools: Option<Vec<crate::session_mcp::ToolRef>>,
+    pub mcp_catalog_revision: Option<String>,
+    /// None inherits the agent; an empty selection renders --no-tools.
+    pub tools: Option<Vec<String>>,
+    pub effort: Option<String>,
     pub skill_preset: Option<String>,
     pub agent: String,
     pub provider: Option<String>,
@@ -364,6 +377,7 @@ pub struct SessionSend {
 /// `rupu session _worker --session-id <id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionWorker {
+    pub approval_channel: bool,
     pub session_id: String,
 }
 
@@ -495,6 +509,9 @@ impl RunArgv {
             Self::Agent(r) => {
                 a.push("run");
                 a.push(&r.agent);
+                if let Some(proof) = &r.exact_agent_definition {
+                    a.push(format!("--exact-agent-definition={proof}"));
+                }
                 a.opt_positional(r.target.as_deref());
                 a.flag_value("--run-id", &r.run_id);
                 if !r.codename_env {
@@ -537,6 +554,12 @@ impl RunArgv {
                     LaunchMessaging::Off => a.push("--no-messaging"),
                 }
                 a.opt_flag_value("--continue", r.continue_from.as_deref());
+                if let Some(options) = &r.continue_options {
+                    a.push(format!(
+                        "--continue-options={}",
+                        serde_json::to_string(options).expect("string-list serialization")
+                    ));
+                }
                 // One element each, like the prompt: a name starting with
                 // `-` can't be read as a flag.
                 if let Some(m) = &r.model {
@@ -628,9 +651,32 @@ impl RunArgv {
                 a.push("session");
                 a.push("start");
                 a.push(&s.agent);
+                if let Some(ceiling) = &s.tool_ceiling {
+                    a.flag_value(
+                        "--tool-ceiling",
+                        &serde_json::to_string(ceiling).expect("ceiling serializes"),
+                    );
+                }
+                if let Some(tools) = &s.mcp_tools {
+                    a.flag_value(
+                        "--mcp-tools",
+                        &serde_json::to_string(tools).expect("tool identities serialize"),
+                    );
+                }
+                a.opt_flag_value("--mcp-catalog-revision", s.mcp_catalog_revision.as_deref());
                 a.opt_flag_value("--skill-preset", s.skill_preset.as_deref());
+                if let Some(tools) = &s.tools {
+                    if tools.is_empty() {
+                        a.push("--no-tools");
+                    } else {
+                        for tool in tools {
+                            a.flag_value("--tool", tool);
+                        }
+                    }
+                }
                 a.opt_flag_value("--provider", s.provider.as_deref());
                 a.opt_flag_value("--model", s.model.as_deref());
+                a.opt_flag_value("--effort", s.effort.as_deref());
                 a.opt_flag_value("--workspace-id", s.workspace_id.as_deref());
                 a.opt_positional(s.target.as_deref());
                 if s.idle {
@@ -673,6 +719,9 @@ impl RunArgv {
                 a.push("session");
                 a.push("_worker");
                 a.flag_value("--session-id", &w.session_id);
+                if w.approval_channel {
+                    a.push("--approval-channel");
+                }
             }
             Self::SessionCompact(c) => {
                 a.push("session");
@@ -1138,7 +1187,12 @@ mod tests {
             ]
         );
         let start = RunArgv::SessionStart(SessionStart {
+            tool_ceiling: None,
+            mcp_tools: None,
+            mcp_catalog_revision: None,
+            effort: None,
             skill_preset: None,
+            tools: None,
             agent: "triage".into(),
             provider: None,
             model: None,

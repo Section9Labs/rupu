@@ -28,8 +28,10 @@
 
 use crate::catalog::ToolCatalog;
 use crate::descriptor::{AliasScope, Service, ToolDescriptor};
+use crate::ToolDefinition;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 /// What an agent with no `tools:` list gets. This is a compatibility
 /// default: it reproduces the registry such an agent had before grants
@@ -273,8 +275,8 @@ pub struct GrantInputs<'a> {
 /// One tool offered to the model.
 #[derive(Clone, Debug)]
 pub struct GrantEntry {
-    pub canonical: &'static str,
-    pub descriptor: &'static ToolDescriptor,
+    pub canonical: String,
+    pub descriptor: Arc<ToolDefinition>,
     /// Why it is offered, in the order the reasons were found.
     pub reasons: Vec<GrantReason>,
 }
@@ -294,7 +296,7 @@ impl GrantEntry {
 /// A tool the grant names that this run can't serve.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unavailable {
-    pub tool: &'static str,
+    pub tool: String,
     /// The services it needs that the run lacks.
     pub missing: Vec<Service>,
 }
@@ -321,10 +323,14 @@ pub const UNAVAILABLE_NOTICE_KIND: &str = "tool_unavailable";
 /// The result of [`ToolCatalog::resolve_grant`].
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedGrant {
+    /// Exact immutable session ceiling applied after all grant sources.
+    pub tool_ceiling: Option<Vec<String>>,
     /// Offered to the model, by canonical name.
-    pub entries: BTreeMap<&'static str, GrantEntry>,
+    pub entries: BTreeMap<String, GrantEntry>,
+    /// Exact metadata and body snapshot used to resolve this grant.
+    pub catalog: ToolCatalog,
     /// Connector tools the grant held that the step's `actions:` removed.
-    pub narrowed: Vec<&'static str>,
+    pub narrowed: Vec<String>,
     /// Named exactly, but a service is missing: not offered, and the run
     /// writes a `tool_unavailable` notice for each.
     pub unavailable: Vec<Unavailable>,
@@ -359,7 +365,7 @@ impl ResolvedGrant {
     /// narrowing — offered, narrowed away, or named but unservable.
     pub fn granted_before_narrowing(&self, name: &str) -> bool {
         self.entries.contains_key(name)
-            || self.narrowed.contains(&name)
+            || self.narrowed.iter().any(|n| n == name)
             || self.unavailable.iter().any(|u| u.tool == name)
     }
 
@@ -372,24 +378,29 @@ impl ResolvedGrant {
     /// Offer `d` for `reason`, or record why not.
     fn offer(
         &mut self,
-        d: &'static ToolDescriptor,
+        d: Arc<ToolDefinition>,
         reason: GrantReason,
         named: bool,
         available: &ServiceSet,
     ) {
-        if let Some(entry) = self.entries.get_mut(d.name) {
+        if let Some(entry) = self.entries.get_mut(&d.name) {
             if !entry.reasons.contains(&reason) {
                 entry.reasons.push(reason);
             }
             return;
         }
-        let missing = available.missing_for(d);
+        let missing = d
+            .needs
+            .iter()
+            .copied()
+            .filter(|s| !available.contains(*s))
+            .collect::<Vec<_>>();
         if missing.is_empty() {
             self.skipped.retain(|u| u.tool != d.name);
             self.entries.insert(
-                d.name,
+                d.name.clone(),
                 GrantEntry {
-                    canonical: d.name,
+                    canonical: d.name.clone(),
                     descriptor: d,
                     reasons: vec![reason],
                 },
@@ -401,13 +412,13 @@ impl ResolvedGrant {
             self.skipped.retain(|u| u.tool != d.name);
             if !known(&self.unavailable) {
                 self.unavailable.push(Unavailable {
-                    tool: d.name,
+                    tool: d.name.clone(),
                     missing,
                 });
             }
         } else if !known(&self.unavailable) && !known(&self.skipped) {
             self.skipped.push(Unavailable {
-                tool: d.name,
+                tool: d.name.clone(),
                 missing,
             });
         }
@@ -417,6 +428,8 @@ impl ResolvedGrant {
 /// Why a `tools:` or `actions:` list can't be resolved.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GrantError {
+    #[error("tool_ceiling requires at most 256 unique exact canonical tool names known to the selected catalog")]
+    InvalidToolCeiling,
     /// A name no tool answers to. `field` is where it was written
     /// (`tools:` / `actions:`); `suggestion` is the closest known name,
     /// already formatted (`"report_finding" → findings.report`).
@@ -463,9 +476,9 @@ fn suggestion_suffix(s: &Option<String>) -> String {
 /// One `tools:` / `actions:` entry, expanded.
 enum Expansion {
     /// An exact name (canonical or alias).
-    Exact(&'static ToolDescriptor),
+    Exact(Arc<ToolDefinition>),
     /// A wildcard: every matching tool.
-    Wildcard(Vec<&'static ToolDescriptor>),
+    Wildcard(Vec<Arc<ToolDefinition>>),
 }
 
 impl ToolCatalog {
@@ -484,6 +497,22 @@ impl ToolCatalog {
             }
         }
         self.descriptor(name)
+            .or_else(|| scoped_alias(AliasScope::Everywhere))
+    }
+
+    /// Alias resolution over the complete snapshot. Static-only callers may
+    /// continue to use `resolve_name`; runtime selection uses this method.
+    pub fn resolve_definition(&self, name: &str, scope: AliasScope) -> Option<Arc<ToolDefinition>> {
+        let scoped_alias = |want| {
+            self.definitions()
+                .find(|d| d.aliases.iter().any(|a| a.name == name && a.scope == want))
+        };
+        if scope == AliasScope::FlowLead {
+            if let Some(d) = scoped_alias(AliasScope::FlowLead) {
+                return Some(d);
+            }
+        }
+        self.definition(name)
             .or_else(|| scoped_alias(AliasScope::Everywhere))
     }
 
@@ -515,7 +544,11 @@ impl ToolCatalog {
             if connectors.is_empty() {
                 return Err(GrantError::NotConnector { name: a.clone() });
             }
-            out.extend(connectors.into_iter().map(|d| d.name));
+            out.extend(
+                connectors
+                    .into_iter()
+                    .filter_map(|d| d.static_descriptor().map(|s| s.name)),
+            );
         }
         Ok(out)
     }
@@ -541,8 +574,10 @@ impl ToolCatalog {
                 return Err(GrantError::NotMessaging { name: n.clone() });
             }
             for d in descs {
-                if !out.contains(&d.name) {
-                    out.push(d.name);
+                if let Some(d) = d.static_descriptor() {
+                    if !out.contains(&d.name) {
+                        out.push(d.name);
+                    }
                 }
             }
         }
@@ -576,7 +611,10 @@ impl ToolCatalog {
     ///    `effective = (G \ Connector) ∪ (G ∩ Connector ∩ actions)`.
     /// 3. Ambient grants are added, un-narrowed.
     pub fn resolve_grant(&self, inputs: GrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
-        let mut g = ResolvedGrant::default();
+        let mut g = ResolvedGrant {
+            catalog: self.clone(),
+            ..Default::default()
+        };
         let scope = inputs.alias_scope;
 
         let (list, is_default): (Vec<&str>, bool) = match inputs.declared {
@@ -632,16 +670,16 @@ impl ToolCatalog {
             g.entries.retain(|name, e| {
                 let k = keep(name, e.descriptor.is_connector());
                 if !k {
-                    narrowed.push(*name);
+                    narrowed.push(name.clone());
                 }
                 k
             });
             for list in [&mut g.unavailable, &mut g.skipped] {
                 list.retain(|u| {
-                    let connector = self.descriptor(u.tool).is_some_and(|d| d.is_connector());
-                    let k = keep(u.tool, connector);
+                    let connector = self.definition(&u.tool).is_some_and(|d| d.is_connector());
+                    let k = keep(&u.tool, connector);
                     if !k {
-                        narrowed.push(u.tool);
+                        narrowed.push(u.tool.clone());
                     }
                     k
                 });
@@ -662,13 +700,13 @@ impl ToolCatalog {
 
         for a in inputs.ambient {
             for name in &a.tools {
-                let d = self
-                    .resolve_name(name, scope)
-                    .ok_or_else(|| GrantError::UnknownTool {
+                let d = self.resolve_definition(name, scope).ok_or_else(|| {
+                    GrantError::UnknownTool {
                         field: "an ambient grant",
                         name: name.to_string(),
                         suggestion: None,
-                    })?;
+                    }
+                })?;
                 g.offer(d, a.reason.clone(), false, inputs.available);
             }
         }
@@ -677,7 +715,7 @@ impl ToolCatalog {
             crate::launch::join::DESCRIPTOR.name,
         );
         if g.offers(dispatch) && !g.offers(join) {
-            if let Some(d) = self.descriptor(join) {
+            if let Some(d) = self.definition(join) {
                 g.offer(d, GrantReason::Implied(dispatch), false, inputs.available);
             }
         }
@@ -695,19 +733,19 @@ impl ToolCatalog {
         if entry == "*" {
             // Every capability, but never authority over other agents (D22).
             return Ok(Expansion::Wildcard(
-                self.descriptors().filter(|d| d.wildcard).collect(),
+                self.definitions().filter(|d| d.wildcard).collect(),
             ));
         }
         if entry == CORE_NAMESPACE {
             return Ok(Expansion::Wildcard(
-                self.descriptors().filter(|d| d.is_core()).collect(),
+                self.definitions().filter(|d| d.is_core()).collect(),
             ));
         }
         if let Some(ns) = entry.strip_suffix(".*") {
             if !ns.is_empty() && !ns.contains('*') {
                 let prefix = format!("{ns}.");
                 let ds: Vec<_> = self
-                    .descriptors()
+                    .definitions()
                     .filter(|d| d.name.starts_with(&prefix))
                     .collect();
                 if ds.is_empty() {
@@ -721,7 +759,7 @@ impl ToolCatalog {
             }
         }
         if !entry.contains('*') {
-            if let Some(d) = self.resolve_name(entry, scope) {
+            if let Some(d) = self.resolve_definition(entry, scope) {
                 return Ok(Expansion::Exact(d));
             }
         }
@@ -737,21 +775,21 @@ impl ToolCatalog {
     /// error (`"report_finding" → findings.report`).
     fn suggest(&self, typo: &str) -> Option<String> {
         let typo = typo.to_ascii_lowercase();
-        let mut candidates: Vec<(String, Option<&'static str>)> = Vec::new();
-        for d in self.descriptors() {
+        let mut candidates: Vec<(String, Option<String>)> = Vec::new();
+        for d in self.definitions() {
             candidates.push((d.name.to_string(), None));
-            for a in d.aliases {
-                candidates.push((a.name.to_string(), Some(d.name)));
+            for a in &d.aliases {
+                candidates.push((a.name.to_string(), Some(d.name.clone())));
             }
         }
         let mut namespaces: BTreeSet<String> = self
-            .descriptors()
+            .definitions()
             .filter_map(|d| d.name.split_once('.').map(|(ns, _)| format!("{ns}.*")))
             .collect();
         namespaces.insert(CORE_NAMESPACE.to_string());
         candidates.extend(namespaces.into_iter().map(|n| (n, None)));
 
-        let mut best: Option<(usize, &(String, Option<&'static str>))> = None;
+        let mut best: Option<(usize, &(String, Option<String>))> = None;
         for c in &candidates {
             let dist = edit_distance(&typo, &c.0.to_ascii_lowercase());
             if dist <= 2 && best.is_none_or(|(b, _)| dist < b) {

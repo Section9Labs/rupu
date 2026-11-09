@@ -314,7 +314,9 @@ impl MessageRoot {
     }
 
     /// Send `msg` into the space, when the root is live
-    /// ([`MessageRoot::liveness`]).
+    /// ([`MessageRoot::liveness`]). A guarded recipient is checked by the bus
+    /// under its shared join/leave/enqueue lock. This does not promise the
+    /// participant stays live or consumes the message after enqueue.
     pub fn operator_send(
         &self,
         global: &Path,
@@ -878,6 +880,61 @@ mod tests {
             "workflow run `run_1` is not running (completed)"
         );
         assert!(!root.space.exists());
+    }
+
+    #[test]
+    fn expected_run_refusals_keep_the_same_wire_codes_for_each_root_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let g = tmp.path();
+        for (relative, id, record, address) in [
+            (
+                "sessions/ses_guard/session.json",
+                "ses_guard",
+                json!({"status": "idle"}),
+                "heron",
+            ),
+            (
+                "runs/run_guard/run.json",
+                "run_guard",
+                json!({"workflow_name": "review", "status": "running"}),
+                "lynx#1",
+            ),
+            (
+                "agentiflows/af_guard/agentiflow.json",
+                "af_guard",
+                json!({"status": "running"}),
+                "lead",
+            ),
+        ] {
+            write(&g.join(relative), record);
+            let root = MessageRoot::resolve(g, id).unwrap();
+            let participant = Bus::open(&root.space, address);
+            participant
+                .join(member("run_current", Some(ALIVE)))
+                .unwrap();
+            let mut message = to(address, "Only this occupant");
+            message.expected_run_id = Some("run_current".into());
+            root.operator_send(g, message.clone(), BusCaps::default(), &alive)
+                .unwrap();
+            participant.mailbox.drain(address).unwrap();
+            let log_before = std::fs::read(root.log_path()).unwrap();
+
+            for (expected, code) in [("run_stale", 409), ("", 400), ("../run", 400)] {
+                message.expected_run_id = Some(expected.into());
+                let error = root
+                    .operator_send(g, message.clone(), BusCaps::default(), &alive)
+                    .unwrap_err();
+                assert_eq!(MessageError::from(&error).code.http_status(), code, "{id}");
+            }
+            participant.leave("completed").unwrap();
+            message.expected_run_id = Some("run_current".into());
+            let error = root
+                .operator_send(g, message, BusCaps::default(), &alive)
+                .unwrap_err();
+            assert_eq!(MessageError::from(&error).code, MessageErrorCode::NotLive);
+            assert_eq!(std::fs::read(root.log_path()).unwrap(), log_before);
+            assert_eq!(participant.mailbox.inbox_len(address).unwrap(), 0);
+        }
     }
 
     #[test]

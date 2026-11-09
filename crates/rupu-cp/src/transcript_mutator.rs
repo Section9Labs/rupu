@@ -37,6 +37,8 @@ pub enum TranscriptMutateError {
     NotFound(String),
     #[error("invalid transcript state: {0}")]
     Invalid(String),
+    #[error("exact transcript deletion unsupported: {0}")]
+    Unsupported(String),
     #[error("failed to {action} transcript: {message}")]
     Failed {
         action: &'static str,
@@ -46,6 +48,29 @@ pub enum TranscriptMutateError {
 
 #[async_trait]
 pub trait TranscriptMutator: Send + Sync {
+    fn supports_exact_delete(&self) -> bool {
+        false
+    }
+    async fn exact_delete_context(
+        &self,
+        _id: &str,
+        _scope: &ExactTranscriptScope,
+    ) -> Result<ExactTranscriptContext, TranscriptMutateError> {
+        Err(TranscriptMutateError::Unsupported(
+            "adapter does not implement exact source deletion".into(),
+        ))
+    }
+    async fn delete_exact(
+        &self,
+        _id: &str,
+        _scope: &ExactTranscriptScope,
+        _revision: &str,
+    ) -> Result<(), TranscriptMutateError> {
+        Err(TranscriptMutateError::Unsupported(
+            "adapter does not implement exact source deletion".into(),
+        ))
+    }
+
     /// `ignore_liveness` — skip the CLI's still-running check
     /// (`ensure_standalone_not_running` in
     /// `crates/rupu-cli/src/cmd/transcript.rs`). Defaults to `false`
@@ -94,4 +119,57 @@ mod tests {
             Err(TranscriptMutateError::NotFound(_))
         ));
     }
+}
+
+/// Explicit local source selected by the operator, independent of CLI cwd.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactTranscriptScope {
+    pub workspace_id: String,
+    pub path: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactTranscriptEffect {
+    pub kind: String,
+    pub path: String,
+    /// Decimal byte count; never rounded through a JSON floating-point value.
+    pub bytes: String,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactTranscriptLimits {
+    pub metadata_bytes: usize,
+    pub prologue_bytes: usize,
+    pub effect_entries: usize,
+    pub context_bytes: usize,
+}
+impl Default for ExactTranscriptLimits {
+    fn default() -> Self {
+        Self {
+            metadata_bytes: 262_144,
+            prologue_bytes: 262_144,
+            effect_entries: 32,
+            context_bytes: 65_536,
+        }
+    }
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactTranscriptContext {
+    pub schema: String,
+    pub id: String,
+    pub workspace_id: String,
+    pub host_id: String,
+    pub path: String,
+    /// ready | unavailable. Only ready carries a revision and effects.
+    pub state: String,
+    pub reason: Option<String>,
+    pub source_kind: Option<String>,
+    pub archived: Option<bool>,
+    pub revision: Option<String>,
+    pub observed_at: String,
+    pub effects: Vec<ExactTranscriptEffect>,
+    pub coordination: String,
+    pub limits: ExactTranscriptLimits,
 }

@@ -415,6 +415,24 @@ impl Registry {
         ids.into_iter().collect()
     }
 
+    /// Configured issue adapters only; no credential resolution or network IO.
+    pub fn all_issue_connectors(&self) -> Vec<(AccountId, IssueTracker, Arc<dyn IssueConnector>)> {
+        let mut rows = Vec::new();
+        for tracker in [
+            IssueTracker::Github,
+            IssueTracker::Gitlab,
+            IssueTracker::Linear,
+            IssueTracker::Jira,
+        ] {
+            for id in self.accounts_for_tracker(tracker) {
+                if let Ok((id, connector)) = self.issues_for(tracker, None, None, Some(&id)) {
+                    rows.push((id, tracker, connector));
+                }
+            }
+        }
+        rows
+    }
+
     fn accounts_for_tracker(&self, tracker: IssueTracker) -> Vec<AccountId> {
         match platform_for_tracker(tracker) {
             Some(kind) => self

@@ -1235,3 +1235,59 @@ async fn no_requested_skills_reads_no_layer() {
         .unwrap();
     assert!(got.is_none());
 }
+
+#[tokio::test]
+#[serial]
+async fn session_tool_ceiling_is_final_after_real_assembly_ambient_grants() {
+    let home = Home::new();
+    home.skill("audit", "Review fixture", "No actions.");
+    let assembler = home.assembler(config());
+    for (id, ceiling, frozen_remote_names, expected) in [
+        (
+            "run_ceil_one",
+            Some(vec!["skills.load".into()]),
+            vec![],
+            vec!["skills.load"],
+        ),
+        ("run_ceil_empty", Some(vec![]), vec![], vec![]),
+        (
+            "run_ceil_removed_remote",
+            Some(vec!["mcp.frozen_fixture".into()]),
+            vec!["mcp.frozen_fixture".into()],
+            vec![],
+        ),
+    ] {
+        let mut spec = agent(
+            &home,
+            "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: [read_file]",
+        );
+        spec.concerns = rupu_agent::builtin::session_agent().concerns;
+        let mut l = launch(
+            &home,
+            spec,
+            Origin::SessionTurn {
+                session_id: "ses_ceiling".into(),
+                session_dir: home.global().join("sessions/ses_ceiling"),
+            },
+            id,
+        );
+        l.overrides.skills = vec!["audit".into()];
+        l.overrides.tool_ceiling = ceiling;
+        l.overrides.tool_ceiling_frozen_remote_names = frozen_remote_names;
+        let path = l.transcript_path.clone();
+        let _mock = MockScript::set(DONE);
+        rupu_runtime::run_agent(&assembler, l)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let evs = events(&path);
+        assert_eq!(
+            offered(&evs)
+                .iter()
+                .map(|e| e.tool.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}

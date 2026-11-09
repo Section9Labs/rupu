@@ -11,6 +11,48 @@ pub struct GithubExtras {
 }
 
 impl GithubExtras {
+    /// Connector lifetime plus nonsecret accepted credential generation.
+    pub fn review_identity_epoch(&self) -> String {
+        self.client.review_identity_epoch()
+    }
+    pub fn review_api_profile(&self) -> String {
+        self.client.review_api_profile()
+    }
+    pub fn review_matches_origin(&self, origin: &str) -> bool {
+        self.client.review_matches_origin(origin)
+    }
+    pub async fn review_get(
+        &self,
+        path: &str,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.client.review_get(path).await
+    }
+    pub async fn review_get_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.client.review_get_bounded(path, max_bytes).await
+    }
+
+    pub async fn review_graphql(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.client.review_graphql(query, variables).await
+    }
+    pub async fn review_graphql_bounded(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+        max_bytes: usize,
+    ) -> Result<crate::review_transport::ReviewResponse, ScmError> {
+        self.client
+            .review_graphql_bounded(query, variables, max_bytes)
+            .await
+    }
+
     pub fn new(client: GithubClient) -> Self {
         Self { client }
     }

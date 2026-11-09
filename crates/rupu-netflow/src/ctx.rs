@@ -8,13 +8,11 @@ use serde::{Deserialize, Serialize};
 /// Which subsystem opened the connection.
 ///
 /// This enum is a claim about what the subsystem can capture, so it lists
-/// only egress that can actually occur. `Mcp` and `Webhook` were removed
-/// deliberately: the MCP server makes no outbound HTTP of its own (its
-/// connector tools dispatch into `rupu-scm`'s connectors, which tag their own calls `Scm`), and
-/// `rupu-webhook` is an inbound server. A variant nothing can construct
-/// is a promise of coverage that does not exist. `Subprocess` IS present
-/// and CAN occur — it is emitted by the subprocess-capture backend (spec
-/// 2026-10-04).
+/// only egress that can actually occur. `Mcp` now denotes the outbound
+/// configured-tools client, not the inbound operator server. The operator
+/// server's connector tools still tag their own calls `Scm`. `Webhook`
+/// remains absent because that server makes no outbound HTTP. `Subprocess`
+/// is emitted by the subprocess-capture backend.
 ///
 /// "Can occur" is not "is captured", though: `Update`, `Cp` and `System`
 /// CAN be constructed (every one of their production call sites does), but
@@ -31,6 +29,8 @@ pub enum Origin {
     Provider(String),
     /// SCM / issue connector, by platform (`github`, `gitlab`, …).
     Scm(String),
+    /// Outbound MCP tools client, by trusted configured server ID.
+    Mcp(String),
     /// A process the agent started through the `bash` tool, by process
     /// name (`curl`, `git`, `nmap`…), or `"unknown"` when the owning
     /// process could not be resolved. Flows tagged this way are
@@ -43,13 +43,11 @@ pub enum Origin {
 
 /// Attribution for every flow a client produces.
 ///
-/// `run_id` is `None` for every production flow today — there is no
-/// per-request call site anywhere in the workspace that sets it (the
-/// netflow-per-run plan attributes by LEDGER FILE, not by this field: a
-/// run's sink is scoped to one `NetflowPaths::for_run` file at
-/// construction time, so which run a flow belongs to is answered by
-/// which file it landed in, never by reading `ctx.run_id` back out of
-/// the record). Long-lived, run-less clients (the update checker,
+/// Provider and SCM callers traditionally attribute by their per-run ledger
+/// sink, leaving `run_id` unset. The outbound MCP client additionally accepts
+/// an explicit owner context. In both cases the sink must belong to that
+/// owner; never reuse another run's client/sink. Long-lived, run-less clients
+/// (the update checker,
 /// CP's host registry / fleet traffic, auth/oauth token exchange) are
 /// wired to `NullSink` and produce no flow at all, not a
 /// `run_id: None` one — see `rupu-cp/src/api/netflow.rs`'s module doc
@@ -93,14 +91,11 @@ mod tests {
 
     #[test]
     fn origin_enumerates_only_egress_that_can_occur() {
-        // The enum is a claim about what this subsystem can capture.
-        // `Mcp` and `Webhook` were removed because neither crate makes
-        // outbound HTTP: the MCP server's tools dispatch into rupu-scm's connectors
-        // (already tagged Scm), and rupu-webhook is an inbound server.
-        // A variant that can never be constructed is a false claim.
+        // Only real outbound paths have variants; MCP now has a client.
         for json in [
             r#"{"kind":"provider","name":"anthropic"}"#,
             r#"{"kind":"scm","name":"github"}"#,
+            r#"{"kind":"mcp","name":"fixture"}"#,
             r#"{"kind":"subprocess","name":"curl"}"#,
             r#"{"kind":"update"}"#,
             r#"{"kind":"cp"}"#,
@@ -110,7 +105,6 @@ mod tests {
         }
 
         // Retired variants must no longer deserialize.
-        assert!(serde_json::from_str::<Origin>(r#"{"kind":"mcp","name":"x"}"#).is_err());
         assert!(serde_json::from_str::<Origin>(r#"{"kind":"webhook"}"#).is_err());
     }
 }

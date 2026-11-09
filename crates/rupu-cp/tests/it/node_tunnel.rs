@@ -2050,7 +2050,12 @@ mod tunnel_connector {
 
         let err = conn
             .start_session(rupu_cp::session_starter::SessionStartRequest {
+                tool_ceiling: None,
+                mcp_tools: None,
+                mcp_catalog_revision: None,
+                effort: None,
                 skill_preset: None,
+                tools: None,
                 agent: "a".into(),
                 provider: None,
                 model: None,

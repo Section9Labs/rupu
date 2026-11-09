@@ -21,6 +21,7 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "assistant_message",
     "tool_call",
     "tool_result",
+    "tool_approval",
     "file_edit",
     "command_run",
     "action_emitted",
@@ -46,6 +47,30 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
     "injected",
 ];
 
+/// Broker-authored, exact-call approval evidence. The current operator
+/// decision must still be read from the owning broker before UI mutation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolApprovalRecord {
+    pub schema_version: u32,
+    pub cp_instance_id: String,
+    pub broker_epoch: String,
+    pub approval_id: String,
+    pub session_id: String,
+    pub root_turn_run_id: String,
+    pub run_id: String,
+    pub parent_run_id: Option<String>,
+    pub workspace_id: String,
+    pub turn_index: u64,
+    pub tool_call_id: String,
+    pub call_sequence: u64,
+    pub tool: String,
+    pub effect: String,
+    pub state: String,
+    pub intent_fingerprint: String,
+    pub review_fingerprint: String,
+    pub expires_at_ms: u64,
+}
+
 /// One tool in a [`Event::ToolGrant`]: its canonical name and why it was
 /// offered (`declared`, `declared:scm.*`, `default`, `ambient:concerns`,
 /// `origin:injected`, …).
@@ -53,6 +78,15 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
 pub struct ToolGrantEntry {
     pub tool: String,
     pub reasons: Vec<String>,
+    /// Exact remote identity, absent for builtins and older transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteToolIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteToolIdentity {
+    pub server: String,
+    pub tool: String,
 }
 
 /// A tool a [`Event::ToolGrant`] could not offer, and the services it
@@ -158,6 +192,9 @@ pub enum Event {
         call_id: String,
         tool: String,
         input: Value,
+    },
+    ToolApproval {
+        record: ToolApprovalRecord,
     },
     ToolResult {
         call_id: String,
@@ -610,6 +647,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exact_call_approval_event_roundtrips_without_review_arguments() {
+        let record: ToolApprovalRecord = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"cp_instance_id":"instance_fixture","broker_epoch":"epoch_fixture",
+            "approval_id":"approval_fixture","session_id":"ses_fixture","root_turn_run_id":"run_fixture",
+            "run_id":"run_child_fixture","parent_run_id":"run_fixture","workspace_id":"ws_fixture",
+            "turn_index":3,"tool_call_id":"call_fixture","call_sequence":2,"tool":"core.write_file",
+            "effect":"write","state":"pending","intent_fingerprint":"intent_fixture",
+            "review_fingerprint":"review_fixture","expires_at_ms":1000
+        })).unwrap();
+        let event = Event::ToolApproval { record };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "tool_approval");
+        assert_eq!(value["data"]["record"]["run_id"], "run_child_fixture");
+        assert!(value["data"]["record"].get("review").is_none());
+        assert!(value["data"]["record"].get("input").is_none());
+        assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+    }
+
+    #[test]
     fn tool_audit_roundtrips_with_the_adjacently_tagged_shape() {
         // The CP web reads this as `{"type":"tool_audit","data":{...}}` —
         // the SAME tag="type"/content="data" envelope every other Event
@@ -839,6 +895,7 @@ mod tests {
             (
                 Event::ToolGrant {
                     entries: vec![ToolGrantEntry {
+                        remote: None,
                         tool: "findings.report".into(),
                         reasons: vec!["declared".into(), "ambient:concerns".into()],
                     }],

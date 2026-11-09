@@ -127,3 +127,53 @@ mod tests {
         assert!(open_with_deadline(tmp.path()).is_err());
     }
 }
+
+/// Descriptor-relative, no-symlink walk for captured search input. Callers pass
+/// an absolute canonical owner locator; no parent component is re-resolved.
+pub(crate) fn open_anchored_regular_file(path: &FsPath) -> std::io::Result<File> {
+    use std::path::Component;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "absolute regular path required",
+        )
+    };
+    if !path.is_absolute() {
+        return Err(invalid());
+    }
+    let mut directory = rustix::fs::open(
+        "/",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let parts: Vec<_> = path
+        .components()
+        .filter(|c| *c != Component::RootDir)
+        .collect();
+    for (index, component) in parts.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(invalid());
+        };
+        let last = index + 1 == parts.len();
+        let flags = OFlags::RDONLY
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC
+            | if last {
+                OFlags::empty()
+            } else {
+                OFlags::DIRECTORY
+            };
+        let next = rustix::fs::openat(&directory, *name, flags, Mode::empty())?;
+        if last {
+            let file = File::from(next);
+            return if file.metadata()?.is_file() {
+                Ok(file)
+            } else {
+                Err(invalid())
+            };
+        }
+        directory = next;
+    }
+    Err(invalid())
+}

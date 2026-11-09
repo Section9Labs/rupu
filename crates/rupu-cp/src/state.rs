@@ -6,6 +6,13 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AppState {
+    #[cfg(unix)]
+    pub workflow_observations: Arc<crate::api::workflow_observation::Cache>,
+    pub review_pages: Arc<crate::api::review_pages::Cache>,
+    /// Bounded immutable, read-time Agentiflow observations.
+    pub agentiflow_observations: Arc<crate::api::agentiflows::observation::ObservationCache>,
+    #[cfg(unix)]
+    pub agentiflow_usage_pages: Arc<crate::api::agentiflows::usage_pages::UsageCache>,
     pub global_dir: PathBuf,
     /// Workspace dir — used for coverage data that lives under
     /// `<workspace>/.rupu/coverage/`. Defaults to `std::env::current_dir()`
@@ -171,6 +178,7 @@ impl AppState {
             launcher: None,
             session_sender: None,
             repos: None,
+            review_pages: Arc::default(),
             model_catalog: None,
             agent_launcher: None,
             session_starter: None,
@@ -192,6 +200,11 @@ impl AppState {
             agentiflow_launcher: None,
             skill_installer: None,
             admin_ops: None,
+            agentiflow_observations: Arc::default(),
+            #[cfg(unix)]
+            workflow_observations: Arc::default(),
+            #[cfg(unix)]
+            agentiflow_usage_pages: Arc::default(),
         }
     }
 

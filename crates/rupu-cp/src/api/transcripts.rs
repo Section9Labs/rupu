@@ -10,6 +10,11 @@
 //! port (501 when absent — i.e. not running under `rupu cp serve`), or proxy
 //! to a resolved remote host with `?host=<id>`.
 
+#[path = "transcripts_exact.rs"]
+mod exact;
+pub(crate) use exact::available as exact_delete_available;
+pub(crate) const EXACT_DELETE_FEATURE: &str = "transcript.delete.exact.v1";
+
 use crate::{
     error::{ApiError, ApiResult},
     host::connector::HostConnectorError,
@@ -25,7 +30,18 @@ use serde::Deserialize;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/transcripts/:id/archive", post(archive_transcript))
-        .route("/api/transcripts/:id", axum::routing::delete(delete_transcript))
+        .route(
+            "/api/transcripts/:id",
+            axum::routing::delete(delete_transcript),
+        )
+        .route(
+            "/api/transcripts/:id/delete-context",
+            axum::routing::get(exact::context),
+        )
+        .route(
+            "/api/transcripts/:id/exact-source",
+            axum::routing::delete(exact::guarded_delete),
+        )
 }
 
 /// Optional `?host=<id>` query param, same shape as `sessions.rs`'s
@@ -37,6 +53,9 @@ pub(crate) struct TranscriptHostQuery {
     host: Option<String>,
     #[serde(default)]
     ignore_liveness: bool,
+    ws_id: Option<String>,
+    expected_path: Option<String>,
+    expected_revision: Option<String>,
 }
 
 async fn mutate_transcript(
@@ -55,6 +74,7 @@ async fn mutate_transcript(
             E::NotFound(_) => ApiError::not_found(format!("transcript {id} not found")),
             E::Invalid(msg) => ApiError::conflict(msg),
             E::Failed { message, .. } => ApiError::internal(message),
+            E::Unsupported(message) => ApiError::not_available(message),
         })?;
     Ok(Json(serde_json::json!({ "ok": true, "id": id })))
 }
@@ -90,13 +110,20 @@ async fn archive_transcript(
     Query(q): Query<TranscriptHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
+    if q.ws_id.is_some() || q.expected_path.is_some() || q.expected_revision.is_some() {
+        return Err(ApiError::bad_request(
+            "exact source preconditions require DELETE",
+        ));
+    }
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
         conn.archive_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_transcript(
         &s,
@@ -114,13 +141,18 @@ async fn delete_transcript(
     Query(q): Query<TranscriptHostQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     crate::api::runs::validate_id(&id)?;
+    if q.ws_id.is_some() || q.expected_path.is_some() || q.expected_revision.is_some() {
+        return exact::delete(&s, &id, q).await;
+    }
     let host = q.host.as_deref().unwrap_or("local");
     if host != "local" {
         let conn = crate::api::runs::resolve_host(&s, host)?;
         conn.delete_transcript(&id, q.ignore_liveness)
             .await
             .map_err(map_host_transcript_mutate_err)?;
-        return Ok(Json(serde_json::json!({ "ok": true, "id": id, "host_id": host })));
+        return Ok(Json(
+            serde_json::json!({ "ok": true, "id": id, "host_id": host }),
+        ));
     }
     mutate_transcript(
         &s,
@@ -187,10 +219,7 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(
-            resp.0,
-            serde_json::json!({ "ok": true, "id": "run_1" })
-        );
+        assert_eq!(resp.0, serde_json::json!({ "ok": true, "id": "run_1" }));
     }
 
     #[tokio::test]
@@ -205,10 +234,7 @@ mod tests {
         )
         .await
         .expect("ok");
-        assert_eq!(
-            resp.0,
-            serde_json::json!({ "ok": true, "id": "run_1" })
-        );
+        assert_eq!(resp.0, serde_json::json!({ "ok": true, "id": "run_1" }));
     }
 
     /// SAFETY-CRITICAL: a session-owned transcript must be REFUSED (409),
@@ -318,6 +344,7 @@ mod tests {
             Query(TranscriptHostQuery {
                 host: Some("host_nonexistent".into()),
                 ignore_liveness: false,
+                ..Default::default()
             }),
         )
         .await
@@ -329,10 +356,8 @@ mod tests {
     // 409 here too, not fall through to the generic 500 `other` arm.
     #[test]
     fn map_host_transcript_mutate_err_preserves_remote_409_as_conflict() {
-        let err = map_host_transcript_mutate_err(HostConnectorError::Remote(
-            409,
-            "still running".into(),
-        ));
+        let err =
+            map_host_transcript_mutate_err(HostConnectorError::Remote(409, "still running".into()));
         assert_eq!(err.0, axum::http::StatusCode::CONFLICT);
     }
 
@@ -362,6 +387,7 @@ mod tests {
             Query(TranscriptHostQuery {
                 host: None,
                 ignore_liveness: true,
+                ..Default::default()
             }),
         )
         .await

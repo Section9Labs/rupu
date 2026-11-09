@@ -272,3 +272,29 @@ async fn update_issue_state_uses_team_state_mapping() {
     meta.assert();
     update.assert();
 }
+
+#[tokio::test]
+async fn operator_read_rejects_full_identifier_mismatch() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start_async().await;
+    let team = server.mock(|when, then| {
+        when.method(POST).body_contains("team(id:$id)");
+        then.status(200).json_body(team_metadata_response());
+    });
+    let issue = server.mock(|when, then| {
+        when.method(POST).body_contains("issue(id:$id)");
+        then.status(200).json_body(
+            serde_json::json!({"data":{"issue":issue_node("OTHER-42","started","bug")}}),
+        );
+    });
+    assert!(connector_against(&server)
+        .operator_get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Linear,
+            project: "team-123".into(),
+            number: 42
+        })
+        .await
+        .is_err());
+    team.assert();
+    issue.assert();
+}

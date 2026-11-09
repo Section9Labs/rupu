@@ -92,6 +92,108 @@ impl IssueConnector for GitlabIssueConnector {
         IssueTracker::Gitlab
     }
 
+    fn forge_actions(&self) -> Vec<crate::forge_write::ForgeAction> {
+        use crate::forge_write::ForgeAction::*;
+        vec![
+            ReviewComment,
+            ReviewCreate,
+            BranchCreate,
+            IssueComment,
+            IssueCreate,
+            IssueSetState,
+        ]
+    }
+    async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        self.client.forge_session().await
+    }
+
+    fn discussion_supported(&self) -> bool {
+        self.operator_read_capabilities()
+            .origin
+            .is_some_and(|o| o.ends_with("/api/v4"))
+    }
+    fn discussion_epoch(&self) -> Option<String> {
+        self.discussion_supported()
+            .then(|| self.client.review_identity_epoch())
+    }
+    async fn discussion_page(
+        &self,
+        issue: &IssueRef,
+        after: Option<&str>,
+    ) -> Result<crate::issue_discussion::DiscussionPage, ScmError> {
+        self.operator_expected_issue(issue)?;
+        self.client
+            .discussion_session()
+            .await?
+            .page(issue, after)
+            .await
+    }
+
+    fn discovery_supported(&self) -> bool {
+        self.discussion_supported()
+    }
+    fn discovery_search_supported(&self) -> bool {
+        self.discovery_supported()
+    }
+    fn discovery_epoch(&self) -> Option<String> {
+        self.discussion_epoch()
+    }
+    async fn discovery_page(
+        &self,
+        request: &crate::issue_discovery::DiscoveryRequest,
+    ) -> Result<crate::issue_discovery::DiscoveryPage, ScmError> {
+        crate::issue_discovery::validate(request, self.tracker())?;
+        // Synthetic number validates project/account issuer only; no issue 1 read.
+        let expected = self.operator_expected_issue(&IssueRef {
+            tracker: self.tracker(),
+            project: request.project.clone(),
+            number: 1,
+        })?;
+        let mut request = request.clone();
+        request.project = expected.project;
+        self.client
+            .discussion_session()
+            .await?
+            .discover(&request)
+            .await
+    }
+
+    fn operator_read_capabilities(&self) -> crate::operator_issues::IssueReadCapabilities {
+        crate::operator_issues::IssueReadCapabilities::configured(
+            crate::operator_issues::safe_origin(&self.client.base_url),
+            false,
+        )
+    }
+
+    async fn operator_get_issue(&self, issue: &IssueRef) -> Result<Issue, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let _permit = self.client.permit().await;
+        let id = encode_project_id(&issue.project)?;
+        let project = self
+            .client
+            .operator_json(&format!("/projects/{id}"))
+            .await?;
+        if project["path_with_namespace"].as_str() != Some(issue.project.as_str()) {
+            return Err(crate::operator_issues::rejected());
+        }
+        let project_id = project["id"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let value = self
+            .client
+            .operator_json(&format!("/projects/{project_id}/issues/{}", issue.number))
+            .await?;
+        if value["project_id"].as_u64() != Some(project_id)
+            || value["iid"].as_u64() != Some(issue.number)
+        {
+            return Err(crate::operator_issues::rejected());
+        }
+        translate_issue(issue.project.clone(), &value)
+    }
+
     async fn list_issues(
         &self,
         project: &str,

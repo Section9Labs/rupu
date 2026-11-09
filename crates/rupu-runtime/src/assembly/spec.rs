@@ -55,6 +55,10 @@ pub struct WorkspaceBinding {
 /// What a site overrides of the agent's own settings.
 #[derive(Clone, Debug, Default)]
 pub struct Overrides {
+    /// Immutable session-own-turn ceiling; None preserves legacy grants.
+    pub tool_ceiling: Option<Vec<String>>,
+    /// Creation-frozen MCP names for ceiling validation, never tool grants.
+    pub tool_ceiling_frozen_remote_names: Vec<String>,
     /// `--provider`.
     pub provider: Option<String>,
     /// `--model`. A model other than the agent's drops its model-specific
@@ -102,11 +106,17 @@ pub struct Overrides {
 /// Services the site provides (they belong to the root run, not this one).
 #[derive(Default)]
 pub struct LaunchServices {
+    /// Verified session/descendant approval channel; absent in legacy launches.
+    pub authorizer: Option<Arc<dyn rupu_tools::approval::CallAuthorizer>>,
+    /// Explicit tool snapshot for this launch only. Defaults to builtins.
+    pub tool_catalog: rupu_tools::ToolCatalog,
     /// Durable identity from a session created with the bundled harness.
     /// False for legacy sessions, even if their custom agent used its name.
     pub builtin_session_harness: bool,
     /// Frozen session configuration; only meaningful for SessionTurn.
     pub session_orchestration: bool,
+    /// Exact-turn read bindings; never inherited by spawned children.
+    pub session_reads: Option<Arc<dyn rupu_tools::ports::SessionReadPort>>,
     /// The launcher behind `dispatch` / `join` (`rupu_launch::RunLauncher`),
     /// offered when the origin's defaults allow it.
     pub launcher: Option<Arc<dyn Launcher>>,

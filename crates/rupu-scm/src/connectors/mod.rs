@@ -84,6 +84,74 @@ pub trait RepoConnector: Send + Sync {
 pub trait IssueConnector: Send + Sync {
     fn tracker(&self) -> IssueTracker;
 
+    fn forge_actions(&self) -> Vec<crate::forge_write::ForgeAction> {
+        Vec::new()
+    }
+    async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        Err(crate::forge_write::ForgeError::unsupported())
+    }
+
+    /// Additive bounded operator-only discussion surface, not a runtime grant.
+    fn discussion_supported(&self) -> bool {
+        false
+    }
+    fn discussion_epoch(&self) -> Option<String> {
+        None
+    }
+    async fn discussion_page(
+        &self,
+        _issue: &IssueRef,
+        _after: Option<&str>,
+    ) -> Result<crate::issue_discussion::DiscussionPage, ScmError> {
+        Err(crate::issue_discussion::unsupported())
+    }
+
+    /// Bounded project issue discovery, without runtime tool grants.
+    fn discovery_supported(&self) -> bool {
+        false
+    }
+    fn discovery_search_supported(&self) -> bool {
+        false
+    }
+    fn discovery_epoch(&self) -> Option<String> {
+        None
+    }
+    async fn discovery_page(
+        &self,
+        _request: &crate::issue_discovery::DiscoveryRequest,
+    ) -> Result<crate::issue_discovery::DiscoveryPage, ScmError> {
+        Err(crate::issue_discovery::unsupported())
+    }
+
+    fn operator_read_capabilities(&self) -> crate::operator_issues::IssueReadCapabilities {
+        crate::operator_issues::IssueReadCapabilities::configured(None, false)
+    }
+
+    /// Expected returned identity; the original request is still passed to
+    /// get_issue. Jira overrides this to verify its site before credentials and
+    /// retain the connector's canonical response identity without retargeting.
+    fn operator_expected_issue(&self, issue: &IssueRef) -> Result<IssueRef, ScmError> {
+        crate::operator_issues::validate_project(issue)?;
+        Ok(issue.clone())
+    }
+
+    /// Bounded transport plus provider-returned identity validation.
+    async fn operator_get_issue(&self, _issue: &IssueRef) -> Result<Issue, ScmError> {
+        Err(crate::operator_issues::rejected())
+    }
+
+    async fn operator_comments_page(
+        &self,
+        _issue: &IssueRef,
+        _page: u32,
+    ) -> Result<crate::operator_issues::IssueCommentPage, ScmError> {
+        Err(ScmError::BadRequest {
+            message: "Operator comment paging is unsupported".into(),
+        })
+    }
+
     async fn list_issues(&self, project: &str, filter: IssueFilter)
         -> Result<Vec<Issue>, ScmError>;
     async fn get_issue(&self, i: &IssueRef) -> Result<Issue, ScmError>;

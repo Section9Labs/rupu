@@ -20,8 +20,14 @@ const DEFAULT_SITE_SCHEME: &str = "https";
 
 pub struct JiraIssueConnector {
     http: reqwest_middleware::ClientWithMiddleware,
+    operator_http: reqwest_middleware::ClientWithMiddleware,
+    forge_http: reqwest_middleware::ClientWithMiddleware,
+    discussion_http: reqwest_middleware::ClientWithMiddleware,
+    discussion_epoch: String,
     auth: JiraAuth,
     base_url: Option<String>,
+    operator_read_origin: Option<String>,
+    forge_generation: String,
 }
 
 impl JiraIssueConnector {
@@ -34,12 +40,23 @@ impl JiraIssueConnector {
         // client build propagates via `?` too — no fallback to an
         // uninstrumented client.
         Ok(Self {
+            forge_generation: format!("{:032x}", rand::random::<u128>()),
+            forge_http: crate::forge_write::http("jira", sink.clone())?,
+            discussion_epoch: format!("{:032x}", rand::random::<u128>()),
+            discussion_http: crate::issue_discussion::http("jira", sink.clone())?,
+            operator_http: crate::operator_issues::http("jira", sink.clone())?,
             http: rupu_netflow::http::client_with(
                 rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm("jira".into())),
                 reqwest::Client::builder(),
                 sink,
             )?,
             auth: JiraAuth::from_credentials(creds)?,
+            // Validate the original configured endpoint before normalization can
+            // remove an API path containing a query or fragment.
+            operator_read_origin: base_url
+                .as_deref()
+                .and_then(crate::operator_issues::safe_origin)
+                .map(|url| normalize_site_base_url(&url)),
             base_url: base_url.map(|url| normalize_site_base_url(&url)),
         })
     }
@@ -190,6 +207,161 @@ impl JiraIssueConnector {
 impl IssueConnector for JiraIssueConnector {
     fn tracker(&self) -> IssueTracker {
         IssueTracker::Jira
+    }
+
+    fn forge_actions(&self) -> Vec<crate::forge_write::ForgeAction> {
+        use crate::forge_write::ForgeAction::*;
+        vec![IssueComment, IssueCreate, IssueSetState]
+    }
+    async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        use crate::forge_write::ForgeError;
+        let origin = self
+            .operator_read_origin
+            .clone()
+            .ok_or_else(ForgeError::unsupported)?;
+        let generation = self.forge_generation.clone();
+        let current = generation.clone();
+        crate::forge_write::ForgeSession::new(
+            IssueTracker::Jira,
+            origin,
+            generation,
+            self.forge_http.clone(),
+            self.request_headers()
+                .map_err(|_| ForgeError::unsupported())?,
+            std::sync::Arc::new(move || current.clone()),
+        )
+    }
+
+    fn discussion_supported(&self) -> bool {
+        self.operator_read_capabilities().origin.is_some()
+    }
+    fn discussion_epoch(&self) -> Option<String> {
+        self.discussion_supported()
+            .then(|| self.discussion_epoch.clone())
+    }
+    async fn discussion_page(
+        &self,
+        issue: &IssueRef,
+        after: Option<&str>,
+    ) -> Result<crate::issue_discussion::DiscussionPage, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let origin = self
+            .operator_read_origin
+            .clone()
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let auth = self
+            .request_headers()
+            .map_err(|_| crate::issue_discussion::unsupported())?;
+        let epoch = self.discussion_epoch.clone();
+        let current = epoch.clone();
+        crate::issue_discussion::Session::new(
+            IssueTracker::Jira,
+            origin.clone(),
+            String::new(),
+            epoch,
+            self.discussion_http.clone(),
+            auth,
+            std::sync::Arc::new(move || current.clone()),
+        )?
+        .page(issue, after)
+        .await
+    }
+
+    fn discovery_supported(&self) -> bool {
+        self.discussion_supported()
+    }
+    fn discovery_search_supported(&self) -> bool {
+        false
+    }
+    fn discovery_epoch(&self) -> Option<String> {
+        self.discussion_epoch()
+    }
+    async fn discovery_page(
+        &self,
+        request: &crate::issue_discovery::DiscoveryRequest,
+    ) -> Result<crate::issue_discovery::DiscoveryPage, ScmError> {
+        crate::issue_discovery::validate(request, self.tracker())?;
+        // Synthetic number validates project/account issuer only; no issue 1 read.
+        let expected = self.operator_expected_issue(&IssueRef {
+            tracker: self.tracker(),
+            project: request.project.clone(),
+            number: 1,
+        })?;
+        let mut request = request.clone();
+        request.project = expected.project;
+        let origin = self
+            .operator_read_origin
+            .clone()
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let auth = self
+            .request_headers()
+            .map_err(|_| crate::issue_discussion::unsupported())?;
+        let epoch = self.discussion_epoch.clone();
+        let current = epoch.clone();
+        crate::issue_discussion::Session::new(
+            IssueTracker::Jira,
+            origin.clone(),
+            String::new(),
+            epoch,
+            self.discussion_http.clone(),
+            auth,
+            std::sync::Arc::new(move || current.clone()),
+        )?
+        .discover(&request)
+        .await
+    }
+
+    fn operator_read_capabilities(&self) -> crate::operator_issues::IssueReadCapabilities {
+        crate::operator_issues::IssueReadCapabilities::configured(
+            self.operator_read_origin.clone(),
+            false,
+        )
+    }
+
+    fn operator_expected_issue(&self, issue: &IssueRef) -> Result<IssueRef, ScmError> {
+        crate::operator_issues::validate_project(issue)?;
+        let configured =
+            self.operator_read_capabilities()
+                .origin
+                .ok_or_else(|| ScmError::BadRequest {
+                    message: "Jira operator reads require a configured base URL".into(),
+                })?;
+        let target = self.resolve_target(&issue.project)?;
+        // resolve_target historically accepts arbitrary caller sites for model
+        // tools. The operator surface never forwards this account's auth there.
+        if crate::operator_issues::safe_origin(&target.base_url).as_deref()
+            != Some(configured.as_str())
+            || target.project_key.is_empty()
+            || !target
+                .project_key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(ScmError::BadRequest {
+                message: "Jira issue target does not match the configured account origin".into(),
+            });
+        }
+        Ok(IssueRef {
+            tracker: IssueTracker::Jira,
+            project: target.project_ref,
+            number: issue.number,
+        })
+    }
+
+    async fn operator_get_issue(&self, issue: &IssueRef) -> Result<Issue, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let target = self.resolve_target(&issue.project)?;
+        let key = format!("{}-{}", target.project_key, issue.number);
+        let response = self.operator_http.get(format!("{}/rest/api/3/issue/{key}?fields=summary,description,status,labels,reporter,created,updated",target.base_url.trim_end_matches('/')))
+            .headers(self.request_headers()?).send().await.map_err(|_|crate::operator_issues::rejected())?;
+        let value = crate::operator_issues::json(response).await?;
+        if value["key"].as_str() != Some(key.as_str()) {
+            return Err(crate::operator_issues::rejected());
+        }
+        let node = serde_json::from_value(value).map_err(|_| crate::operator_issues::rejected())?;
+        Ok(jira_issue_from_node(&target.project_ref, node))
     }
 
     async fn list_issues(
@@ -700,4 +872,56 @@ struct JiraTransition {
     id: String,
     name: String,
     to: Option<JiraIssueStatus>,
+}
+
+#[cfg(test)]
+mod operator_read_tests {
+    use super::*;
+
+    fn connector(base: Option<&str>) -> JiraIssueConnector {
+        crate::install_default_crypto_provider();
+        JiraIssueConnector::new(
+            rupu_providers::auth::AuthCredentials::ApiKey {
+                key: "fixture@example.invalid:fixture".into(),
+            },
+            base.map(str::to_string),
+            std::sync::Arc::new(rupu_netflow::NullSink),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn operator_site_is_checked_without_sending_a_request() {
+        let c = connector(Some("https://jira.example:8443/context"));
+        let reference = |project: &str| IssueRef {
+            tracker: IssueTracker::Jira,
+            project: project.into(),
+            number: 42,
+        };
+        assert!(c.operator_expected_issue(&reference("ENG")).is_ok());
+        assert!(c
+            .operator_expected_issue(&reference("https://jira.example:8443/context/ENG"))
+            .is_ok());
+        for project in [
+            "evil.example/ENG",
+            "https://jira.example/context/ENG",
+            "https://jira.example:8443/other/ENG",
+            "ENG?token=fixture",
+        ] {
+            assert!(c.operator_expected_issue(&reference(project)).is_err());
+        }
+        assert!(connector(None)
+            .operator_expected_issue(&reference("jira.example/ENG"))
+            .is_err());
+    }
+    #[test]
+    fn normalization_cannot_hide_unsafe_configured_origin() {
+        for base in [
+            "https://user:secret@jira.example",
+            "https://jira.example/rest/api/3?secret=x",
+            "https://jira.example/rest/api/3#secret",
+        ] {
+            let c = connector(Some(base));
+            assert!(!c.operator_read_capabilities().body_supported);
+        }
+    }
 }

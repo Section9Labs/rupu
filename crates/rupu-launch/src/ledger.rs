@@ -415,6 +415,12 @@ pub fn read(dir: &Path) -> Vec<ChildEntry> {
         .unwrap_or_default()
 }
 
+/// Fold an already captured ledger using the same canonical state transitions
+/// as [`read`]. The caller owns byte limits and incomplete-tail handling.
+pub fn read_captured(text: &str) -> Vec<ChildEntry> {
+    fold(text)
+}
+
 fn fold(text: &str) -> Vec<ChildEntry> {
     let mut order: Vec<String> = Vec::new();
     let mut by_handle: BTreeMap<String, ChildEntry> = BTreeMap::new();

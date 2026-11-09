@@ -77,9 +77,11 @@ fn build_run_graph_json(
         .map_err(|e| run_not_found_or_internal(id, e))?;
 
     // 2. Load the workflow YAML snapshot saved at run-start.
-    let yaml = store
-        .read_workflow_snapshot(id)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let (yaml, source_missing) = match store.read_workflow_snapshot(id) {
+        Ok(yaml) => (yaml, false),
+        Err(rupu_orchestrator::runs::RunStoreError::NotFound(_)) => (String::new(), true),
+        Err(e) => return Err(ApiError::internal(e.to_string())),
+    };
 
     // 3. Parse the snapshot and build the DAG DTO.
     //
@@ -94,7 +96,11 @@ fn build_run_graph_json(
     // A snapshot that declares `steps: []` is refused by `Workflow::parse`
     // (`WorkflowParseError::Empty`); it has nothing to draw, so it is an empty
     // graph rather than a 500.
-    let dag = if run.workflow_name.starts_with("agent:") || yaml.trim().is_empty() {
+    let dag = if source_missing && !run.workflow_name.starts_with("agent:") {
+        // Missing declaration is not an invented agent node or today's workflow.
+        // Actual result/identity/ledger evidence below remains inspectable.
+        StepDag { steps: vec![], edges: vec![] }
+    } else if run.workflow_name.starts_with("agent:") || yaml.trim().is_empty() {
         agent_run_dag(&run.workflow_name)
     } else {
         match Workflow::parse(&yaml) {
@@ -177,6 +183,8 @@ fn build_run_graph_json(
     Ok(serde_json::json!({
         "run": run_json,
         "workflow": dag,
+        "workflow_source_available": !source_missing,
+        "workflow_source_notice": source_missing.then_some("Run-start source is unavailable. Recorded results remain readable; declared steps and edges are not reconstructed."),
         "step_results": step_results,
         "units": units,
         "usage": usage,

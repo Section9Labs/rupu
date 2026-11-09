@@ -155,14 +155,25 @@ pub fn load_agent_in(
     overlay: &[rupu_skills::OverlaySkill],
 ) -> Result<AgentSpec, AgentLoadError> {
     let spec = find_agent(global, project, name)?;
+    validate_loaded_agent_in(&spec, global, project, overlay)?;
+    Ok(spec)
+}
+
+/// Validate an already selected exact spec without performing name lookup.
+pub fn validate_loaded_agent_in(
+    spec: &AgentSpec,
+    global: &Path,
+    project: Option<&Path>,
+    overlay: &[rupu_skills::OverlaySkill],
+) -> Result<(), AgentLoadError> {
     spec.validate_tools()
         .map_err(|source| AgentLoadError::UnknownTool {
             agent: spec.name.clone(),
             source,
         })?;
     let dirs = rupu_skills::LayerDirs::for_layers(global, project).with_overlay(overlay.to_vec());
-    check_skills(&spec, &dirs, &mut None, SkillCheck::Names)?;
-    Ok(spec)
+    check_skills(spec, &dirs, &mut None, SkillCheck::Names)?;
+    Ok(())
 }
 
 /// The installed skills a set of checks shares: discovered on the first

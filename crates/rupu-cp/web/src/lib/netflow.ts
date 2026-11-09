@@ -54,12 +54,11 @@ export type Outcome = 'ok' | 'http_error' | 'transport_error' | 'timeout';
  * process, at `socket` fidelity.
  *
  * This lists only egress that can actually occur, mirroring the Rust enum:
- * `mcp` and `webhook` don't exist because neither subsystem makes outbound
- * HTTP (MCP dispatches into SCM connectors, which tag their own calls
- * `scm`; the webhook server is inbound-only).
+ * `mcp` identifies the outbound configured-tools client. The operator MCP
+ * server still dispatches connectors tagged `scm`; webhook is inbound-only.
  */
 export interface Origin {
-  kind: 'provider' | 'scm' | 'subprocess' | 'update' | 'cp' | 'system';
+  kind: 'provider' | 'scm' | 'mcp' | 'subprocess' | 'update' | 'cp' | 'system';
   name?: string;
 }
 

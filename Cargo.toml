@@ -21,6 +21,7 @@ members = [
     "crates/rupu-orchestrator",
     "crates/rupu-autoflow",
     "crates/rupu-mcp",
+    "crates/rupu-mcp-client",
     "crates/rupu-webhook",
     "crates/rupu-cp",
     "crates/rupu-cli",
@@ -69,7 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Process control + non-blocking/no-follow file opens (safe wrappers over the
 # POSIX syscalls; the workspace forbids `unsafe_code`, so signalling/liveness
 # and open(2) flags std doesn't expose cannot call libc directly)
-rustix = { version = "1", features = ["process", "fs", "net"] }
+rustix = { version = "1", features = ["process", "fs", "net", "stdio"] }
 # macOS netwatch backend: ntstat kernel-control socket (nix) and process-tree
 # walking (libproc). Target-gated in rupu-netwatch; Linux uses rustix.
 nix = { version = "0.31", default-features = false }

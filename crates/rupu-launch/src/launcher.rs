@@ -320,6 +320,7 @@ struct Caller {
     workspace: WorkspaceBinding,
     ceiling: PermissionMode,
     prompter: Option<Arc<dyn Prompter>>,
+    authorizer: Option<Arc<dyn rupu_tools::approval::CallAuthorizer>>,
     coverage_stream: Option<PathBuf>,
     /// The caller's netflow stream (spec 2026-10-14 remote netflow
     /// transport §N1): a sub-agent tees into it under its own ledger id.
@@ -344,6 +345,7 @@ impl Caller {
             },
             ceiling: permission.ceiling,
             prompter: permission.prompter,
+            authorizer: ctx.services.authorizer.clone(),
             coverage_stream: ctx.services.coverage_stream.clone(),
             netflow_stream: ctx.services.netflow_stream.clone(),
             engagement: ctx
@@ -1052,6 +1054,7 @@ impl RunLauncher {
             // `finish` stops an abandoned child at its next safe boundary.
             pause: Some(child.stop.clone()),
             services: LaunchServices {
+                authorizer: from.authorizer.clone(),
                 launcher: Some(Arc::clone(&self) as Arc<dyn Launcher>),
                 workflow_generator: from.generator.clone(),
                 // It shares its parent's message space.
@@ -1417,6 +1420,18 @@ impl RunLauncher {
     /// means it exists; a refused spawn is the caller's error, and leaves no
     /// record. Any other child is recorded at once, queued or not.
     fn start(&self, child: Arc<Child>, work: Work, from: Caller) -> Result<(), LaunchError> {
+        // The private broker channel is inherited only by in-process agents.
+        // Refuse unsupported process dispatch explicitly; never silently turn
+        // an operator's Ask selection into readonly or unattended execution.
+        if matches!(&work, Work::Process(_))
+            && from.ceiling == PermissionMode::Ask
+            && from.authorizer.is_some()
+        {
+            return Err(LaunchError::new(
+                "approval_channel_unsupported",
+                "Ask approvals are not available for process agent or workflow children; use an in-process subagent or explicitly choose another mode",
+            ));
+        }
         let stopping = crate::reaper::stop_token();
         let me = self.arc();
         let slot = self.slot(&child.parent_run);

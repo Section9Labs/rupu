@@ -30,6 +30,10 @@
 //! Remote hosts and SSE are a later pass; this module reads
 //! `AppState::global_dir` directly.
 
+pub(crate) mod observation;
+#[cfg(unix)]
+pub(crate) mod usage_pages;
+
 use crate::{
     error::{ApiError, ApiResult},
     host::messages::MessageRoute,
@@ -59,11 +63,14 @@ const MAX_RUN_ID_LEN: usize = 128;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(usage_page_routes())
         .route(
             "/api/agentiflows",
             get(list_agentiflows).post(launch_agentiflow),
         )
         .route("/api/agentiflows/:id", get(get_agentiflow))
+        .route("/api/agentiflows/:id/snapshot", get(observation::snapshot))
+        .route("/api/agentiflows/:id/snapshot/pages", get(observation::page))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route(
             "/api/agentiflows/:id/usage-timeline",
@@ -1571,6 +1578,13 @@ fn read_record(id: &str, run_dir: &std::path::Path) -> ApiResult<AgentiflowRecor
             "agentiflow {id}: agentiflow.json is unreadable: {e}"
         ))),
     }
+}
+
+fn usage_page_routes() -> Router<AppState> {
+    #[cfg(unix)]
+    { Router::new().route("/api/agentiflows/:id/usage-timeline/page", get(usage_pages::page)) }
+    #[cfg(not(unix))]
+    { Router::new() }
 }
 
 #[cfg(test)]

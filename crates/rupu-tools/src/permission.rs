@@ -130,15 +130,15 @@ pub enum Decision {
 /// this run. Keyed by tool, never by mode: allowing one tool always never
 /// allows another (T4).
 #[derive(Debug, Clone, Default)]
-pub struct AllowAlways(BTreeSet<&'static str>);
+pub struct AllowAlways(BTreeSet<String>);
 
 impl AllowAlways {
     pub fn contains(&self, tool: &str) -> bool {
         self.0.contains(tool)
     }
 
-    pub fn insert(&mut self, tool: &'static str) {
-        self.0.insert(tool);
+    pub fn insert(&mut self, tool: &str) {
+        self.0.insert(tool.to_owned());
     }
 }
 
@@ -148,6 +148,7 @@ impl AllowAlways {
 pub struct PermissionPolicy {
     mode: PermissionMode,
     prompter: Option<Arc<dyn Prompter>>,
+    authorizer: Option<Arc<dyn crate::approval::CallAuthorizer>>,
 }
 
 impl std::fmt::Debug for PermissionPolicy {
@@ -161,7 +162,27 @@ impl std::fmt::Debug for PermissionPolicy {
 
 impl PermissionPolicy {
     pub fn new(mode: PermissionMode, prompter: Option<Arc<dyn Prompter>>) -> Self {
-        Self { mode, prompter }
+        Self {
+            mode,
+            prompter,
+            authorizer: None,
+        }
+    }
+
+    /// Attach an owner-bound asynchronous channel; it never populates AllowAlways.
+    pub fn with_authorizer(
+        mut self,
+        authorizer: Option<Arc<dyn crate::approval::CallAuthorizer>>,
+    ) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
+    pub fn authorizer(&self) -> Option<&Arc<dyn crate::approval::CallAuthorizer>> {
+        self.authorizer.as_ref()
+    }
+    pub fn has_approval_channel(&self) -> bool {
+        self.prompter.is_some() || self.authorizer.is_some()
     }
 
     /// `mode` with no operator to prompt (detached runs, workflow steps,
@@ -193,7 +214,7 @@ impl PermissionPolicy {
     /// than by descriptor.
     pub fn decide_call(
         &self,
-        tool: &'static str,
+        tool: &str,
         effect: Effect,
         input: &Value,
         always: &mut AllowAlways,
@@ -207,6 +228,13 @@ impl PermissionPolicy {
                     reason: DenyReason::Readonly,
                 },
                 PermissionMode::Ask => {
+                    // A synchronous caller cannot bypass a bound async approval
+                    // channel. The agent loop invokes it with exact call ownership.
+                    if self.authorizer.is_some() {
+                        return Decision::Deny {
+                            reason: DenyReason::OperatorDenied,
+                        };
+                    }
                     let Some(prompter) = self.prompter.as_ref() else {
                         return Decision::AllowDegraded;
                     };

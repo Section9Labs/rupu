@@ -8,19 +8,42 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{Path as AxPath, Query, State};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use rupu_launch::ledger::{self, ChildEntry};
 use rupu_orchestrator::runs::RunStore;
 use rupu_tools::{ChildState, ChildTokens};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
+#[path = "children_pages.rs"]
+pub(crate) mod pages;
+#[path = "transcript_search.rs"]
+pub(crate) mod search;
+
+pub(crate) const CAPABILITY: &str = "run.children.pages.v1";
+pub(crate) const ROOT_TYPES: &[&str] = &["recorded_run", "standalone_agent", "session_turn", "agentiflow"];
+
+#[derive(Default, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ChildrenQuery {
+    /// Omit or use local. Remote owners require a direct connection.
+    host: Option<String>,
+    /// Opt into immutable pages; default 50, clamped to 1..200.
+    limit: Option<usize>,
+    /// Opaque continuation; preserve the exact parent_run_id filter.
+    cursor: Option<String>,
+    /// Exact recorded parent within this root's captured launch tree.
+    parent_run_id: Option<String>,
+}
+
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/runs/:id/children", get(get_run_children))
+    Router::new()
+        .route("/api/runs/:id/children", get(get_run_children))
+        .route("/api/runs/:id/transcripts/search", get(search::get))
 }
 
 /// Run directories walked, at most: a guard against a hand-edited tree, far
@@ -98,7 +121,8 @@ pub struct ChildrenResponse {
 async fn get_run_children(
     State(s): State<AppState>,
     AxPath(id): AxPath<String>,
-) -> ApiResult<Json<ChildrenResponse>> {
+    Query(query): Query<ChildrenQuery>,
+) -> ApiResult<Response> {
     if id.is_empty()
         || !id
             .chars()
@@ -106,11 +130,26 @@ async fn get_run_children(
     {
         return Err(ApiError::bad_request(format!("`{id}` is not a run id")));
     }
+    if query.host.as_deref().is_some_and(|host| host != "local") {
+        return Err(ApiError::not_available(
+            "children require a direct connection to the owning host",
+        ));
+    }
+    if query.limit.is_some() || query.cursor.is_some() || query.parent_run_id.is_some() {
+        return super::runs::blocking(move || {
+            match pages::get(&s, &id, query) {
+                Ok(page) => Ok(Json(page).into_response()),
+                Err(error) if error.0 == axum::http::StatusCode::NOT_IMPLEMENTED && error.1.starts_with("children_root_unsupported:") => Ok((error.0, Json(serde_json::json!({"error": error.1, "code": "children_root_unsupported", "supported_root_types": ROOT_TYPES}))).into_response()),
+                Err(error) => Err(error),
+            }
+        })
+        .await;
+    }
     let store = s.run_store.clone();
     let response = tokio::task::spawn_blocking(move || children_of(&store, &id))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(response))
+    Ok(Json(response).into_response())
 }
 
 fn from_entry(e: ChildEntry, parent: &str) -> ChildDto {
@@ -404,7 +443,10 @@ mod tests {
         let store = RunStore::new(tmp.path().join("runs"));
         let af_dir = tmp.path().join("agentiflows").join("af_x");
         // The flow's own ledger: two units the lead dispatched.
-        ledger::append(&af_dir, &started("u_recon", ChildKind::Agent, "run_recon", 1));
+        ledger::append(
+            &af_dir,
+            &started("u_recon", ChildKind::Agent, "run_recon", 1),
+        );
         ledger::append(&af_dir, &started("u_wf", ChildKind::Workflow, "run_wf", 1));
         // The recon unit is a real `rupu run` that dispatched its own
         // sub-agent, recorded under its own run directory.

@@ -643,3 +643,29 @@ async fn events_poll_treats_ghes_base_url_as_api_root() {
     m.assert_hits(1);
     assert!(result.expect("poll against the mock").events.is_empty());
 }
+
+#[tokio::test]
+async fn operator_issue_rejects_actual_repository_mismatch() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start_async().await;
+    let mut value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string("tests/fixtures/github/issue_get_happy.json").unwrap(),
+    )
+    .unwrap();
+    value["number"] = serde_json::json!(42);
+    value["url"] = serde_json::json!(format!("{}/repos/other/repo/issues/42", server.base_url()));
+    value["repository_url"] = serde_json::json!(format!("{}/repos/other/repo", server.base_url()));
+    let response = server.mock(|when, then| {
+        when.method(GET).path("/repos/org/repo/issues/42");
+        then.status(200).json_body(value);
+    });
+    assert!(common::github_issue_connector_against(&server)
+        .operator_get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Github,
+            project: "org/repo".into(),
+            number: 42
+        })
+        .await
+        .is_err());
+    response.assert();
+}

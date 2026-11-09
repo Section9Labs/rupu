@@ -67,6 +67,23 @@ pub fn outcome_event_row(ev: &Event) -> Option<(Status, &'static str, String)> {
                 ROW_DETAIL_MAX,
             ),
         )),
+        Event::ToolApproval { record } => Some((
+            if record.state == "pending" {
+                Status::Awaiting
+            } else if record.state == "unknown" {
+                Status::SoftFailed
+            } else {
+                Status::Active
+            },
+            "tool approval",
+            truncate_single_line(
+                &format!(
+                    "{} · {} · {}",
+                    record.tool, record.state, record.approval_id
+                ),
+                ROW_DETAIL_MAX,
+            ),
+        )),
         Event::Unknown { tag, data } => Some((
             Status::Active,
             "event",

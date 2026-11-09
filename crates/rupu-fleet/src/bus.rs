@@ -10,6 +10,9 @@
 //! crash between the two leaves a logged message nobody received (and no
 //! `seen` line says otherwise), never a received message the log lacks.
 
+mod operator_board;
+pub use operator_board::OperatorBoardWrite;
+
 use crate::address::{self, Address};
 use crate::board::Board;
 use crate::error::{BusError, FleetError};
@@ -76,7 +79,10 @@ impl ClaimTable {
 /// A message from the operator (spec F1b §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorMessage {
-    /// Require the current recipient to be this live run, atomically with enqueue.
+    /// Require the current registered recipient to be this live run, atomically
+    /// with enqueue. Only a concrete participant address or `lead` is supported.
+    /// This is an enqueue precondition, not an eventual-consumption guarantee:
+    /// inboxes remain address-owned if that address is reused after enqueue.
     pub expected_run_id: Option<String>,
     pub to: Address,
     pub body: String,
@@ -361,6 +367,24 @@ impl Bus {
     /// never joins; no catalog tool reaches this, so an agent can never
     /// speak as the operator (FD5).
     pub fn operator_send(&self, msg: OperatorMessage) -> Result<SendReceipt, BusError> {
+        if let Some(expected) = msg.expected_run_id.as_deref() {
+            if expected.is_empty()
+                || expected.len() > 128
+                || !expected
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            {
+                return Err(FleetError::Refused(
+                    "expected_run_id must contain 1..128 ASCII letters, digits, underscores or hyphens"
+                        .into(),
+                ));
+            }
+            if !matches!(msg.to, Address::Named(_) | Address::Lead) {
+                return Err(FleetError::Refused(
+                    "expected_run_id requires a concrete participant address or lead".into(),
+                ));
+            }
+        }
         if msg.to == Address::Operator {
             return Err(FleetError::Refused(
                 "the operator can't send a message to the operator".into(),
@@ -495,8 +519,8 @@ impl Bus {
     }
 
     /// A write by this run. `from: operator` is the operator's alone
-    /// ([`Bus::operator_send`]): a bus at that address writes nothing else,
-    /// so a log line from `operator` is always the operator's.
+    /// ([`Bus::operator_send`] and [`Bus::operator_board`]): worker writes at
+    /// that address are refused, so operator attribution stays explicit.
     fn write(
         &self,
         draft: Draft<'_>,
@@ -519,7 +543,18 @@ impl Bus {
         draft: Draft<'_>,
         apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
     ) -> Result<SendReceipt, BusError> {
+        self.write_as_checked(from, draft, || Ok(()), apply)
+    }
+
+    fn write_as_checked(
+        &self,
+        from: &str,
+        draft: Draft<'_>,
+        check: impl FnOnce() -> Result<(), FleetError>,
+        apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
+    ) -> Result<SendReceipt, BusError> {
         let _lock = self.lock()?;
+        check()?;
         let log_path = self.log_path();
         let size = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         if size >= self.caps.log_max_bytes {
@@ -532,28 +567,36 @@ impl Bus {
             None => (None, self.unaddressed(draft.kind)?),
             Some(to) => {
                 let roster = self.roster()?;
-                let resolution = roster.resolve(
-                    to,
-                    Sender {
-                        address: from,
-                        parent_run_id: member.as_ref().and_then(|m| m.parent_run_id.as_deref()),
-                    },
-                    &|name| self.mailbox.has_mailbox(name),
-                );
-                if let Some(expected) = draft.expected_run_id {
+                let resolution = if let Some(expected) = draft.expected_run_id {
                     // The same lock protects join/leave, resolution, log append and delivery.
-                    // Require an exact address, not a role, codename alias or group selector.
-                    let exact = matches!(to, Address::Named(name) if name == &resolution.to);
-                    let valid = exact
-                        && resolution.recipients.len() == 1
-                        && resolution.recipients[0] == resolution.to
-                        && roster
-                            .get(&resolution.to)
-                            .is_some_and(|p| p.live && p.member.run_id == expected);
-                    if !valid {
+                    // Bypass role/codename/legacy resolution entirely: a registered
+                    // address, including the concrete `lead` slot, must match now.
+                    let target = match to {
+                        Address::Named(name) => name.as_str(),
+                        Address::Lead => address::LEAD,
+                        _ => return Err(FleetError::RecipientChanged),
+                    };
+                    if !roster
+                        .get(target)
+                        .is_some_and(|p| p.live && p.member.run_id == expected)
+                    {
                         return Err(FleetError::RecipientChanged);
                     }
-                }
+                    Resolution {
+                        to: target.to_owned(),
+                        recipients: vec![target.to_owned()],
+                        undelivered: None,
+                    }
+                } else {
+                    roster.resolve(
+                        to,
+                        Sender {
+                            address: from,
+                            parent_run_id: member.as_ref().and_then(|m| m.parent_run_id.as_deref()),
+                        },
+                        &|name| self.mailbox.has_mailbox(name),
+                    )
+                };
                 let to_string = resolution.to.clone();
                 (
                     Some(to_string),
@@ -761,3 +804,7 @@ impl Drop for Bus {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "message_guard_tests.rs"]
+mod message_guard_tests;

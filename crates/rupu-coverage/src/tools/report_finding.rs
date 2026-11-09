@@ -435,7 +435,7 @@ pub(crate) fn planned_ref(a: crate::report::PlannedArtifact) -> crate::report::A
 /// The walk shared by [`ingest_block_files`] and [`check_block_files`]:
 /// `resolve` turns one block's requested ref into what the store records (or
 /// would), against the budget left.
-fn resolve_block_files(
+pub(crate) fn resolve_block_files(
     workspace: &std::path::Path,
     report: &mut crate::report::FindingReport,
     limits: crate::report::IngestLimits,

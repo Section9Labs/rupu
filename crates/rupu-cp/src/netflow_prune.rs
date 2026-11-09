@@ -549,7 +549,7 @@ pub fn prune_ledgers(
             continue;
         }
 
-        match std::fs::remove_file(&path) {
+        match remove_quiet_ledger(&path, &metadata) {
             Ok(()) => out.push(PrunedLedger {
                 path,
                 bytes,
@@ -568,6 +568,39 @@ pub fn prune_ledgers(
     }
 
     Ok(out)
+}
+
+// Preserve the scan decision only if the exact file is still unchanged after
+// acquiring exclusive coordination. A new writer or replacement is kept.
+fn remove_quiet_ledger(
+    path: &std::path::Path,
+    observed: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let held = rupu_netflow::ledger::lease::LedgerLease::exclusive(path)?;
+        let current = held.read()?.metadata()?;
+        if current.dev() != observed.dev()
+            || current.ino() != observed.ino()
+            || current.len() != observed.len()
+            || current.mtime() != observed.mtime()
+            || current.mtime_nsec() != observed.mtime_nsec()
+            || current.ctime() != observed.ctime()
+            || current.ctime_nsec() != observed.ctime_nsec()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "network ledger changed after scan; kept",
+            ));
+        }
+        held.unlink(&current)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = observed;
+        std::fs::remove_file(path)
+    }
 }
 
 #[cfg(test)]
@@ -925,7 +958,7 @@ mod tests {
     /// actually freed.
     #[cfg(unix)]
     #[test]
-    fn a_symlink_reports_zero_bytes_reclaimed_not_the_targets_size() {
+    fn a_symlink_is_kept_with_zero_reclaimed_bytes_under_coordination() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -945,7 +978,8 @@ mod tests {
             removed[0].bytes, 0,
             "removing a symlink reclaims none of its target's bytes"
         );
-        assert!(!link.exists(), "the symlink itself is gone");
+        assert!(link.exists(), "non-regular ledger is kept");
+        assert!(removed[0].error.is_some());
         assert!(
             target.exists(),
             "remove_file on a symlink must never touch its target"
@@ -1004,5 +1038,29 @@ mod tests {
         assert!(removed[0].error.is_some());
         assert!(removed[0].modified_at.is_none());
         assert!(blocked.exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn prune_keeps_cooperating_writer_and_rechecks_stale_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("run_fixture.jsonl");
+        std::fs::write(&path, "old").unwrap();
+        backdate(&path, 40);
+        let observed = std::fs::metadata(&path).unwrap();
+        let held = rupu_netflow::ledger::lease::LedgerLease::shared(&path).unwrap();
+        let result = prune_ledgers(
+            tmp.path(),
+            chrono::Duration::days(30),
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].error.is_some());
+        assert!(path.exists());
+        drop(held);
+        std::fs::write(&path, "new").unwrap();
+        assert!(remove_quiet_ledger(&path, &observed).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"new");
     }
 }

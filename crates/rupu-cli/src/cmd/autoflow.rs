@@ -4343,7 +4343,7 @@ fn live_run_event_lines(
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
         | TranscriptEvent::AssistantBlock { .. }
-        | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
+        | TranscriptEvent::ToolApproval { .. } | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| serve_event_line(status, format!("{label}  ·  {text}")))
             .collect(),

@@ -34,6 +34,25 @@ impl PortError {
     }
 }
 
+/// Fixed verbs for the root session's bounded local readers. An ancestry is
+/// an ordered chain of recorded child run IDs, never an arbitrary lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionReadRequest {
+    Context,
+    Workflows { offset: usize, limit: usize },
+    Inspect { ancestry: Vec<String> },
+    Netflows { ancestry: Vec<String> },
+}
+
+/// Host-provided, owner-bound readers. The implementation must independently
+/// check `ctx` on every call; possession of an Arc is not an ownership proof.
+pub trait SessionReadPort: Send + Sync {
+    /// Exact trusted binding names for this turn. A wildcard declaration
+    /// cannot manufacture a service that the worker did not authorize.
+    fn permits(&self, name: &str) -> bool;
+    fn read(&self, request: SessionReadRequest, ctx: &ToolContext) -> Result<Value, PortError>;
+}
+
 // ---- the agent / workflow catalog --------------------------------------------
 
 /// One agent, as the roster tools (`agents.*`, `catalog.search`) show it:

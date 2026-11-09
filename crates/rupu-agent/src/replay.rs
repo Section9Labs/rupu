@@ -404,6 +404,7 @@ fn reconstruct_with(
             | Event::Recovery { .. }
             | Event::Message { .. }
             | Event::Injected { .. }
+            | Event::ToolApproval { .. }
             | Event::Unknown { .. } => {}
         }
     }

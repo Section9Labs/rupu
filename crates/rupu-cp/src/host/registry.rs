@@ -187,6 +187,21 @@ impl HostRegistry {
         }
     }
 
+    /// Exact collision check for local execution provenance. Does not resolve a
+    /// connector, read tokens, or treat a malformed host record as absent.
+    pub(crate) fn has_persisted_identity(&self, id: &str) -> std::io::Result<bool> {
+        if id.is_empty() || id.len() > 128
+            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid host identity"));
+        }
+        match std::fs::symlink_metadata(self.store.root.join(format!("{id}.toml"))) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// List all known hosts: local (host[0]) first, then every persisted host
     /// from the store in sorted order.
     pub fn list_hosts(&self) -> Vec<Host> {

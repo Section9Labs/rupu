@@ -15,7 +15,8 @@ pub mod writer;
 pub use aggregate::{aggregate, TimeWindow, UsageRow};
 pub use cursor::{transcript_key, DrainStats, JsonlCursor};
 pub use event::{
-    Event, FileEditKind, RunMode, RunStatus, SkillIndexEntry, ToolGrantEntry, ToolGrantMissing,
+    Event, FileEditKind, RemoteToolIdentity, RunMode, RunStatus, SkillIndexEntry,
+    ToolApprovalRecord, ToolGrantEntry, ToolGrantMissing,
 };
 pub use messages::{MessageDirection, MessageVia};
 pub use netflow_sink::TranscriptSink;

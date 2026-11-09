@@ -15,8 +15,8 @@ mod participants;
 mod types;
 
 pub use address::{Address, AddressError};
-pub use board::Board;
-pub use bus::{Bus, BusCaps, ClaimTable, OperatorMessage, DEFAULT_LOG_MAX_MB};
+pub use board::{Board, OperatorClaimLease, OperatorClaimOutcome};
+pub use bus::{Bus, BusCaps, ClaimTable, OperatorBoardWrite, OperatorMessage, DEFAULT_LOG_MAX_MB};
 pub use error::{BusError, FleetError};
 pub use log::{
     Delivery, LogLine, LogMessage, LogPage, MessageKind, OperatorVia, Refs, SendReceipt,
@@ -33,3 +33,6 @@ pub use types::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod operator_board_tests;

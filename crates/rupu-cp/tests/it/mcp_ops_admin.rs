@@ -206,3 +206,21 @@ async fn autoflows_get_never_reaches_a_literal_sibling() {
     }
     assert!(ops.calls().is_empty(), "no sibling ran: {:?}", ops.calls());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retention_policy_tools_expose_explicit_scope_and_one_shot_receipts() {
+    let (addr, _tmp) = spawn(Arc::new(StubOps::default())).await;
+    let listed = rpc(addr, "tools/list", json!({})).await;
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap();
+    assert_eq!(tool("maintenance.retention_execute")["annotations"]["destructiveHint"], true);
+    assert_eq!(tool("maintenance.retention_operation")["annotations"]["readOnlyHint"], true);
+    assert_eq!(tool("maintenance.retention_preview")["annotations"]["readOnlyHint"], false);
+    let result = call_tool(addr,"maintenance.retention_preview",json!({"host":"local","kind":"transcripts","scopes":{"global":true},"older_than":"1d"})).await;
+    let receipt = json_of(&result);
+    assert_eq!(receipt["authorization_mode"],"policy_at_execution","{result}");
+    let observed = call_tool(addr,"maintenance.retention_operation",json!({"id":receipt["operation_id"],"host":"local","section":"summary"})).await;
+    assert_eq!(json_of(&observed)["policy_digest"], receipt["policy_digest"]);
+    assert_eq!(json_of(&observed)["state"],"prepared");
+}

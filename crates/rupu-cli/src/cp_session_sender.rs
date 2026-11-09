@@ -14,6 +14,8 @@ use std::path::PathBuf;
 /// `rupu` binary (resolved via `std::env::current_exe()` in `cp serve`).
 pub struct SubprocessSessionSender {
     pub exe: PathBuf,
+    #[cfg(unix)]
+    pub approval_broker: Option<std::sync::Arc<rupu_runtime::session_approvals::broker::Broker>>,
 }
 
 /// Scan `session send --detach` stdout for the `run: <id>` line and return the
@@ -64,8 +66,26 @@ impl SessionSender for SubprocessSessionSender {
             ));
         }
 
-        let out = tokio::process::Command::new(&self.exe)
-            .args(session_send_argv(&req).to_args())
+        let mut command = tokio::process::Command::new(&self.exe);
+        command.args(session_send_argv(&req).to_args());
+        #[cfg(unix)]
+        if let Some(broker) = &self.approval_broker {
+            if let Some((workspace_id, workspace_path)) =
+                broker.channel_workspace(&req.session_id).map_err(|_| {
+                    SendError::Invalid("active session approval owner unavailable".into())
+                })?
+            {
+                let channel = broker
+                    .spawn_channel(Some(req.session_id.clone()), workspace_id, workspace_path)
+                    .map_err(|_| SendError::Spawn("approval channel unavailable".into()))?;
+                // Insert before the positional separator, not after the prompt.
+                command = tokio::process::Command::new(&self.exe);
+                command.args(["session", "send", "--approval-channel"]);
+                command.args(session_send_argv(&req).to_args().into_iter().skip(2));
+                command.stdin(crate::session_approval_channel::stdin_for_child(channel));
+            }
+        }
+        let out = command
             .output()
             .await
             .map_err(|e| SendError::Spawn(e.to_string()))?;
@@ -171,6 +191,8 @@ pub(crate) mod tests {
         );
 
         let sender = SubprocessSessionSender {
+            #[cfg(unix)]
+            approval_broker: None,
             exe: failing_rupu(tmp.path(), &format!("{message}  \n")),
         };
         match sender.send(send_req(None, &["pdff"])).await {
@@ -181,7 +203,8 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_run_id_finds_run_line() {
-        let stdout = "session: sess_01XYZ\nrun: run_01ABCDEF\nattach: rupu session attach sess_01XYZ\n";
+        let stdout =
+            "session: sess_01XYZ\nrun: run_01ABCDEF\nattach: rupu session attach sess_01XYZ\n";
         assert_eq!(parse_run_id(stdout), Some("run_01ABCDEF".to_string()));
     }
 

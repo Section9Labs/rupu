@@ -13,9 +13,13 @@ pub mod cp_agent_launcher;
 pub mod cp_agentiflow_launcher;
 pub mod cp_definition_generator;
 pub mod cp_inventory;
+pub mod cp_issues;
+pub mod cp_forge_writer;
 pub mod cp_launcher;
 pub mod cp_model_catalog;
 pub mod cp_repos;
+mod cp_review_detail;
+mod cp_review_pages;
 pub mod cp_session_mutator;
 pub mod cp_session_commands;
 pub mod cp_session_sender;
@@ -30,6 +34,8 @@ pub mod netflow_sink;
 pub mod output;
 pub mod paths;
 pub mod resume;
+#[cfg(unix)]
+pub(crate) mod session_approval_channel;
 pub use rupu_scm::run_target;
 pub mod standalone_run_metadata;
 /// The embedded `rupu init` samples and the stock fleet (`rupu-templates`).
@@ -1011,6 +1017,7 @@ mod arg_parse_tests {
                         id,
                         body: got,
                         to,
+                        expected_run_id,
                         urgent,
                         viewer,
                     },
@@ -1018,6 +1025,7 @@ mod arg_parse_tests {
                 assert_eq!(id, "run_01ABC");
                 assert_eq!(got, body);
                 assert_eq!(to.as_deref(), Some("step:scan"));
+                assert_eq!(expected_run_id, None);
                 assert!(urgent);
                 assert_eq!(viewer.as_deref(), Some("matt"));
             }

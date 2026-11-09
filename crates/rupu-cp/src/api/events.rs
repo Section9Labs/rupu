@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/events/stream", get(events_stream))
         .route("/api/events", get(recent_events))
+        .merge(super::event_scan::routes())
 }
 
 /// Wrap a pre-formatted `EventByteStream` in an axum `Response` with the

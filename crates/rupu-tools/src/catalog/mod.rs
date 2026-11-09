@@ -2,11 +2,13 @@
 //! carries its descriptor next to its body in this crate ([`crate::bodies`]
 //! builds the bodies).
 //!
-//! A [`ToolCatalog`] value is this static list plus extra descriptors
-//! ([`ToolCatalog::with`]): a run's injected tools. Grant resolution
-//! ([`crate::grant`]) runs over a value.
+//! A [`ToolCatalog`] value adds static descriptors ([`ToolCatalog::with`])
+//! and owned metadata/body bindings ([`ToolCatalog::with_owned`]) to that
+//! list. Grant resolution retains the complete snapshot for dispatch.
 
 use crate::descriptor::ToolDescriptor;
+use crate::{BoundTool, CatalogError, ToolContext, ToolDefinition};
+use std::sync::{Arc, OnceLock};
 
 /// The unqualified core fs/shell tools (D11). Every other tool is
 /// `namespace.verb`, apart from the launch pair `dispatch` / `join`.
@@ -85,6 +87,10 @@ pub static ALL: &[&ToolDescriptor] = &[
     &crate::budget::STATUS,
     // a run's skills
     &crate::skills::LOAD,
+    &crate::session_reads::CONTEXT,
+    &crate::session_reads::WORKFLOWS,
+    &crate::session_reads::INSPECT,
+    &crate::session_reads::NETFLOWS,
 ];
 
 /// The catalog's queries. The associated functions ([`Self::all`],
@@ -94,6 +100,7 @@ pub static ALL: &[&ToolDescriptor] = &[
 #[derive(Clone, Debug, Default)]
 pub struct ToolCatalog {
     extra: Vec<&'static ToolDescriptor>,
+    owned: Vec<Arc<BoundTool>>,
 }
 
 impl ToolCatalog {
@@ -106,15 +113,65 @@ impl ToolCatalog {
     /// catalog already holds is ignored (the first one listed wins).
     pub fn with(mut self, extra: impl IntoIterator<Item = &'static ToolDescriptor>) -> Self {
         for d in extra {
-            if !self.descriptors().any(|have| have.name == d.name) {
+            let shadows_owned = self.owned.iter().any(|have| {
+                have.name() == d.name || d.aliases.iter().any(|alias| alias.name == have.name())
+            });
+            if !shadows_owned && !self.descriptors().any(|have| have.name == d.name) {
                 self.extra.push(d);
             }
         }
         self
     }
 
-    /// Every descriptor this value holds: the static list, then the extras
-    /// in the order they were added.
+    /// Add an owned tool without shadowing canonical names, aliases or remote identities.
+    pub fn with_owned(mut self, tool: BoundTool) -> Result<Self, CatalogError> {
+        let d = tool.descriptor();
+        if self.definitions().any(|have| have.answers_to(&d.name)) {
+            return Err(CatalogError::DuplicateName(d.name.clone()));
+        }
+        if let Some(id) = d.remote_identity() {
+            if self
+                .owned
+                .iter()
+                .any(|have| have.descriptor().remote_identity() == Some(id))
+            {
+                return Err(CatalogError::DuplicateIdentity {
+                    server: id.server.clone(),
+                    tool: id.tool.clone(),
+                });
+            }
+        }
+        self.owned.push(Arc::new(tool));
+        Ok(self)
+    }
+
+    /// The complete immutable metadata snapshot, including owned tools.
+    pub fn definitions(&self) -> impl Iterator<Item = Arc<ToolDefinition>> + '_ {
+        static BUILTINS: OnceLock<Vec<Arc<ToolDefinition>>> = OnceLock::new();
+        BUILTINS
+            .get_or_init(|| ALL.iter().map(|d| ToolDefinition::builtin(d)).collect())
+            .iter()
+            .cloned()
+            .chain(self.extra.iter().map(|d| ToolDefinition::builtin(d)))
+            .chain(self.owned.iter().map(|t| t.definition().clone()))
+    }
+
+    pub fn definition(&self, name: &str) -> Option<Arc<ToolDefinition>> {
+        self.definitions().find(|d| d.name == name)
+    }
+
+    /// Resolve the implementation from the same catalog that produced the grant.
+    pub fn body(&self, name: &str, ctx: &ToolContext) -> Option<Arc<BoundTool>> {
+        if let Some(tool) = self.owned.iter().find(|t| t.name() == name) {
+            return Some(tool.clone());
+        }
+        let definition = self.definition(name)?;
+        let tool = crate::bodies::body(name, ctx)?;
+        Some(Arc::new(BoundTool::with_builtin(definition, tool)))
+    }
+
+    /// Static descriptors only: the builtin list, then static extras.
+    /// Use `definitions` for a runtime snapshot that includes owned tools.
     pub fn descriptors(&self) -> impl Iterator<Item = &'static ToolDescriptor> + '_ {
         ALL.iter().copied().chain(self.extra.iter().copied())
     }

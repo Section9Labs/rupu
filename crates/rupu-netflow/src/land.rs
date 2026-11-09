@@ -126,19 +126,16 @@ pub fn parse_stream(bytes: &[u8]) -> ParsedStream {
 fn write_ledgers(netflow_dir: &Path, parsed: &ParsedStream) -> std::io::Result<Vec<String>> {
     crate::ensure_netflow_dir(netflow_dir)?;
     let mut written = Vec::new();
-    for (n, (ledger, lines)) in parsed.ledgers.iter().enumerate() {
-        let dest = netflow_dir.join(format!("{ledger}.jsonl"));
-        let tmp = netflow_dir.join(format!(".{ledger}.landing-{}-{n}.tmp", std::process::id()));
+    for (ledger, lines) in &parsed.ledgers {
+        let lease = crate::ledger::lease::LedgerLease::shared(
+            &netflow_dir.join(format!("{ledger}.jsonl")),
+        )?;
         let mut body = String::new();
         for l in lines {
             body.push_str(l);
             body.push('\n');
         }
-        let res = std::fs::write(&tmp, body.as_bytes()).and_then(|_| std::fs::rename(&tmp, &dest));
-        if let Err(e) = res {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
+        lease.replace(body.as_bytes())?;
         written.push(ledger.clone());
     }
     Ok(written)
@@ -298,4 +295,28 @@ pub fn read_roster(runs_root: &Path, workflow_run_id: &str) -> Vec<RosterLine> {
     text.lines()
         .filter_map(|l| serde_json::from_str::<RosterLine>(l).ok())
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod lease_tests {
+    use super::*;
+    #[test]
+    fn landing_keeps_exact_existing_bytes_while_cleanup_holds_exclusive_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run_fixture.jsonl");
+        std::fs::write(&path, "preserve\n").unwrap();
+        let held = crate::ledger::lease::LedgerLease::exclusive(&path).unwrap();
+        let mut parsed = ParsedStream::default();
+        parsed
+            .ledgers
+            .insert("run_fixture".into(), vec!["replacement".into()]);
+        assert_eq!(
+            write_ledgers(temp.path(), &parsed).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve\n");
+        drop(held);
+        write_ledgers(temp.path(), &parsed).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement\n");
+    }
 }

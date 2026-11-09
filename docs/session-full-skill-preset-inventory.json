@@ -1,0 +1,775 @@
+{
+  "repository": "https://github.com/Section9Labs/rupu-skills",
+  "commit": "d57aa11a8964202ab28d1c21818c97dcedc0d6f1",
+  "classification": "security methodology instructions, not a runtime feature or service inventory",
+  "count": 109,
+  "skills": [
+    {
+      "name": "access-control-testing",
+      "path": "skills/access-control-testing/SKILL.md",
+      "sha256": "ee8ac7dddcc6e59cbf69a004296296fcce12c047b90bce58d032a9e062307613",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "angr",
+      "path": "skills/angr/SKILL.md",
+      "sha256": "a22eddf2a60743d354ad4f0814ed05ec50023b7b4e18dccaa963491e2c06531b",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "api-authorization",
+      "path": "skills/api-authorization/SKILL.md",
+      "sha256": "67d5628aa100c1eb46a22fb8285b525e78e55db6536f17d5842e4e650be6d179",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-broken-auth",
+      "path": "skills/api-broken-auth/SKILL.md",
+      "sha256": "dce385b15229a70c02934356cbfb9817da4a105cf6e62b45b6fe3464b8179eb8",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-endpoint-brute",
+      "path": "skills/api-endpoint-brute/SKILL.md",
+      "sha256": "f1ac0d3b730f9a6c818341a12a061130494810f3dfd17e8a611a1a6290e99010",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-fuzzing",
+      "path": "skills/api-fuzzing/SKILL.md",
+      "sha256": "edf43c4ce688b439603f25619d4265cb6e81684748a9e63787b000b5306c432b",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-injection",
+      "path": "skills/api-injection/SKILL.md",
+      "sha256": "4bf591f2ea98cb73ced8714c1b75fb04073df0a666b6476e576c65364d62580d",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-nuclei",
+      "path": "skills/api-nuclei/SKILL.md",
+      "sha256": "9fe4b6370b7c7f97209304f3b7766f58f99c0f7dfd11f0f722a2b7c29f3ff599",
+      "metadata_version": "1.0.0",
+      "compatibility": "Requires nuclei v3 on PATH and Python 3; network egress to the target API (and optionally to an interactsh server for OOB detection)."
+    },
+    {
+      "name": "api-param-discovery",
+      "path": "skills/api-param-discovery/SKILL.md",
+      "sha256": "8c209478c508b16c8ca67d9a807482405acd4018075394d1b90da4ab92580411",
+      "metadata_version": "1.0.0",
+      "compatibility": "Requires arjun >= 2.2 on PATH (pipx install arjun) and Python 3.8+. Network reach to the target API."
+    },
+    {
+      "name": "api-resource-consumption",
+      "path": "skills/api-resource-consumption/SKILL.md",
+      "sha256": "aaee02fca2eb198828b125174221b4c915c8f37ee1583b39026865e88ee8ccc8",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-spec-discovery",
+      "path": "skills/api-spec-discovery/SKILL.md",
+      "sha256": "e8b085f7a5cb7d4d263625b48eb2f277c3b35b93bb9656f01e166483ac5ffdcd",
+      "metadata_version": "1.0.0",
+      "compatibility": "Requires Python 3.8+ and outbound HTTP to the target; yq optional for YAML specs"
+    },
+    {
+      "name": "api-ssrf",
+      "path": "skills/api-ssrf/SKILL.md",
+      "sha256": "4a60882e3c9c568fef6c0d9800e89f132093cb12d21e9336bbc3deb957a6dbf4",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "api-testing",
+      "path": "skills/api-testing/SKILL.md",
+      "sha256": "5242ac515e97d6a7093bfa9bcc4dec3ee79975510217920dd911351907566d57",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "auth-session-testing",
+      "path": "skills/auth-session-testing/SKILL.md",
+      "sha256": "f38784bf5b4bad420dd0d909a2c572e02fa0f878e39b2c6bf26a0f563c619526",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "aws-enumeration",
+      "path": "skills/aws-enumeration/SKILL.md",
+      "sha256": "d7b8c8cda1882086b47fdcb7b4d087ea0232d13da4939fc94cc67810a254f618",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "azure-entra-id",
+      "path": "skills/azure-entra-id/SKILL.md",
+      "sha256": "0c6df2bf1f4631f32408ea7b1d37631aae5ff033c4e0e38a2b9004a846057670",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "azure-enumeration",
+      "path": "skills/azure-enumeration/SKILL.md",
+      "sha256": "b2ca0fec9e44e2a01ee18dfa7b591e56cf6d24f08cb51d56cec48ce0a79bbf86",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "bandit",
+      "path": "skills/bandit/SKILL.md",
+      "sha256": "450bacc0928fbe850df98d1b43199a3b3649515d5ce0d782242ed54875cb3006",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "binary-analysis",
+      "path": "skills/binary-analysis/SKILL.md",
+      "sha256": "3ca6e7756d723b113149bb243f0b1e5e0c9991d185fd8826964368f30ba1c24d",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "binary-protections",
+      "path": "skills/binary-protections/SKILL.md",
+      "sha256": "129b5ed23bc4dc2dd93288ba22ab3d82b8bba5a36e95f556e7070bfa89101c9e",
+      "metadata_version": null,
+      "compatibility": "Linux host; checksec.sh or pwntools recommended; readelf/rabin2 fallback paths included; PE/Mach-O notes apply cross-platform"
+    },
+    {
+      "name": "binary-triage",
+      "path": "skills/binary-triage/SKILL.md",
+      "sha256": "b128e830123be53384345c2bcf020df0a8c9bd5b6b86cedf40854cd97798e63d",
+      "metadata_version": null,
+      "compatibility": "Linux host with binutils (file, strings, nm, readelf, objdump); rabin2 (radare2) recommended for PE/Mach-O; checksec optional"
+    },
+    {
+      "name": "binwalk-firmware",
+      "path": "skills/binwalk-firmware/SKILL.md",
+      "sha256": "0c5db8e9e40aa4f29f680dfdd387c4d657e24e8dafb2b99b2141e5661f94e1be",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "brakeman",
+      "path": "skills/brakeman/SKILL.md",
+      "sha256": "f0c3ae624fd9cc7b64ca5c9e7161eee76091d9f90d01633e08b4371331f9de63",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "burp-suite",
+      "path": "skills/burp-suite/SKILL.md",
+      "sha256": "56fa82b32be73dd028fd0a17d75d574be0e568d1e5f5f521642b3284f5b44e92",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "business-logic-testing",
+      "path": "skills/business-logic-testing/SKILL.md",
+      "sha256": "4c054fb1cff9e3e16d256ed4d2fd5cdb43e092169b10e42f886ca95f9f784473",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cargo-audit",
+      "path": "skills/cargo-audit/SKILL.md",
+      "sha256": "5575c11bb00f5222e8efc1b89d21bd6ce82f4cab15dae3b7136ab0c29bcfd0e6",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloud-credential-enumeration",
+      "path": "skills/cloud-credential-enumeration/SKILL.md",
+      "sha256": "fbdae6a9901f0f974f5586f8736bb77cba2e515c922e76c8f70127f5f71c69b5",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloud-privilege-escalation",
+      "path": "skills/cloud-privilege-escalation/SKILL.md",
+      "sha256": "f2c1741ec9bad07d301c517dbee3e6e1171256b5288ab0a400da7f24b7c38a63",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloud-security",
+      "path": "skills/cloud-security/SKILL.md",
+      "sha256": "b44eff22d3338a9e12882137466f13bb21e0396fe0930fdda10a65de8c1bdbd5",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloud-storage-exposure",
+      "path": "skills/cloud-storage-exposure/SKILL.md",
+      "sha256": "a5f1c2ff83d8c3076b47d6195218d3c1e4f9238b866abd399147c88649af543d",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloudfox",
+      "path": "skills/cloudfox/SKILL.md",
+      "sha256": "4cae73aa00b8b092f08ee93ab357a0843ba5ccde4886577fad9e1c5f06658b60",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cloudsploit",
+      "path": "skills/cloudsploit/SKILL.md",
+      "sha256": "c140b175ab44795be4d72ea960e9c6d3e2f4633b5470d049ddf7da1b1121e44e",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cms-testing",
+      "path": "skills/cms-testing/SKILL.md",
+      "sha256": "a535e2876c93ab50188f080eada3127746f3a86b1977b9a84073764f63a4765e",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "code-review",
+      "path": "skills/code-review/SKILL.md",
+      "sha256": "32f072ac4ec83d031c7a79847dd63642f783815122ebdd612514a426c33b1808",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "codeql",
+      "path": "skills/codeql/SKILL.md",
+      "sha256": "e66125b0ca59d66c2c7268c048365693adcac4c4554c8cb9ad61f7d25854d29b",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "command-injection-testing",
+      "path": "skills/command-injection-testing/SKILL.md",
+      "sha256": "35768bf2dfdb87e27045a4982b0ef57486456a75353a6a873a8ef3ef58e44072",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "content-discovery",
+      "path": "skills/content-discovery/SKILL.md",
+      "sha256": "5198ec7d8e73b961a7b35face8be5a3c596f7439a813ad0872058a89f22bff34",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "cors-testing",
+      "path": "skills/cors-testing/SKILL.md",
+      "sha256": "090268053901c82b848ca2b2df5f4e05b091d21a691e877ea26c1718ee24bee2",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "coverage-assets",
+      "path": "skills/coverage-assets/SKILL.md",
+      "sha256": "5a4f56f8e4ffd96c88e0d81f51fbbf0f74be4799a7c95a29d6c26cb03bb51045",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "dependency-check",
+      "path": "skills/dependency-check/SKILL.md",
+      "sha256": "60413247a766f672819d9f88fe9cc2f8506b88f4c1febde4b974137034216926",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "deserialization-testing",
+      "path": "skills/deserialization-testing/SKILL.md",
+      "sha256": "82df646bcbec58afae1602aa845b1c3710880f35d8677d396c91f225e32498f0",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "dns-recon",
+      "path": "skills/dns-recon/SKILL.md",
+      "sha256": "6fb877b49bb53b8cf336db20f116de9322307af38be1f819c80f04f9f0c62d27",
+      "metadata_version": null,
+      "compatibility": "Linux; requires subfinder, amass, dnsx, massdns, puredns, dnsrecon, dnsenum, fierce, dig/host; Python 3 for parsing"
+    },
+    {
+      "name": "dynamic-tracing",
+      "path": "skills/dynamic-tracing/SKILL.md",
+      "sha256": "f0cbf1c31cfe5ec6737e6765767321e6255288c414c5ef4094b09c9163e37f71",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "file-upload-testing",
+      "path": "skills/file-upload-testing/SKILL.md",
+      "sha256": "88cddf693a51620407cbb4c8173946960511a32a192445108c6cf36911eeadef",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "find-sec-bugs",
+      "path": "skills/find-sec-bugs/SKILL.md",
+      "sha256": "0c18f046d6f941631e72b838b40a08c6b61f6381d8aad2d31c9d276328d7503e",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "finding-report",
+      "path": "skills/finding-report/SKILL.md",
+      "sha256": "0ec7712961c396070859bad47b0daaebe939f13015cb9ee3e8f3f2d1b0eb9c51",
+      "metadata_version": "1.0",
+      "compatibility": null
+    },
+    {
+      "name": "format-string-exploitation",
+      "path": "skills/format-string-exploitation/SKILL.md",
+      "sha256": "a75950267eac0e0cb9fa160319b1bafaca7fce953bba0eeb06ca3fd6e8c7d86f",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "fuzzing",
+      "path": "skills/fuzzing/SKILL.md",
+      "sha256": "2db0ac832ab2b830cbbbfd2463396cb3924e84d9afdbc657160d0344a9f0ef36",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "gcp-enumeration",
+      "path": "skills/gcp-enumeration/SKILL.md",
+      "sha256": "82232d5be9d88a0618ec025e31639ccad70bd0221498472ca56c0f22f8853f9a",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "gdb-debugging",
+      "path": "skills/gdb-debugging/SKILL.md",
+      "sha256": "3eaeaa4d4f6e2d69bce65f0a071befd24379e982c520a41eb55232f9cc0b6335",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "ghidra-headless",
+      "path": "skills/ghidra-headless/SKILL.md",
+      "sha256": "2c5d1e409ab35c8c8e4cc9502d78866e171d033313b89378f366015628a2fd10",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "gitleaks",
+      "path": "skills/gitleaks/SKILL.md",
+      "sha256": "3565395c64b30a8f8050122325f73ba1ad5a058ebe54ffc9e24f4f28ac72fb9c",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "gosec",
+      "path": "skills/gosec/SKILL.md",
+      "sha256": "94466185c22e8eeb563d0d40cdb54bc7b4d06daed4d9cb76a897dd859e0ed525",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "graphql-testing",
+      "path": "skills/graphql-testing/SKILL.md",
+      "sha256": "9b47068cc0bd62a8fdb10a4c1440eec2a828bae2f99a7cd89ad3fb4dfd7006fa",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "grpc-testing",
+      "path": "skills/grpc-testing/SKILL.md",
+      "sha256": "e97dc95af1b10731ef80c5d31995449d6908b9e039168e0cc0c0192c6d7dad2a",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "grype-syft",
+      "path": "skills/grype-syft/SKILL.md",
+      "sha256": "ca4a6ceef0c1e41ac5c599ec3af33becd1670db12b3c251dd5cc088bb8800945",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "heap-exploitation",
+      "path": "skills/heap-exploitation/SKILL.md",
+      "sha256": "f7e6714f32cc9c40276c42b9c8f9e9261821bd7f8d9fc5152911338eae42e623",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "host-discovery",
+      "path": "skills/host-discovery/SKILL.md",
+      "sha256": "0237e99003d82fc3aa18a9427844dad1a1d2402f6cc5d5a3d0ea9741f29b885c",
+      "metadata_version": null,
+      "compatibility": "Linux with fping, arp-scan, netdiscover, nmap, zmap, nbtscan installed; root/CAP_NET_RAW for raw-socket tools"
+    },
+    {
+      "name": "http-probing",
+      "path": "skills/http-probing/SKILL.md",
+      "sha256": "8d89d9c275fecf2f9ffa20f178d3aac7d2156718e95a576dea5f8c880e1c609a",
+      "metadata_version": null,
+      "compatibility": "Linux/macOS agents with httpx (ProjectDiscovery Go binary), whatweb, webanalyze installed; Python 3 for the parsing scripts"
+    },
+    {
+      "name": "ike-scan",
+      "path": "skills/ike-scan/SKILL.md",
+      "sha256": "71f888d497140000fe8d7e86aedba88a81fbc7ef0c8e29c6b161b974cb68bf4d",
+      "metadata_version": null,
+      "compatibility": "Linux with ike-scan and psk-crack installed; root/CAP_NET_RAW for source port 500"
+    },
+    {
+      "name": "jwt-attacks",
+      "path": "skills/jwt-attacks/SKILL.md",
+      "sha256": "289ad18dc58d160684f99c322b81dff70afedd1a13c0b28f61eefdaa5a950aa7",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "ldap-ad-enum",
+      "path": "skills/ldap-ad-enum/SKILL.md",
+      "sha256": "ff6750b922974c56010bfd10cbbfe62c15fc49b103cc5a50796c81ee90570296",
+      "metadata_version": null,
+      "compatibility": "linux"
+    },
+    {
+      "name": "libc-identification",
+      "path": "skills/libc-identification/SKILL.md",
+      "sha256": "c82bc36d53832f4bc8ac45b738fcd49e99ea27b6bc86b67a591a6c6d4bb1a40a",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "masscan",
+      "path": "skills/masscan/SKILL.md",
+      "sha256": "7264f6f9c2c2aeda9118bb12ad23b3b0a5f4b6d04f0f55c2c30c5bff66a3a09f",
+      "metadata_version": null,
+      "compatibility": "linux (root or CAP_NET_RAW required for raw-packet TX/RX)"
+    },
+    {
+      "name": "metadata-ssrf-pivot",
+      "path": "skills/metadata-ssrf-pivot/SKILL.md",
+      "sha256": "6ed6a1e9822d9e1208672108efd9654b9ee48b306c33ea700ce27b4e6686f62c",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "mitmproxy",
+      "path": "skills/mitmproxy/SKILL.md",
+      "sha256": "2cfc60e31987ea01d4c8c1c39412e05b66ef8a3da9367ebd4a4673b4ad7e5022",
+      "metadata_version": null,
+      "compatibility": "Requires mitmproxy >= 10 (mitmproxy, mitmdump, mitmweb on PATH); Python 3 for helper scripts."
+    },
+    {
+      "name": "naabu",
+      "path": "skills/naabu/SKILL.md",
+      "sha256": "7c2cf2d32d2050ce61e5e152059f745916fa54d1e7b3295f22a9d580f678fbcb",
+      "metadata_version": null,
+      "compatibility": "linux/macos (go install or pdtm; SYN mode needs root/CAP_NET_RAW, else falls back to CONNECT)"
+    },
+    {
+      "name": "netexec",
+      "path": "skills/netexec/SKILL.md",
+      "sha256": "f03eea824b7fac7a24c549ce4d62f01a4b76c2c6e803ba2fd428e57a46be0187",
+      "metadata_version": null,
+      "compatibility": "Requires netexec (nxc) >= 1.1 on the operator box; Python 3 for scripts/parse_nxc.py"
+    },
+    {
+      "name": "nfs-enum",
+      "path": "skills/nfs-enum/SKILL.md",
+      "sha256": "7bf1171c9421811bea56350903aeb4668a94def7c4b0e6177c0e0c00f6e7b621",
+      "metadata_version": null,
+      "compatibility": "Linux attack host with nfs-common (showmount, rpcinfo, mount.nfs), nmap; python3 for the parser; local root for uid attacks"
+    },
+    {
+      "name": "nikto-scan",
+      "path": "skills/nikto-scan/SKILL.md",
+      "sha256": "3b043a18f296ee7b87846ca49c2984715a7c3591f31cf9f4261f49da7094bdeb",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "njsscan",
+      "path": "skills/njsscan/SKILL.md",
+      "sha256": "76373f2c85c2c80a05e664778bb35eb1555a7653e809f67fc208959b2718cff8",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "nmap",
+      "path": "skills/nmap/SKILL.md",
+      "sha256": "3fed4d8a7e32b8d627a32cfb59a6ac3b701a0c4ac93370874ffceca5f7b6950d",
+      "metadata_version": null,
+      "compatibility": "Linux/macOS with nmap >= 7.80; root/CAP_NET_RAW for raw-socket scans; Python 3.8+ for scripts"
+    },
+    {
+      "name": "nuclei",
+      "path": "skills/nuclei/SKILL.md",
+      "sha256": "ca46406429505da456412fa93324954a05e1a3b5ab879efb83d3e5b8ab534018",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "oauth-oidc-testing",
+      "path": "skills/oauth-oidc-testing/SKILL.md",
+      "sha256": "d2285d968757dfd7a531e43838a4af82bf1a9b6f6cf512e81308f4e2a5ed6d12",
+      "metadata_version": "1.0.0",
+      "compatibility": null
+    },
+    {
+      "name": "open-redirect-testing",
+      "path": "skills/open-redirect-testing/SKILL.md",
+      "sha256": "ee2405ba9ef21ced03dd85a8eca1e4f3210eb8d7cb6ac97e8e7a259e5fd0813b",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "osv-scanner",
+      "path": "skills/osv-scanner/SKILL.md",
+      "sha256": "6fdd55a48c86476af9e9162441d7cd2810a41129f4d0297a80edafcf8c282b4a",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "owasp-zap",
+      "path": "skills/owasp-zap/SKILL.md",
+      "sha256": "5926c3e9333a5f402b5d4eae2733e3fdb986c5aaf308eb4b8826f6c11313b37b",
+      "metadata_version": null,
+      "compatibility": "Linux/macOS; ZAP 2.14+ (zap.sh or Docker ghcr.io/zaproxy/zaproxy:stable); Python 3.8+ for helper scripts"
+    },
+    {
+      "name": "pacu",
+      "path": "skills/pacu/SKILL.md",
+      "sha256": "e0cf0c46789a9c48c71be04f1a390bada9d984489e05926a1525232edb1000c8",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "parameter-discovery",
+      "path": "skills/parameter-discovery/SKILL.md",
+      "sha256": "5ba031c2047eed7ebc0b258919dfc882ee6e2ada9330f9c2b47f2cdd2870d8e7",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "path-traversal-testing",
+      "path": "skills/path-traversal-testing/SKILL.md",
+      "sha256": "d4960a3ba40996a30b5ddcb2778ce24afa503f88f063310857fce88d5bb3ac0a",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "pmapper",
+      "path": "skills/pmapper/SKILL.md",
+      "sha256": "3f4c7681f5643bb99d1aa3bc736d38ac25500738559dcff5cb656ca894efda4c",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "prowler",
+      "path": "skills/prowler/SKILL.md",
+      "sha256": "1372eca0638deba5ccc77a3c9634df047685c03db1940a9e0e008674e945cdb9",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "pwntools",
+      "path": "skills/pwntools/SKILL.md",
+      "sha256": "60bc49ff713c9eb17c8a11b073070febbb24aa5c9804282319515231863c38c8",
+      "metadata_version": null,
+      "compatibility": "linux, python3, pwntools>=4.x"
+    },
+    {
+      "name": "qiling-unicorn",
+      "path": "skills/qiling-unicorn/SKILL.md",
+      "sha256": "d8076c5cc3031f899f840ca70e1596ac3b49bddb666e34dc2855521b1c54a00c",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "radare2",
+      "path": "skills/radare2/SKILL.md",
+      "sha256": "4f912f61defb95399815be7a0d21a58636a8f533ed892848703a6fc4f0beba74",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "recon",
+      "path": "skills/recon/SKILL.md",
+      "sha256": "f980b33523c952721b0f062cd3b6c5200fe4b2a295c9a6303fbabfa06dc075c2",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "request-smuggling-testing",
+      "path": "skills/request-smuggling-testing/SKILL.md",
+      "sha256": "2900d19b70af6eef58c28c687ffc6783f16b932cd9d55d2c661b3972b81c6b7c",
+      "metadata_version": "1.0",
+      "compatibility": null
+    },
+    {
+      "name": "retire-js",
+      "path": "skills/retire-js/SKILL.md",
+      "sha256": "580bd71348bee8195f442252e9bd43774a89b6f20cf462dc3edd2b927719d048",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "rop-chains",
+      "path": "skills/rop-chains/SKILL.md",
+      "sha256": "a63f9a4982734774ff522f2dbe66ce2c4bc4a4ef846cc2b8d1a826541771e15e",
+      "metadata_version": null,
+      "compatibility": "linux, python3, ROPgadget/ropper/one_gadget optional"
+    },
+    {
+      "name": "rustscan",
+      "path": "skills/rustscan/SKILL.md",
+      "sha256": "020e5ff22f2ae9b9cca326bc9ad510b540feec01c445be1c7002bcbbcde2cbcd",
+      "metadata_version": null,
+      "compatibility": "linux/macos (binary, docker, or cargo install rustscan)"
+    },
+    {
+      "name": "sarif-triage",
+      "path": "skills/sarif-triage/SKILL.md",
+      "sha256": "6c3cb51bb4e30225a94dce947456ba7063653f2c3a308214b50fa83e623e8ebb",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "scoutsuite",
+      "path": "skills/scoutsuite/SKILL.md",
+      "sha256": "da8adc466de5bb87279b1025e2bdb43633a62de31aa73415a6e43ac32f48ddd6",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "security-headers-testing",
+      "path": "skills/security-headers-testing/SKILL.md",
+      "sha256": "f6a79b7a3f41b1085c2117934b98e41b717571cdba4991b19112a7ea86d27c02",
+      "metadata_version": "1.0",
+      "compatibility": null
+    },
+    {
+      "name": "semgrep",
+      "path": "skills/semgrep/SKILL.md",
+      "sha256": "b4ce962e5737da62c4cb7487f6ecceddc8e2bc9b8b496f4b41b1c32b61d14155",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "smb-enum",
+      "path": "skills/smb-enum/SKILL.md",
+      "sha256": "13a48468c5c3466e796462245d712f561b01ead616c497b83a43ae121c4f6677",
+      "metadata_version": null,
+      "compatibility": "linux"
+    },
+    {
+      "name": "snmp-enum",
+      "path": "skills/snmp-enum/SKILL.md",
+      "sha256": "a39d4d347f2f21162678143658847613af3272b4fb2451b07518c62ab4da29b7",
+      "metadata_version": null,
+      "compatibility": "Linux attack host with net-snmp, onesixtyone, snmp-check, braa; python3 for the parser"
+    },
+    {
+      "name": "sqli-testing",
+      "path": "skills/sqli-testing/SKILL.md",
+      "sha256": "b5d26c0e7abad3a1e57cae1ee07b33068dd88a0de15c20392004356b028a87f9",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "ssrf-testing",
+      "path": "skills/ssrf-testing/SKILL.md",
+      "sha256": "b13ec8020ea0afea7a54fa37cd8cd44c098917c928259034b13860d6821191d6",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "ssti-testing",
+      "path": "skills/ssti-testing/SKILL.md",
+      "sha256": "f12c3c90e2a2dc1e803d039b37f8031bc1139359a2cd31f0e9325fb6ea94d6d7",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "steampipe",
+      "path": "skills/steampipe/SKILL.md",
+      "sha256": "5d0624d61aefcae65b8ef0d2e1c7493198c520b75cc9228ba991cb06b257f895",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "taint-analysis",
+      "path": "skills/taint-analysis/SKILL.md",
+      "sha256": "09f8f6491369eb4722b51e3a1d6b4000589a49e9941a9b26b260b0834d7d357f",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "tls-testing",
+      "path": "skills/tls-testing/SKILL.md",
+      "sha256": "60b506dc6c4cc3a0ca0713a0a9b1b00f83ad3377056965046d5fed4c65659b8f",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "trufflehog",
+      "path": "skills/trufflehog/SKILL.md",
+      "sha256": "8da3df9a89b9e55b8dfa04dc4545cc16f0364de02541c12b466a3b57b6166680",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "vuln-classes",
+      "path": "skills/vuln-classes/SKILL.md",
+      "sha256": "4d5266e48afc65f280d74fcbe0005986105a9b58633a4ca8681420fac18e9fad",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "web-crawling",
+      "path": "skills/web-crawling/SKILL.md",
+      "sha256": "13c847e75f88f3b3ed34a27d228775498b977219564872144e8a5c69e0ecb66e",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "web-testing",
+      "path": "skills/web-testing/SKILL.md",
+      "sha256": "7c22dfd40fbd26cc7301006990622f835ab4f1e40928e5485a28387187a1c0a4",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "work-units",
+      "path": "skills/work-units/SKILL.md",
+      "sha256": "be68fae5d182d6c90df96f6580fa2af01cea59b635715f5f36984be23c0b8497",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "xss-testing",
+      "path": "skills/xss-testing/SKILL.md",
+      "sha256": "dc1641526dd14439fcc8988d1a97ed7ae35854be0498286ca18308aeceadf5e7",
+      "metadata_version": null,
+      "compatibility": null
+    },
+    {
+      "name": "xxe-testing",
+      "path": "skills/xxe-testing/SKILL.md",
+      "sha256": "f0155f68fe8ec1a7107b17e5711a957e94c1601facb3af5d6ecbebf1f51e4be2",
+      "metadata_version": null,
+      "compatibility": null
+    }
+  ],
+  "local_entries": [
+    "global:rupu-session-operations"
+  ],
+  "qualification": "Compatibility is only declared upstream text when present; null means unlisted, not no dependencies. No binary/service/credential availability was tested. Installed contents may differ; preset membership is classification, not provenance attestation."
+}

@@ -215,11 +215,12 @@ fn cache_run_location(s: &AppState, run_id: &str, loc: RunLocation) {
     guard.insert(run_id.to_string(), (now, loc));
 }
 
-/// The uncached resolution walk — see [`resolve_run_location`] for the
-/// memoization wrapper and the module doc for the full order + rationale.
-async fn resolve_run_location_uncached(s: &AppState, run_id: &str) -> RunLocation {
+/// Local recorded-artifact resolution only. Never consults the federation
+/// cache, Autoflow history or host connectors. Callers validate the ID and
+/// reload the chosen record before returning authoritative local metadata.
+pub(crate) fn local_run_location(s: &AppState, run_id: &str) -> Option<RunLocation> {
     match s.run_store.load(run_id) {
-        Ok(_) => return RunLocation::Global,
+        Ok(_) => return Some(RunLocation::Global),
         // Not in the global store: keep resolving elsewhere (project-local,
         // autoflow history, host probe).
         Err(RunStoreError::NotFound(_)) => {}
@@ -228,11 +229,21 @@ async fn resolve_run_location_uncached(s: &AppState, run_id: &str) -> RunLocatio
         // the probe-then-404 path — that would swallow a real 500. Report
         // `Global` so the caller re-loads via the same store and surfaces
         // the actual error (see `run_not_found_or_internal`).
-        Err(_) => return RunLocation::Global,
+        Err(_) => return Some(RunLocation::Global),
     }
 
     if let Some(path) = find_project_local(s, run_id) {
-        return RunLocation::ProjectLocal { path };
+        return Some(RunLocation::ProjectLocal { path });
+    }
+
+    None
+}
+
+/// The uncached resolution walk — see [`resolve_run_location`] for the
+/// memoization wrapper and the module doc for the full order + rationale.
+async fn resolve_run_location_uncached(s: &AppState, run_id: &str) -> RunLocation {
+    if let Some(location) = local_run_location(s, run_id) {
+        return location;
     }
 
     if let Some(ctx) = autoflow_run_context(&s.global_dir, run_id) {
