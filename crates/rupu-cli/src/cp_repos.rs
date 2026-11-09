@@ -39,6 +39,18 @@ impl RepoLister for CpRepoLister {
         Ok(out)
     }
 
+    async fn review_detail(
+        &self,
+        repo: &rupu_scm::RepoRef,
+        cwd: &std::path::Path,
+        origin_host: &str,
+        number: u32,
+        selection: &rupu_cp::repos::ReviewSelection,
+    ) -> Result<serde_json::Value, RepoListError> {
+        crate::cp_review_detail::read(&self.registry, repo, cwd, origin_host, number, selection)
+            .await
+    }
+
     async fn reviews(
         &self,
         repo: &rupu_scm::RepoRef,

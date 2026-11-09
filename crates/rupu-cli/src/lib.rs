@@ -16,6 +16,7 @@ pub mod cp_inventory;
 pub mod cp_launcher;
 pub mod cp_model_catalog;
 pub mod cp_repos;
+mod cp_review_detail;
 pub mod cp_session_mutator;
 pub mod cp_session_commands;
 pub mod cp_session_sender;

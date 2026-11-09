@@ -20,8 +20,19 @@ pub struct RepoEntry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoListError {
+    #[error("review selection changed; refresh repository context")]
+    SelectionChanged,
     #[error("failed to list repos: {0}")]
     Backend(String),
+}
+
+/// Captured read selection, never an account override. Resolution still follows
+/// the owning checkout's configured rules before equality is checked.
+pub struct ReviewSelection {
+    pub account: String,
+    pub branch: String,
+    pub head: String,
+    pub include_diff: bool,
 }
 
 #[async_trait::async_trait]
@@ -31,6 +42,19 @@ pub trait RepoLister: Send + Sync {
     /// Explicit read-only query through this CP's owning account-selection rules.
     /// Kept optional for older/read-only adapters; never infer authorization from
     /// the presence of account configuration or a local checkout.
+    async fn review_detail(
+        &self,
+        _repo: &rupu_scm::RepoRef,
+        _cwd: &std::path::Path,
+        _origin_host: &str,
+        _number: u32,
+        _selection: &ReviewSelection,
+    ) -> Result<serde_json::Value, RepoListError> {
+        Err(RepoListError::Backend(
+            "review detail adapter unavailable".into(),
+        ))
+    }
+
     async fn reviews(
         &self,
         _repo: &rupu_scm::RepoRef,

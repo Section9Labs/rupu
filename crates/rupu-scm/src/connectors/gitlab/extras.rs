@@ -76,6 +76,63 @@ impl GitlabExtras {
         Ok((result, truncated))
     }
 
+    /// Read-only first pages for a selected current-branch MR. Each optional
+    /// section can fail independently; no request ever mutates the forge.
+    /// Number-addressed responses are guarded again after the multi-read.
+    pub async fn review_detail(
+        &self,
+        r: &RepoRef,
+        number: u32,
+        branch: &str,
+        head: &str,
+        include_diff: bool,
+    ) -> Result<serde_json::Value, ScmError> {
+        use serde_json::json;
+        let _permit = self.client.permit().await;
+        let id = url::form_urlencoded::byte_serialize(format!("{}/{}", r.owner, r.repo).as_bytes())
+            .collect::<String>();
+        let path = format!("/projects/{id}/merge_requests/{number}");
+        let detail = self.client.get_json(&path).await?;
+        if detail["iid"].as_u64() != Some(u64::from(number))
+            || detail["source_branch"].as_str() != Some(branch)
+            || detail["diff_refs"]["head_sha"].as_str() != Some(head)
+            || detail["source_project_id"].as_u64().is_none()
+            || detail["source_project_id"] != detail["target_project_id"]
+        {
+            return Ok(json!({"detail":detail}));
+        }
+        let pipeline = detail["head_pipeline"]["id"]
+            .as_u64()
+            .filter(|_| detail["head_pipeline"]["sha"].as_str() == Some(head));
+        let jobs = if let Some(pipeline) = pipeline {
+            self.client
+                .get_json(&format!(
+                    "/projects/{id}/pipelines/{pipeline}/jobs?per_page=41&page=1"
+                ))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let discussions = self
+            .client
+            .get_json(&format!("{path}/discussions?per_page=21&page=1"))
+            .await
+            .ok();
+        let diffs = if include_diff {
+            self.client
+                .get_json(&format!("{path}/diffs?per_page=41&page=1"))
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let verified = self.client.get_json(&path).await?;
+        Ok(
+            json!({"detail":detail,"verified":verified,"jobs":jobs,"no_pipeline":detail["head_pipeline"].is_null(),"discussions":discussions,"diffs":diffs}),
+        )
+    }
+
     pub async fn pipeline_trigger(&self, r: &RepoRef, p: PipelineTrigger) -> Result<(), ScmError> {
         let _permit = self.client.permit().await;
         let id = format!("{}/{}", r.owner, r.repo).replace('/', "%2F");

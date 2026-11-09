@@ -111,6 +111,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects", get(list_projects).post(register_project))
         .route("/api/projects/:ws_id", get(get_project))
         .route("/api/projects/:ws_id/scm", get(super::project_scm::context))
+        .route(
+            "/api/projects/:ws_id/scm/reviews/:number",
+            get(super::project_scm::review_detail),
+        )
         .route("/api/projects/:ws_id/runs", get(project_runs))
         .route(
             "/api/projects/:ws_id/sessions",
