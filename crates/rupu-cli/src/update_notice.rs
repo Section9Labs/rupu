@@ -130,12 +130,15 @@ fn packaged_call_to_action() -> Option<String> {
 /// `cmd::update::packaged_refusal`, whose command-naming this mirrors (in
 /// particular: never `sudo brew`, and never a backticked command we cannot
 /// spell).
-fn packaged_call_to_action_for(
+pub(crate) fn packaged_call_to_action_for(
     owner: Option<crate::build_info::InstallOwner>,
     pm: &str,
 ) -> Option<String> {
     let owner = owner?;
     match crate::build_info::upgrade_command(owner, pm) {
+        None if owner == crate::build_info::InstallOwner::DesktopApp => {
+            Some("Update rupu.app instead.".to_string())
+        }
         Some(cmd) => Some(format!("Run '{cmd}'.")),
         None if owner == crate::build_info::InstallOwner::Nix => Some(
             "Upgrade it through the Nix profile or flake that installed it instead.".to_string(),
@@ -147,6 +150,14 @@ fn packaged_call_to_action_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_update_notice_points_to_the_app() {
+        assert_eq!(
+            packaged_call_to_action_for(Some(crate::build_info::InstallOwner::DesktopApp), "apt"),
+            Some("Update rupu.app instead.".to_string())
+        );
+    }
 
     #[test]
     fn defaults_on_for_interactive_tty() {
