@@ -403,6 +403,8 @@ async fn read(
     is_text: bool,
 ) -> Result<Json<Value>> {
     let target = target(tracker, number, &q)?;
+    let current = super::issues_read::current_state(s).await?;
+    let s = &current;
     let port = reader(s)?;
     let started = Instant::now();
     let _permit = admission.try_acquire().map_err(|_| busy())?;

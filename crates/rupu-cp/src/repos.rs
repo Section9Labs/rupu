@@ -38,7 +38,16 @@ pub struct ReviewSelection {
 
 #[async_trait::async_trait]
 pub trait RepoLister: Send + Sync {
-    fn forge_writer(&self) -> Option<&dyn crate::forge_writer::ForgeWriter> { None }
+    /// Capture current credentials/configuration once for this request. The
+    /// returned adapter must retain its identity while inputs are unchanged:
+    /// issue cursors and prepared writes are bound to that identity. `None`
+    /// means this adapter is already an immutable snapshot.
+    async fn snapshot(&self) -> Result<Option<std::sync::Arc<dyn RepoLister>>, RepoListError> {
+        Ok(None)
+    }
+    fn forge_writer(&self) -> Option<&dyn crate::forge_writer::ForgeWriter> {
+        None
+    }
     fn issue_reader(&self) -> Option<&dyn crate::issue_reader::IssueReader> {
         None
     }
@@ -101,4 +110,19 @@ pub trait RepoLister: Send + Sync {
     ) -> Result<serde_json::Value, RepoListError> {
         Err(RepoListError::Backend("review adapter unavailable".into()))
     }
+}
+
+/// Pin one immutable SCM adapter for a whole request, including its synchronous
+/// account/capability checks. Never swap a connector halfway through a read or
+/// mutation preflight, and never fall back to a stale adapter on refresh error.
+pub async fn snapshot_state(
+    state: &crate::state::AppState,
+) -> Result<crate::state::AppState, RepoListError> {
+    let mut state = state.clone();
+    if let Some(port) = &state.repos {
+        if let Some(current) = port.snapshot().await? {
+            state.repos = Some(current);
+        }
+    }
+    Ok(state)
 }

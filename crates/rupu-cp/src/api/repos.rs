@@ -42,6 +42,11 @@ async fn list_repos_with(port: Option<Arc<dyn RepoLister>>) -> ApiResult<Vec<Rep
     let port = port.ok_or_else(|| {
         ApiError::not_available("repo listing requires `rupu cp serve` with SCM credentials")
     })?;
+    let port = port
+        .snapshot()
+        .await
+        .map_err(|_| ApiError::internal("SCM enrollment unavailable"))?
+        .unwrap_or(port);
     port.list()
         .await
         .map_err(|e| ApiError::internal(e.to_string()))

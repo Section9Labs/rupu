@@ -295,6 +295,7 @@ async fn verify(
 }
 
 async fn read(s: AppState, ws: String, number: u32, q: Query) -> ApiResult<Value> {
+    let s = crate::repos::snapshot_state(&s).await.map_err(translate)?;
     let port = s
         .repos
         .clone()

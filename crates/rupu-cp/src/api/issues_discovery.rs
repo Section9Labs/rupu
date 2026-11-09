@@ -318,6 +318,7 @@ async fn page(
     Query(q): Query<DiscoveryQuery>,
 ) -> Result<Json<Value>> {
     let (target, filters) = selection(&tracker, &q)?;
+    let s = super::issues_read::current_state(&s).await?;
     let port = reader(&s)?;
     let owner = instance(&s);
     let _permit = READERS.try_acquire().map_err(|_| {

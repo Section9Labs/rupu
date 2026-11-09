@@ -16,6 +16,9 @@ url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true

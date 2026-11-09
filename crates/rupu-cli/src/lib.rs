@@ -20,6 +20,7 @@ pub mod cp_model_catalog;
 pub mod cp_repos;
 mod cp_review_detail;
 mod cp_review_pages;
+pub mod cp_scm;
 pub mod cp_session_mutator;
 pub mod cp_session_commands;
 pub mod cp_session_sender;

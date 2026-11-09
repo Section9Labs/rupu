@@ -124,6 +124,16 @@ pub(super) fn require_local(host: Option<&str>) -> ReadResult<()> {
         ))
     }
 }
+pub(super) async fn current_state(s: &AppState) -> ReadResult<AppState> {
+    crate::repos::snapshot_state(s).await.map_err(|_| {
+        ReadError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enrollment_unavailable",
+            "Current SCM enrollment is unavailable; retry after checking credentials/configuration",
+        )
+    })
+}
+
 pub(super) fn reader(s: &AppState) -> ReadResult<&dyn IssueReader> {
     s.repos
         .as_ref()
@@ -144,6 +154,7 @@ async fn accounts(
     Query(q): Query<HostQuery>,
 ) -> ReadResult<Json<Value>> {
     require_local(q.host.as_deref())?;
+    let s = current_state(&s).await?;
     let all = reader(&s)?.accounts();
     let count = all.len();
     let rows: Vec<_> = all
@@ -425,6 +436,7 @@ async fn read(
     kind: Option<Kind>,
 ) -> ReadResult<Json<Value>> {
     let target = target(&tracker, &number, &q)?;
+    let s = current_state(&s).await?;
     let _ = reader(&s)?;
     let owner = instance(&s);
     let cursor = kind

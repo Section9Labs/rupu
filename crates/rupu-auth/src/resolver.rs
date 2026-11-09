@@ -86,10 +86,12 @@ pub struct SsoPeek {
 /// On SSO entries whose access token is within [`EXPIRY_REFRESH_BUFFER_SECS`]
 /// of expiry, [`KeychainResolver::get`] performs a silent token refresh via
 /// the standard OAuth refresh-token grant before returning credentials.
+#[derive(Clone)]
 pub struct KeychainResolver {
     /// Where credentials live: a chmod-600 JSON file. There is no
     /// second backend — see the type docs.
     path: PathBuf,
+    allow_environment: bool,
     /// Accounts declared in config. Empty means "built-in vendor names
     /// only", which is exactly the pre-multi-account behavior.
     accounts: Vec<crate::account::AccountSpec>,
@@ -97,6 +99,69 @@ pub struct KeychainResolver {
     refresh_timeout: std::time::Duration,
     /// [`LOCK_TIMEOUT`]; tests shorten it.
     lock_timeout: std::time::Duration,
+}
+
+/// Opaque, account-scoped enrollment comparison. May contain credentials in
+/// memory; intentionally has no Debug, serialization, or byte/string accessor.
+#[derive(Clone)]
+pub struct CredentialEnrollmentRevision {
+    selected: Vec<(String, Option<serde_json::Value>)>,
+    publication: Option<CredentialPublication>,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct CredentialPublication {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+impl CredentialPublication {
+    fn of(metadata: &std::fs::Metadata) -> std::io::Result<Self> {
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+impl PartialEq for CredentialEnrollmentRevision {
+    fn eq(&self, other: &Self) -> bool {
+        self.selected == other.selected
+    }
+}
+impl Eq for CredentialEnrollmentRevision {}
+impl CredentialEnrollmentRevision {
+    /// Nonsecret account names expected to produce a connector at discovery.
+    pub fn enrolled_accounts(&self) -> impl Iterator<Item = &str> {
+        self.selected
+            .iter()
+            .filter(|(_, value)| value.is_some())
+            .map(|(name, _)| name.as_str())
+    }
+    /// Construction guard only: detects A→B→A publications while connectors
+    /// are being built. Cache reuse compares effective enrollment instead, so
+    /// an unrelated provider write does not invalidate SCM receipt epochs.
+    pub fn same_publication(&self, other: &Self) -> bool {
+        self.publication == other.publication
+    }
+
+    /// Check a resolver result against the captured account/mode/credential.
+    /// Prevents transient file publications (including an absent-store ABA)
+    /// from entering a connector under another snapshot's enrollment.
+    pub fn matches_resolution(&self, name: &str, mode: AuthMode, credentials: &AuthCredentials) -> bool {
+        let Some((_, Some(selected))) = self.selected.iter().find(|(account, _)| account == name) else { return false };
+        let expected = selected.get(1).map(|value| value.get("credentials").unwrap_or(value));
+        selected.get(0) == Some(&serde_json::json!(mode)) && expected == Some(&serde_json::json!(credentials))
+    }
 }
 
 /// Resolve the global rupu directory, honoring `$RUPU_HOME` (set by
@@ -125,6 +190,81 @@ fn default_auth_json_path() -> PathBuf {
 }
 
 impl KeychainResolver {
+    /// Compare the effective stored enrollment for selected accounts without
+    /// refreshing OAuth or exposing credentials. Uses the resolver's own key,
+    /// legacy-key and mode-precedence rules; unrelated provider writes do not
+    /// change this revision. A malformed/unreadable store is an error.
+    pub fn enrollment_revision(
+        &self,
+        requests: &[(String, Option<AuthMode>)],
+    ) -> Result<CredentialEnrollmentRevision> {
+        use std::io::Read;
+        let path = self.auth_file();
+        #[cfg(unix)]
+        let opened = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from);
+        #[cfg(not(unix))]
+        let opened = std::fs::File::open(&path);
+        let (map, publication) = match opened {
+            Ok(mut file) => {
+                let metadata = file.metadata()?;
+                anyhow::ensure!(metadata.is_file(), "credential store is not a regular file");
+                let publication = CredentialPublication::of(&metadata)?;
+                let mut bytes = Vec::new();
+                (&mut file)
+                    .take(8 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(
+                    bytes.len() <= 8 * 1024 * 1024,
+                    "credential store exceeds its limit"
+                );
+                anyhow::ensure!(
+                    publication == CredentialPublication::of(&file.metadata()?)?,
+                    "credential store changed during read"
+                );
+                (serde_json::from_slice(&bytes)?, Some(publication))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Default::default(), None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut selected = Vec::with_capacity(requests.len());
+        for (name, hint) in requests {
+            let declared = crate::account::resolve_provider_id(name, &self.accounts).is_some();
+            let legacy = if declared {
+                Self::legacy_base(name)
+            } else {
+                Some(name.as_str())
+            };
+            let modes = match (declared, hint) {
+                (_, Some(AuthMode::Sso)) => vec![AuthMode::Sso],
+                (true, Some(mode)) => vec![*mode],
+                _ => vec![AuthMode::Sso, AuthMode::ApiKey],
+            };
+            let mut value = None;
+            for mode in modes {
+                if let Some(stored) = Self::read_account_from_map(&map, name, legacy, mode)? {
+                    value = Some(serde_json::json!([mode, stored]));
+                    break;
+                }
+            }
+            if value.is_none() && *hint != Some(AuthMode::Sso) {
+                value = self
+                    .environment_api_key(name)
+                    .map(|creds| serde_json::json!([AuthMode::ApiKey, creds]));
+            }
+            selected.push((name.clone(), value));
+        }
+        Ok(CredentialEnrollmentRevision {
+            selected,
+            publication,
+        })
+    }
+
     pub fn new() -> Self {
         Self::with_service("rupu")
     }
@@ -161,7 +301,21 @@ impl KeychainResolver {
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         }
+    }
+
+    /// Resolve only this store, without inheriting process API keys. Useful
+    /// for an explicitly isolated credential scope; the default is unchanged.
+    pub fn without_environment(mut self) -> Self {
+        self.allow_environment = false;
+        self
+    }
+
+    fn environment_api_key(&self, provider: &str) -> Option<AuthCredentials> {
+        self.allow_environment
+            .then(|| Self::env_api_key(provider))
+            .flatten()
     }
 
     /// Bound each SSO token refresh by `timeout` instead of
@@ -317,8 +471,16 @@ impl KeychainResolver {
         legacy_base: Option<&str>,
         mode: AuthMode,
     ) -> Result<Option<StoredCredential>> {
+        Self::read_account_from_map(&Self::read_file_map(path)?, account_base, legacy_base, mode)
+    }
+
+    fn read_account_from_map(
+        map: &std::collections::BTreeMap<String, String>,
+        account_base: &str,
+        legacy_base: Option<&str>,
+        mode: AuthMode,
+    ) -> Result<Option<StoredCredential>> {
         let account = format!("{account_base}/{}", mode.as_str());
-        let map = Self::read_file_map(path)?;
         if let Some(s) = map.get(&account) {
             return Ok(Some(parse_stored_credential(s, mode)?));
         }
@@ -677,7 +839,7 @@ impl KeychainResolver {
         if let Some(sc) = self.read_account(provider, Some(provider), AuthMode::ApiKey)? {
             return Ok((AuthMode::ApiKey, sc.credentials));
         }
-        if let Some(creds) = Self::env_api_key(provider) {
+        if let Some(creds) = self.environment_api_key(provider) {
             return Ok((AuthMode::ApiKey, creds));
         }
         anyhow::bail!(
@@ -1290,7 +1452,7 @@ impl CredentialResolver for KeychainResolver {
             // API-key" invariant) and mask the real problem — no SSO
             // credential is stored.
             if hint != Some(AuthMode::Sso) {
-                if let Some(creds) = Self::env_api_key(provider) {
+                if let Some(creds) = self.environment_api_key(provider) {
                     return Ok((AuthMode::ApiKey, creds));
                 }
             }
@@ -1622,6 +1784,7 @@ mod tests {
             ],
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
 
         resolver
@@ -1663,6 +1826,7 @@ mod tests {
             )],
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
 
         resolver
@@ -1710,6 +1874,7 @@ mod tests {
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
         resolver
             .store(
@@ -1740,6 +1905,7 @@ mod tests {
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
 
         let (mode, creds) = resolver.get("anthropic", None).await.unwrap();
@@ -1756,6 +1922,7 @@ mod tests {
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
         let err = resolver.get("anthropic-typo", None).await.unwrap_err();
         assert!(
@@ -1779,6 +1946,7 @@ mod tests {
             accounts: Vec::new(),
             refresh_timeout: REFRESH_TIMEOUT,
             lock_timeout: LOCK_TIMEOUT,
+            allow_environment: true,
         };
 
         let sso = StoredCredential {

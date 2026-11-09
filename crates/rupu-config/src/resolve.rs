@@ -172,7 +172,112 @@ pub fn resolve(paths: LayerPaths<'_>) -> Result<Resolved, LayerError> {
     let g = read_optional_toml(paths.global)?;
     let c = read_optional_toml(paths.customer)?;
     let p = read_optional_toml(paths.project)?;
+    resolve_layers(paths, g, c, p)
+}
 
+/// The same precedence and policy locks as `resolve`, with an actual read
+/// bound per file for long-lived request readers. Missing layers stay empty.
+/// Error text is intentionally generic: configuration may contain secrets.
+pub fn resolve_bounded(paths: LayerPaths<'_>, max_bytes: u64) -> Result<Resolved, LayerError> {
+    fn read(path: Option<&std::path::Path>, max: u64) -> Result<Option<Value>, LayerError> {
+        use std::io::Read;
+        let Some(path) = path else { return Ok(None) };
+        #[cfg(unix)]
+        let opened = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from);
+        #[cfg(not(unix))]
+        let opened = std::fs::File::open(path);
+        let file = match opened {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(LayerError::Invalid("configuration unavailable".into())),
+        };
+        if !file
+            .metadata()
+            .map_err(|_| LayerError::Invalid("configuration unavailable".into()))?
+            .is_file()
+        {
+            return Err(LayerError::Invalid(
+                "configuration is not a regular file".into(),
+            ));
+        }
+        let mut text = String::new();
+        file.take(max.saturating_add(1))
+            .read_to_string(&mut text)
+            .map_err(|_| LayerError::Invalid("configuration unavailable".into()))?;
+        if text.len() as u64 > max {
+            return Err(LayerError::Invalid(
+                "configuration exceeds read limit".into(),
+            ));
+        }
+        toml::from_str(&text)
+            .map(Some)
+            .map_err(|_| LayerError::Invalid("configuration is not valid TOML".into()))
+    }
+    resolve_layers(
+        paths,
+        read(paths.global, max_bytes)?,
+        read(paths.customer, max_bytes)?,
+        read(paths.project, max_bytes)?,
+    )
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reads_preserve_layering_and_policy_locks() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global.toml");
+        let customer = root.path().join("customer.toml");
+        let project = root.path().join("project.toml");
+        std::fs::write(
+            &global,
+            "[policy]\nlock=['bash.timeout_secs']\n[bash]\ntimeout_secs=17\n",
+        )
+        .unwrap();
+        std::fs::write(&customer, "[bash]\ntimeout_secs=31\n").unwrap();
+        std::fs::write(&project, "[bash]\ntimeout_secs=41\n").unwrap();
+        let paths = LayerPaths::new(Some(&global), Some(&customer), Some(&project));
+        let ordinary = resolve(paths).unwrap();
+        let bounded = resolve_bounded(paths, 4096).unwrap();
+        assert_eq!(
+            serde_json::to_value(ordinary.config).unwrap(),
+            serde_json::to_value(bounded.config).unwrap()
+        );
+        assert_eq!(ordinary.provenance, bounded.provenance);
+    }
+
+    #[test]
+    fn bounded_reads_refuse_oversize_and_invalid_text_without_echoing_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        let paths = LayerPaths::global_only(&path);
+        assert!(resolve_bounded(paths, 32).is_ok());
+        std::fs::write(&path, "# fixture-secret-do-not-echo".repeat(20)).unwrap();
+        let error = resolve_bounded(paths, 32).unwrap_err().to_string();
+        assert!(error.contains("limit"));
+        assert!(!error.contains("fixture-secret"));
+        std::fs::write(&path, "fixture-secret-do-not-echo invalid toml").unwrap();
+        assert!(!resolve_bounded(paths, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("fixture-secret"));
+    }
+}
+
+fn resolve_layers(
+    paths: LayerPaths<'_>,
+    g: Option<Value>,
+    c: Option<Value>,
+    p: Option<Value>,
+) -> Result<Resolved, LayerError> {
     let flat = |v: &Option<Value>| {
         let mut out: BTreeMap<Vec<String>, Value> = BTreeMap::new();
         if let Some(v) = v {

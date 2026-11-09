@@ -4644,6 +4644,7 @@ dependencies = [
  "reqwest-middleware",
  "rupu-netflow",
  "rupu-providers",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serial_test",
@@ -4748,6 +4749,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -4773,6 +4775,7 @@ dependencies = [
 name = "rupu-config"
 version = "0.88.0"
 dependencies = [
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",

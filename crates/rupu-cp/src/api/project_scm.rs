@@ -115,6 +115,9 @@ pub async fn review_detail(
             "Review readers are busy; retry after the current observation".into(),
         )
     })?;
+    let s = crate::repos::snapshot_state(&s)
+        .await
+        .map_err(|_| ApiError::bad_gateway("SCM enrollment unavailable"))?;
     let port = s.repos.clone().ok_or_else(|| {
         ApiError(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -208,6 +211,10 @@ async fn review_context(port: Option<Arc<dyn crate::repos::RepoLister>>, value: 
     let unavailable = |reason: &str| json!({"state":"unavailable","reason":reason,"reviews":[],"truncated":false});
     let Some(port) = port else {
         return unavailable("This control plane has no SCM review adapter");
+    };
+    let port = match port.snapshot().await {
+        Ok(current) => current.unwrap_or(port),
+        Err(_) => return unavailable("Current SCM enrollment unavailable"),
     };
     let Some(branch) = value["branch"].as_str().filter(|b| !b.is_empty()) else {
         return unavailable("The checkout has no current branch");

@@ -41,13 +41,11 @@ pub const ISSUE_FETCH_CAP: u32 = 500;
 /// operates on): adding a built-in vendor means updating both.
 const PROVIDERS: [&str; 4] = ["anthropic", "openai", "gemini", "copilot"];
 
-/// Everything the SCM half needs. Built once by `cp serve`, which already has
-/// all of it in scope — this must never re-resolve credentials itself.
+/// The same enrollment source operator requests and MCP use. Each inventory
+/// sweep pins one snapshot for both repository and issue counts.
 pub struct ScmDeps {
     pub global_dir: std::path::PathBuf,
-    pub resolver: Arc<rupu_auth::resolver::KeychainResolver>,
-    pub repos: Arc<dyn rupu_cp::repos::RepoLister>,
-    pub scm: Arc<rupu_scm::Registry>,
+    pub current: Arc<crate::cp_scm::CurrentScm>,
 }
 
 /// The provider half of the cache, refreshed on [`PROBE_TTL_SECS`].
@@ -184,7 +182,18 @@ impl CpFleetInventory {
             return;
         };
 
-        let repo_entries = match deps.repos.list().await {
+        let snapshot = match deps.current.current().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                // No stale authenticated registry or stale counts after failed
+                // enrollment refresh. The next scheduled sweep can retry.
+                if let Ok(mut cache) = self.scm_cache.write() {
+                    *cache = ScmHalf::default();
+                }
+                return;
+            }
+        };
+        let repo_entries = match snapshot.repos.list().await {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(error = %e, "fleet inventory: repo listing failed; repos unreported");
@@ -201,8 +210,13 @@ impl CpFleetInventory {
         let mut any_repo_unread = false;
         if let Some(entries) = &repo_entries {
             for entry in entries {
-                match count_open_issues(&deps.scm, &entry.platform, &entry.account, &entry.repo)
-                    .await
+                match count_open_issues(
+                    &snapshot.registry,
+                    &entry.platform,
+                    &entry.account,
+                    &entry.repo,
+                )
+                .await
                 {
                     Ok(n) => per_repo.push((n, n >= u64::from(ISSUE_FETCH_CAP))),
                     Err(e) => {
@@ -217,7 +231,7 @@ impl CpFleetInventory {
         // nothing to qualify.
         let issues_capped = issues_open.is_some() && (hit_cap || any_repo_unread);
 
-        let issues_pending = self.derive_pending(deps).await;
+        let issues_pending = self.derive_pending(deps, snapshot.resolver.as_ref()).await;
 
         if let Ok(mut c) = self.scm_cache.write() {
             c.repos = repo_entries.map(|v| v.len() as u64);
@@ -234,7 +248,11 @@ impl CpFleetInventory {
     ///
     /// A second matcher living in the CP could drift from this one, and a
     /// strip that disagrees with the scheduler is worse than no strip.
-    async fn derive_pending(&self, deps: &ScmDeps) -> Option<u64> {
+    async fn derive_pending(
+        &self,
+        deps: &ScmDeps,
+        resolver: &rupu_auth::KeychainResolver,
+    ) -> Option<u64> {
         let repo_store = rupu_workspace::RepoRegistryStore {
             root: deps.global_dir.join("repos"),
         };
@@ -249,11 +267,7 @@ impl CpFleetInventory {
             }
         };
 
-        let matches = match crate::cmd::autoflow::collect_issue_matches(
-            &discovered,
-            deps.resolver.as_ref(),
-        )
-        .await
+        let matches = match crate::cmd::autoflow::collect_issue_matches(&discovered, resolver).await
         {
             Ok(m) => m,
             Err(e) => {

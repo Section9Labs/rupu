@@ -138,11 +138,22 @@ struct ExecuteBody {
     confirm: bool,
 }
 
+async fn current_state(s: &AppState) -> Result<AppState> {
+    crate::repos::snapshot_state(s).await.map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "enrollment_unavailable",
+            "Current SCM enrollment is unavailable",
+        )
+    })
+}
+
 async fn capabilities(
     State(s): State<AppState>,
     Query(q): Query<LocalQuery>,
 ) -> Result<Json<Value>> {
     gate(&s, q.host.as_deref())?;
+    let s = current_state(&s).await?;
     let port = s
         .repos
         .as_ref()
@@ -220,6 +231,8 @@ fn instance_id(s: &AppState) -> Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 async fn prepared(s: &AppState, request: &ForgeRequest) -> Result<PreparedWrite> {
+    let current = current_state(s).await?;
+    let s = &current;
     let owner = match request_owner_id(request)? {
         Some(id) => Some(owner::resolve(s, id).await.map_err(|_| {
             error(
@@ -521,6 +534,7 @@ async fn execute_job(s: AppState, id: String, body: ExecuteBody) -> Result<Value
     };
     let before = ticket.operation().clone();
     let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        let s = current_state(&s).await?;
         let prepared: PreparedWrite = serde_json::from_value(intent.payload).map_err(|_| {
             error(
                 StatusCode::CONFLICT,
