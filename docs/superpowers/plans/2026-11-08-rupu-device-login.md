@@ -17,10 +17,10 @@
 - Every HTTP client in these flows is `rupu_netflow::http::client_with(FlowCtx::system(Origin::System), reqwest::Client::builder(), Arc::new(NullSink))` (matt's ruling: login traffic is outside netflow).
 - Never print or log a pasted code, a device code or a token.
 - Workspace deps only; `#![deny(clippy::all)]`; no new top-level `tests/*.rs` (modules under `tests/it/`, listed in `main.rs`); every env-mutating test is `#[serial]`.
-- Test seams (spec D4): `RUPU_DEVICE_DEVICE_URL_OVERRIDE`, `RUPU_DEVICE_TOKEN_URL_OVERRIDE`, `RUPU_DEVICE_FAST_POLL` (RFC 8628 flows, built-in applications only), `RUPU_OAUTH_TOKEN_URL_OVERRIDE` (paste flows' exchange, built-in applications only), `RUPU_OPENAI_DEVICE_ISSUER_OVERRIDE` (OpenAI issuer). A chosen GitLab application's endpoints are never overridden.
+- Test seams (spec D4): `RUPU_DEVICE_DEVICE_URL_OVERRIDE`, `RUPU_DEVICE_TOKEN_URL_OVERRIDE` (RFC 8628 flows, built-in applications only), `RUPU_DEVICE_FAST_POLL` (RFC 8628 flows, a chosen GitLab application included: it is a sleep seam, not an endpoint), `RUPU_OAUTH_TOKEN_URL_OVERRIDE` (paste flows' exchange, built-in applications only), `RUPU_OPENAI_DEVICE_ISSUER_OVERRIDE` (OpenAI issuer). A chosen GitLab application's endpoints are never overridden: the two URL-override seams never apply to it.
 - Messages, verbatim from the spec:
   - headless refusal (callback.rs): `SSO requires a desktop browser. Run with --mode device to log in from any browser, or --mode api-key.`
-  - no headless flow: `<kind> has no device login; use --mode api-key`
+  - no headless flow: `<kind> has no device login; use --mode api-key` (an `openai-compatible` account is refused earlier, by the pre-existing `openai-compatible providers only support --mode api-key` — the same meaning, for `--mode sso` and `--mode device` alike)
   - GitLab 404: `this GitLab does not offer device login (it needs GitLab 17.9 or later); log in from a desktop with --mode sso, or use --mode api-key with a personal access token`
   - OpenAI 404: `device login is not enabled for this ChatGPT account. Turn it on in ChatGPT settings → Security (a workspace admin does it under workspace permissions), then retry; or log in from a desktop with --mode sso`
   - OpenAI deadline: `device login timed out`

@@ -71,7 +71,7 @@ SSO requires a desktop browser. Run with --mode device to log in from any
 browser, or --mode api-key.
 ```
 
-`--mode device` on a vendor with no headless login (`local`, an `openai-compatible` provider, `linear`, `jira`) refuses with `<kind> has no device login; use --mode api-key`.
+`--mode device` on a vendor with no headless login (`local`, an `openai-compatible` provider, `linear`, `jira`) refuses with `<kind> has no device login; use --mode api-key`. An `openai-compatible` account is refused earlier, by the pre-existing `openai-compatible providers only support --mode api-key` (the same meaning, for `--mode sso` and `--mode device` alike), so it never reaches this refusal.
 
 `rupu auth logout --mode device` means the same slot as `--mode sso` (see below) and is accepted as a spelling of it.
 
@@ -127,7 +127,7 @@ All in `crates/rupu-auth/src/oauth/`, one module per flow, each returning a `Sto
 
 ### D4. Test seams
 
-Every endpoint a flow calls has an override, named like the existing ones and read only by the flow: `RUPU_DEVICE_DEVICE_URL_OVERRIDE` / `RUPU_DEVICE_TOKEN_URL_OVERRIDE` (every RFC 8628 flow, as today) and `RUPU_DEVICE_FAST_POLL`; `RUPU_OAUTH_TOKEN_URL_OVERRIDE` (the paste flows' exchange, as the browser flow); `RUPU_OPENAI_DEVICE_ISSUER_OVERRIDE` (the OpenAI issuer, so the two accounts endpoints and the exchange all point at the mock). A chosen GitLab application's endpoints are never overridden (as today). The pasted code comes from stdin.
+Every endpoint a flow calls has an override, named like the existing ones and read only by the flow: `RUPU_DEVICE_DEVICE_URL_OVERRIDE` / `RUPU_DEVICE_TOKEN_URL_OVERRIDE` (every RFC 8628 flow, as today) and `RUPU_DEVICE_FAST_POLL`; `RUPU_OAUTH_TOKEN_URL_OVERRIDE` (the paste flows' exchange, as the browser flow); `RUPU_OPENAI_DEVICE_ISSUER_OVERRIDE` (the OpenAI issuer, so the two accounts endpoints and the exchange all point at the mock). A chosen GitLab application's endpoints are never overridden (as today): the two URL-override seams (`RUPU_DEVICE_DEVICE_URL_OVERRIDE` / `RUPU_DEVICE_TOKEN_URL_OVERRIDE`) never apply to it, while `RUPU_DEVICE_FAST_POLL` — a sleep seam, not an endpoint — applies to a chosen GitLab application too. The OpenAI flow's in-process tests poll with no wait through `openai_device::Options.interval_override` (`Options::from_env` sets none). The pasted code comes from stdin.
 
 ### D5. Messages
 
