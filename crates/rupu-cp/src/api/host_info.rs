@@ -19,6 +19,7 @@ struct HostInfoResponse {
     /// remote that would silently drop it (see
     /// `HttpHostConnector::require_feature`).
     features: Vec<String>,
+    children_paging_root_types: &'static [&'static str],
 }
 
 async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResponse>> {
@@ -57,6 +58,7 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
 
     Ok(Json(HostInfoResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        children_paging_root_types: super::children::ROOT_TYPES,
         capabilities: HostCapabilities {
             backends: backends_vec,
             scm_hosts: scm_hosts_vec,
@@ -71,6 +73,8 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             features.push("workflow.session_history".to_string());
             features.push(super::session_capabilities::FEATURE.to_string());
             features.push(super::attempt_history::CAPABILITY.to_string());
+            features.push(super::children::CAPABILITY.to_string());
+            features.push(super::transcript::page::CAPABILITY.to_string());
             if s.launcher.is_some() {
                 features.push("workflow.session_attach".to_string());
             }

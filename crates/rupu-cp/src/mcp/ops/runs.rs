@@ -2,7 +2,7 @@
 
 use super::{op, OpSpec};
 use crate::api::{
-    attempt_history, autoflow_runs, board, events, run_streams, runs, source, transcript,
+    attempt_history, autoflow_runs, board, children, events, run_streams, runs, source, transcript,
     transcripts,
 };
 use http::Method;
@@ -117,8 +117,8 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "runs.children",
             Method::GET,
             "/api/runs/:id/children",
-            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns `{children}`, each with its handle, kind, status and tokens.",
-        ),
+            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local owner only (omit host or use local). Without paging arguments returns legacy {children,truncated?}. Supply limit (default 50, clamped 1–200) to capture immutable pages for a canonical recorded run, standalone-agent metadata or session-turn ownership record (including roots without child directories). Optional parent_run_id must be a recorded member of that tree. Continue with next_cursor as cursor and the identical parent filter. Returns {schema_version,root_type,owner_host_id,root_run_id,snapshot,children,next_cursor,snapshot_matching_total,evidence}; history completeness remains unknown. A structured children_root_unsupported code with 501 allows explicit legacy selection for unsupported root evidence; never fall back on 404. A 409 means restart without cursor; 413 means the capture exceeded a bounded source or memory budget, with no partial success. Reads never launch work.",
+        ).query::<children::ChildrenQuery>(),
         op(
             "runs.board",
             Method::GET,

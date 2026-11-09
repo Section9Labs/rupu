@@ -75,6 +75,11 @@ async fn host_info_returns_version_and_capabilities() {
         .and_then(|v| v.as_str())
         .expect("version field should be a string");
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
+    assert!(body["features"]
+        .as_array()
+        .expect("features should be an array")
+        .iter()
+        .any(|feature| feature == "transcript.pages.v1"));
 
     let capabilities = body
         .get("capabilities")

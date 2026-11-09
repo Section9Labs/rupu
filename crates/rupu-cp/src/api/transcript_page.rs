@@ -21,6 +21,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub(crate) const CAPABILITY: &str = "transcript.pages.v1";
+
 const MAX_RECORDS: usize = 200;
 const MAX_LINE_BYTES: usize = 256 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
