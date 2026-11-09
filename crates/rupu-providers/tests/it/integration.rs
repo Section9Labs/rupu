@@ -22,6 +22,7 @@ fn test_full_request_response_type_flow() {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     };
     assert_eq!(request.messages.len(), 1);
     assert_eq!(request.model, "claude-sonnet-4-6");
@@ -69,6 +70,7 @@ fn test_tool_use_flow() {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     };
     assert_eq!(request.tools.len(), 1);
 
@@ -150,6 +152,7 @@ fn test_all_public_types_accessible() {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     };
     let _role = Role::User;
     let _stop = StopReason::EndTurn;

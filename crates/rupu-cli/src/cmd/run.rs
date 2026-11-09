@@ -97,6 +97,12 @@ pub struct Args {
     /// passes its step's resolved profile this way.
     #[arg(long, value_name = "PROFILE", value_parser = parse_findings_profile)]
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
+    /// OpenAI Daybreak `cyber` access program for this run: `standard`,
+    /// `daybreak_blue`, or `daybreak_red`. Overrides the agent's `cyber:`
+    /// frontmatter and the provider model-config default. openai-codex only;
+    /// the org/project must already be approved for the program.
+    #[arg(long, value_name = "PROGRAM", value_parser = parse_cyber)]
+    pub cyber: Option<rupu_providers::types::CyberAccessProgram>,
     /// Engagement profile(s) for this run — the asset domain(s) findings are
     /// validated against (e.g. `network`, `binary`, or a composite like
     /// `pentest`). Repeatable or comma-separated. Empty = the `code` path.
@@ -227,6 +233,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         message_space,
         participant,
         findings_profile,
+        cyber,
         engagement_profiles,
         skills,
         preload_skills,
@@ -273,6 +280,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         ("message-space", message_space.as_ref().map(path)),
         ("participant", participant.clone()),
         ("findings-profile", findings_profile.map(|p| p.to_string())),
+        ("cyber", cyber.map(|c| c.as_wire().to_string())),
         ("skill-bundle", skill_bundle.clone()),
         ("model", model.clone()),
         ("provider", provider.clone()),
@@ -351,6 +359,7 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         message_space,
         participant,
         findings_profile,
+        cyber,
         engagement_profiles,
         skills,
         preload_skills,
@@ -400,6 +409,7 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
             findings_profile,
             recorded.findings_profile,
         ),
+        cyber: pick(given("cyber"), cyber, recorded.cyber),
         engagement_profiles: pick(
             given("engagement_profiles"),
             engagement_profiles,
@@ -423,6 +433,10 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
+    s.parse()
+}
+
+fn parse_cyber(s: &str) -> Result<rupu_providers::types::CyberAccessProgram, String> {
     s.parse()
 }
 
@@ -1416,6 +1430,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                 .as_ref()
                 .map(crate::run_target::format_run_target_for_prompt),
             findings_profile: args.findings_profile,
+            cyber: args.cyber,
             skills: launch_skills.0.clone(),
             preload_skills: launch_skills.1.clone(),
             launch_args,

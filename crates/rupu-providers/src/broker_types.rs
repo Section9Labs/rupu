@@ -74,6 +74,10 @@ impl From<LlmRequestWire> for LlmRequest {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            // The broker wire format carries no provider-specific knobs
+            // (like `anthropic_speed`); cyber is openai-codex-only and not
+            // proxied through the broker.
+            openai_cyber_access: None,
         }
     }
 }
@@ -203,6 +207,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let wire = LlmRequestWire::from(&request);
         assert_eq!(wire.model, request.model);

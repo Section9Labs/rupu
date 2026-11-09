@@ -203,6 +203,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let response = provider.send(&request).await.unwrap();
         assert_eq!(response.text(), Some("Hello"));
@@ -231,6 +232,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let mut events = Vec::new();
         let response = provider
@@ -285,6 +287,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let result = provider.send(&request).await;
         assert!(matches!(

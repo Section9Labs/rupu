@@ -73,6 +73,7 @@ async fn a_configured_provider_builds_a_hop_with_resolved_limits() {
             id: "fallback-model".into(),
             context_window: Some(123_000),
             max_output: Some(4_000),
+            cyber: None,
         }],
     )]);
     let b = builder(ctx);

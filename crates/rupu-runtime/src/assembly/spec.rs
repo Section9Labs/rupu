@@ -60,6 +60,10 @@ pub struct Overrides {
     /// `--model`. A model other than the agent's drops its model-specific
     /// pins ([`super::pins::PinRule`]).
     pub model: Option<String>,
+    /// `rupu run --cyber`: the OpenAI Daybreak `cyber` access program for this
+    /// run. Wins over the agent's `cyber:` frontmatter and a provider
+    /// model-config default (precedence resolved in [`super::RunAssembler::assemble`]).
+    pub cyber: Option<rupu_providers::types::CyberAccessProgram>,
     /// Appended to the agent's system prompt under `## Run target`.
     pub system_prompt_suffix: Option<String>,
     pub max_turns: Option<u32>,

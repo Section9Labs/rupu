@@ -127,6 +127,7 @@ async fn agent_beats_config_beats_live_per_field() {
             id: "claude-a".into(),
             context_window: Some(500_000),
             max_output: None,
+            cyber: None,
         }],
     );
     let (mut p, _) = fake(Ok(vec![("claude-a", 1_000_000, 128_000)]));
@@ -507,11 +508,13 @@ async fn catalog_lists_custom_models_with_unknown_limits_as_none() {
                     id: "claude-pinned".into(),
                     context_window: Some(123_000),
                     max_output: None,
+                    cyber: None,
                 },
                 rupu_config::CustomModel {
                     id: "claude-bare".into(),
                     context_window: None,
                     max_output: None,
+                    cyber: None,
                 },
             ],
             ..Default::default()
@@ -541,6 +544,7 @@ fn custom_ctx(
             id: "claude-a".into(),
             context_window,
             max_output,
+            cyber: None,
         }],
     );
     c
@@ -813,6 +817,7 @@ async fn catalog_fills_a_config_models_unset_limits_from_live() {
             id: "base-model".into(),
             context_window: None,
             max_output: None,
+            cyber: None,
         }],
     )
     .await;
@@ -848,6 +853,7 @@ async fn catalog_merges_config_and_live_per_field() {
         id: "base-model".into(),
         context_window: Some(9000),
         max_output: None,
+        cyber: None,
     }];
     let cat = catalog_of(&cfg, &tmp, Some("oracle")).await.unwrap();
     let m = cat[0].models.iter().find(|m| m.id == "base-model").unwrap();
@@ -1346,6 +1352,7 @@ async fn a_limitless_config_entry_does_not_hide_a_model_missing_from_the_list() 
             id: "claude-zzz".into(),
             context_window: None,
             max_output: None,
+            cyber: None,
         }],
     );
     let (mut p, _) = fake(Ok(vec![("claude-a", 1, 1)]));

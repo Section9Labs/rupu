@@ -70,6 +70,7 @@ Everything after the closing `---` is the system prompt.
 | `anthropicTaskBudget` | integer | no | none | Anthropic-only soft output budget |
 | `anthropicContextManagement` | string | no | none | Anthropic-only context pruning |
 | `anthropicSpeed` | string | no | none | Anthropic-only fast mode |
+| `cyber` | `standard` \| `daybreak_blue` \| `daybreak_red` | no | none | OpenAI Daybreak access program for the `cyber` capability; openai-codex only. See [`cyber`](#cyber) |
 | `outputSchema` | object (inline YAML) | no | none | JSON Schema for Anthropic structured outputs; only takes effect with `outputFormat: json` |
 | `dispatchableAgents` | array\<string\> | no | none (no dispatch) | Allowlist of agent names this agent may start with `dispatch` (kinds `subagent` and `agent`, and the legacy `dispatch_agent` / `dispatch_agents_parallel`) |
 | `dispatchableWorkflows` | array\<string\> | no | none | Allowlist of workflow names this agent may start with `dispatch {kind: workflow}` (and the legacy `run_workflow`) |
@@ -464,6 +465,35 @@ findingsProfile: summary   # lightweight findings; set to full for complete repo
 ```
 
 See `docs/coverage.md` for what a complete report requires. Every field is required except `cwe` (it may be empty) and `artifacts`. `verification` is set by verification runs, not by the reporting agent, and a call that supplies it is rejected.
+
+### `cyber`
+
+Selects OpenAI's [Daybreak](https://developers.openai.com/api/docs/guides/daybreak) access program for the `cyber` capability. openai-codex only — the agent runs on `provider: openai-codex` with a Daybreak-capable model (e.g. `gpt-5.6-cyber`). The value is emitted on the Responses API request body as `access_programs: { cyber: <value> }`.
+
+- `standard` — the ordinary access tier (no cyber program).
+- `daybreak_blue` — the Daybreak defensive program.
+- `daybreak_red` — the Daybreak offensive program.
+
+Setting `cyber` **selects** a program; it does not **grant** access. Your organization and project must already be approved for the program, and the value must match the model (a Sol model takes `daybreak_blue`, a Cyber model takes `daybreak_red`). A mismatch is a hard `invalid_access_program` error from the API — rupu passes the value through and surfaces that error rather than second-guessing the model (OpenAI re-points the program/model mapping as new Daybreak models ship). Other providers ignore the value.
+
+```yaml
+---
+name: exploit-verifier
+provider: openai-codex
+model: gpt-5.6-cyber
+cyber: daybreak_red
+---
+```
+
+**Precedence.** Three surfaces set `cyber`, highest first:
+
+1. `rupu run --cyber <program>` — a per-run override on the command line.
+2. This `cyber:` frontmatter key.
+3. A provider model-config default: a `cyber` on the matching `[[providers.openai-codex.models]]` entry (see [configuration.md](configuration.md#cyber-access-programs)).
+
+A program set at run start follows the run through a model fallback hop only while the model stays the same; a hop to a different model or provider drops it, since the right value is model-specific. A session freezes the program at `session start` and applies it to every turn.
+
+**Remote hosts:** like every frontmatter key, a rupu release that predates `cyber` refuses to load an agent file that sets it, so upgrade rupu on any remote host (`host:` / `distribute:`) before placing a `cyber` agent there.
 
 ### `fallbacks`
 

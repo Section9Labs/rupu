@@ -8,7 +8,9 @@
 
 use rupu_coverage::ConcernsBlock;
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
-use rupu_providers::types::{ContextManagement, OutputFormat, Speed, ThinkingDisplay};
+use rupu_providers::types::{
+    ContextManagement, CyberAccessProgram, OutputFormat, Speed, ThinkingDisplay,
+};
 use rupu_providers::AuthMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -126,6 +128,17 @@ struct Frontmatter {
     /// Ignored by other providers.
     #[serde(default, rename = "anthropicSpeed")]
     anthropic_speed: Option<Speed>,
+    /// OpenAI Daybreak access program for the `cyber` capability. `standard`
+    /// (the default tier), `daybreak_blue` (defensive), or `daybreak_red`
+    /// (offensive). Emitted by the openai-codex provider as the Responses
+    /// API `access_programs: { cyber: <value> }`. The organization/project
+    /// must already be approved for the program, and the value must match
+    /// the model (e.g. a `*-cyber` model takes `daybreak_red`); this only
+    /// selects the program per request. Ignored by every other provider.
+    /// A `rupu run --cyber` flag and a provider model-config default both
+    /// override / back-fill this; see `docs/agent-format.md`.
+    #[serde(default)]
+    cyber: Option<CyberAccessProgram>,
     /// Allowlist of agent names this agent is permitted to dispatch
     /// via the `dispatch_agent` / `dispatch_agents_parallel` tools.
     /// `None` = the agent doesn't dispatch any children (default for
@@ -206,6 +219,10 @@ pub struct AgentSpec {
     pub anthropic_task_budget: Option<u32>,
     pub anthropic_context_management: Option<ContextManagement>,
     pub anthropic_speed: Option<Speed>,
+    /// OpenAI Daybreak `cyber` access program. See the `cyber` frontmatter
+    /// field. Emitted by the openai-codex provider as
+    /// `access_programs: { cyber: <value> }`; ignored by other providers.
+    pub cyber: Option<CyberAccessProgram>,
     /// Reasoning display hint (`thinking.display`). See the `thinkingDisplay`
     /// frontmatter field.
     pub thinking_display: Option<ThinkingDisplay>,
@@ -282,6 +299,7 @@ impl AgentSpec {
             anthropic_task_budget: fm.anthropic_task_budget,
             anthropic_context_management: fm.anthropic_context_management,
             anthropic_speed: fm.anthropic_speed,
+            cyber: fm.cyber,
             thinking_display: fm.thinking_display,
             dispatchable_agents: fm.dispatchable_agents,
             dispatchable_workflows: fm.dispatchable_workflows,
@@ -414,6 +432,23 @@ You are a test agent.
         );
         let s = "---\nname: a\n---\nbody\n";
         assert_eq!(AgentSpec::parse(s).unwrap().findings_profile, None);
+    }
+
+    #[test]
+    fn parses_cyber_access_program() {
+        let s = "---\nname: a\nprovider: openai-codex\nmodel: gpt-5.6-cyber\ncyber: daybreak_red\n---\nbody\n";
+        let spec = AgentSpec::parse(s).unwrap();
+        assert_eq!(spec.cyber, Some(rupu_providers::types::CyberAccessProgram::DaybreakRed));
+
+        let s = "---\nname: a\ncyber: daybreak_blue\n---\nbody\n";
+        assert_eq!(
+            AgentSpec::parse(s).unwrap().cyber,
+            Some(rupu_providers::types::CyberAccessProgram::DaybreakBlue)
+        );
+
+        // Omitted → None; an unknown value is a parse error.
+        assert_eq!(AgentSpec::parse("---\nname: a\n---\nbody\n").unwrap().cyber, None);
+        assert!(AgentSpec::parse("---\nname: a\ncyber: daybreak_rad\n---\nbody\n").is_err());
     }
 
     #[test]

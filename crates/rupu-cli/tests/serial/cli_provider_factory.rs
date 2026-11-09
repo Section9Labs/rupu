@@ -229,6 +229,7 @@ async fn anthropic_factory_oauth_credential_uses_bearer_not_x_api_key() {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     };
 
     let result = provider.send(&request).await;

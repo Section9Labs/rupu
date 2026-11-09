@@ -118,6 +118,8 @@ impl SessionSettings {
             agent.context_window_tokens = None;
             agent.effort = None;
             agent.context_window = None;
+            // Daybreak cyber is openai-codex-only and model-specific.
+            agent.cyber = None;
         }
         if self.provider.is_some() || self.model.is_some() {
             // An override must not quietly fall back to the definition's model.

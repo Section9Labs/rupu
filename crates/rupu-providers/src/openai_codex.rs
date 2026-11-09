@@ -618,6 +618,14 @@ impl OpenAiCodexClient {
             body["text"] = serde_json::json!({ "format": { "type": "json_object" } });
         }
 
+        // OpenAI Daybreak access program (Responses API). When the run pins a
+        // `cyber:` program, select it for this request. The org/project must
+        // already be approved; a mismatched value for the model returns
+        // `invalid_access_program`, which surfaces as a normal API error.
+        if let Some(program) = request.openai_cyber_access {
+            body["access_programs"] = serde_json::json!({ "cyber": program.as_wire() });
+        }
+
         body
     }
 
@@ -1882,11 +1890,52 @@ mod tool_name_sanitize_tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&req, false);
         let tools = body["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "scm__dot__repos__dot__list_owned");
+    }
+
+    #[test]
+    fn build_request_body_emits_cyber_access_program() {
+        let creds = AuthCredentials::ApiKey {
+            key: "sk-test".into(),
+        };
+        let client =
+            OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).expect("new");
+
+        // Unset → no access_programs object at all.
+        let plain = LlmRequest {
+            model: "gpt-5.6-cyber".into(),
+            messages: vec![Message::user("hi")],
+            ..Default::default()
+        };
+        let body = client.build_request_body(&plain, false);
+        assert!(
+            body.get("access_programs").is_none(),
+            "no access_programs when cyber is unset"
+        );
+
+        // Set → access_programs.cyber carries the wire token.
+        let red = LlmRequest {
+            model: "gpt-5.6-cyber".into(),
+            messages: vec![Message::user("hi")],
+            openai_cyber_access: Some(CyberAccessProgram::DaybreakRed),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&red, false);
+        assert_eq!(body["access_programs"]["cyber"], "daybreak_red");
+
+        let blue = LlmRequest {
+            model: "gpt-6-sol".into(),
+            messages: vec![Message::user("hi")],
+            openai_cyber_access: Some(CyberAccessProgram::DaybreakBlue),
+            ..Default::default()
+        };
+        let body = client.build_request_body(&blue, false);
+        assert_eq!(body["access_programs"]["cyber"], "daybreak_blue");
     }
 }
 
@@ -1921,6 +1970,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, true);
@@ -1962,6 +2012,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -1998,6 +2049,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2031,6 +2083,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2496,6 +2549,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2534,6 +2588,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2571,6 +2626,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, false);
@@ -2627,6 +2683,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request, true);

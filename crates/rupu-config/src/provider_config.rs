@@ -47,6 +47,14 @@ pub struct CustomModel {
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<u32>,
+    /// OpenAI Daybreak `cyber` access program to default for this model:
+    /// `standard`, `daybreak_blue`, or `daybreak_red`. openai-codex only — a
+    /// run of this model emits `access_programs: { cyber: <value> }` unless an
+    /// agent's `cyber:` frontmatter or `rupu run --cyber` overrides it. Stored
+    /// as a string because rupu-config is a leaf crate; the run assembler
+    /// parses it and ignores an unknown token with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cyber: Option<String>,
 }
 
 #[cfg(test)]
@@ -71,6 +79,17 @@ max_output = 8192
         assert_eq!(cfg.stream, Some(true));
         assert_eq!(cfg.base_url.as_deref(), Some("http://192.29.35.246:8080"));
         assert_eq!(cfg.models.len(), 1);
+    }
+
+    #[test]
+    fn custom_model_cyber_round_trips_and_is_omitted_when_unset() {
+        let toml = "[[models]]\nid = \"gpt-5.6-cyber\"\ncyber = \"daybreak_red\"\n";
+        let cfg: ProviderConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.models[0].cyber.as_deref(), Some("daybreak_red"));
+        // Round-trips, and a model without `cyber` omits it.
+        let plain: ProviderConfig = toml::from_str("[[models]]\nid = \"gpt-5\"\n").unwrap();
+        assert_eq!(plain.models[0].cyber, None);
+        assert!(!toml::to_string(&plain).unwrap().contains("cyber"));
     }
 
     #[test]

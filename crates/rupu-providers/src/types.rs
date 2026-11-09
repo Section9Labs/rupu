@@ -328,6 +328,63 @@ pub struct LlmRequest {
     /// honors it, and only on the adaptive paths; other providers and the
     /// fixed `budget_tokens` path ignore it. See [`ThinkingDisplay`].
     pub thinking_display: Option<ThinkingDisplay>,
+    /// OpenAI Daybreak "cyber" access program (Responses API). When set,
+    /// the Codex client emits `access_programs: { cyber: <value> }` on the
+    /// request body. The organization/project must already be approved for
+    /// the program; this only *selects* it per request, it does not grant
+    /// access, and the value must match the model (e.g. a `daybreak_red`
+    /// value against a `*-sol` model returns `invalid_access_program`).
+    /// `None` sends no `access_programs` object (the account default
+    /// applies). Ignored by every other provider.
+    pub openai_cyber_access: Option<CyberAccessProgram>,
+}
+
+/// OpenAI Daybreak "cyber" access program (`access_programs.cyber` on the
+/// Responses API). Selects which program a request runs under — it does not
+/// grant access, so the organization/project must already be approved. See
+/// <https://developers.openai.com/api/docs/guides/daybreak>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CyberAccessProgram {
+    /// No cyber program — the ordinary access tier.
+    Standard,
+    /// The Daybreak "blue" (defensive) program.
+    DaybreakBlue,
+    /// The Daybreak "red" (offensive) program.
+    DaybreakRed,
+}
+
+impl CyberAccessProgram {
+    /// The wire / frontmatter / config / CLI token: `standard`,
+    /// `daybreak_blue`, or `daybreak_red`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::DaybreakBlue => "daybreak_blue",
+            Self::DaybreakRed => "daybreak_red",
+        }
+    }
+}
+
+impl std::fmt::Display for CyberAccessProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire())
+    }
+}
+
+impl std::str::FromStr for CyberAccessProgram {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standard" => Ok(Self::Standard),
+            "daybreak_blue" => Ok(Self::DaybreakBlue),
+            "daybreak_red" => Ok(Self::DaybreakRed),
+            other => Err(format!(
+                "unknown cyber access program {other:?}: expected `standard`, `daybreak_blue`, or `daybreak_red`"
+            )),
+        }
+    }
 }
 
 /// Output-format hint passed to providers that support structured
