@@ -123,9 +123,13 @@ async fn pending_replies_are_polled_until_approval() {
     let pending = pending_poll_mock(&server);
 
     let login = tokio::spawn(run_with(fast_options(&server)));
-    while pending.hits_async().await < 2 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pending.hits_async().await < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two pending polls");
     let pending_hits = pending.hits_async().await;
     pending.delete_async().await;
     let approved = approved_poll_mock(&server);
@@ -152,9 +156,13 @@ async fn a_404_poll_is_pending_too() {
     });
 
     let login = tokio::spawn(run_with(fast_options(&server)));
-    while pending.hits_async().await < 2 {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pending.hits_async().await < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two pending polls");
     pending.delete_async().await;
     let approved = approved_poll_mock(&server);
 

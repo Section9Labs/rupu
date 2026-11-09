@@ -79,8 +79,10 @@ pub enum Action {
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum AuthModeArg {
+    /// an API key from the vendor's console
     #[clap(name = "api-key")]
     ApiKey,
+    /// log in in a browser on this machine
     Sso,
     /// log in from a browser on another machine
     Device,

@@ -124,8 +124,14 @@ async fn a_gitlab_device_login_uses_the_chosen_application_and_records_it() {
         then.status(200).json_body(gitlab_token_body());
     });
 
+    // A chosen client's endpoints are never overridden: bogus overrides
+    // must not redirect the flow away from the mock.
+    std::env::set_var("RUPU_DEVICE_DEVICE_URL_OVERRIDE", "http://127.0.0.1:9/nope");
+    std::env::set_var("RUPU_DEVICE_TOKEN_URL_OVERRIDE", "http://127.0.0.1:9/nope");
     std::env::set_var("RUPU_DEVICE_FAST_POLL", "1");
     let result = device::run_with_client(ProviderId::Gitlab, Some(corp_app(&server))).await;
+    std::env::remove_var("RUPU_DEVICE_DEVICE_URL_OVERRIDE");
+    std::env::remove_var("RUPU_DEVICE_TOKEN_URL_OVERRIDE");
     std::env::remove_var("RUPU_DEVICE_FAST_POLL");
     let stored = result.expect("flow ok");
 
