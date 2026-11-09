@@ -194,7 +194,10 @@ impl BoundTool {
         &self.definition.name
     }
     pub fn description(&self) -> &str {
-        &self.definition.description
+        match &self.body {
+            Body::Builtin(tool) => tool.description(),
+            Body::Owned(_) => &self.definition.description,
+        }
     }
     pub fn input_schema(&self) -> Value {
         match &self.body {
