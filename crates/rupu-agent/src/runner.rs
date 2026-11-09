@@ -463,6 +463,9 @@ pub async fn compact_messages(
         // pay the 1.25× cache-write premium (spec 2026-09-29 §9).
         disable_prompt_cache: true,
         thinking_display: None,
+        // The summariser never needs a Daybreak cyber program (and shouldn't
+        // pay its premium rate); the turn requests carry it, not this one.
+        openai_cyber_access: None,
     };
 
     // The summariser is an LLM call: none once SIGTERM has arrived. Checked
@@ -1300,6 +1303,7 @@ struct OriginPins {
     anthropic_speed: Option<rupu_providers::types::Speed>,
     anthropic_task_budget: Option<u32>,
     anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
+    openai_cyber: Option<rupu_providers::types::CyberAccessProgram>,
 }
 
 impl OriginPins {
@@ -1310,6 +1314,7 @@ impl OriginPins {
             anthropic_speed: opts.pins.anthropic_speed,
             anthropic_task_budget: opts.pins.anthropic_task_budget,
             anthropic_context_management: opts.pins.anthropic_context_management,
+            openai_cyber: opts.pins.openai_cyber,
         }
     }
 
@@ -1320,6 +1325,7 @@ impl OriginPins {
         opts.pins.anthropic_speed = self.anthropic_speed.filter(|_| same);
         opts.pins.anthropic_task_budget = self.anthropic_task_budget.filter(|_| same);
         opts.pins.anthropic_context_management = self.anthropic_context_management.filter(|_| same);
+        opts.pins.openai_cyber = self.openai_cyber.filter(|_| same);
     }
 }
 
@@ -1610,6 +1616,11 @@ pub struct AgentPins {
     pub anthropic_context_management: Option<rupu_providers::types::ContextManagement>,
     /// Anthropic-only fast-mode toggle (account-gated).
     pub anthropic_speed: Option<rupu_providers::types::Speed>,
+    /// OpenAI Daybreak `cyber` access program (openai-codex only). Emitted as
+    /// the Responses API `access_programs: { cyber: <value> }`. Model-specific
+    /// (the right value depends on the model), so a fallback hop onto another
+    /// model drops it. Ignored by other providers.
+    pub openai_cyber: Option<rupu_providers::types::CyberAccessProgram>,
 }
 
 /// How a run's reply streams are shown.
@@ -2432,6 +2443,7 @@ async fn run_agent_inner(
                 anthropic_speed: opts.pins.anthropic_speed,
                 disable_prompt_cache: false,
                 thinking_display: opts.pins.thinking_display,
+                openai_cyber_access: opts.pins.openai_cyber,
             };
             let mut trim_attempts = 0u32;
             // Compact-on-overflow runs at most once per turn (spec §7); a
@@ -2846,6 +2858,7 @@ async fn run_agent_inner(
                             req.anthropic_task_budget = opts.pins.anthropic_task_budget;
                             req.anthropic_context_management =
                                 opts.pins.anthropic_context_management;
+                            req.openai_cyber_access = opts.pins.openai_cyber;
                             if messages_changed {
                                 req.messages = messages.clone();
                             }

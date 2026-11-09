@@ -149,7 +149,25 @@ An agent's `provider:` names the account. Full narrative reference:
 | `max_concurrency` | integer                  | anthropic `4`, openai `8`, gemini `4`, copilot `4`; `0` treated as unset |
 | `prompt_cache`    | bool                     | `true` (Anthropic only; `false` for gateways that reject `cache_control` — gateway routing is process-wide today, see [providers.md](providers.md#field-reference); agent `anthropicPromptCache` overrides) |
 | `default_model`   | string                   | none — the agent must set `model:` or rely on this      |
-| `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (input-token limit) and `max_output` (both optional; when omitted, or `0`, the limit is discovered from the provider's model list, else unknown — see [providers.md](providers.md#model-limits)) |
+| `models`          | array\<table\>           | `[]` — each entry: `id` (required), `context_window` (input-token limit), `max_output` (both optional; when omitted, or `0`, the limit is discovered from the provider's model list, else unknown — see [providers.md](providers.md#model-limits)), and `cyber` (optional OpenAI Daybreak program for that model — see [below](#cyber-access-programs)) |
+
+### `cyber` access programs
+
+On an `openai-codex` account, a `[[providers.openai-codex.models]]` entry may set
+`cyber` to default OpenAI's [Daybreak](https://developers.openai.com/api/docs/guides/daybreak)
+access program for that model — `standard`, `daybreak_blue`, or `daybreak_red`.
+A run of the matching model then emits the Responses API
+`access_programs: { cyber: <value> }` unless an agent's [`cyber:` frontmatter](agent-format.md#cyber)
+or [`rupu run --cyber`](agent-format.md#cyber) overrides it (precedence: flag →
+frontmatter → this config default). The organization/project must already be
+approved for the program, and the value must match the model; an unknown token
+here is ignored with a warning. Ignored by every other provider.
+
+```toml
+[[providers.openai-codex.models]]
+id = "gpt-5.6-cyber"
+cyber = "daybreak_red"
+```
 
 An `openai-compatible` entry additionally requires `base_url` and `default_model`
 (validated at load time), and may not reuse a reserved built-in provider name

@@ -11,7 +11,8 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use rupu_providers::model_tier::{ContextWindow, ThinkingLevel};
 use rupu_providers::types::{
-    ContextManagement, Message, OutputFormat as ProviderOutputFormat, Speed, ThinkingDisplay,
+    ContextManagement, CyberAccessProgram, Message, OutputFormat as ProviderOutputFormat, Speed,
+    ThinkingDisplay,
 };
 use rupu_providers::AuthMode;
 use rupu_transcript::RunStatus;
@@ -132,6 +133,11 @@ pub struct SessionRecord {
     pub anthropic_context_management: Option<ContextManagement>,
     #[serde(default)]
     pub anthropic_speed: Option<Speed>,
+    /// OpenAI Daybreak `cyber` access program frozen from the agent at
+    /// session start (openai-codex only). Each turn rebuilds the agent spec
+    /// with it, so every turn runs under the same program.
+    #[serde(default)]
+    pub cyber: Option<CyberAccessProgram>,
     #[serde(default)]
     pub dispatchable_agents: Option<Vec<String>>,
     #[serde(default)]

@@ -11,6 +11,7 @@ use clap::Parser as _;
 use rupu_cli::cmd::{self, run::RunAction};
 use rupu_cli::{Cli, Cmd};
 use rupu_coverage::FindingProfile;
+use rupu_providers::types::CyberAccessProgram;
 use rupu_runtime::argv::{
     AgentRun, AgentiflowRun, AutoflowRun, FlowAttach, LaunchLink, LaunchMessaging, MessageSpace,
     RunArgv, SessionCompact, SessionSend, SessionStart, SessionWorker, WorkflowControl,
@@ -134,6 +135,12 @@ fn agent_runs() -> Vec<RunArgv> {
                 "a".repeat(64)
             ));
         }
+        r.cyber = match mask % 4 {
+            1 => Some(CyberAccessProgram::Standard),
+            2 => Some(CyberAccessProgram::DaybreakBlue),
+            3 => Some(CyberAccessProgram::DaybreakRed),
+            _ => None,
+        };
         r.messaging = messagings()[(mask as usize >> 9) % 4].clone();
         r.prompt = match mask as usize % (PROMPTS.len() + 1) {
             0 => None,
@@ -459,6 +466,7 @@ fn back(cli: Cli) -> RunArgv {
                 mode: mode(a.mode),
                 prompt: a.prompt_flag,
                 findings_profile: a.findings_profile,
+                cyber: a.cyber,
                 engagement_profiles: a.engagement_profiles,
                 skills: a.skills,
                 preload_skills: a.preload_skills,

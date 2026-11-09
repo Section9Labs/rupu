@@ -111,6 +111,7 @@ async fn a_factory_client_refresh_counts_as_one_tracked_write() {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     };
     // The message itself 404s; the refresh before it is what matters.
     let send = tokio::spawn(async move { provider.send(&request).await });

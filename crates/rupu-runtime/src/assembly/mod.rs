@@ -347,6 +347,36 @@ pub struct RunAssembler {
 }
 
 /// A run's `[bash]` settings from the layered config.
+/// The provider model-config default for OpenAI's Daybreak `cyber` access
+/// program: the `cyber` of the `[[providers.<provider>.models]]` entry whose
+/// `id` matches this run's model. An unknown token is ignored with a warning
+/// (rupu-config is a leaf crate, so the value is stored and validated here).
+fn config_model_cyber(
+    providers: &BTreeMap<String, rupu_config::ProviderConfig>,
+    provider_name: &str,
+    model: &str,
+) -> Option<rupu_providers::types::CyberAccessProgram> {
+    let raw = providers
+        .get(provider_name)?
+        .models
+        .iter()
+        .find(|m| m.id == model)?
+        .cyber
+        .as_deref()?;
+    match raw.parse() {
+        Ok(program) => Some(program),
+        Err(e) => {
+            tracing::warn!(
+                provider = provider_name,
+                model,
+                value = raw,
+                "ignoring invalid cyber access program in provider model config: {e}"
+            );
+            None
+        }
+    }
+}
+
 fn bash_config(config: &rupu_config::Config) -> BashConfig {
     BashConfig {
         env_allowlist: config.bash.env_allowlist.clone().unwrap_or_default(),
@@ -673,7 +703,7 @@ impl RunAssembler {
             provider_name,
             model,
             mut provider,
-            pin: pins,
+            pin: mut pins,
             limits: known_limits,
         } = match prepared {
             Ok(p) => p,
@@ -684,6 +714,16 @@ impl RunAssembler {
                 return Err(e);
             }
         };
+        // OpenAI Daybreak `cyber` precedence: `rupu run --cyber` (override) >
+        // the agent's `cyber:` frontmatter (already on the pin, dropped by
+        // PinRule on a cross-provider/model hop) > the provider model-config
+        // default. A pin set at run start follows the run's hops via the
+        // runner's `OriginPins` (same-model filter).
+        pins.pins.openai_cyber = spec
+            .overrides
+            .cyber
+            .or(pins.pins.openai_cyber)
+            .or_else(|| config_model_cyber(self.providers(), &provider_name, &model));
         let agent = &spec.agent;
         let settings = AgentProviderSettings {
             oauth_prefix: agent.anthropic_oauth_prefix,
@@ -1442,5 +1482,46 @@ fn chain_usage(a: Option<OnUsageCallback>, b: Option<OnUsageCallback>) -> Option
             b(u);
         })),
         (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod cyber_config_tests {
+    use super::config_model_cyber;
+    use rupu_providers::types::CyberAccessProgram;
+    use std::collections::BTreeMap;
+
+    fn providers(id: &str, cyber: Option<&str>) -> BTreeMap<String, rupu_config::ProviderConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "openai-codex".to_string(),
+            rupu_config::ProviderConfig {
+                models: vec![rupu_config::CustomModel {
+                    id: id.to_string(),
+                    cyber: cyber.map(str::to_string),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn reads_model_default_and_ignores_unknowns() {
+        let p = providers("gpt-5.6-cyber", Some("daybreak_red"));
+        assert_eq!(
+            config_model_cyber(&p, "openai-codex", "gpt-5.6-cyber"),
+            Some(CyberAccessProgram::DaybreakRed)
+        );
+        // Wrong model id, wrong provider, no entry → None.
+        assert_eq!(config_model_cyber(&p, "openai-codex", "gpt-5"), None);
+        assert_eq!(config_model_cyber(&p, "anthropic", "gpt-5.6-cyber"), None);
+        // An invalid token is ignored (logged), not a panic.
+        let bad = providers("gpt-5.6-cyber", Some("daybreak_rad"));
+        assert_eq!(config_model_cyber(&bad, "openai-codex", "gpt-5.6-cyber"), None);
+        // No cyber configured → None.
+        let none = providers("gpt-5.6-cyber", None);
+        assert_eq!(config_model_cyber(&none, "openai-codex", "gpt-5.6-cyber"), None);
     }
 }

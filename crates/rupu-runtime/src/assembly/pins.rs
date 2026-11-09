@@ -12,7 +12,8 @@ use crate::model_limits::LimitOverrides;
 /// `anthropicContextManagement` (each exists only on some models — the rule
 /// a fallback hop follows; `effort` and `thinkingDisplay` are
 /// provider-generic and stay); a provider other than the agent's drops its
-/// `auth:`.
+/// `auth:`, and the openai-codex-only `cyber` program drops on either a
+/// different provider or a different model.
 #[derive(Debug, Clone, Default)]
 pub struct PinRule {
     pub pins: AgentPins,
@@ -34,6 +35,10 @@ impl PinRule {
                     .anthropic_context_management
                     .filter(|_| !other_model),
                 anthropic_speed: spec.anthropic_speed.filter(|_| !other_model),
+                // Daybreak `cyber` is openai-codex only (drop on another
+                // provider) and its value is model-specific (drop on another
+                // model) — a mismatched program is a hard `invalid_access_program`.
+                openai_cyber: spec.cyber.filter(|_| !other_model && !other_provider),
             },
             limits: if other_model {
                 LimitOverrides::default()
@@ -103,5 +108,25 @@ mod tests {
         );
         assert_eq!(other_provider.pins.anthropic_task_budget, Some(40_000));
         assert!(other_provider.pins.anthropic_context_management.is_some());
+    }
+
+    #[test]
+    fn cyber_pin_drops_on_any_provider_or_model_hop() {
+        let spec = rupu_agent::AgentSpec::parse(
+            "---\nname: cyber\nprovider: openai-codex\nmodel: gpt-5.6-cyber\n\
+             cyber: daybreak_red\n---\nhi\n",
+        )
+        .unwrap();
+
+        let own = PinRule::for_run(&spec, false, false);
+        assert_eq!(
+            own.pins.openai_cyber,
+            Some(rupu_providers::types::CyberAccessProgram::DaybreakRed)
+        );
+
+        // Daybreak is openai-codex only: another provider drops it.
+        assert_eq!(PinRule::for_run(&spec, true, false).pins.openai_cyber, None);
+        // Its value is model-specific: another model drops it.
+        assert_eq!(PinRule::for_run(&spec, false, true).pins.openai_cyber, None);
     }
 }

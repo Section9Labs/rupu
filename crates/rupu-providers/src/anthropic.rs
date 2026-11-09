@@ -3615,6 +3615,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -3725,6 +3726,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -3751,6 +3753,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["model"], "claude-sonnet-4-6");
@@ -3804,6 +3807,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, true);
         // Prompt caching is on by default: the (last) system block carries
@@ -3856,6 +3860,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         // `betas` belongs in the `anthropic-beta` header only — including it
@@ -3893,6 +3898,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(
@@ -3926,6 +3932,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -3958,6 +3965,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         let user_id = body["metadata"]["user_id"]
@@ -3989,6 +3997,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         }
     }
 
@@ -4060,6 +4069,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4090,6 +4100,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -4121,6 +4132,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -4152,6 +4164,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(
@@ -4192,6 +4205,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         }
     }
 
@@ -4473,6 +4487,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4500,6 +4515,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4527,6 +4543,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none());
@@ -4553,6 +4570,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(body.get("thinking").is_none()); // Minimal = skip
@@ -4579,6 +4597,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -4606,6 +4625,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
@@ -4689,6 +4709,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = client.build_request_body(&request, false);
         assert!(

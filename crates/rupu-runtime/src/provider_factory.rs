@@ -869,6 +869,7 @@ mod tests {
                     id: "/raid/models/zai-org/GLM-5.2-FP8".into(),
                     context_window: Some(131072),
                     max_output: Some(8192),
+                    cyber: None,
                 }],
                 ..Default::default()
             },
@@ -1216,6 +1217,7 @@ mod tests {
                     id: "m".into(),
                     context_window: None,
                     max_output: None,
+                    cyber: None,
                 }],
                 ..Default::default()
             },
@@ -1459,6 +1461,7 @@ mod decorate_kind_tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         }
     }
 

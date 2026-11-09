@@ -1238,6 +1238,7 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         run_id: None,
         codename: None,
         findings_profile: None,
+        cyber: None,
         // Rerun uses the code path unless/until the run manifest records the
         // engagement selection (follow-on); it never silently guesses one.
         engagement_profiles: Vec::new(),

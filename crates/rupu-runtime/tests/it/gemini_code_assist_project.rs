@@ -86,6 +86,7 @@ fn request() -> LlmRequest {
         anthropic_speed: None,
         disable_prompt_cache: false,
         thinking_display: None,
+        openai_cyber_access: None,
     }
 }
 

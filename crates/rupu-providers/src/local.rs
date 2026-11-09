@@ -350,6 +350,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = provider.build_openai_request(&request);
         assert_eq!(body["model"], "phi-local");
@@ -420,6 +421,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let body = provider.build_openai_request(&request);
         let messages = body["messages"]

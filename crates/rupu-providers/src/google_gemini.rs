@@ -1766,6 +1766,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let dropped =
             tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
@@ -1832,6 +1833,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
         let dropped =
             tokio::time::timeout(std::time::Duration::from_millis(50), client.send(&request)).await;
@@ -1941,6 +1943,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2018,6 +2021,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2056,6 +2060,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2094,6 +2099,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2136,6 +2142,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2175,6 +2182,7 @@ mod tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         };
 
         let body = client.build_request_body(&request);
@@ -2226,6 +2234,7 @@ mod tests {
                     anthropic_speed: None,
                     disable_prompt_cache: false,
                     thinking_display: None,
+                    openai_cyber_access: None,
                 };
                 let body = client.build_request_body(&request);
                 let config = &body["request"]["generationConfig"]["thinkingConfig"];
@@ -3377,6 +3386,7 @@ mod tests {
                 anthropic_speed: None,
                 disable_prompt_cache: false,
                 thinking_display: None,
+                openai_cyber_access: None,
             };
             let body = client.build_request_body(&request);
             let config = &body["request"]["generationConfig"]["thinkingConfig"];
@@ -3942,6 +3952,7 @@ mod code_assist_project_tests {
             anthropic_speed: None,
             disable_prompt_cache: false,
             thinking_display: None,
+            openai_cyber_access: None,
         }
     }
 

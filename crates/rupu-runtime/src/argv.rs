@@ -15,6 +15,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use rupu_coverage::FindingProfile;
+use rupu_providers::types::CyberAccessProgram;
 use rupu_tools::PermissionMode;
 
 /// Host feature: this build's `rupu run` takes the hidden `--codename` flag.
@@ -73,6 +74,10 @@ pub struct AgentRun {
     pub mode: Option<PermissionMode>,
     pub prompt: Option<String>,
     pub findings_profile: Option<FindingProfile>,
+    /// `--cyber`: the OpenAI Daybreak `cyber` access program for this run,
+    /// over the agent's `cyber:` frontmatter and the provider model-config
+    /// default. openai-codex only.
+    pub cyber: Option<CyberAccessProgram>,
     pub engagement_profiles: Vec<String>,
     /// `--skill`, repeated: a workflow step's `skills:`.
     pub skills: Vec<String>,
@@ -116,6 +121,7 @@ impl AgentRun {
             mode: None,
             prompt: None,
             findings_profile: None,
+            cyber: None,
             engagement_profiles: Vec::new(),
             skills: Vec::new(),
             preload_skills: Vec::new(),
@@ -499,6 +505,7 @@ impl RunArgv {
                     "--findings-profile",
                     r.findings_profile.map(FindingProfile::as_str),
                 );
+                a.opt_flag_value("--cyber", r.cyber.map(CyberAccessProgram::as_wire));
                 for id in &r.engagement_profiles {
                     a.flag_value("--engagement-profile", id);
                 }
