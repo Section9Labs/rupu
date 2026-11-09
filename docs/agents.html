@@ -1,0 +1,759 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Agents</title>
+<meta name="description" content="An agent in rupu is a single AI worker: a Markdown file with YAML frontmatter for config and a body that becomes the system prompt.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item active" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Agents</h1>
+    <p class="intro">An agent is a single AI worker — one Markdown file whose YAML frontmatter configures it and whose body becomes its system prompt.</p>
+
+    <h2>What is an agent</h2>
+    <p>
+      An <strong>agent</strong> is the smallest unit of work in rupu: a narrow, single-purpose AI worker.
+      Each agent lives in one Markdown file. The file has two parts — a block of YAML
+      <strong>frontmatter</strong> that tells rupu how to run the agent (which provider, which model,
+      which tools, what it is allowed to do), and a Markdown <strong>body</strong> that is sent verbatim
+      to the model as its system prompt.
+    </p>
+    <p>
+      Good agents are narrow, explicit, and testable. A well-scoped agent answers six questions clearly:
+      what job it owns, what tools it may use, what sequence it should follow, what counts as done,
+      what it must not do, and what shape the final answer should take. When several specialists, review
+      boundaries, or fix loops are involved, reach for a <a class="link" href="/docs/workflows.html">workflow</a>
+      instead of one giant prompt.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 640 200" role="img" aria-label="Anatomy of an agent file">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <rect class="d-box" x="20" y="20" width="250" height="56" rx="10"></rect>
+        <text class="d-label" x="145" y="42" text-anchor="middle">YAML frontmatter</text>
+        <text class="d-sub" x="145" y="60" text-anchor="middle">provider · model · tools · permissions</text>
+        <rect class="d-box" x="20" y="124" width="250" height="56" rx="10"></rect>
+        <text class="d-label" x="145" y="146" text-anchor="middle">system prompt</text>
+        <text class="d-sub" x="145" y="164" text-anchor="middle">the Markdown body</text>
+        <line class="d-edge" x1="270" y1="48" x2="430" y2="92" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="270" y1="152" x2="430" y2="108" marker-end="url(#ar)"></line>
+        <rect class="d-box-accent" x="430" y="72" width="190" height="56" rx="10"></rect>
+        <text class="d-label" x="525" y="94" text-anchor="middle">an agent</text>
+        <text class="d-sub" x="525" y="112" text-anchor="middle">rupu run &lt;name&gt;</text>
+      </svg>
+      <figcaption>Config plus a system prompt is everything an agent is.</figcaption>
+    </figure>
+
+    <h2>The agent file</h2>
+    <p>
+      An agent is a Markdown file with YAML frontmatter. The frontmatter (between the opening and closing
+      <code class="inline">---</code> lines) tells rupu how to run the agent; everything after the closing
+      <code class="inline">---</code> is the system prompt. rupu parses the frontmatter with
+      <strong>strict unknown-field rejection</strong> — a misspelled key fails fast rather than being silently ignored.
+      A rupu release older than a field also refuses an agent that sets it, so upgrade remote hosts before adding
+      new keys to agents they run.
+    </p>
+    <p>Agent files resolve from two locations:</p>
+    <ul>
+      <li><code class="inline">~/.rupu/agents/&lt;name&gt;.md</code> — global agents (personal utilities).</li>
+      <li><code class="inline">&lt;project&gt;/.rupu/agents/&lt;name&gt;.md</code> — project-local agents (checked into the repo).</li>
+    </ul>
+    <p>
+      Project-local agents <strong>shadow</strong> global agents by <code class="inline">name:</code>. Shadowing
+      is all-or-nothing — rupu does not merge frontmatter or prompts. <code class="inline">rupu agent list</code>
+      shows whether each agent comes from project or global scope, and
+      <code class="inline">rupu agent validate &lt;name&gt;</code> / <code class="inline">--all</code> checks that an
+      agent file parses, names only tools rupu knows and only skills that are installed.
+    </p>
+
+    <h3>Frontmatter fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>string</td><td>required</td><td>Agent identifier used by <code class="inline">rupu run &lt;name&gt;</code> and by workflows. Lowercase, hyphen-separated.</td></tr>
+        <tr><td><code>description</code></td><td>string</td><td>none</td><td>Human-readable summary shown by <code class="inline">rupu agent list</code>.</td></tr>
+        <tr><td><code>provider</code></td><td>string</td><td><code>anthropic</code></td><td>Which LLM provider (account) to use. Canonical names: <code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>.</td></tr>
+        <tr><td><code>auth</code></td><td><code>api-key</code> | <code>sso</code></td><td>resolver chooses (SSO preferred when both exist)</td><td>Optional auth-mode hint when a provider has both credentials.</td></tr>
+        <tr><td><code>model</code></td><td>string</td><td>config <code>default_model</code>, else <code>claude-sonnet-4-6</code></td><td>Provider-specific model id. Not validated at parse time; an invalid id fails at runtime.</td></tr>
+        <tr><td><code>tools</code></td><td>array&lt;string&gt;</td><td>the default grant (below)</td><td>The agent's tool grant: what its model may call. See <a class="link" href="#tools-grant">Tools &amp; permissions</a>.</td></tr>
+        <tr><td><code>maxTurns</code></td><td>integer</td><td><code>50</code></td><td>Hard cap on model turns (not a token budget).</td></tr>
+        <tr><td><code>permissionMode</code></td><td><code>ask</code> | <code>bypass</code> | <code>readonly</code></td><td><code>ask</code></td><td>Permission model, decided per tool call from the tool's effect. CLI <code class="inline">--mode</code> overrides it.</td></tr>
+        <tr><td><code>dispatchableAgents</code></td><td>array&lt;string&gt;</td><td>none (no dispatch)</td><td>Allowlist of agent names this agent may start with <code class="inline">dispatch</code> (kinds <code class="inline">subagent</code> and <code class="inline">agent</code>, and the legacy <code class="inline">dispatch_agent</code> / <code class="inline">dispatch_agents_parallel</code>).</td></tr>
+        <tr><td><code>dispatchableWorkflows</code></td><td>array&lt;string&gt;</td><td>none</td><td>Allowlist of workflow names this agent may start with <code class="inline">dispatch {kind: workflow}</code> (and the legacy <code class="inline">run_workflow</code>).</td></tr>
+        <tr><td><code>messaging</code></td><td>bool</td><td><code>true</code></td><td><code class="inline">false</code> turns the messaging tools (<code class="inline">board.*</code>, <code class="inline">msg.send</code>) off for this agent wherever it runs. See <a class="link" href="#messaging">Messaging</a>.</td></tr>
+        <tr><td><code>skills</code></td><td>array&lt;string&gt;</td><td>none</td><td>Skills the model may load with <code class="inline">skills.load</code>. See <a class="link" href="#skills">Skills</a>.</td></tr>
+        <tr><td><code>preloadSkills</code></td><td>array&lt;string&gt;</td><td>none</td><td>Skills whose whole body goes into the system prompt; implies granted.</td></tr>
+        <tr><td><code>effort</code></td><td>string</td><td>provider default</td><td>Cross-provider reasoning level: <code class="inline">auto</code>, <code class="inline">minimal</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, <code class="inline">max</code>.</td></tr>
+        <tr><td><code>thinkingDisplay</code></td><td><code>summarized</code> | <code>omitted</code> | <code>updates</code></td><td><code>summarized</code></td><td>Reasoning-display hint; honored by Anthropic adaptive models only.</td></tr>
+        <tr><td><code>contextWindow</code></td><td>string</td><td>model default</td><td>Cross-provider context tier: <code class="inline">default</code> or <code class="inline">1m</code>.</td></tr>
+        <tr><td><code>outputFormat</code></td><td><code>text</code> | <code>json</code></td><td>free-form text</td><td>Hint for structured output; describe the JSON shape in the prompt too.</td></tr>
+        <tr><td><code>outputSchema</code></td><td>object (inline YAML)</td><td>none</td><td>JSON Schema for Anthropic structured outputs. Only takes effect together with <code class="inline">outputFormat: json</code>.</td></tr>
+        <tr><td><code>concerns</code></td><td>object</td><td>none</td><td>Coverage-concerns block; injects the coverage tools and the catalog into the system prompt.</td></tr>
+        <tr><td><code>findingsProfile</code></td><td><code>full</code> | <code>summary</code></td><td><code>full</code></td><td>Findings contract for <code class="inline">findings.report</code>. A workflow step's <code class="inline">findings_profile</code> or the workflow's <code class="inline">defaults.findings_profile</code> overrides it.</td></tr>
+        <tr><td><code>fallbacks</code></td><td>array of <code>{model, provider?}</code></td><td><code>[recovery].fallbacks</code> from config, else none</td><td>Ordered fallback models tried when a reply cannot be used. See <a class="link" href="#fallbacks">Fallbacks</a>.</td></tr>
+        <tr><td><code>maxTokens</code></td><td>integer</td><td>discovered output cap</td><td>Per-request output-token cap.</td></tr>
+        <tr><td><code>contextWindowTokens</code></td><td>integer</td><td>discovered input limit</td><td>Input-token limit used for proactive compaction.</td></tr>
+        <tr><td><code>compactAtPercent</code></td><td>integer</td><td><code>80</code></td><td>Percentage of the input limit at which compaction triggers; clamped to 10&ndash;95.</td></tr>
+        <tr><td><code>anthropicOauthPrefix</code></td><td>bool</td><td>provider default</td><td>Anthropic SSO only — enables/disables the OAuth system prefix.</td></tr>
+        <tr><td><code>anthropicPromptCache</code></td><td>bool</td><td><code>[providers.&lt;name&gt;] prompt_cache</code>, else on</td><td>Anthropic only; <code class="inline">false</code> disables prompt caching for this agent.</td></tr>
+        <tr><td><code>anthropicTaskBudget</code></td><td>integer</td><td>none</td><td>Anthropic-only soft output budget, separate from <code class="inline">maxTurns</code>.</td></tr>
+        <tr><td><code>anthropicContextManagement</code></td><td>string</td><td>none</td><td>Anthropic-only server-side pruning of older tool blocks (<code class="inline">tool_clearing</code>).</td></tr>
+        <tr><td><code>anthropicSpeed</code></td><td>string</td><td>none</td><td>Anthropic-only account-gated fast mode (<code class="inline">fast</code>).</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Note.</strong> Keep agents portable by avoiding the <code class="inline">anthropic*</code> fields unless
+      you specifically need them. For checked-in repo agents, set <code class="inline">provider</code>,
+      <code class="inline">model</code>, <code class="inline">tools</code>, and <code class="inline">permissionMode</code>
+      explicitly so behavior does not drift with a mutable global default.
+    </div>
+
+    <h2 id="advanced-frontmatter">Advanced frontmatter</h2>
+    <p>
+      The fields above cover most agents. The ones below tune reasoning, token limits, findings, failure
+      recovery, skills, messaging and provider-specific behavior. All are optional; leave them out and rupu uses the
+      discovered or configured default.
+    </p>
+
+    <h3 id="provider-accounts">Provider accounts</h3>
+    <p>
+      <code class="inline">provider:</code> names an <strong>account</strong>, not only a vendor. A bare vendor
+      name (<code class="inline">anthropic</code>, <code class="inline">openai</code>, &hellip;) is its own
+      account; to keep two identities for one vendor, log in to a named account with
+      <code class="inline">--kind</code> and point the agent at it, e.g.
+      <code class="inline">provider: anthropic-work</code>. <code class="inline">auth:</code>
+      (<code class="inline">api-key</code> or <code class="inline">sso</code>) then picks between that account&rsquo;s
+      credentials when it holds both. See <a class="link" href="/docs/providers.html#accounts">Providers &rarr; Accounts</a>.
+    </p>
+
+    <h3 id="reasoning-and-limits">Reasoning, context &amp; token limits</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>effort</code></td><td>string</td><td>provider default</td><td>One cross-provider reasoning level: <code class="inline">auto</code>, <code class="inline">minimal</code>, <code class="inline">low</code>, <code class="inline">medium</code>, <code class="inline">high</code>, <code class="inline">max</code>; aliases <code class="inline">adaptive</code> (= <code class="inline">auto</code>) and <code class="inline">xhigh</code> (= <code class="inline">max</code>). rupu translates it per provider &mdash; Anthropic adaptive models get <code class="inline">thinking.type: adaptive</code> plus <code class="inline">output_config.effort</code>, pre-4.6 Anthropic models <code class="inline">thinking.budget_tokens</code>, Gemini <code class="inline">thinkingLevel</code> / <code class="inline">thinkingBudget</code>, OpenAI Codex <code class="inline">reasoning.effort</code>, OpenAI-compatible endpoints <code class="inline">reasoning_effort</code> forwarded verbatim.</td></tr>
+        <tr><td><code>thinkingDisplay</code></td><td>string</td><td><code>summarized</code></td><td>What reasoning the model returns alongside its answer (the <code class="inline">thinking.display</code> knob). <code class="inline">summarized</code> returns a readable summary captured into the transcript; <code class="inline">omitted</code> still runs (and bills) thinking but returns no text; <code class="inline">updates</code> returns between-tool-call progress notes and needs a capable model, else degrades to <code class="inline">summarized</code>. Honored only by Anthropic adaptive models (4.6+ and the Claude-5 family); elsewhere the run degrades to the model's default display with a one-time warning rather than failing.</td></tr>
+        <tr><td><code>contextWindow</code></td><td>string</td><td><code>default</code></td><td><code class="inline">default</code> or <code class="inline">1m</code> (aliases <code class="inline">1M</code>, <code class="inline">one_million</code>). On Anthropic, <code class="inline">1m</code> opts an API-key account into the 1M-token context beta; an SSO account uses a <code class="inline">[1m]</code> suffix on <code class="inline">model:</code> instead. Neither changes the input limit rupu discovers.</td></tr>
+        <tr><td><code>maxTokens</code></td><td>integer</td><td>discovered output cap</td><td>Per-request output-token cap. Overrides the cap discovered from the provider&rsquo;s model list; when neither is known, Anthropic gets <code class="inline">8192</code> and other providers get no cap. <code class="inline">0</code> is ignored. Extended thinking draws from this budget.</td></tr>
+        <tr><td><code>contextWindowTokens</code></td><td>integer</td><td>discovered input limit</td><td>Input-token limit used for proactive context compaction. Overrides the discovered limit; compaction is off only when neither is known. <code class="inline">0</code> is ignored.</td></tr>
+        <tr><td><code>compactAtPercent</code></td><td>integer</td><td><code>80</code></td><td>Share of the input limit at which older turns are summarized before the next turn. Clamped to 10&ndash;95. When the output cap is known and shares the input window, compaction also triggers early enough that a full-length reply still fits.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Limits come, in order, from the agent's pins, a <code class="inline">[[providers.&lt;name&gt;.models]]</code>
+      entry in <code class="inline">config.toml</code>, the provider's live model list (cached for 1 hour in
+      <code class="inline">~/.rupu/cache/models/</code>), else unknown. Every run writes a
+      <code class="inline">model_limits</code> notice to its transcript saying what it will use and where each value came from.
+      Pin <code class="inline">maxTokens</code> / <code class="inline">contextWindowTokens</code> only to override what rupu
+      discovers &mdash; see <a class="link" href="/docs/reliability.html">Reliability &rarr; Model limits discovery</a>.
+    </p>
+
+    <h3 id="findings-frontmatter">Coverage &amp; findings</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>concerns</code></td><td>list</td><td>none</td><td>Coverage-concerns block (<code class="inline">include:</code> a catalog, or inline concerns). Injects the coverage tools and prepends the concern catalog to the system prompt. A workflow step&rsquo;s own <code class="inline">concerns:</code> wins.</td></tr>
+        <tr><td><code>findingsProfile</code></td><td><code>full</code> | <code>summary</code></td><td><code>full</code></td><td>Contract for <code class="inline">findings.report</code> (alias <code class="inline">report_finding</code>), whether the tool comes from a <code class="inline">concerns:</code> block or an explicit <code class="inline">tools:</code> grant. <code class="inline">full</code> requires a complete structured <code class="inline">report</code> and rejects <code class="inline">summary</code> / <code class="inline">severity</code> / <code class="inline">evidence</code> as separate arguments; <code class="inline">summary</code> records the lightweight summary / severity / evidence form and refuses a <code class="inline">report</code>. Precedence: workflow step &rarr; workflow defaults &rarr; agent &rarr; <code class="inline">full</code>; <code class="inline">rupu run --findings-profile</code> overrides it for a standalone run. Children started with <code class="inline">dispatch</code> resolve only from their own agent file.</td></tr>
+      </tbody>
+    </table>
+    <p>See <a class="link" href="/docs/coverage.html">Coverage</a> and <a class="link" href="/docs/findings.html">Findings</a>.</p>
+
+    <h3 id="fallbacks">Fallbacks</h3>
+    <p>
+      <code class="inline">fallbacks:</code> is an ordered list of models to try when the agent&rsquo;s own model
+      can&rsquo;t give a usable reply or the provider fails the request (a refusal, repeated truncation, an overloaded
+      provider). Each entry has a <code class="inline">model</code> and an optional <code class="inline">provider</code>;
+      without one, the entry means the provider the run started on. Unknown keys inside an entry are an error. The list
+      <strong>replaces</strong> <code class="inline">[recovery].fallbacks</code> from <code class="inline">config.toml</code>
+      for this agent (it is not merged), and <code class="inline">fallbacks: []</code> means no fallbacks. A cross-provider
+      entry sends the whole conversation to that provider, so list one only when the run's data may go there. See
+      <a class="link" href="/docs/reliability.html">Reliability &rarr; Configuring fallbacks</a>.
+    </p>
+    <pre class="code"><span class="k">fallbacks</span>:
+  - <span class="k">model</span>: <span class="s">claude-sonnet-5-5</span>        <span class="c"># same provider as the agent</span>
+  - <span class="k">provider</span>: <span class="s">openai-codex</span>          <span class="c"># another provider</span>
+    <span class="k">model</span>: <span class="s">gpt-5.6-cyber</span></pre>
+
+    <h3 id="skills">Skills</h3>
+    <p>
+      <code class="inline">skills:</code> and <code class="inline">preloadSkills:</code> grant the agent
+      <a class="link" href="/docs/skills.html">Agent Skills</a> installed under <code class="inline">~/.rupu/skills/</code>
+      or the project's <code class="inline">.rupu/skills/</code>. Installing a skill gives it to no agent: an agent without
+      these keys has no skills, no skill index and no <code class="inline">skills.load</code> tool.
+    </p>
+    <pre class="code"><span class="k">skills</span>: <span class="v">[pdf, code-review]</span>     <span class="c"># listed in the prompt; the model loads one when a task matches it</span>
+<span class="k">preloadSkills</span>: <span class="v">[house-style]</span>   <span class="c"># its whole body is in the system prompt from the start</span></pre>
+    <table>
+      <thead><tr><th>Entry</th><th>Grants</th></tr></thead>
+      <tbody>
+        <tr><td><code>code-review</code></td><td>the skill of that name in whichever layer has it. If both the global and the project layer have it, the agent fails to load until the entry names a layer.</td></tr>
+        <tr><td><code>global:code-review</code>, <code>project:code-review</code></td><td>that layer's skill</td></tr>
+        <tr><td><code>*</code></td><td>every valid global skill (never a project skill)</td></tr>
+        <tr><td><code>project:*</code></td><td>every valid project skill</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A run binds each name once, so granting the same name from both layers (<code class="inline">global:x</code> and
+      <code class="inline">project:x</code>, or <code class="inline">*</code> and <code class="inline">project:*</code> over a
+      name in both) is an error. An unknown name, an invalid skill or a malformed entry fails the agent's load with a
+      did-you-mean, and <code class="inline">rupu agent validate</code> reports the same.
+    </p>
+    <p>A granted skill reaches the run as:</p>
+    <ul>
+      <li><strong>The index.</strong> Each skill in <code class="inline">skills:</code> is listed under <code class="inline">## Skills</code> in the system prompt, after the agent's body and any <code class="inline">## Run target</code>, with its description. The model calls <code class="inline">skills.load</code> with a name to get the skill's instructions, base directory and file list.</li>
+      <li><strong>Preloaded bodies.</strong> Each skill in <code class="inline">preloadSkills:</code> is rendered in full under <code class="inline">## Skill: &lt;name&gt;</code>, ahead of the index, and is not listed in it.</li>
+      <li><strong>Its files.</strong> <code class="inline">read_file</code>, <code class="inline">grep</code>, <code class="inline">glob</code> and <code class="inline">ast_grep</code> may read under a granted skill's directory even outside the workspace; <code class="inline">write_file</code> and <code class="inline">edit_file</code> may not. A skill's scripts run through <code class="inline">bash</code>, under the run's permission mode.</li>
+    </ul>
+    <p>
+      A skill never widens the agent's <code class="inline">tools:</code> grant or its permission mode. A child started with
+      <code class="inline">dispatch</code> gets its own agent file's skills, never its parent's. A session fixes its agent's
+      skills when it starts (see <a class="link" href="/docs/sessions.html#skills">Sessions &rarr; Skills</a>).
+    </p>
+
+    <h3 id="messaging">Messaging</h3>
+    <p>
+      Every run with a message space is offered <code class="inline">board.claim</code>, <code class="inline">board.release</code>,
+      <code class="inline">board.post</code>, <code class="inline">board.read</code> and <code class="inline">msg.send</code> by
+      default. <code class="inline">messaging: false</code> turns them off for this agent wherever it runs: as a standalone run, a
+      workflow step, a sub-agent, a session's agent or an agentiflow's lead or unit. The run is still in its space, so the
+      operator and its children reach it, and every child it launches has messaging off too. A file that sets
+      <code class="inline">messaging: false</code> and also names a messaging tool in <code class="inline">tools:</code> (by name,
+      alias or <code class="inline">board.*</code> / <code class="inline">msg.*</code>) fails to load. See
+      <a class="link" href="/docs/messaging.html">Messaging</a>.
+    </p>
+
+    <h3 id="anthropic-fields">Anthropic-only fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Values</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>anthropicOauthPrefix</code></td><td><code>true</code> | <code>false</code></td><td>SSO (OAuth) only. Enables or disables Anthropic's OAuth system prefix.</td></tr>
+        <tr><td><code>anthropicPromptCache</code></td><td><code>true</code> | <code>false</code></td><td>Explicit prompt caching, on by default. <code class="inline">false</code> drops the <code class="inline">cache_control</code> breakpoints (e.g. for a gateway that rejects them). Overrides <code class="inline">[providers.&lt;name&gt;] prompt_cache</code> in either direction.</td></tr>
+        <tr><td><code>anthropicTaskBudget</code></td><td>positive integer</td><td>Soft output-token budget, separate from <code class="inline">maxTurns</code>.</td></tr>
+        <tr><td><code>anthropicContextManagement</code></td><td><code>tool_clearing</code></td><td>Server-side pruning of older tool blocks.</td></tr>
+        <tr><td><code>anthropicSpeed</code></td><td><code>fast</code></td><td>Account-gated fast mode.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout">
+      <strong>Use the frontmatter names, not wire names.</strong> Keys such as <code class="inline">thinking</code>,
+      <code class="inline">budget_tokens</code>, <code class="inline">thinkingBudget</code>,
+      <code class="inline">context_management</code> or <code class="inline">speed</code> are what rupu
+      <em>sends</em> to a provider, not frontmatter fields &mdash; strict parsing rejects them. Use
+      <code class="inline">effort</code>, <code class="inline">thinkingDisplay</code>,
+      <code class="inline">anthropicContextManagement</code> and <code class="inline">anthropicSpeed</code>.
+    </div>
+
+    <h3 id="advanced-example">Example</h3>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">deep-auditor</span>
+<span class="k">description</span>: <span class="s">Long-running audit agent with tuned limits, a skill and a fallback chain.</span>
+<span class="k">provider</span>: <span class="s">anthropic-work</span>        <span class="c"># a named account</span>
+<span class="k">auth</span>: <span class="s">sso</span>
+<span class="k">model</span>: <span class="s">claude-sonnet-4-6</span>
+<span class="k">tools</span>: <span class="v">[read_file, grep, glob]</span>
+<span class="k">permissionMode</span>: <span class="s">readonly</span>
+<span class="k">effort</span>: <span class="s">high</span>
+<span class="k">maxTokens</span>: <span class="v">32000</span>
+<span class="k">compactAtPercent</span>: <span class="v">70</span>
+<span class="k">concerns</span>:
+  - <span class="k">include</span>: <span class="s">secrets-in-source</span>
+<span class="k">findingsProfile</span>: <span class="s">summary</span>
+<span class="k">skills</span>: <span class="v">[code-review]</span>
+<span class="k">messaging</span>: <span class="v">false</span>
+<span class="k">fallbacks</span>:
+  - <span class="k">model</span>: <span class="s">claude-sonnet-5-5</span>       <span class="c"># same account</span>
+  - <span class="k">provider</span>: <span class="s">openai-codex</span>       <span class="c"># another provider</span>
+    <span class="k">model</span>: <span class="s">gpt-5.6-cyber</span>
+<span class="k">anthropicContextManagement</span>: <span class="s">tool_clearing</span>
+<span class="c">---</span>
+
+Audit the repository for hard-coded secrets and record each one you find.</pre>
+
+    <h2>A complete example</h2>
+    <p>
+      This is the <code class="inline">code-reviewer</code> agent that ships as a rupu template — a read-only
+      reviewer that can inspect a local file, a diff, or a pull request and return concise findings.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">code-reviewer</span>
+<span class="k">description</span>: <span class="s">Read a file, diff, or PR and return concise textual findings.</span>
+<span class="k">provider</span>: <span class="s">anthropic</span>
+<span class="k">model</span>: <span class="s">claude-sonnet-4-6</span>
+<span class="k">tools</span>: <span class="v">[read_file, grep, glob, scm.prs.get, scm.prs.diff]</span>
+<span class="k">maxTurns</span>: <span class="v">12</span>
+<span class="k">permissionMode</span>: <span class="s">readonly</span>
+<span class="c">---</span>
+
+You are a code reviewer.
+
+If the prompt contains a PR reference, use the SCM tools to inspect the PR metadata and diff.
+If the prompt names local files or includes a diff, review that directly.
+
+Focus on:
+- correctness bugs
+- missing edge-case handling
+- unclear or brittle structure
+- missing tests where behavior changed
+
+Return either:
+- <span class="s">`no issues`</span>
+- or a short bulleted list ordered by severity
+
+Do not edit code.</pre>
+    <p>
+      Note the shape: the frontmatter pins a provider and model, declares the smallest useful tool set, and
+      runs <code class="inline">readonly</code> so a <em>reviewer</em> can never mutate the thing it is reviewing.
+      The body gives the agent a role, a process, and an explicit output contract.
+    </p>
+
+    <h2 id="tools-grant">Tools &amp; permissions</h2>
+    <p>
+      <code class="inline">tools:</code> is the agent's tool grant: what its model may call. Each entry is one of:
+    </p>
+    <table>
+      <thead><tr><th>Entry</th><th>Means</th></tr></thead>
+      <tbody>
+        <tr><td><code>bash</code>, <code>findings.report</code>, <code>scm.prs.get</code>, &hellip;</td><td>that tool, by its canonical name</td></tr>
+        <tr><td><code>report_finding</code>, <code>query_findings</code>, &hellip;</td><td>a legacy name, accepted forever as an alias of its canonical tool (see <a class="link" href="#tool-names">Tool names</a>)</td></tr>
+        <tr><td><code>findings.*</code>, <code>scm.*</code>, <code>issues.*</code>, <code>board.*</code>, &hellip;</td><td>every tool in that namespace</td></tr>
+        <tr><td><code>core.*</code></td><td>the core tools: <code>bash</code>, <code>read_file</code>, <code>write_file</code>, <code>edit_file</code>, <code>grep</code>, <code>glob</code>, <code>ast_grep</code></td></tr>
+        <tr><td><code>*</code></td><td>the whole catalog, except the authority tools <code>board.directive</code> and <code>board.retract</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      There are no other wildcards (<code class="inline">scm*</code>, <code class="inline">coverage_*</code> are errors).
+      <strong>Authority is never implied by <code class="inline">*</code>.</strong> <code class="inline">board.directive</code>
+      and <code class="inline">board.retract</code> let one agent direct the others, so <code class="inline">*</code> leaves them
+      out: an agent gets them only by naming them (or <code class="inline">board.*</code>), and an agentiflow lead gets them from
+      its origin grant.
+    </p>
+    <p>
+      <strong>An unknown name is an error.</strong> An agent whose <code class="inline">tools:</code> names a tool rupu doesn't
+      know fails to load — <code class="inline">rupu run</code>, a workflow step and a sub-agent dispatch all refuse it — with
+      a suggestion when a known name is close. <code class="inline">rupu agent validate</code> catches it ahead of time.
+    </p>
+    <p>
+      <strong>A tool is offered only where it works.</strong> The connector tools (<code class="inline">scm.*</code>,
+      <code class="inline">issues.*</code>, <code class="inline">github.*</code>, <code class="inline">gitlab.*</code>) need
+      configured SCM connectors, <code class="inline">coverage.*</code> a <code class="inline">concerns:</code> block,
+      <code class="inline">assets.mark</code> an engagement profile, the board and mailbox tools a message space,
+      <code class="inline">goal.*</code> and <code class="inline">budget.status</code> an agentiflow lead, and
+      <code class="inline">workflows.generate</code> a provider to author with. <code class="inline">dispatch</code> and
+      <code class="inline">join</code> work in every agent run, and so do the roster tools (<code class="inline">agents.list</code>,
+      <code class="inline">agents.get</code>, <code class="inline">workflows.list</code>, <code class="inline">workflows.get</code>,
+      <code class="inline">catalog.search</code>). A wildcard silently leaves out a tool the run can't serve; a tool named exactly
+      that the run can't serve is left out too, and the run says so with a <code class="inline">tool_unavailable</code> notice in
+      its transcript.
+    </p>
+    <p>
+      <strong>Omitting <code class="inline">tools:</code></strong> gives the default grant: the core tools, the launch pair and
+      every connector tool (<code class="inline">core.*</code>, <code class="inline">dispatch</code>, <code class="inline">join</code>,
+      <code class="inline">scm.*</code>, <code class="inline">issues.*</code>, <code class="inline">github.*</code>,
+      <code class="inline">gitlab.*</code>). For reusable agents an explicit <code class="inline">tools:</code> is better than the default.
+    </p>
+    <p>
+      <strong>Ambient grants.</strong> The run's context adds tools the agent didn't list: a <code class="inline">concerns:</code>
+      block adds the coverage tools and <code class="inline">findings.report</code>; an active engagement profile adds
+      <code class="inline">findings.report</code> and <code class="inline">assets.mark</code>; a message space adds the default
+      messaging tools; an agentiflow lead's or unit's origin adds its coordination tools. A run granted
+      <code class="inline">dispatch</code> (by any route, a legacy name included) also gets <code class="inline">join</code>.
+      None of this is hidden: every run's transcript opens with a <code class="inline">tool_grant</code> event listing exactly
+      the tools the model was offered and why, and every call is audited (<code class="inline">tool_audit</code>).
+    </p>
+    <div class="callout">
+      <strong>Tools vs. actions.</strong> <code class="inline">tools:</code> is this agent's full grant. A
+      workflow step&rsquo;s <code class="inline">actions:</code> can only <em>narrow</em> the connector subset of that
+      grant for one step &mdash; it never touches any other tool, and never grants a tool beyond what
+      <code class="inline">tools:</code> already allows. See
+      <a class="link" href="/docs/workflow-reference.html#step-actions">Step actions</a>.
+    </div>
+
+    <h3 id="tool-names">Tool names</h3>
+    <p>
+      Tools are named <code class="inline">namespace.verb</code> (<code class="inline">findings.report</code>,
+      <code class="inline">coverage.mark</code>); the core fs/shell tools stay unqualified. Earlier names remain accepted
+      forever, in <code class="inline">tools:</code> and when a model calls them, as aliases:
+    </p>
+    <table>
+      <thead><tr><th>Canonical</th><th>Also accepted</th></tr></thead>
+      <tbody>
+        <tr><td><code>findings.report</code></td><td><code>report_finding</code>, <code>findings.record</code></td></tr>
+        <tr><td><code>findings.verify</code></td><td><code>finding.verify</code></td></tr>
+        <tr><td><code>findings.query</code> / <code>findings.tag</code></td><td><code>query_findings</code> / <code>tag_findings</code></td></tr>
+        <tr><td><code>assets.mark</code></td><td><code>asset_mark</code></td></tr>
+        <tr><td><code>coverage.mark</code> / <code>coverage.status</code> / <code>coverage.remaining</code></td><td><code>coverage_mark</code> / <code>coverage_status</code> / <code>coverage_remaining</code></td></tr>
+        <tr><td><code>coverage.concerns.search</code> / <code>coverage.concerns.detail</code></td><td><code>coverage_concerns_search</code> / <code>coverage_concerns_detail</code></td></tr>
+        <tr><td><code>dispatch</code></td><td><code>dispatch_agent</code>, <code>dispatch_agents_parallel</code>, <code>run_workflow</code> (see <a class="link" href="#legacy-launch-names">Legacy launch names</a>)</td></tr>
+        <tr><td><code>workflows.generate</code></td><td><code>generate_workflow</code></td></tr>
+        <tr><td><code>goal.coverage</code> (agentiflow lead)</td><td><code>coverage.status</code>, inside a lead only</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="ast-grep">Structural search with <code class="inline">ast_grep</code></h3>
+    <p>
+      <code class="inline">ast_grep</code> matches code by its <strong>syntax tree</strong> rather than its text, so a
+      pattern finds every call site or definition however it&rsquo;s formatted. It runs the
+      <a class="link" href="https://ast-grep.github.io/" target="_blank" rel="noopener">ast-grep</a> binary, which must be
+      on <code class="inline">PATH</code> as <code class="inline">ast-grep</code> (<code class="inline">brew install ast-grep</code>
+      or <code class="inline">cargo install ast-grep</code>); without it every call returns an &ldquo;ast-grep not found&rdquo; error.
+      It is a read tool: <code class="inline">readonly</code> mode allows it. It takes a
+      <code class="inline">pattern</code>, a <code class="inline">lang</code> (required: any language ast-grep supports, e.g.
+      <code class="inline">rust</code>, <code class="inline">python</code>, <code class="inline">typescript</code>,
+      <code class="inline">tsx</code>, <code class="inline">javascript</code>, <code class="inline">go</code>,
+      <code class="inline">java</code>, <code class="inline">c</code>, <code class="inline">cpp</code>) and an optional
+      <code class="inline">path</code> inside the workspace.
+    </p>
+    <p>A pattern is ordinary code in the target language, with <strong>metavariables</strong> where anything may appear:</p>
+    <table>
+      <thead><tr><th>Metavariable</th><th>Matches</th></tr></thead>
+      <tbody>
+        <tr><td><code>$NAME</code></td><td>exactly one syntax node, captured as <code>NAME</code> (upper-case). The same name used twice must match identical code.</td></tr>
+        <tr><td><code>$$$</code> / <code>$$$NAME</code></td><td>zero or more nodes, such as an argument list or a block body; the named form captures them.</td></tr>
+        <tr><td><code>$_</code></td><td>one node without capturing it.</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>Pattern</th><th>lang</th><th>Finds</th></tr></thead>
+      <tbody>
+        <tr><td><code>impl $TRAIT for $TYPE { $$$ }</code></td><td><code>rust</code></td><td>every trait implementation</td></tr>
+        <tr><td><code>$X.unwrap()</code></td><td><code>rust</code></td><td>every <code>.unwrap()</code> call, whatever it is called on</td></tr>
+        <tr><td><code>subprocess.run($$$, shell=True, $$$)</code></td><td><code>python</code></td><td>shell-invoking subprocess calls</td></tr>
+        <tr><td><code>fetch($URL, $$$)</code></td><td><code>typescript</code></td><td><code>fetch</code> call sites with any options</td></tr>
+        <tr><td><code>$EL.innerHTML = $VALUE</code></td><td><code>javascript</code></td><td>direct <code>innerHTML</code> assignments</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The agent sees one <code class="inline">path:line:col: match</code> line per hit (1-based, workspace-relative); no
+      matches is empty output, not an error, while a malformed pattern or a bad path surfaces ast-grep's diagnostic as the
+      error. Under a <code class="inline">concerns:</code> block, each matched file is recorded in the
+      <a class="link" href="/docs/coverage.html">coverage</a> ledger like a <code class="inline">grep</code> hit. Each call also
+      records up to 200 matches as structured data (file, range, matched text and every metavariable's capture), which the
+      control plane uses to show a source slice and a syntax-tree preview per match.
+    </p>
+
+    <h3 id="permission-modes">Permission modes</h3>
+    <p>
+      <code class="inline">permissionMode</code> is <code class="inline">ask</code>, <code class="inline">bypass</code> or
+      <code class="inline">readonly</code>. Every tool declares one <strong>effect</strong>, and the mode decides each call from
+      the effect alone — never from the tool's name, so a new tool is gated correctly the day it lands:
+    </p>
+    <table>
+      <thead><tr><th>Effect</th><th>Examples</th></tr></thead>
+      <tbody>
+        <tr><td><code>read</code></td><td><code>read_file</code>, <code>grep</code>, <code>glob</code>, <code>ast_grep</code>, <code>findings.query</code>, <code>coverage.status</code>, <code>scm.prs.get</code>, <code>goal.status</code>, <code>join</code></td></tr>
+        <tr><td><code>record</code></td><td>rupu's own bookkeeping: <code>findings.report</code>, <code>findings.verify</code>, <code>findings.tag</code>, <code>assets.mark</code>, <code>coverage.mark</code>, <code>board.post</code>, <code>msg.send</code></td></tr>
+        <tr><td><code>write</code></td><td>changes the workspace or runs code: <code>bash</code>, <code>write_file</code>, <code>edit_file</code></td></tr>
+        <tr><td><code>external</code></td><td>acts outside this machine: <code>scm.prs.create</code>, <code>scm.branches.create</code>, <code>issues.comment</code>, <code>issues.create</code>, <code>github.workflows_dispatch</code></td></tr>
+        <tr><td><code>spawn</code></td><td>starts another run or model call: <code>dispatch</code> (and its aliases), <code>workflows.generate</code></td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>Effect &darr; / Mode &rarr;</th><th><code>bypass</code></th><th><code>ask</code> (interactive)</th><th><code>ask</code> (no operator)</th><th><code>readonly</code></th></tr></thead>
+      <tbody>
+        <tr><td>read</td><td>allow</td><td>allow</td><td>allow</td><td>allow</td></tr>
+        <tr><td>record</td><td>allow</td><td>allow</td><td>allow</td><td>allow</td></tr>
+        <tr><td>write</td><td>allow</td><td><strong>prompt</strong></td><td>allow, with a notice</td><td><strong>deny</strong></td></tr>
+        <tr><td>external</td><td>allow</td><td><strong>prompt</strong></td><td>allow, with a notice</td><td><strong>deny</strong></td></tr>
+        <tr><td>spawn</td><td>allow; child keeps its own mode</td><td>allow; child capped at <code>ask</code></td><td>allow; child capped at <code>ask</code></td><td>allow; <strong>child capped at <code>readonly</code></strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>A child never has more than its parent.</strong> A child of any kind runs at the more restrictive of the parent's mode and its own <code class="inline">permissionMode</code>; a readonly run's children are readonly whatever their frontmatter says, across a process boundary too.</li>
+      <li><strong><code class="inline">readonly</code> still records findings.</strong> It means &ldquo;no change to your workspace or the outside world&rdquo;; rupu's own ledgers are bookkeeping, so a readonly reviewer can report, tag and verify findings.</li>
+      <li><strong><code class="inline">ask</code> without an operator</strong> (a workflow step, a session turn, a flow, a detached run) cannot prompt, so it allows write/external calls and the transcript says so once with a <code class="inline">permission_mode_degraded</code> notice. An interactive <code class="inline">rupu run</code> in <code class="inline">ask</code> prompts; a non-TTY <code class="inline">rupu run</code> in <code class="inline">ask</code> is refused at startup, so pass <code class="inline">--mode bypass</code> or <code class="inline">--mode readonly</code> there.</li>
+      <li><strong>&ldquo;Allow always&rdquo;</strong> (<code class="inline">a</code> at the prompt) allows that one tool for the rest of the run, not every tool.</li>
+    </ul>
+    <p>
+      <code class="inline">ask</code> is the safest default for agents that edit code. Pass <code class="inline">--mode readonly</code>
+      for unattended runs that must not change anything. The CLI <code class="inline">--mode</code> flag always overrides the value in the file.
+    </p>
+
+    <h2 id="sub-agent-dispatch">Launching children</h2>
+    <p>
+      An agent can start <em>other</em> runs as tool calls in the middle of its own run, keep working while they run,
+      and fold their results back into its context. This is composition at the <strong>agent layer</strong> — distinct
+      from a <a class="link" href="/docs/workflows.html">workflow</a>, which composes agents at the step layer. A writer
+      agent can dispatch a reviewer mid-draft, revise against the findings, and carry on, without the workflow author
+      fanning out at the YAML level.
+    </p>
+    <p>Three tools drive it. The legacy names (<code class="inline">dispatch_agent</code>, <code class="inline">dispatch_agents_parallel</code>, <code class="inline">run_workflow</code>, <code class="inline">generate_workflow</code>) are aliases that keep their old behavior and output shapes.</p>
+    <ul>
+      <li><code class="inline">dispatch</code> — start a child and return at once with <code class="inline">{handle, kind, name, run_id, codename}</code>; with <code class="inline">wait: true</code> the reply also carries the child's <code class="inline">join</code> entry.</li>
+      <li><code class="inline">join</code> — collect the results of handles <code class="inline">dispatch</code> returned (or every unjoined child when omitted), with a <code class="inline">timeout_secs</code> (default 300, at most 3600; <code class="inline">0</code> just looks) and <code class="inline">until: all | any</code>.</li>
+      <li><code class="inline">workflows.generate {description}</code> — write a new workflow under the run's <code class="inline">generated/</code> directory, check it, and return <code class="inline">{file, name, steps, inputs}</code>. It does not start it: run it with <code class="inline">dispatch {kind: "workflow", file}</code>.</li>
+    </ul>
+    <table>
+      <thead><tr><th><code>dispatch</code> field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>kind</code></td><td><code>subagent</code> (default), <code>agent</code> or <code>workflow</code></td></tr>
+        <tr><td><code>name</code></td><td>The agent, or for kind <code>workflow</code> the workflow, to run</td></tr>
+        <tr><td><code>file</code></td><td>Kind <code>workflow</code> only, instead of <code>name</code>: a file <code>workflows.generate</code> returned in this run</td></tr>
+        <tr><td><code>prompt</code></td><td>An agent child's task. Required for <code>subagent</code> and <code>agent</code></td></tr>
+        <tr><td><code>inputs</code></td><td>A workflow's declared inputs. For an agent child, structured inputs appended to its prompt as a JSON block</td></tr>
+        <tr><td><code>wait</code></td><td><code>true</code> starts the child and waits for it in one call. Default <code>false</code></td></tr>
+        <tr><td><code>timeout_secs</code></td><td>With <code>wait</code>: how long to wait. Default 300, at most 3600</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th><code>kind</code></th><th>Runs as</th><th>Its record</th></tr></thead>
+      <tbody>
+        <tr><td><code>subagent</code></td><td>a task in the parent's process; it dies with the parent</td><td>transcript under the parent's run: <code>&lt;RUPU_HOME&gt;/runs/&lt;parent run id&gt;/sub/&lt;sub_id&gt;/transcript.jsonl</code></td></tr>
+        <tr><td><code>agent</code></td><td>its own <code>rupu run</code> process</td><td>its own run and transcript, like any <code>rupu run</code></td></tr>
+        <tr><td><code>workflow</code></td><td>its own <code>rupu workflow run --plain</code> process</td><td>its own workflow run under <code>&lt;RUPU_HOME&gt;/runs/&lt;id&gt;/</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">join</code> returns one entry per child: <code class="inline">handle</code>, <code class="inline">kind</code>,
+      <code class="inline">name</code>, <code class="inline">run_id</code>, <code class="inline">codename</code>,
+      <code class="inline">status</code> (<code class="inline">pending</code>, <code class="inline">running</code>,
+      <code class="inline">done</code>, <code class="inline">failed</code>, <code class="inline">abandoned</code> or
+      <code class="inline">interrupted</code>) and, once it ended, <code class="inline">success</code>, <code class="inline">output</code>,
+      <code class="inline">error</code>, <code class="inline">cause</code>, <code class="inline">tokens</code> and
+      <code class="inline">duration_ms</code>. While a run has children it has not joined, each turn starts with a status block
+      naming them, so the agent knows what is still out without polling. A workflow child is checked before anything starts:
+      it parses, has no approval gate and no <code class="inline">host:</code> / <code class="inline">distribute:</code> step,
+      every agent its steps run is one the caller may dispatch, and its inputs resolve.
+    </p>
+    <h3 id="dispatch-rules">Rules every kind shares</h3>
+    <ul>
+      <li><strong>Allowlist.</strong> The agents and workflows a run may start are its <code class="inline">dispatchableAgents</code> / <code class="inline">dispatchableWorkflows</code>. Inside an agentiflow the flow's pool applies, intersected with the declared lists when the agent has them. Either way the result is capped by what the parent may launch. Neither declared nor in a flow means none: <code class="inline">dispatch</code> is still offered, but a call fails with <code class="inline">agent_not_dispatchable</code> / <code class="inline">workflow_not_dispatchable</code>.</li>
+      <li><strong>Depth.</strong> A run you start is depth 0 and each child is one deeper. A run at depth 5 can't start a child (<code class="inline">max_dispatch_depth_exceeded</code>).</li>
+      <li><strong>Permission ceiling.</strong> A child runs at the more restrictive of the parent's mode and its own <code class="inline">permissionMode</code>. A sub-agent of an <code class="inline">ask</code> parent asks the parent's operator; a process child can't reach that prompt, so under an interactive <code class="inline">ask</code> parent it runs <code class="inline">readonly</code>, and under an unattended <code class="inline">ask</code> parent it runs <code class="inline">ask</code> unattended.</li>
+      <li><strong>Connector narrowing.</strong> A workflow step's <code class="inline">actions:</code> narrowing reaches the step's children, and a generated workflow may call a connector tool from an <code class="inline">action:</code> step only when the run that generates or starts it is offered that tool itself.</li>
+      <li><strong>Concurrency.</strong> At most <code class="inline">[dispatch].max_concurrent_children</code> (default 8) children of one run run at once; the rest wait as <code class="inline">pending</code>.</li>
+      <li><strong>Engagement and findings.</strong> Children run under the parent's engagement profiles; a child's findings profile comes from its own agent file.</li>
+      <li><strong>Usage.</strong> A sub-agent's calls are recorded in its parent's usage ledger. A process child keeps its own ledger and copies each call into the root run's ledger as a rollup, which the control plane's usage reports skip, so nothing is counted twice.</li>
+    </ul>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">writer</span>
+<span class="k">tools</span>: <span class="v">[read_file, edit_file, dispatch]</span>    <span class="c"># join is implied by dispatch</span>
+<span class="k">dispatchableAgents</span>: <span class="v">[security-reviewer, perf-reviewer]</span>
+<span class="k">dispatchableWorkflows</span>: <span class="v">[release-checks]</span>
+<span class="c">---</span>
+
+Draft the change, then dispatch the reviewers on your diff.
+Revise against their findings before you finish.</pre>
+    <h3 id="when-the-parent-ends">When the parent ends</h3>
+    <p>
+      A run's unjoined children are stopped when the run ends and recorded <code class="inline">abandoned</code>, and so is
+      whatever they left below them. A workflow step that pauses, or a <code class="inline">rupu run</code> / <code class="inline">rupu workflow run</code>
+      stopped by SIGTERM or SIGINT, stops them the same way but records each <code class="inline">interrupted</code>; when that
+      run's conversation is continued (<code class="inline">rupu workflow resume</code>, <code class="inline">rupu run --continue</code>),
+      the continued run takes on every child under the same handles — ended ones as they ended, the rest continued from their
+      own records. Every launch is appended to the parent's children ledger, <code class="inline">&lt;RUPU_HOME&gt;/runs/&lt;run id&gt;/children.jsonl</code>,
+      which <code class="inline">join</code>, the orphan reaper and the control plane's <strong>Children</strong> tab read. Each child
+      gets a codename below its parent's (<code class="inline">&lt;parent&gt;&gt;&lt;role&gt;#n</code>), and a sub-agent can be continued by its
+      <code class="inline">sub_…</code> id like any run.
+    </p>
+    <h3 id="legacy-launch-names">Legacy launch names</h3>
+    <p>The tools that predate <code class="inline">dispatch</code> keep working, in <code class="inline">tools:</code> and when a model calls them:</p>
+    <table>
+      <thead><tr><th>Old call</th><th>Does</th><th>Returns</th></tr></thead>
+      <tbody>
+        <tr><td><code>dispatch_agent {agent, prompt, inputs?}</code></td><td>a <code>subagent</code>, waited for</td><td><code>{ok, agent, output, findings, tokens_used, duration_ms, transcript_path, sub_run_id, codename, error?}</code></td></tr>
+        <tr><td><code>dispatch_agents_parallel {agents: [{id, agent, prompt, inputs?}], max_parallel?}</code></td><td>one <code>subagent</code> per entry, all checked before any starts, all waited for</td><td><code>{ok, results: {&lt;id&gt;: ...}, all_succeeded}</code></td></tr>
+        <tr><td><code>run_workflow {workflow, inputs?}</code></td><td>a <code>workflow</code> child, not waited for</td><td><code>{handle, participant}</code></td></tr>
+        <tr><td><code>generate_workflow {description, inputs?}</code></td><td><code>workflows.generate</code>, then starts it</td><td><code>{handle, participant, generated_file}</code></td></tr>
+        <tr><td><code>join {handle}</code></td><td><code>join</code> on one child</td><td><code>{status, success?, output?}</code>, or <code>{status: "failed", error}</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      A model only sees <code class="inline">dispatch</code>, so a prompt written for an old name arrives as a
+      <code class="inline">dispatch</code> call in the old shape. See <a class="link" href="/docs/mcp.html">MCP &amp; tools</a>
+      for the tool surface and <a class="link" href="/docs/workflows.html">Workflows</a> for step-layer composition.
+    </p>
+
+    <h2>Structured outputs</h2>
+    <p>
+      By default an agent returns free-form text. Two frontmatter fields tighten that when a downstream step or
+      tool needs a predictable shape.
+    </p>
+    <p>
+      <code class="inline">outputFormat: json</code> is a <strong>hint</strong> — it asks the model to return
+      JSON (describe the shape in the prompt too). On its own it is prompt-driven: nothing structurally guarantees the
+      result parses or matches a particular schema.
+    </p>
+    <p>
+      <code class="inline">outputSchema:</code> goes further. Declare a JSON Schema inline in the frontmatter and, when
+      <code class="inline">outputFormat: json</code> is also set, rupu hands it to Anthropic's structured-output mode
+      (<code class="inline">output_config.format = {type: "json_schema", schema: ...}</code>), which returns a
+      <strong>guaranteed schema-conforming</strong> object. Without <code class="inline">outputFormat: json</code> the schema
+      has no effect; providers other than Anthropic ignore it.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">security-reviewer</span>
+<span class="k">outputFormat</span>: <span class="s">json</span>
+<span class="k">outputSchema</span>:
+  <span class="k">type</span>: <span class="s">object</span>
+  <span class="k">properties</span>:
+    <span class="k">findings</span>:
+      <span class="k">type</span>: <span class="s">array</span>
+      <span class="k">items</span>:
+        <span class="k">type</span>: <span class="s">object</span>
+        <span class="k">properties</span>:
+          <span class="k">severity</span>: <span class="v">{ type: string, enum: [low, medium, high, critical] }</span>
+          <span class="k">title</span>: <span class="v">{ type: string }</span>
+          <span class="k">body</span>: <span class="v">{ type: string }</span>
+        <span class="k">required</span>: <span class="v">[severity, title]</span>
+        <span class="k">additionalProperties</span>: <span class="v">false</span>
+  <span class="k">required</span>: <span class="v">[findings]</span>
+  <span class="k">additionalProperties</span>: <span class="v">false</span>
+<span class="c">---</span>
+
+Audit the diff and return your findings.</pre>
+    <p>
+      With a guaranteed shape, downstream <a class="link" href="/docs/workflows.html">workflow</a> steps can rely
+      on those fields in their template expressions instead of defensively parsing free text.
+    </p>
+
+    <h2>Providers &amp; models</h2>
+    <p>
+      rupu supports four LLM providers, each with two authentication modes (API key or SSO):
+    </p>
+    <table>
+      <thead><tr><th>Provider</th><th>API key</th><th>SSO</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>anthropic</code></td><td>yes</td><td>browser callback</td><td>Console API key or Claude.ai SSO. The most exercised provider.</td></tr>
+        <tr><td><code>openai</code></td><td>yes</td><td>browser callback</td><td>Platform API key or ChatGPT SSO.</td></tr>
+        <tr><td><code>gemini</code></td><td>yes</td><td>browser callback</td><td>API key via Google AI Studio; SSO via Vertex / CLI.</td></tr>
+        <tr><td><code>copilot</code></td><td>yes</td><td>device code</td><td>API-key path uses a GitHub PAT; requires paid Copilot.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      An agent picks its provider with <code class="inline">provider:</code> and its model with
+      <code class="inline">model:</code>. Model ids are provider-specific and are <strong>not</strong> validated
+      at parse time — an invalid id fails at runtime when the provider is called. When an agent omits
+      <code class="inline">model:</code>, rupu uses the provider's <code class="inline">default_model</code> from config,
+      else <code class="inline">claude-sonnet-4-6</code>; for stable project behavior, set <code class="inline">model:</code>
+      per agent. <code class="inline">rupu run --model</code> / <code class="inline">--provider</code> override the file for one run.
+    </p>
+    <p>
+      Inspect the models rupu knows with <code class="inline">rupu models list</code> and refresh the cached model lists
+      with <code class="inline">rupu models refresh</code>. Authenticate a provider before running an agent against it:
+    </p>
+    <pre class="code"><span class="c"># API key (or pipe the secret on stdin)</span>
+rupu auth login --provider anthropic --mode api-key --key &lt;secret&gt;
+
+<span class="c"># SSO</span>
+rupu auth login --provider anthropic --mode sso</pre>
+
+    <h2>Generate one from a description</h2>
+    <p>Don&rsquo;t want to hand-write the frontmatter? Describe the agent in plain language and let rupu draft it for you. <code class="inline">create</code> scaffolds the <code class="inline">.md</code>, with <code class="inline">--describe</code> a model drafts the definition, and the file opens in your editor to refine.</p>
+    <pre class="code"><span class="c"># scaffold + AI-draft an agent from a one-line brief</span>
+rupu agent create security-reviewer \
+  --describe <span class="s">"A read-only reviewer that audits a diff for OWASP Top 10 issues and returns JSON findings"</span>
+
+<span class="c"># or scaffold an empty agent and edit it yourself (omit --describe)</span>
+rupu agent create my-agent</pre>
+    <p>The same generate-from-a-description flow is available in the <a class="link" href="/docs/control-plane.html">control plane</a>&rsquo;s authoring UI.</p>
+
+    <h2>Running an agent</h2>
+    <p>List and inspect the agents rupu can see, validate them, then run one:</p>
+    <pre class="code"><span class="c"># list every resolvable agent (project + global scope)</span>
+rupu agent list
+
+<span class="c"># show one agent's resolved frontmatter and prompt</span>
+rupu agent show code-reviewer
+
+<span class="c"># check every agent file in both layers (tools:, skills:, syntax)</span>
+rupu agent validate --all
+
+<span class="c"># run an agent with a prompt</span>
+rupu run code-reviewer --prompt <span class="s">"Review the staged diff for correctness bugs"</span></pre>
+    <p>
+      Use <code class="inline">--mode</code> to override the file's <code class="inline">permissionMode</code> at
+      run time — for example <code class="inline">--mode bypass</code> or <code class="inline">--mode readonly</code>
+      in a non-interactive context. <code class="inline">--skill</code> / <code class="inline">--preload-skill</code> add skills
+      to one run on top of the agent's own, and <code class="inline">--no-messaging</code> / <code class="inline">--messaging-tool</code>
+      switch its messaging tools off or narrow them. Every run is recorded as a JSONL transcript you can replay later:
+    </p>
+    <pre class="code"><span class="c"># inspect a recorded run</span>
+rupu transcript</pre>
+    <h3 id="continuing">Continuing a run</h3>
+    <p>
+      If a run stops before it finishes — a closed terminal, a killed process, a crash — pick it up where it left off instead
+      of starting over. rupu rebuilds the conversation from the run's transcript, drops the turn that was in flight, and tells
+      the agent it was interrupted. The run's command is restored too: its repo target and every flag it was launched with;
+      a flag given on the continue replaces only its own setting. Run it from the same directory as the original run.
+    </p>
+    <pre class="code"><span class="c"># continue an interrupted run</span>
+rupu run code-reviewer --continue &lt;agent_run_id&gt;
+
+<span class="c"># continue any ended run with something new to do</span>
+rupu run code-reviewer --continue &lt;agent_run_id&gt; <span class="s">"now write the fix"</span>
+
+<span class="c"># a run that failed on a provider-side outcome (a refusal, say) can move to another model</span>
+rupu run code-reviewer --continue &lt;agent_run_id&gt; --model &lt;model&gt; [--provider &lt;provider&gt;]</pre>
+    <p>
+      A run that had already finished prints its recorded answer without calling the model; with a prompt it gets a new turn
+      after its answer. A run that failed can't be continued bare — give the continue a prompt, or, when it failed on a
+      provider-side outcome, a <code class="inline">--model</code> / <code class="inline">--provider</code>. The continued run also
+      takes on the children the interrupted one launched. <code class="inline">rupu run pause</code> / <code class="inline">rupu run resume</code>
+      act on workflow runs only; a standalone agent run has no pause boundary.
+    </p>
+    <div class="callout">
+      <strong>Next.</strong> When a job needs multiple specialists, review boundaries, fan-out, or fix loops,
+      compose agents into a <a class="link" href="/docs/workflows.html">workflow</a> rather than growing one
+      agent prompt.
+    </div>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/">&#8592; Overview &amp; install</a>
+      <a href="/docs/workflows.html">Workflows &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

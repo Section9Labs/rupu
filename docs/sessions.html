@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Sessions</title>
+<meta name="description" content="Sessions are long-lived, multi-turn conversations with a rupu agent — context is kept across turns, tools stay available, and a persistent worker drives each turn from the CLI or the web control plane.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item active" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Sessions</h1>
+    <p class="intro">A session is a long-lived, interactive conversation with an agent — it keeps context across many turns and can use tools the whole time, unlike a one-shot <code class="inline">rupu run</code>.</p>
+
+    <h2>What is a session</h2>
+    <p>
+      <code class="inline">rupu run</code> is a single shot: you give an agent one
+      prompt, it works, and it exits. A <strong>session</strong> is the
+      conversational counterpart. You start it once against an agent, then keep
+      sending follow-up prompts; each turn sees the full history of everything
+      that came before — earlier messages, tool calls, file edits, and results.
+    </p>
+    <p>
+      Because the context survives between turns, a session is the right surface
+      for back-and-forth work: ask a question, read the reply, refine, correct
+      course, ask the agent to also look at the writer side. The same agent
+      files in <code class="inline">.rupu/agents/</code> that power
+      <code class="inline">rupu run</code> back a session — a session just wraps
+      one in a durable, multi-turn loop.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 680 200" role="img" aria-label="The session turn loop: you prompt, the agent thinks and uses tools, then replies — and the loop repeats across turns.">
+        <defs>
+          <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+            <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path>
+          </marker>
+        </defs>
+        <!-- forward row -->
+        <rect class="d-box" x="24" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="109" y="60" text-anchor="middle">you</text>
+        <text class="d-sub" x="109" y="78" text-anchor="middle">prompt</text>
+
+        <line class="d-edge" x1="194" y1="64" x2="254" y2="64" marker-end="url(#ar)"></line>
+
+        <rect class="d-box-accent" x="254" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="339" y="60" text-anchor="middle">agent</text>
+        <text class="d-sub" x="339" y="78" text-anchor="middle">thinks &middot; uses tools</text>
+
+        <line class="d-edge" x1="424" y1="64" x2="484" y2="64" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="484" y="36" width="170" height="56" rx="10"></rect>
+        <text class="d-label" x="569" y="60" text-anchor="middle">reply</text>
+        <text class="d-sub" x="569" y="78" text-anchor="middle">streamed back</text>
+
+        <!-- loop-back edge -->
+        <path class="d-edge" d="M569,92 L569,150 L109,150 L109,92" marker-end="url(#ar)"></path>
+        <text class="d-sub" x="339" y="170" text-anchor="middle">next turn &mdash; full context kept</text>
+      </svg>
+      <figcaption>One turn of a session, repeated. Context carries forward across every turn.</figcaption>
+    </figure>
+
+    <h2>Starting &amp; using a session</h2>
+    <p>
+      Everything lives under the <code class="inline">rupu session</code>
+      subcommand. A session id is <code class="inline">ses_&lt;ULID&gt;</code>; every command that takes one also
+      accepts a unique prefix or the session's codename. The full set:
+    </p>
+    <table>
+      <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+      <tbody>
+        <tr><td><code>start &lt;agent&gt; [target] [prompt]</code></td><td>Start a persistent agent session and run its first turn.</td></tr>
+        <tr><td><code>send &lt;session-id&gt; [prompt]</code></td><td>Send a follow-up prompt to an existing session, or invoke a skill in the next turn (<code>--skill</code>).</td></tr>
+        <tr><td><code>attach &lt;session-id&gt;</code></td><td>Attach to the current or last run in a session (the live view; <code>--view focused|compact|full</code>).</td></tr>
+        <tr><td><code>list</code></td><td>List sessions (<code>--all</code>, <code>--archived</code>).</td></tr>
+        <tr><td><code>show &lt;session-id&gt;</code></td><td>Show session details (<code>--view</code>, <code>--pager</code> / <code>--no-pager</code>, <code>--no-color</code>).</td></tr>
+        <tr><td><code>usage-timeline &lt;session-id&gt;</code></td><td>Per-turn token series across every run the session recorded.</td></tr>
+        <tr><td><code>stop &lt;session-id&gt;</code></td><td>Stop an active session worker.</td></tr>
+        <tr><td><code>compact &lt;session-id&gt;</code></td><td>Summarize older turns now to reclaim context window (<code>--window</code>).</td></tr>
+        <tr><td><code>archive &lt;session-id&gt;</code></td><td>Archive an inactive session and its owned transcripts.</td></tr>
+        <tr><td><code>restore &lt;session-id&gt;</code></td><td>Restore an archived session and its owned transcripts.</td></tr>
+        <tr><td><code>delete &lt;session-id&gt;</code></td><td>Permanently delete a session and its owned transcripts (<code>--force</code> required; a session whose worker is still running is refused).</td></tr>
+        <tr><td><code>prune</code></td><td>Delete archived sessions older than a cutoff (<code>--older-than 30d</code>, <code>--dry-run</code>).</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">start</code> accepts an agent name, an optional
+      <a class="link" href="/docs/workflows.html">target reference</a> (e.g.
+      <code class="inline">github:owner/repo#42</code>), and an optional opening
+      prompt. Its flags:
+    </p>
+    <table>
+      <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>--prompt &lt;text&gt;</code></td><td>The opening message via flag, so it is never parsed as a target. Preferred over the positional.</td></tr>
+        <tr><td><code>--mode ask|bypass|readonly</code></td><td>Override the agent's permission mode.</td></tr>
+        <tr><td><code>--no-stream</code></td><td>Don't render tokens as they arrive, for every turn in this session. The request still streams on the wire.</td></tr>
+        <tr><td><code>--into &lt;path&gt;</code></td><td>For repo targets: clone into this directory instead of <code>./&lt;repo&gt;/</code>.</td></tr>
+        <tr><td><code>--detach</code></td><td>Start the first turn without auto-attaching to the live view.</td></tr>
+        <tr><td><code>--view focused|compact|full</code></td><td>Live renderer mode when auto-attaching.</td></tr>
+        <tr><td><code>--engagement-profile &lt;id&gt;</code></td><td>Engagement profile(s) every turn of the session runs under (repeatable or comma-separated). See <a class="link" href="/docs/profiles.html">Engagement profiles</a>.</td></tr>
+        <tr><td><code>--skill &lt;skill&gt;</code></td><td>A skill every turn of the session is given beside the agent's own (<code>name</code>, <code>global:name</code> or <code>project:name</code>). Repeatable.</td></tr>
+        <tr><td><code>--preload-skill &lt;skill&gt;</code></td><td>A skill whose instructions go into the session's system prompt. Repeatable.</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="c"># start a session against an agent, with an opening question</span>
+$ rupu session <span class="k">start</span> code-explorer <span class="v">--prompt</span> <span class="s">"where is the run target parsed?"</span>
+
+<span class="c"># …rupu prints the new session id, e.g. ses_01J…  then continue the thread:</span>
+$ rupu session <span class="k">send</span> ses_01J… <span class="s">"now also check the writer side"</span>
+
+<span class="c"># re-open the live view of a running session, or list what you have</span>
+$ rupu session <span class="k">attach</span> ses_01J…
+$ rupu session <span class="k">list</span></pre>
+    <div class="callout">
+      <strong>Tip.</strong> If you omit the opening prompt, the first turn
+      defaults to <code class="inline">go</code>. Pass
+      <code class="inline">--prompt</code> when your message could be mistaken
+      for a target reference.
+    </div>
+
+    <h2>The live view</h2>
+    <p>
+      A session turn runs in a child <code class="inline">rupu</code> worker process, so the attached view
+      (after <code class="inline">start</code> or <code class="inline">attach</code>) can be left without killing the
+      active turn. While attached:
+    </p>
+    <ul>
+      <li><strong>p</strong> or <strong>Enter</strong> submits the next prompt once the session is idle; <strong>Esc</strong> cancels local prompt composition without sending.</li>
+      <li><strong>x</strong> cancels the active turn and returns the session to idle.</li>
+      <li><strong>q</strong> leaves the viewer while keeping the session alive; <strong>d</strong> or <strong>Ctrl-]</strong> detaches without stopping the worker.</li>
+      <li><strong>?</strong> shows the attach help.</li>
+    </ul>
+    <p>
+      The prompt input also accepts slash commands: <code class="inline">/help</code>, <code class="inline">/status</code>,
+      <code class="inline">/history</code>, <code class="inline">/runs</code>, <code class="inline">/transcript</code>,
+      <code class="inline">/cancel</code>, <code class="inline">/compact</code> (summarize older turns now; the session must be idle),
+      <code class="inline">/coverage</code> (the session's coverage progress, for an agent with a <code class="inline">concerns:</code>
+      block, after its first turn), <code class="inline">/stop</code>, <code class="inline">/detach</code> and
+      <code class="inline">/quit</code> (or <code class="inline">/exit</code>), plus read-only CLI views routed inline:
+      <code class="inline">/workflow list|show|show-run|runs …</code>, <code class="inline">/session list|show …</code>,
+      <code class="inline">/transcript list|show …</code>, <code class="inline">/issues list|show …</code>. The routed views work in
+      the full-screen attach view only. A prompt that starts with <code class="inline">/name</code> where <code class="inline">name</code>
+      is an installed skill invokes that skill instead (see <a class="link" href="#skills">Skills in a session</a>).
+    </p>
+    <p>
+      The attach header shows the session's token totals, <code class="inline">Cov &lt;complete&gt;/&lt;total&gt;</code> when the
+      agent declares <code class="inline">concerns:</code>, and a <strong>context gauge</strong>, <code class="inline">ctx 52K/200K 26%</code>:
+      the last turn's input tokens against the model's input limit (the resolved model limit, else the agent's
+      <code class="inline">contextWindowTokens</code>). It is green well below the compaction point, amber within 15 points of it,
+      and red at or past it. The compaction point is the model's <code class="inline">compact_at_percent</code> (default 80%; an agent
+      can set <code class="inline">compactAtPercent</code>). The gauge is hidden until a turn has completed or when no input limit is known.
+    </p>
+
+    <h2>The session worker</h2>
+    <p>
+      A session is backed by a <strong>persistent worker process</strong> that
+      runs in the background and survives between turns. That's what lets
+      <code class="inline">rupu session send</code> continue the <em>same</em>
+      conversation with all its context intact rather than starting over — each
+      prompt is queued for the already-running worker as the next turn. Sends can queue behind a
+      running turn. The live view is just a window onto that worker: <code class="inline">--detach</code>
+      (or the <code class="inline">/detach</code> command) leaves the view while
+      the worker keeps running, and <code class="inline">rupu session attach</code>
+      re-opens the view on the current or last run.
+    </p>
+    <p>
+      <code class="inline">rupu session stop &lt;id&gt;</code> ends the worker and any running turn and marks the session
+      stopped; a later <code class="inline">send</code> reactivates it. A running session must be stopped before it can be
+      archived or deleted.
+    </p>
+    <div class="callout">
+      <strong>Upgrading rupu.</strong> The worker is a long-lived daemon, so installing a newer
+      <code class="inline">rupu</code> does not change a running session by itself. <code class="inline">rupu session send</code>
+      restarts a worker whose rupu binary is older than its own (judged by the binary's modification time; the worker is kept
+      when that can't be read). To be sure, and before using <code class="inline">--skill</code> on a running session, run
+      <code class="inline">rupu session stop &lt;id&gt;</code> after an upgrade.
+    </div>
+
+    <h2 id="skills">Skills in a session</h2>
+    <p>
+      A session fixes its <a class="link" href="/docs/skills.html">skills</a> when it starts. <code class="inline">rupu session start</code>
+      resolves the agent's <code class="inline">skills:</code> and <code class="inline">preloadSkills:</code> once, against the
+      global layer and the session's project layer, and stores the set and the rendered skills section on the session. Every
+      turn sends that same section, so the system prompt is byte-identical from turn to turn and the prompt cache holds. A
+      preloaded skill's body is the one it had at start; a session that wants its newer version is a new session. A skill
+      installed after the session started is not offered, even under <code class="inline">*</code>. A skill the model loads
+      is read at its current version (one edited since the start loads with a <code class="inline">skill_changed</code> notice),
+      and a skill uninstalled mid-session is left out of each turn with a <code class="inline">skill_missing</code> notice while
+      the session keeps running.
+    </p>
+    <p>
+      <code class="inline">rupu session start --skill &lt;name&gt;</code> and <code class="inline">--preload-skill &lt;name&gt;</code>
+      (repeat the flag for several) add skills to the session on top of its agent's; its <code class="inline">skill_index</code>
+      records them with reason <code class="inline">session</code>.
+    </p>
+    <p>
+      <code class="inline">rupu session send --skill &lt;name&gt; &lt;id&gt; [prompt]</code> (repeatable) invokes a skill in that
+      turn. It takes any valid skill installed in the session's global or project layer, granted or not, including one marked
+      <code class="inline">disable-model-invocation</code>. The <code class="inline">global:</code> and <code class="inline">project:</code>
+      prefixes work as in a grant. A bare name installed in both layers, a wildcard, an unknown name (with a did-you-mean) and a
+      name the session holds from the other layer are refused before anything is sent. The prompt is optional when a skill is
+      given. The skill's body goes ahead of the prompt in the turn's message:
+    </p>
+    <pre class="code">&lt;skill name=<span class="s">"pdf"</span> base=<span class="s">"/Users/me/.rupu/skills/pdf"</span> version=<span class="s">"3f2a9c0d41b7"</span>&gt;
+...the skill's instructions...
+&lt;/skill&gt;
+
+summarise x.pdf</pre>
+    <p>
+      A prompt that starts with <code class="inline">/name</code> does the same as <code class="inline">--skill name</code>
+      (<code class="inline">rupu session send &lt;id&gt; "/pdf summarise x.pdf"</code>), after any <code class="inline">--skill</code>
+      entries; <code class="inline">rupu session start</code> takes <code class="inline">/name</code> in its first prompt the same
+      way. A token that names no installed skill starts the prompt as text. <code class="inline">version</code> is the first 12 hex
+      digits of the skill's content hash, and the turn's transcript records a <code class="inline">skill_load</code> with
+      <code class="inline">via: operator</code>. From then on the skill is part of the session with reason
+      <code class="inline">operator</code>: the model may load it again with <code class="inline">skills.load</code> and read its
+      files. It is never added to the index, so the system prompt does not change.
+    </p>
+    <p>
+      The skills the model loaded survive turns and compaction: the session keeps its loaded set from turn to turn, and every
+      compaction puts those skills back at their current version. A loaded skill uninstalled for a while is named as missing
+      and stays in the set, so it comes back once it is installed again.
+    </p>
+    <div class="callout">
+      <strong>Record versions.</strong> A session record that carries skills is written as version 2; one without skills stays
+      version 1. A rupu that knows session skills refuses a record from a newer rupu (&ldquo;this session was written by a newer
+      rupu; upgrade rupu to continue it&rdquo;) rather than write it back without the fields it doesn't know;
+      <code class="inline">rupu session list</code> shows such a session with status <code class="inline">newer rupu</code>, and
+      <code class="inline">rupu session prune</code> leaves it alone. A queued turn that invokes skills is turn request version 2:
+      a worker that knows <code class="inline">--skill</code> fails a turn queued by a newer rupu with a transcript saying to restart
+      the worker (<code class="inline">rupu session stop &lt;id&gt;</code>), rather than run it without what it asked for.
+    </div>
+
+    <h2 id="compacting">Compacting a session</h2>
+    <p>
+      A long session's stored conversation can be summarized on demand:
+    </p>
+    <pre class="code">rupu session compact ses_01J…
+rupu session compact ses_01J… --window 1000000   <span class="c"># size against an explicit input limit</span></pre>
+    <p>
+      It summarizes the older turns so the history fits under the same threshold a run compacts at, and stores the result as
+      the session's history. It refuses a session that is running (stop it, or <code class="inline">/cancel</code> the turn,
+      first), does nothing when the history has fewer than four messages, and needs a known input limit: when the model's
+      limits are unknown and the agent pins no <code class="inline">contextWindowTokens</code>, pass
+      <code class="inline">--window</code>. <code class="inline">/compact</code> in the attach view queues the same thing for the
+      worker. Every compaction re-attaches the skills the model had loaded.
+    </p>
+
+    <h2 id="messages">Messages</h2>
+    <p>
+      A session has a <a class="link" href="/docs/messaging.html">message space</a> of its own,
+      <code class="inline">&lt;sessions&gt;/&lt;session_id&gt;/messages/</code>, shared by every turn and by the children a turn
+      dispatches. The session stays joined between turns; <code class="inline">rupu session stop</code> and
+      <code class="inline">rupu session archive</code> record its participants as <code class="inline">left</code>. As the operator
+      you can message a running session from the CLI:
+    </p>
+    <pre class="code"><span class="c"># reaches the session's agent before its next model call</span>
+rupu message send ses_01J… <span class="s">"skip the vendored code"</span>
+rupu message send ses_01J… <span class="v">--urgent</span> <span class="s">"stop editing tests"</span>
+
+<span class="c"># what was said, and who is in the space</span>
+rupu message list ses_01J… <span class="v">--follow</span>
+rupu message participants ses_01J…</pre>
+    <p>
+      Without <code class="inline">--to</code> a message goes to everyone in the session's space (<code class="inline">broadcast</code>);
+      <code class="inline">--to</code> takes a participant, a codename, <code class="inline">role:&lt;agent&gt;</code> or
+      <code class="inline">step:&lt;id&gt;</code>. A session that isn't running takes no message. The control plane shows the same
+      space on the session page's <strong>Messages</strong> tab and serves it as
+      <code class="inline">GET</code>/<code class="inline">POST /api/sessions/:id/messages</code>, with a local SSE stream at
+      <code class="inline">…/messages/stream</code>.
+    </p>
+
+    <h2>When a turn fails</h2>
+    <p>
+      A turn can fail &mdash; the provider refuses, the context window overflows,
+      the recovery ladder runs out. The session does not lose the turn: a failed session turn keeps its
+      conversation, so your next <code class="inline">send</code> continues it instead of re-asking from scratch.
+      When nothing is left to try, the run ends with the outcome's title and the hint
+      <code class="inline">no recovery left — send another message to continue, or start a new session on another model</code>.
+      A session resolves its model limits on its first turn and keeps them, including a limit the provider lowered, for later
+      turns. Recovery and fallbacks are covered on <a class="link" href="/docs/reliability.html">Reliability</a>.
+    </p>
+
+    <h2>Codenames and attribution</h2>
+    <p>
+      Each session gets one human codename alongside its ULID &mdash; a crew plus
+      the agent's role, such as <code class="inline">amber-lantern/heron</code>. The crew is derived from the session id
+      and the role from the agent's name, so the same agent keeps the same role across sessions. Names are minted once and
+      stored on the records, so the name in <code class="inline">rupu session list</code>, the transcript and the control plane
+      is the same on every turn, and any <code class="inline">rupu session</code> command accepts it in place of the id.
+    </p>
+    <p>
+      A run uses the <a class="link" href="/docs/customers.html">customer</a> of the nearest assigned ancestor of its working
+      directory, and a session's record carries the customer of its directory as of its latest turn. Every turn's transcript
+      records the customer it actually ran under, and the control plane prices each turn at that turn's own attribution rather
+      than the session's latest customer.
+    </p>
+
+    <h2>Sessions in the control plane</h2>
+    <p>
+      <code class="inline">/sessions/:id</code> in the <a class="link" href="/docs/control-plane.html">control plane</a> is a
+      chat view over a persistent session: type a prompt and the turn streams back token by token, with tool calls and
+      thinking in position. Start a session from an agent's page (<code class="inline">POST /api/agents/:name/session</code>,
+      which takes the prompt, mode, target and the session's <code class="inline">skills</code> / <code class="inline">preload_skills</code>).
+      Sending queues the turn for the session's worker, as the CLI does; a send may carry <code class="inline">skills</code> to
+      invoke in that turn, and its prompt may be empty when a skill is given. The composer opens a menu of the installed skills
+      when a message starts with <code class="inline">/</code>; the prompt is sent as typed and the CLI reads the
+      <code class="inline">/</code> tokens.
+    </p>
+    <table>
+      <thead><tr><th>Action</th><th>Route</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td>Send</td><td><code>POST /api/sessions/:id/send</code></td><td>Body <code>{prompt?, skills?}</code>; 409 when the session is stopped.</td></tr>
+        <tr><td>Stop</td><td><code>POST /api/sessions/:id/stop</code></td><td>Ends the worker and running turn, marks the session stopped; a later send reactivates it. Local host only.</td></tr>
+        <tr><td>Compact</td><td><code>POST /api/sessions/:id/compact</code></td><td>Compacts the stored conversation now, detached; while it runs, send / stop / archive / delete answer 409, and the session detail reports the outcome as <code>last_compaction</code>. Local host only.</td></tr>
+        <tr><td>Archive / restore / delete</td><td><code>POST …/archive</code>, <code>POST …/restore</code>, <code>DELETE /api/sessions/:id</code></td><td>Same as the CLI commands.</td></tr>
+        <tr><td>Messages</td><td><code>GET</code>/<code>POST /api/sessions/:id/messages</code></td><td>The session's message space; the Messages tab on the session page.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The session list (<code class="inline">/sessions</code>) takes the control plane's query line
+      (<code class="inline">status</code>, <code class="inline">agent</code>, <code class="inline">model</code>,
+      <code class="inline">is:active</code> / <code class="inline">is:archived</code>, <code class="inline">customer</code>, &hellip;).
+      Sessions on a remote host are driven the same way; a remote rupu must advertise <code class="inline">session.skills</code>
+      before a send or start with skills reaches it. These are the same on-disk sessions, transcripts and worker as the CLI's.
+    </p>
+
+    <h2>Sessions vs runs vs workflows</h2>
+    <table>
+      <thead><tr><th>Use</th><th>When</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Session</strong></td><td>Interactive, exploratory, back-and-forth work where you want to refine across turns and keep context — debugging, code exploration, iterative changes.</td></tr>
+        <tr><td><strong>Run</strong> (<code>rupu run</code>)</td><td>A single, self-contained task you can describe in one prompt. No conversation needed — describe it, let it work, review the result.</td></tr>
+        <tr><td><strong>Workflow</strong></td><td>A repeatable, multi-step pipeline defined in YAML — deterministic ordering, templated inputs, and an action allowlist. Reach for this when the same sequence runs again and again.</td></tr>
+      </tbody>
+    </table>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/agentiflows.html">&#8592; Agentiflows</a>
+      <a href="/docs/skills.html">Skills &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Skills</title>
+<meta name="description" content="Agent Skills in rupu: the agentskills.io SKILL.md format, global and project layers, rupu skill install/update, granting skills to agents, steps and sessions, and shipping them to placed units.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item active" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Skills</h1>
+    <p class="intro">A skill is a directory of instructions, scripts and reference files that an agent can load when a task calls for it. rupu reads the open <a class="link" href="https://agentskills.io" target="_blank" rel="noopener">Agent Skills</a> format, so a skill written for another harness installs and validates here unchanged.</p>
+
+    <h2>Layers</h2>
+    <p>Skills live in two places:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>Directory</th></tr></thead>
+      <tbody>
+        <tr><td>global</td><td><code>~/.rupu/skills/&lt;name&gt;/</code> (or <code>$RUPU_HOME/skills/</code>)</td></tr>
+        <tr><td>project</td><td><code>&lt;repo&gt;/.rupu/skills/&lt;name&gt;/</code></td></tr>
+      </tbody>
+    </table>
+    <p>
+      A project skill does not shadow a global one of the same name. Both are kept, and the grant decides which one
+      an agent gets. When the repo has no <code class="inline">.rupu/</code> of its own, its project root resolves to
+      <code class="inline">$HOME</code>, and <code class="inline">~/.rupu</code> is then the global layer only, never both.
+    </p>
+    <div class="callout">
+      <strong>Not scanned.</strong> rupu does not read <code class="inline">.claude/skills</code>,
+      <code class="inline">.agents/skills</code> or <code class="inline">.codex/skills</code>. Scanning them would let a repo
+      under assessment plant instructions and scripts that rupu's agents then run. Copy a skill in on purpose with
+      <code class="inline">rupu skill install</code>.
+    </div>
+
+    <h2>The <code class="inline">SKILL.md</code> format</h2>
+    <p>A skill is a directory whose name is the skill's name and which contains <code class="inline">SKILL.md</code>:</p>
+    <pre class="code">~/.rupu/skills/report-style/
+├── SKILL.md
+├── scripts/render.sh
+└── references/STYLE.md</pre>
+    <p><code class="inline">SKILL.md</code> starts with YAML frontmatter. rupu enforces these rules:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Rule</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>Required. 1 to 64 chars, <code>a-z</code>, <code>0-9</code>, <code>-</code>, no leading, trailing or doubled <code>-</code>. Must equal the directory name.</td></tr>
+        <tr><td><code>description</code></td><td>Required, not empty. Over 1024 chars is a warning; the index the model sees cuts it at 1024 chars.</td></tr>
+        <tr><td><code>license</code></td><td>Optional, free text.</td></tr>
+        <tr><td><code>compatibility</code></td><td>Optional, not empty when present. Over 500 chars is a warning. Shown by <code>rupu skill show</code>.</td></tr>
+        <tr><td><code>metadata</code></td><td>Optional string-to-string map. Kept, not interpreted. A number such as <code>version: 1.0</code> is read as the string <code>"1.0"</code>.</td></tr>
+        <tr><td><code>allowed-tools</code></td><td>Optional. A space-separated string, or a YAML list. Informational only: it is never a tool grant.</td></tr>
+        <tr><td><code>disable-model-invocation</code></td><td>When <code>true</code> the skill is left out of the index the model sees.</td></tr>
+        <tr><td>anything else</td><td>Accepted and ignored, since other harnesses add their own keys.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The 1024 and 500 limits come from the agentskills.io specification. Published skills go over them, so rupu
+      warns rather than rejecting the skill. The body after the frontmatter is the instructions; paths in it are
+      relative to the skill's directory. A UTF-8 BOM and CRLF line endings are accepted.
+    </p>
+    <p>
+      A skill is <strong>invalid</strong> when its frontmatter breaks a rule above, or when a symlink inside it does
+      not resolve or resolves outside the skill directory. In the global layer the skill directory itself may be a
+      symlink. In the project layer it may not, so a repo cannot point a skill at an arbitrary directory on the
+      machine. Invalid skills are listed with their error.
+    </p>
+    <h3>Versions</h3>
+    <p>
+      rupu fingerprints a skill two ways. The <strong>stamp</strong> hashes each file's path, size, modification time
+      and mode, and costs one <code class="inline">stat</code> per file. The <strong>content hash</strong> reads every
+      byte and is computed only when a skill is loaded. Both skip <code class="inline">.git</code> and
+      <code class="inline">.DS_Store</code> at any depth, and both count a file's mode only as executable or not.
+      Because the stamp reads no bytes, it can miss a same-size edit whose modification time was put back (for
+      example by <code class="inline">cp -p</code> or <code class="inline">touch -r</code>).
+    </p>
+
+    <h2>Installing</h2>
+    <pre class="code">rupu skill install &lt;source&gt; [--ref &lt;r&gt;] [--skill &lt;name&gt;]... [--all] [--list] [--project] [--force]</pre>
+    <p>The source is whatever you would copy from a README or a browser:</p>
+    <table>
+      <thead><tr><th>Source</th><th>Resolves to</th></tr></thead>
+      <tbody>
+        <tr><td>an existing path (<code>./x</code>, <code>/abs/x</code>, <code>~/x</code>)</td><td>that local directory</td></tr>
+        <tr><td><code>owner/repo</code></td><td><code>https://github.com/owner/repo</code></td></tr>
+        <tr><td><code>https://github.com/o/r/tree/&lt;ref&gt;/&lt;path&gt;</code> (or <code>/blob/&lt;ref&gt;/&lt;path&gt;/SKILL.md</code>)</td><td>that repo, ref and path</td></tr>
+        <tr><td>any <code>https://</code> git URL, with an optional <code>#&lt;path&gt;</code></td><td>that repo, and the folder at that path</td></tr>
+      </tbody>
+    </table>
+    <p>
+      In a GitHub tree URL the ref is the first segment after <code class="inline">tree/</code>, so a branch with
+      <code class="inline">/</code> in its name needs <code class="inline">--ref</code> and <code class="inline">#&lt;path&gt;</code>
+      instead. Only <code class="inline">https://</code> is fetched: <code class="inline">ssh://</code>,
+      <code class="inline">git@</code> and <code class="inline">file://</code> are refused, and a local checkout is
+      installed as a path. The fetch is a shallow clone of the default branch, or a full clone checked out at
+      <code class="inline">--ref</code>. No git hooks run and submodules are not fetched. Private repositories are not
+      supported yet, and a URL with credentials in it is refused so the token never lands in the source record:
+      clone the repository yourself and install from the directory.
+    </p>
+    <p>
+      rupu searches the source for every directory holding a <code class="inline">SKILL.md</code>, through hidden
+      folders such as <code class="inline">.claude/skills/</code>, up to 6 levels deep, skipping
+      <code class="inline">.git</code> and <code class="inline">node_modules</code>. Then:
+    </p>
+    <ul>
+      <li>One skill found: it is installed.</li>
+      <li>Several found: <code class="inline">--skill &lt;name&gt;</code> (repeatable) picks some, <code class="inline">--all</code> takes every valid one and reports the invalid ones it skipped, and with neither the command lists them and installs nothing.</li>
+      <li><code class="inline">--list</code> lists the skills in the source and installs nothing. An invalid skill's row reads <code class="inline">INVALID: &lt;error&gt;</code> in place of its description.</li>
+    </ul>
+    <pre class="code">rupu skill install anthropics/skills --list
+rupu skill install anthropics/skills --skill pdf</pre>
+    <p>The other flags:</p>
+    <ul>
+      <li><code class="inline">--ref &lt;branch|tag|commit&gt;</code> installs from that ref. It conflicts with a different ref in a tree URL.</li>
+      <li><code class="inline">--project</code> installs into the current project's <code class="inline">.rupu/skills/</code> instead of <code class="inline">~/.rupu/skills/</code>. Outside a rupu project it is refused.</li>
+      <li><code class="inline">--force</code> replaces an installed skill of the same name. Without it the install is refused.</li>
+    </ul>
+    <p>
+      Every chosen skill is validated before anything is written, and a skill containing an absolute symlink is
+      refused. Each copy keeps its file modes, so scripts stay executable, and is swapped in by rename, so a failed
+      install, <code class="inline">--force</code> included, never damages the installed skill. When an install of
+      several skills fails part way, the skills installed before the failure stay installed, with their source
+      records.
+    </p>
+    <p>
+      A skill's scripts need their own tools on the machine: a skill that runs <code class="inline">python3 scripts/render.py</code>
+      needs <code class="inline">python3</code> wherever the agent runs, including any remote host a placed unit runs on.
+    </p>
+
+    <h2>Updating</h2>
+    <p>
+      Each install writes a source record to <code class="inline">&lt;layer&gt;/skills/.sources/&lt;name&gt;.json</code>,
+      outside the skill's directory so it never changes the skill's fingerprints. It holds what you typed, the
+      resolved URL, ref and path (or the local directory), the commit, and the content hash of what was installed.
+    </p>
+    <pre class="code">rupu skill update report-style
+rupu skill update --all [--project] [--force]</pre>
+    <p><code class="inline">update</code> re-fetches each skill from its record, cloning each URL and ref once, and replaces the installed copy. It prints one line per skill:</p>
+    <table>
+      <thead><tr><th>Result</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>updated &lt;old&gt; → &lt;new&gt;</code></td><td>the source changed and the new copy is installed</td></tr>
+        <tr><td><code>up to date</code></td><td>the source matches what is installed</td></tr>
+        <tr><td><code>no source record</code></td><td>the skill was copied in by hand; reinstall it to track a source</td></tr>
+        <tr><td><code>locally modified</code></td><td>the installed copy no longer matches its record, so someone edited it; <code>--force</code> replaces the edits</td></tr>
+      </tbody>
+    </table>
+    <p>
+      If the repository moved the skill, <code class="inline">update</code> finds it by name and the record follows it.
+      A skill installed at a pinned <code class="inline">--ref</code> stays on that ref; moving it is a new
+      <code class="inline">rupu skill install --ref</code>. <code class="inline">update</code> exits 1 when any skill was
+      locally modified, missing or failed to update. There is no <code class="inline">remove</code>: delete the skill's
+      directory; an orphaned source record is ignored.
+    </p>
+
+    <h2>Listing, showing and validating</h2>
+    <pre class="code">rupu skill list [--project]
+rupu skill show report-style
+rupu skill show project:report-style
+rupu skill validate report-style
+rupu skill validate --all</pre>
+    <p>
+      <code class="inline">list</code> shows every skill in both layers with its layer, status, source and description,
+      or its error when it is invalid (<code class="inline">--format json|csv</code> supported).
+      <code class="inline">show</code> prints the frontmatter, the source record, the stamp and content hash, and the
+      skill's files; a bare name shows every layer that has it, and the <code class="inline">global:</code> or
+      <code class="inline">project:</code> prefix picks one. <code class="inline">validate</code> checks skills against the
+      rules above and exits 1 when any is invalid; it prints a <code class="inline">warn</code> line for each warning,
+      and warnings alone exit 0.
+    </p>
+
+    <h2 id="grants">Granting skills to agents</h2>
+    <p>Installing a skill makes it available; it does not give it to any agent. An agent names the skills it gets in its frontmatter:</p>
+    <pre class="code"><span class="k">skills</span>: [<span class="s">pdf</span>, <span class="s">code-review</span>]     <span class="c"># the model may load these</span>
+<span class="k">preloadSkills</span>: [<span class="s">house-style</span>]   <span class="c"># always in the system prompt</span></pre>
+    <p>
+      <code class="inline">*</code> grants every valid global skill and never a project one; a project skill needs its
+      exact name or <code class="inline">project:*</code>. A bare name installed in both layers is an error until it is
+      written <code class="inline">global:&lt;name&gt;</code> or <code class="inline">project:&lt;name&gt;</code>. An unknown
+      or invalid skill fails the agent's load, and <code class="inline">rupu agent validate</code> catches it. The
+      frontmatter keys are described with the rest in <a class="link" href="/docs/agents.html">Agents</a>.
+    </p>
+
+    <h2 id="steps">Skills on workflow steps</h2>
+    <p>A workflow step can give skills to the agents it launches, on top of each agent's own:</p>
+    <pre class="code"><span class="k">steps</span>:
+  - <span class="k">id</span>: <span class="s">review</span>
+    <span class="k">agent</span>: <span class="s">reviewer</span>
+    <span class="k">prompt</span>: <span class="s">Review the PR.</span>
+    <span class="k">skills</span>: [<span class="s">pdf</span>, <span class="s">"project:*"</span>]      <span class="c"># the model may load these</span>
+    <span class="k">preload_skills</span>: [<span class="s">house-style</span>]   <span class="c"># always in the system prompt</span></pre>
+    <p>
+      The entries use the same grammar as an agent's <code class="inline">skills:</code>. A step's skills only add: they
+      never remove one the agent declares. They reach every agent the step launches: its own agent, each
+      <code class="inline">for_each</code> unit, the members of a <code class="inline">parallel:</code> block, and a panel's
+      panelists and its gate's <code class="inline">fix_with</code> fixer. A sub-step has no <code class="inline">skills:</code>
+      of its own; it takes its parent step's.
+    </p>
+    <p>
+      The keys are allowed only on a step that runs an agent. A gate, <code class="inline">action:</code>,
+      <code class="inline">run:</code>, <code class="inline">branch:</code>, <code class="inline">split:</code> or
+      <code class="inline">join:</code> step that names them fails to parse. Parsing checks each entry's syntax only;
+      whether the skill is installed is checked when the step launches, so a missing skill fails that step before
+      its agent runs, the way a missing agent does. The run's <code class="inline">skill_index</code> records step
+      skills with reason <code class="inline">launch</code>, the same as <code class="inline">rupu run --skill</code>. A
+      placed step (<code class="inline">host:</code> or <code class="inline">distribute:</code>) sends its skills with the
+      unit — see <a class="link" href="#placed">Skills on placed units</a>.
+    </p>
+
+    <h2 id="run">How an agent uses its skills</h2>
+    <p>Every run the agent starts (<code class="inline">rupu run</code>, a workflow step, an agentiflow lead or unit) gets its skills the same way:</p>
+    <ul>
+      <li><strong>Index or preload.</strong> A skill in <code class="inline">skills:</code> is listed under <code class="inline">## Skills</code> at the end of the system prompt: its name and description, about a line each. A skill in <code class="inline">preloadSkills:</code> has its whole body in the system prompt instead. The section is rendered the same way for the same skills, so the prompt cache holds across runs.</li>
+      <li><strong><code class="inline">skills.load</code>.</strong> When a task matches a listed skill, the model calls <code class="inline">skills.load</code> with its name and gets its instructions, base directory and file list. The skill is read from disk at that moment: one edited since the run started loads at its new version, with a <code class="inline">skill_changed</code> notice. The model can load only skills the agent was granted.</li>
+      <li><strong>Reading and running its files.</strong> <code class="inline">read_file</code>, <code class="inline">grep</code>, <code class="inline">glob</code> and <code class="inline">ast_grep</code> reach a granted skill's directory, even outside the workspace. A skill's files are read-only to the model: <code class="inline">write_file</code> and <code class="inline">edit_file</code> refuse them. Its scripts run through <code class="inline">bash</code>, under the run's permission mode (<code class="inline">readonly</code> denies them, <code class="inline">ask</code> prompts) and <code class="inline">[bash]</code> settings. A skill never adds a tool or raises the permission mode.</li>
+      <li><strong>Compaction.</strong> The runner keeps the skills the model loaded and puts them back at their current version, in the rebuilt first message, after every compaction. They are capped at a quarter of the model's input limit, most recently loaded first; a skill that doesn't fit is named, for the model to load again. A skill uninstalled mid-run is named as missing.</li>
+      <li><strong>Continuing a run.</strong> <code class="inline">rupu run --continue</code> and a resumed workflow step start with the skills the interrupted run had loaded, and re-attach them at their next compaction. An agentiflow lead carries them from round to round.</li>
+    </ul>
+    <p>
+      <code class="inline">rupu run --skill &lt;name&gt;</code> and <code class="inline">--preload-skill &lt;name&gt;</code>
+      (repeat the flag for several) give one run skills on top of its agent's; its <code class="inline">skill_index</code>
+      records them with reason <code class="inline">launch</code>. <code class="inline">rupu run --continue</code> restores
+      the earlier run's launch skills with the rest of its command; <code class="inline">--skill</code> on the continue
+      replaces the whole skill list and <code class="inline">--preload-skill</code> the whole preload list.
+    </p>
+    <h3 id="slash">Invoking a skill with <code class="inline">/name</code></h3>
+    <p>
+      A prompt that starts with <code class="inline">/name</code> invokes that skill, as <code class="inline">/skill-name args</code>
+      does in Claude Code:
+    </p>
+    <pre class="code">rupu run reviewer <span class="s">"/pdf summarise q3.pdf"</span></pre>
+    <p>
+      Each leading <code class="inline">/</code> token is an operator entry (<code class="inline">/pdf</code>,
+      <code class="inline">/project:pdf</code>) and the rest of the prompt follows the last one. The skill joins the run's
+      launch skills (recorded as a <code class="inline">--skill</code> in its command, so <code class="inline">--continue</code>
+      keeps it), its body goes ahead of the rest of the prompt, and the transcript records a
+      <code class="inline">skill_load</code> with <code class="inline">via: operator</code>. The first token that names no
+      installed skill starts the prompt as text, so <code class="inline">/tmp is full</code> and
+      <code class="inline">/etc/hosts</code> are sent unchanged. An ambiguous name or one named from both layers fails
+      the run. <code class="inline">rupu session start</code> and <code class="inline">rupu session send</code> read the same
+      tokens.
+    </p>
+    <p>
+      A child started with <code class="inline">dispatch</code> (any kind, or a legacy name like
+      <code class="inline">dispatch_agent</code>) gets its own agent's skills, not its parent's.
+    </p>
+    <p>
+      The transcript records what the run had and used: <code class="inline">skill_index</code> lists the granted skills
+      at run start, and a <code class="inline">skill_load</code> is written for every load, with <code class="inline">via</code>
+      set to <code class="inline">model</code>, <code class="inline">preload</code>, <code class="inline">reattach</code> or
+      <code class="inline">continuation</code>. Notices name what needs attention: <code class="inline">skill_not_indexed</code>,
+      <code class="inline">skill_changed</code>, <code class="inline">skill_missing</code>,
+      <code class="inline">skill_tools_missing</code> and <code class="inline">skill_reattach_truncated</code>. See
+      <a class="link" href="/docs/transcripts.html">Transcript schema</a>.
+    </p>
+
+    <h2 id="sessions">Skills in sessions</h2>
+    <p>
+      A session fixes its skills when it starts. <code class="inline">rupu session start</code> resolves the agent's
+      <code class="inline">skills:</code> and <code class="inline">preloadSkills:</code> once, against the global layer and
+      the session's project layer, and stores the set and the rendered skills section on the session. Every turn
+      sends that same section, so the system prompt is byte-identical from turn to turn and the prompt cache holds.
+      A preloaded skill's body is the one it had at start; a session that wants its newer version is a new session.
+      A skill installed after the session started is not offered, even under <code class="inline">*</code>. A skill the
+      model loads is read at its current version, and one edited since the session started loads with a
+      <code class="inline">skill_changed</code> notice. A skill uninstalled mid-session is left out of each turn with a
+      <code class="inline">skill_missing</code> notice, and the session keeps running.
+    </p>
+    <p>
+      <code class="inline">rupu session start --skill &lt;name&gt;</code> and <code class="inline">--preload-skill &lt;name&gt;</code>
+      (repeatable) add skills to the session on top of its agent's; its <code class="inline">skill_index</code> records
+      them with reason <code class="inline">session</code>.
+    </p>
+    <p>
+      <code class="inline">rupu session send --skill &lt;name&gt; &lt;id&gt; [prompt]</code> (repeatable) invokes a skill in
+      that turn. It takes any valid skill installed in the session's global or project layer, granted or not,
+      including one marked <code class="inline">disable-model-invocation</code>, which exists for exactly this. A bare
+      name installed in both layers, a wildcard, an unknown name (with a did-you-mean) and a name the session holds
+      from the other layer are refused before anything is sent. The prompt is optional when a skill is given. The
+      skill's body goes ahead of the prompt in the turn's message:
+    </p>
+    <pre class="code">&lt;skill name=<span class="s">"pdf"</span> base=<span class="s">"/Users/me/.rupu/skills/pdf"</span> version=<span class="s">"3f2a9c0d41b7"</span>&gt;
+...the skill's instructions...
+&lt;/skill&gt;
+
+summarise x.pdf</pre>
+    <p>
+      A prompt that starts with <code class="inline">/name</code> does the same as <code class="inline">--skill name</code>
+      (<code class="inline">rupu session send &lt;id&gt; "/pdf summarise x.pdf"</code>), after any <code class="inline">--skill</code>
+      entries; <code class="inline">rupu session start</code> takes <code class="inline">/name</code> in its first prompt the
+      same way. <code class="inline">version</code> is the first 12 hex digits of the skill's content hash. The turn's
+      transcript records a <code class="inline">skill_load</code> with <code class="inline">via: operator</code>. From then on
+      the skill is part of the session with reason <code class="inline">operator</code>: the model may load it again with
+      <code class="inline">skills.load</code> and read its files. It is never added to the index, so the system prompt
+      does not change.
+    </p>
+    <p>
+      The skills the model loaded survive turns and compaction: every compaction puts them back at their current
+      version — the runner's own compaction during a turn, <code class="inline">rupu session compact</code>, and the
+      compaction a running session's worker does on request. A loaded skill uninstalled for a while is named as
+      missing and stays in the set, so it comes back once it is installed again.
+    </p>
+    <div class="callout">
+      <strong>Record versions.</strong> A session record that carries skills is written as version 2; one without
+      skills stays version 1. A rupu that knows session skills refuses a record from a newer rupu rather than write
+      it back without the fields it doesn't know; <code class="inline">rupu session list</code> shows such a session
+      with status <code class="inline">newer rupu</code>, and <code class="inline">rupu session prune</code> leaves it alone.
+      A queued turn that invokes skills is turn request version 2, and a worker that knows <code class="inline">--skill</code>
+      fails a turn queued by a newer rupu with a transcript saying so. After upgrading rupu, run
+      <code class="inline">rupu session stop &lt;id&gt;</code> before using <code class="inline">--skill</code> on a running
+      session. More in <a class="link" href="/docs/sessions.html">Sessions</a>.
+    </div>
+
+    <h2 id="placed">Skills on placed units</h2>
+    <p>
+      A placed unit runs <code class="inline">rupu run &lt;agent&gt;</code> on another host. The coordinator ships the
+      skills the unit needs, and the host runs the unit with exactly those copies. The host does not need them
+      installed.
+    </p>
+    <ul>
+      <li><strong>What ships.</strong> The coordinator resolves the unit's skills the way a local run does: the <code class="inline">skills:</code> / <code class="inline">preloadSkills:</code> of its own copy of the agent, plus the step's <code class="inline">skills:</code> / <code class="inline">preload_skills:</code>. <code class="inline">*</code> means the coordinator's global layer. If a step skill is not installed on the coordinator, the unit fails before it is dispatched. If the coordinator has no copy of the agent, or its file does not load, only the step's skills ship, with a warning in the second case.</li>
+      <li><strong>What the host does.</strong> Each skill is packed as a tar and named by its content hash. The coordinator asks the host which hashes it lacks and sends only those. The host checks every tar before keeping it — no absolute or <code class="inline">..</code> paths, no symlink that leaves the skill, only files, directories and symlinks, and the unpacked tree must hash to the name it was sent under — and keeps the copy in <code class="inline">&lt;RUPU_HOME&gt;/cache/skills/&lt;hash&gt;/&lt;name&gt;/</code> (mode 0700). The cache has no eviction.</li>
+      <li><strong>Overlay.</strong> A shipped skill replaces the host's installed skill with the same layer and name, so the coordinator's version wins. The host still loads the agent itself and resolves its grants over its global layer, its staged project layer and the shipped skills; the rules do not change. The step's own entries go to the host as the <code class="inline">layer:name</code> entries they resolved to on the coordinator. The unit's <code class="inline">skill_index</code> marks shipped skills <code class="inline">(shipped)</code>.</li>
+      <li><strong>Limits.</strong> A skill tree may be at most 32 MiB and one unit's bundle at most 128 MiB. The coordinator refuses a unit over either limit before dispatch and names the skill and the limit.</li>
+      <li><strong>Transfers.</strong> Within one coordinator process, a host that confirmed a hash is not asked again, and the units of a fan-out bound for one host share one transfer. Over SSH a transfer is two commands per host (<code class="inline">rupu __skills missing</code>, <code class="inline">rupu __skills receive</code>). Over HTTP the peer serves <code class="inline">POST /api/skills/bundle/missing</code> and <code class="inline">PUT /api/skills/bundle/:hash</code>. Tunnel nodes take <code class="inline">SkillsOffer</code> / <code class="inline">SkillsNeed</code> / <code class="inline">SkillChunk</code> / <code class="inline">SkillsStored</code> frames; a bucket host gets each missing skill as <code class="inline">skills/&lt;hash&gt;.tar</code>, and the worker downloads and verifies what its cache lacks before the job starts. <code class="inline">host: local</code> ships nothing.</li>
+      <li><strong>Older hosts.</strong> A host that does not advertise <code class="inline">agent.skill_bundle</code> is sent the unit by name, as before, and the run gets a warning that names the host and says the unit will use the host's installed copies. Over SSH and HTTP the coordinator remembers the downgrade for the life of its process; for tunnel and bucket the capability is re-checked on every unit.</li>
+      <li><strong>Errors.</strong> Every coordinator-side failure for a placed unit's skills (resolve, pack, limit, transfer) and a skill missing on the host starts with <code class="inline">host &lt;id&gt;: </code>.</li>
+    </ul>
+    <p>
+      Only the placed unit's own skills ship. Children the unit launches on the host, a <code class="inline">rupu coverage</code>
+      rerun, and an agent whose own grants the coordinator did not ship still resolve from the host's installed
+      layers. On the host, the hidden <code class="inline">rupu run --skill-bundle &lt;json&gt;</code> carries the manifest
+      and is recorded with the rest of the command, so <code class="inline">rupu run --continue</code> runs with the same
+      shipped skills. The transports are described in <a class="link" href="/docs/multi-host.html">Multi-host</a>.
+    </p>
+
+    <h2 id="cp">In the control plane</h2>
+    <p>
+      The control plane shows installed skills and edits where they are granted; installing and updating stay CLI
+      operations. The Library's skills tab lists the global layer, and the project picker adds that project's layer,
+      like <code class="inline">rupu skill list</code>. Each row shows its layer, status, source and description; an
+      invalid skill shows its error. A layer that can't be read is left out with a warning, and the other layer still
+      lists. A skill's page shows its description, compatibility, license, <code class="inline">allowed-tools</code> with
+      the rupu tools they map to (informational, never a grant), metadata, files, body, content hash and install
+      record.
+    </p>
+    <p>
+      An agent's <code class="inline">skills:</code> and <code class="inline">preloadSkills:</code> are edited in the agent
+      builder's Skills card, with the installed names as suggestions. The control plane checks an agent's skills the
+      way <code class="inline">rupu agent validate</code> does; an agent that fails shows "This agent can't be launched"
+      with the reason, and an unknown name comes with the install hint. Saving such an agent is allowed, so an agent
+      can be written before its skills are installed. A workflow step's <code class="inline">skills</code> and
+      <code class="inline">preload_skills</code> are fields of the step form for any step that runs an agent. The
+      launcher's Skills section adds skills to a run or a session, and the session composer and the launcher's
+      prompt open a menu of the installed skills when a message starts with <code class="inline">/</code>. A remote host
+      gets no menu, since this control plane can't list its skills; a typed <code class="inline">/name</code> still
+      reaches a rupu there that reads <code class="inline">/</code> tokens. Session skills on a remote host need a rupu
+      there that advertises <code class="inline">session.skills</code>; run skills need <code class="inline">agent.skills</code>.
+      The routes are in the <a class="link" href="/docs/api.html">HTTP API</a>.
+    </p>
+
+    <div class="doc-nav">
+      <a href="/docs/sessions.html">&#8592; Sessions</a>
+      <a href="/docs/messaging.html">Messaging &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
