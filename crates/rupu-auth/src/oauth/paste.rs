@@ -49,7 +49,8 @@ pub struct Pasted {
 
 /// Reads what the operator pasted: surrounding whitespace, quotes and
 /// backticks are dropped; a URL (the page's address bar) is read for its
-/// `code` / `state` query; so is a `code=…&state=…` query string; else
+/// `code` / `state` query, its fragment standing in for a `state` the query
+/// lacks (`…/callback?code=abc#st`); so is a `code=…&state=…` query string; else
 /// `code#state` splits at the first `#`, and anything else is a bare code.
 pub fn parse_pasted(input: &str) -> Result<Pasted> {
     let s = input.trim_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'));
@@ -58,8 +59,15 @@ pub fn parse_pasted(input: &str) -> Result<Pasted> {
     }
     if s.starts_with("https://") || s.starts_with("http://") {
         let url = url::Url::parse(s).map_err(|e| anyhow!("the pasted URL does not parse: {e}"))?;
-        return from_query(url.query().unwrap_or_default())
-            .ok_or_else(|| anyhow!("the pasted URL has no `code`"));
+        let mut pasted = from_query(url.query().unwrap_or_default())
+            .ok_or_else(|| anyhow!("the pasted URL has no `code`"))?;
+        if pasted.state.is_none() {
+            pasted.state = url
+                .fragment()
+                .filter(|st| !st.is_empty())
+                .map(str::to_string);
+        }
+        return Ok(pasted);
     }
     if let Some(pasted) = from_query(s.trim_start_matches('?')) {
         return Ok(pasted);
@@ -224,6 +232,32 @@ mod tests {
         );
     }
 
+    /// The state in a URL's fragment is compared like any other pasted state.
+    #[test]
+    fn a_redirect_url_s_fragment_is_its_state_when_the_query_has_none() {
+        assert_eq!(
+            parse_pasted("https://platform.claude.com/oauth/code/callback?code=abc#st").unwrap(),
+            Pasted {
+                code: "abc".into(),
+                state: Some("st".into())
+            }
+        );
+        // A query `state` wins over the fragment; an empty fragment is none.
+        assert_eq!(
+            parse_pasted("https://h.example/cb?code=abc&state=q#frag")
+                .unwrap()
+                .state
+                .as_deref(),
+            Some("q")
+        );
+        assert_eq!(
+            parse_pasted("https://h.example/cb?code=abc#")
+                .unwrap()
+                .state,
+            None
+        );
+    }
+
     #[test]
     fn a_query_string_is_read_for_code_and_state() {
         assert_eq!(
@@ -237,8 +271,15 @@ mod tests {
 
     #[test]
     fn whitespace_quotes_and_backticks_are_stripped() {
-        for s in ["  abc#st \n", "\"abc#st\"", "`abc#st`", "'abc#st'"] {
-            assert_eq!(parse_pasted(s).unwrap().code, "abc", "{s:?}");
+        let plain = parse_pasted("abc#st").unwrap();
+        for s in [
+            "  abc#st \n",
+            "abc#st\r\n",
+            "\"abc#st\"",
+            "`abc#st`",
+            "'abc#st'",
+        ] {
+            assert_eq!(parse_pasted(s).unwrap(), plain, "{s:?}");
         }
     }
 

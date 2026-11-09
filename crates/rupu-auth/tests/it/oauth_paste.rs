@@ -133,6 +133,34 @@ async fn a_mismatched_pasted_state_is_refused_before_any_exchange() {
     token.assert_hits(0);
 }
 
+/// A pasted redirect URL carrying its state in the fragment
+/// (`…/callback?code=abc#state`) has that state compared too.
+#[tokio::test]
+#[serial]
+async fn a_pasted_url_s_fragment_state_is_compared() {
+    let server = MockServer::start();
+    let _url = TokenUrl::at(&server);
+    let token = server.mock(|when, then| {
+        when.method(POST).path("/token");
+        then.status(200)
+            .json_body(serde_json::json!({ "access_token": "at" }));
+    });
+    let mut input = Paste(|_: &str, _: &str| {
+        Ok("https://platform.claude.com/oauth/code/callback?code=abc#not-the-state".to_string())
+    });
+
+    let err = run_with_input(ProviderId::Anthropic, None, &mut input)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("pasted state does not match this login"),
+        "{err}"
+    );
+    token.assert_hits(0);
+}
+
 #[tokio::test]
 #[serial]
 async fn a_bare_code_proceeds_with_rupu_s_own_state() {
