@@ -47,3 +47,161 @@ fn login_sso_without_browser_errors_on_headless_linux() {
         .failure()
         .stderr(predicate::str::contains("requires a desktop browser"));
 }
+
+/// The stored credentials in `<home>/auth.json`, keyed `<account>/<mode>`.
+fn stored_keys(home: &std::path::Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(home.join("auth.json")).unwrap();
+    let map: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&raw).unwrap();
+    map.into_keys().collect()
+}
+
+/// A GitHub device-code endpoint pair on `server` that grants at once.
+fn github_device_mocks(server: &httpmock::MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
+    let device = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/login/device/code")
+            .body_contains("client_id=178c6fc778ccc68e1d6a");
+        then.status(200).json_body(serde_json::json!({
+            "device_code": "dev-code",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 0,
+        }));
+    });
+    let token = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/login/oauth/access_token")
+            .body_contains("device_code=dev-code");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "ghp-test",
+            "token_type": "bearer",
+            "scope": "repo",
+        }));
+    });
+    (device, token)
+}
+
+/// `rupu auth login --account github --mode device` against `server`.
+fn github_device_login(home: &std::path::Path, server: &httpmock::MockServer) -> Command {
+    let mut cmd = Command::cargo_bin("rupu").unwrap();
+    cmd.env("RUPU_HOME", home)
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .env(
+            "RUPU_DEVICE_DEVICE_URL_OVERRIDE",
+            server.url("/login/device/code"),
+        )
+        .env(
+            "RUPU_DEVICE_TOKEN_URL_OVERRIDE",
+            server.url("/login/oauth/access_token"),
+        )
+        .env("RUPU_DEVICE_FAST_POLL", "1")
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["auth", "login", "--account", "github", "--mode", "device"]);
+    cmd
+}
+
+#[test]
+fn login_device_for_a_vendor_without_a_headless_flow_refuses() {
+    let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .timeout(std::time::Duration::from_secs(30))
+        .args([
+            "auth",
+            "login",
+            "--account",
+            "anthropic",
+            "--mode",
+            "device",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "anthropic has no device login; use --mode api-key",
+        ));
+    assert!(!tmp.path().join("auth.json").exists());
+}
+// NOTE for Task 3: this test flips to a success test when Anthropic gains its paste flow; Task 3 rewrites it.
+
+#[test]
+fn login_device_for_github_runs_the_device_code_flow_and_stores_sso() {
+    let server = httpmock::MockServer::start();
+    let (device, token) = github_device_mocks(&server);
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    github_device_login(tmp.path(), &server)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("enter code: ABCD-1234")
+                .and(predicate::str::contains("stored github sso credential")),
+        );
+
+    device.assert_hits(1);
+    token.assert_hits(1);
+    assert_eq!(stored_keys(tmp.path()), ["github/sso"]);
+}
+
+#[test]
+fn logout_device_removes_the_sso_entry() {
+    let server = httpmock::MockServer::start();
+    let _mocks = github_device_mocks(&server);
+    let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .args([
+            "auth",
+            "login",
+            "--account",
+            "anthropic",
+            "--mode",
+            "api-key",
+            "--key",
+            "sk-x",
+        ])
+        .assert()
+        .success();
+    github_device_login(tmp.path(), &server).assert().success();
+    assert_eq!(stored_keys(tmp.path()), ["anthropic/api-key", "github/sso"]);
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .args(["auth", "logout", "--account", "github", "--mode", "device"])
+        .assert()
+        .success();
+    assert_eq!(stored_keys(tmp.path()), ["anthropic/api-key"]);
+}
+
+#[test]
+fn login_sso_headless_refusal_names_device_mode() {
+    // Only meaningful on Linux without DISPLAY; skipped elsewhere.
+    if std::env::var_os("DISPLAY").is_some() || cfg!(not(target_os = "linux")) {
+        return;
+    }
+    let tmp = assert_fs::TempDir::new().unwrap();
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("DISPLAY")
+        .env_remove("BROWSER")
+        .env_remove("RUPU_OAUTH_SKIP_BROWSER")
+        .args(["auth", "login", "--account", "anthropic", "--mode", "sso"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Run with --mode device to log in from any browser, or --mode api-key.",
+        ));
+}

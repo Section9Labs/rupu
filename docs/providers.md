@@ -4,13 +4,15 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 
 ## Provider × auth-mode matrix
 
-| Provider           | API key | SSO  | SSO flow         | Notes                                                                                      |
-| ------------------ | :-----: | :--: | ---------------- | ------------------------------------------------------------------------------------------ |
-| anthropic          |   ✓     |  ✓   | Browser callback | Console API key OR Claude.ai SSO.                                                          |
-| openai             |   ✓     |  ✓   | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
-| gemini             |   ✓     |  ✓   | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
-| copilot            |   ✓     |  ✓   | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
-| openai-compatible  |   ✓     |  —   | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
+| Provider           | API key | SSO  | Device | SSO flow         | Notes                                                                                      |
+| ------------------ | :-----: | :--: | :----: | ---------------- | ------------------------------------------------------------------------------------------ |
+| anthropic          |   ✓     |  ✓   |   —    | Browser callback | Console API key OR Claude.ai SSO.                                                          |
+| openai             |   ✓     |  ✓   |   —    | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
+| gemini             |   ✓     |  ✓   |   —    | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
+| copilot            |   ✓     |  ✓   |   ✓    | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
+| openai-compatible  |   ✓     |  —   |   —    | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
+
+**Device** is `--mode device`, the login for a machine with no browser — see [Device login](#device-login---mode-device).
 
 Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured.
 
@@ -65,7 +67,7 @@ Steps:
 4. rupu validates the redirect's `state` (CSRF protection), exchanges the auth code for tokens, and stores them in `~/.rupu/auth.json`.
 5. The browser shows "Authentication complete — return to your terminal."
 
-**Headless (Linux without `DISPLAY`/`BROWSER`):** the browser-callback flow errors out with a message pointing at `--mode api-key`. There's no headless fallback for these three providers.
+**Headless (Linux without `DISPLAY`/`BROWSER`):** the browser-callback flow refuses with `SSO requires a desktop browser. Run with --mode device to log in from any browser, or --mode api-key.` See [Device login](#device-login---mode-device) for the vendors that have one.
 
 ### SSO device code (Copilot)
 
@@ -79,6 +81,20 @@ Steps:
 3. Open the URL in any browser, paste the code, authorize the rupu OAuth app.
 4. rupu polls `github.com/login/oauth/access_token` until the user grants access.
 5. The GitHub token is exchanged for a Copilot API token; both are stored in `~/.rupu/auth.json`.
+
+### Device login (`--mode device`)
+
+```sh
+rupu auth login --account <name> --mode device
+```
+
+For a machine with no browser (a server, a VM, an SSH session): rupu prints what to open, you complete the login in a browser on any other machine, and rupu stores the result. The credential is the same one `--mode sso` stores and lands in the account's `sso` entry, so `rupu auth status` shows `sso`, an agent's `auth: sso` picks it, it refreshes like any SSO token, and `rupu auth logout --mode device` removes it (the same entry as `--mode sso`).
+
+Vendors with a device login:
+
+- **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
+
+Any other vendor refuses with `<kind> has no device login; use --mode api-key`.
 
 ### Default precedence
 
@@ -373,7 +389,7 @@ The `[1m]` suffix is only a client-side marker for the 1M beta: it is stripped f
 The token may have expired faster than the refresh window expected. Re-login with `rupu auth login --account <name> --mode sso`. If api-key, the key was rotated server-side — generate a new one and re-login.
 
 **SSO login fails on a server / over SSH.**
-The browser-callback flow can't reach a desktop. Use `--mode api-key`. Copilot's device-code SSO is the only flow that works headless — visit the URL from any browser anywhere and the polling completes.
+The browser-callback flow can't reach a desktop. Use `--mode device` for a vendor that has a device login (see [Device login](#device-login---mode-device)) — visit the URL it prints from any browser anywhere and the login completes — or `--mode api-key`.
 
 **Provider rejects the model id.**
 rupu sends the id as written (it never rejects an unknown one itself), so check it against `rupu models list --provider <name>`. For a private or fine-tuned model that list doesn't include, add the model under `[[providers.<name>.models]]` in `~/.rupu/config.toml` with at least the `id` field, then retry. Custom entries always take precedence over live and baked-in.

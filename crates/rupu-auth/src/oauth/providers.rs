@@ -40,6 +40,23 @@ pub enum OAuthFlow {
     Device,
 }
 
+/// How a vendor logs in from a machine with no browser
+/// (`rupu auth login --mode device`). The credential is stored as `sso`,
+/// the same slot the browser flow fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessFlow {
+    /// RFC 8628 device code (GitHub, Copilot, GitLab).
+    DeviceCode,
+    /// Authorization code shown on a vendor-hosted page the user copies from.
+    PasteCode {
+        redirect_uri: &'static str,
+        /// Appended after `ProviderOAuth::extra_authorize_params`.
+        extra_authorize_params: &'static [(&'static str, &'static str)],
+    },
+    /// Codex CLI's `--device-auth` (OpenAI accounts endpoints).
+    OpenAiDeviceAuth,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenBodyFormat {
     /// `application/x-www-form-urlencoded` body. Used by OpenAI / Codex.
@@ -91,6 +108,9 @@ pub struct ProviderOAuth {
     /// standard doesn't require it at exchange time, but Anthropic's
     /// server seems to want it.
     pub include_state_in_token_body: bool,
+    /// The flow `--mode device` runs, or `None` when the vendor has no
+    /// login a browser on another machine can complete.
+    pub headless: Option<HeadlessFlow>,
 }
 
 /// An OAuth application chosen at login rather than built in: a GitLab
@@ -103,6 +123,9 @@ pub struct OAuthClient {
     pub client_id: String,
     pub authorize_url: String,
     pub token_url: String,
+    /// The application's RFC 8628 device-authorization endpoint, for a
+    /// `--mode device` login. `None` when it has none to offer.
+    pub device_url: Option<String>,
 }
 
 /// The `extra` key a credential records its [`OAuthClient::client_id`] under.
@@ -161,6 +184,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
+            headless: None,
         }),
         ProviderId::Openai => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -204,6 +228,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: None,
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -231,6 +256,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: None,
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
@@ -248,6 +274,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Local => None,
         ProviderId::Github => Some(ProviderOAuth {
@@ -282,6 +309,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Gitlab => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -305,6 +333,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: None,
         }),
         ProviderId::Linear => None,
         ProviderId::Jira => None,
@@ -325,6 +354,30 @@ mod tests {
         ] {
             let cfg = provider_oauth(p).unwrap_or_else(|| panic!("missing oauth config for {p}"));
             assert!(!cfg.client_id.is_empty(), "{p}: empty client_id");
+        }
+    }
+
+    #[test]
+    fn github_and_copilot_headless_is_the_device_code_flow() {
+        for p in [ProviderId::Github, ProviderId::Copilot] {
+            assert_eq!(
+                provider_oauth(p).unwrap().headless,
+                Some(HeadlessFlow::DeviceCode),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn vendors_without_a_headless_flow_yet_say_so() {
+        // Filled in by later tasks: OpenAI (Task 2), Anthropic (3), GitLab (4), Gemini (5).
+        for p in [
+            ProviderId::Anthropic,
+            ProviderId::Openai,
+            ProviderId::Gemini,
+            ProviderId::Gitlab,
+        ] {
+            assert_eq!(provider_oauth(p).unwrap().headless, None, "{p}");
         }
     }
 

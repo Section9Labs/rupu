@@ -377,6 +377,7 @@ async fn a_gitlab_login_uses_and_records_the_chosen_application() {
         client_id: "corp-app".into(),
         authorize_url: server.url("/oauth/authorize"),
         token_url: server.url("/oauth/token"),
+        device_url: None,
     };
     // glab's application is registered on port 7171; any free port will do
     // here.

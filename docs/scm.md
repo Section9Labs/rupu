@@ -41,7 +41,7 @@ named accounts (`--account gh-work --kind github`, `--account gh-personal
 --kind github`); see `docs/providers.md`'s "Accounts vs. vendor kind" for the
 full mechanism.
 
-GitHub uses a device-code SSO flow; GitLab uses browser-callback PKCE. Required
+GitHub uses a device-code SSO flow (`--mode device` is the same flow for GitHub); GitLab uses browser-callback PKCE. Required
 scopes:
 
 | Platform | Scopes                                              |

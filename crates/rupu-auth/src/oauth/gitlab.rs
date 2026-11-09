@@ -59,6 +59,7 @@ pub fn oauth_client(
         client_id,
         authorize_url: format!("{instance}/oauth/authorize"),
         token_url: format!("{instance}/oauth/token"),
+        device_url: None,
     })
 }
 
