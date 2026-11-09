@@ -54,7 +54,7 @@ impl CurrentScm {
             resolver,
             state: tokio::sync::Mutex::new(None),
             availability: crate::cp_repos::CpRepoLister {
-                registry: Arc::new(rupu_scm::Registry::empty()),
+                registry: Arc::new(rupu_scm::Registry::default()),
             },
         }
     }
@@ -186,7 +186,7 @@ impl CurrentScm {
             Ok(snapshot) => Ok(snapshot),
             Err(_) => {
                 let inputs = self.inputs(false).await?;
-                let registry = Arc::new(rupu_scm::Registry::empty());
+                let registry = Arc::new(rupu_scm::Registry::default());
                 Ok(Arc::new(ScmSnapshot {
                     available: false,
                     resolver: Arc::new(
