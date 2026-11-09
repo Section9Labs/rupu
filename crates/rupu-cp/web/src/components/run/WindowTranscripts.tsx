@@ -1,6 +1,7 @@
 // The Transcript tab while a turn window is on: every transcript the window's
-// turns came from (a step's, or one unit's of a fan-out), each with the range
-// of its model calls inside the window; the chosen one shows only those turns.
+// turns came from (a step's, or one unit's of a fan-out; on an agentiflow, a
+// lead round's or a unit's), each with the range of its model calls inside
+// the window; the chosen one shows only those turns.
 
 import { useEffect, useMemo, useState } from 'react';
 import TranscriptPanel from '../TranscriptPanel';
@@ -22,20 +23,25 @@ export function transcriptLabel(model: RunGraphModel | null, path: string): stri
 
 export default function WindowTranscripts({
   window: w,
-  model,
+  model = null,
+  labelOf,
   preferred,
   live,
   runId,
   host,
 }: {
   window: TurnWindow;
-  model: RunGraphModel | null;
+  model?: RunGraphModel | null;
+  /** What to call a transcript, when the page names them itself (an
+   *  agentiflow); else `transcriptLabel` over the run graph. */
+  labelOf?: (path: string) => string;
   /** The transcript the page had selected, shown first when it is in the window. */
   preferred: string | null;
   live: boolean;
-  runId: string;
+  runId?: string;
   host?: string;
 }) {
+  const label = labelOf ?? ((path: string) => transcriptLabel(model, path));
   const entries = useMemo(() => [...w.transcripts], [w]);
   const [chosen, setChosen] = useState<string | null>(null);
   // Pick again only when the choice is no longer in the window (a live run
@@ -78,7 +84,7 @@ export default function WindowTranscripts({
                 : 'border-border bg-panel text-ink-dim hover:bg-surface-hover',
             )}
           >
-            <span className="truncate font-mono">{transcriptLabel(model, path)}</span>
+            <span className="truncate font-mono">{label(path)}</span>
             <span className="shrink-0 tabular-nums text-ink-mute">
               {a === b ? `call ${a}` : `calls ${a}–${b}`}
             </span>

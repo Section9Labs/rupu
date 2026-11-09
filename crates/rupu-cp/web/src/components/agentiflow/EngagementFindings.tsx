@@ -7,11 +7,21 @@ import { FindingsExplorer } from '../findings/FindingsExplorer';
 
 const POLL_MS = 5000;
 
-export default function EngagementFindings({ runId, live }: { runId: string; live?: boolean }) {
+export default function EngagementFindings({
+  runId,
+  live,
+  within,
+}: {
+  runId: string;
+  live?: boolean;
+  /** A window of the Token flow: only findings recorded inside it. */
+  within?: [number, number] | null;
+}) {
   return (
     <FindingsExplorer
       scope={{ runId }}
       pollMs={live ? POLL_MS : undefined}
+      within={within}
       exportTitle="Engagement findings report"
       empty={{
         title: 'No findings recorded yet',

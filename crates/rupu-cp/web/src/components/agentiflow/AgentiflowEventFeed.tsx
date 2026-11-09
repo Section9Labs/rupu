@@ -8,13 +8,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import RunEventFeed from '../RunEventFeed';
 import { agentiflowEventCards } from '../../lib/agentiflowEvents';
+import { withinSpan } from '../../lib/run/turnWindow';
 import { api, apiErrorMessage, type AgentiflowEvent } from '../../lib/api';
 import { ErrorBanner } from '../ui/ErrorBanner';
 import { Spinner } from '../ui/Spinner';
 
 const POLL_MS = 5000;
 
-export default function AgentiflowEventFeed({ id, codename, running }: { id: string; codename?: string; running?: boolean }) {
+export default function AgentiflowEventFeed({
+  id,
+  codename,
+  running,
+  within,
+}: {
+  id: string;
+  codename?: string;
+  running?: boolean;
+  /** A window of the Token flow: only the events inside it. */
+  within?: [number, number] | null;
+}) {
   const [events, setEvents] = useState<AgentiflowEvent[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const seq = useRef(0);
@@ -51,7 +63,10 @@ export default function AgentiflowEventFeed({ id, codename, running }: { id: str
     return () => clearInterval(t);
   }, [running, load]);
 
-  const cards = useMemo(() => agentiflowEventCards(events ?? [], codename), [events, codename]);
+  const cards = useMemo(() => {
+    const all = agentiflowEventCards(events ?? [], codename);
+    return within ? all.filter((c) => withinSpan(within, c.ts)) : all;
+  }, [events, codename, within]);
 
   if (events === null && !error) {
     return (

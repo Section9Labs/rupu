@@ -184,10 +184,14 @@ describe('AgentiflowDetail', () => {
     expect(screen.getByRole('progressbar', { name: 'rounds used' })).toHaveAttribute('aria-valuenow', '100');
     expect(screen.getByRole('progressbar', { name: 'spend used' })).toHaveAttribute('aria-valuenow', '25');
 
-    // Goals and budget show once, in the one Status panel.
+    // Goals and budget show once, in the Engagement tab (the first and
+    // default); the header carries their one-line summary, rounds at its cap.
     expect(screen.getAllByRole('heading', { name: 'Goals' })).toHaveLength(1);
     expect(screen.getAllByRole('heading', { name: 'Budget' })).toHaveLength(1);
-    expect(within(screen.getByTestId('af-status')).getByRole('heading', { name: 'Budget' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Engagement' })).toHaveAttribute('aria-pressed', 'true');
+    const summary = screen.getByTestId('af-summary');
+    expect(summary).toHaveTextContent('0/1goals met');
+    expect(within(summary).getByText('6')).toHaveClass('text-err');
 
     // Fleet (its own tab now; the flow map is always shown above the tabs).
     // Unit identities also render in the map, so scope these to the panel.
@@ -358,5 +362,27 @@ describe('AgentiflowDetail', () => {
     vi.spyOn(api, 'getAgentiflow').mockRejectedValue(new ApiError(404, 'not found', '{"error":"not found"}'));
     renderDetail();
     expect(await screen.findByText('Agentiflow not found')).toBeInTheDocument();
+  });
+
+  it('draws the Token flow under the map from the flow usage timeline, and none without calls', async () => {
+    vi.spyOn(api, 'getAgentiflow').mockResolvedValue(DETAIL);
+    const usage = vi.spyOn(api, 'getAgentiflowUsageTimeline').mockResolvedValue([
+      { turn: 1, label: 'round 0', tokens_in: 1200, tokens_out: 40, tokens_cached: 0, at: '2026-10-07T15:07:09Z', transcript: '/tmp/lead/transcript.r0.jsonl', transcript_turn: 1 },
+      { turn: 2, label: 'round 0', tokens_in: 3400, tokens_out: 90, tokens_cached: 1000, at: '2026-10-07T15:07:20Z', transcript: '/tmp/u1.jsonl', transcript_turn: 1 },
+    ]);
+    renderDetail();
+    const flow = await screen.findByTestId('af-token-flow');
+    expect(usage).toHaveBeenCalledWith('af_01ABC', expect.anything());
+    // The map comes first, then the chart, then the tabs.
+    const map = screen.getByTestId('flow-map');
+    expect(map.compareDocumentPosition(flow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(flow.compareDocumentPosition(screen.getByRole('button', { name: 'Engagement' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    cleanup();
+
+    usage.mockResolvedValue([]);
+    renderDetail();
+    await screen.findByTestId('flow-map');
+    await waitFor(() => expect(usage).toHaveBeenCalledTimes(2));
+    expect(screen.queryByTestId('af-token-flow')).toBeNull();
   });
 });

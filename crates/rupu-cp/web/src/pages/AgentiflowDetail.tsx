@@ -22,7 +22,14 @@ import {
   RefreshCw,
   Server,
   ShieldAlert,
+  Target,
+  X,
 } from 'lucide-react';
+import TokenFlow from '../components/charts/TokenFlow';
+import { spanLabel } from '../components/run/TurnWindowBar';
+import type { UsageTimelinePoint } from '../lib/api';
+import WindowTranscripts from '../components/run/WindowTranscripts';
+import { turnWindow, type TurnWindow } from '../lib/run/turnWindow';
 import {
   api,
   apiErrorMessage,
@@ -79,15 +86,16 @@ import {
 
 const POLL_MS = 5000;
 
-// The tabs, in the workflow run's order (Transcript, Events, Findings,
-// Children, Messages, Network), plus the flow's own Fleet and Assets.
-type AfTab = 'transcript' | 'events' | 'findings' | 'children' | 'fleet' | 'messages' | 'network' | 'assets';
-const AF_TAB_NAMES: AfTab[] = ['transcript', 'events', 'findings', 'children', 'fleet', 'messages', 'network', 'assets'];
+// The tabs: the engagement's goals, budget and definition first, then the
+// workflow run's order (Transcript, Events, Findings, Children, Messages,
+// Network), plus the flow's own Fleet and Assets.
+type AfTab = 'engagement' | 'transcript' | 'events' | 'findings' | 'children' | 'fleet' | 'messages' | 'network' | 'assets';
+const AF_TAB_NAMES: AfTab[] = ['engagement', 'transcript', 'events', 'findings', 'children', 'fleet', 'messages', 'network', 'assets'];
 
 export default function AgentiflowDetail() {
   const { hash, search } = useLocation();
   const navigate = useNavigate();
-  const [tab, setTab] = useTabParam(AF_TAB_NAMES, parseMsgHash(hash) ? 'messages' : 'transcript');
+  const [tab, setTab] = useTabParam(AF_TAB_NAMES, parseMsgHash(hash) ? 'messages' : 'engagement');
   const { id = '' } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<AgentiflowDetailData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -144,6 +152,13 @@ export default function AgentiflowDetail() {
   }, [running, load]);
 
   const [childrenCount, setChildrenCount] = useState<number | null>(null);
+  // The Token flow's points, and a selected range of them: a window the
+  // tabs below narrow to (as on a run page).
+  const usage = useFlowUsage(id, running);
+  const [zoom, setZoom] = useState<[number, number] | null>(null);
+  useEffect(() => setZoom(null), [id]);
+  const turnWin = useMemo(() => (zoom ? turnWindow(usage ?? [], zoom[0], zoom[1]) : null), [usage, zoom]);
+  const windowSpan = turnWin?.span ?? null;
   const messages = useMessageSpace({ route: 'agentiflows', id }, { live: running, load: true, reading: tab === 'messages' });
   const [transcriptFocus, setTranscriptFocus] = useState<TranscriptSelection | null>(null);
   // The transcript a participant's messages are in: a unit's own, or the
@@ -237,14 +252,8 @@ export default function AgentiflowDetail() {
               ended {relativeTime(record.ended_at)} · ran {durationBetween(record.started_at, record.ended_at)}
             </span>
           )}
-          <span>
-            {record.rounds} {record.rounds === 1 ? 'round' : 'rounds'}
-          </span>
-          <span className="inline-flex items-center gap-1.5 font-medium text-ink tabular-nums">
-            {formatSpendUsd(record.spent_usd)}
-            <span className="font-normal text-ink-mute">· {formatSpendTokens(record.spent_tokens)}</span>
-          </span>
         </div>
+        <EngagementSummary detail={detail} goals={goals} onOpen={() => setTab('engagement')} />
         {record.stop_reason && (
           <div className="mt-1.5 text-note text-ink-dim">
             <span className="text-ink-mute">stopped: </span>
@@ -262,70 +271,11 @@ export default function AgentiflowDetail() {
             finalizing and will be closed out by the orphan reaper.
           </div>
         )}
-        {def?.description && <p className="mt-2 max-w-3xl text-sm text-ink-dim">{def.description}</p>}
+        {def?.description && <Objective text={def.description} />}
         {stopControls.panel && <div className="mt-3 max-w-3xl">{stopControls.panel}</div>}
       </div>
 
       {error && <ErrorBanner>{error}</ErrorBanner>}
-
-      {/* Status: the run's goals beside its budget, once (the map and the
-          header no longer repeat them). */}
-      <section className="rounded-xl border border-border bg-panel shadow-card" data-testid="af-status">
-        <div className="grid lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
-          <div className="px-4 pb-3 pt-3">
-            <div className="flex items-center justify-between gap-3 pb-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-dim">Goals</h2>
-              <span className="text-note tabular-nums text-ink-dim">
-                {record.goals.filter((g) => g.met).length}/{record.goals.length} met
-              </span>
-            </div>
-            {goals.length === 0 ? (
-              <Muted>No goals recorded.</Muted>
-            ) : (
-              <ul className="divide-y divide-border">
-                {goals.map((g) => (
-                  <li key={g.id} className="flex items-start gap-3 py-2.5 first:pt-0 last:pb-0">
-                    {g.met ? (
-                      <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-ok" aria-label="met" />
-                    ) : (
-                      <Circle size={16} className="mt-0.5 shrink-0 text-ink-mute" aria-label="not met" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium text-ink">{g.objective}</span>
-                        {g.objective !== g.id && <span className="font-mono text-note text-ink-mute">{g.id}</span>}
-                        {!g.required && <Badge tone="neutral">optional</Badge>}
-                      </div>
-                      {g.predicate && (
-                        <div className="mt-0.5 break-words font-mono text-note text-ink-mute">{g.predicate}</div>
-                      )}
-                      <div className="mt-1.5 flex items-center gap-3">
-                        <ProgressBar value={goalProgress(g)} tone={g.met ? 'ok' : 'brand'} label={`${g.id} progress`} />
-                        <span className="shrink-0 text-note tabular-nums text-ink-dim">
-                          {g.current}/{g.target}
-                        </span>
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-          <div className="border-t border-border px-4 pb-3 pt-3 lg:border-l lg:border-t-0">
-            <div className="flex items-center justify-between gap-3 pb-2">
-              <h2 className="text-xs font-semibold uppercase tracking-wide text-ink-dim">Budget</h2>
-              {detail.budget_state ? (
-                <Badge tone={STOP_TONE_BADGE[budgetStateTone(detail.budget_state)]} ring>
-                  {detail.budget_state}
-                </Badge>
-              ) : (
-                <span className="text-note text-ink-mute">not evaluated yet</span>
-              )}
-            </div>
-            <BudgetBody detail={detail} />
-          </div>
-        </div>
-      </section>
 
       {/* The flow itself, always shown, as a workflow run shows its graph. */}
       <Panel
@@ -343,9 +293,17 @@ export default function AgentiflowDetail() {
         )}
       </Panel>
 
+      {/* Every model call of the lead and its units, by lead round. */}
+      {usage && usage.length > 0 && (
+        <section className="rounded-xl border border-border bg-panel p-4 shadow-card" data-testid="af-token-flow">
+          <TokenFlow points={usage} stages live={running} zoom={zoom} onZoomChange={setZoom} />
+        </section>
+      )}
+
       {/* Tabs in the workflow run's order, on the same tab bar. */}
       <div>
         <TabBar>
+          <TabButton active={tab === 'engagement'} onClick={() => setTab('engagement')} icon={Target} label="Engagement" />
           <TabButton active={tab === 'transcript'} onClick={() => setTab('transcript')} icon={FileText} label="Transcript" />
           <TabButton active={tab === 'events'} onClick={() => setTab('events')} icon={ListOrdered} label="Events" />
           <TabButton active={tab === 'findings'} onClick={() => setTab('findings')} icon={ShieldAlert} label="Findings" />
@@ -365,10 +323,10 @@ export default function AgentiflowDetail() {
           <TabButton active={tab === 'network'} onClick={() => setTab('network')} icon={NetworkIcon} label="Network" />
           <TabButton active={tab === 'assets'} onClick={() => setTab('assets')} icon={Server} label="Assets" />
         </TabBar>
-        <div className="px-1 pt-1.5 text-meta text-ink-mute">
-          profile{record.engagement_profiles.length === 1 ? '' : 's'}: {record.engagement_profiles.join(', ') || 'none'}
-        </div>
       </div>
+      {turnWin && <FlowWindowBar window={turnWin} onClear={() => setZoom(null)} />}
+
+      {tab === 'engagement' && <EngagementTab detail={detail} goals={goals} />}
 
       {tab === 'fleet' && (
         <Panel
@@ -436,17 +394,21 @@ export default function AgentiflowDetail() {
 
       {tab === 'findings' && (
         <Panel title="Findings" meta={<span className="text-meta text-ink-mute">verified by this engagement</span>}>
-          <EngagementFindings runId={record.id} live={running} />
+          <EngagementFindings runId={record.id} live={running} within={windowSpan} />
         </Panel>
       )}
 
       {tab === 'network' && (
         <Panel title="Network" meta={<span className="text-meta text-ink-mute">egress across the fleet</span>}>
           <NetflowExplorer
-            key={record.id}
+            key={windowSpan ? `${record.id}:${windowSpan.join('-')}` : record.id}
             scope="agentiflow"
             agentiflowId={record.id}
-            initialWindow={spanWindow(record.started_at, record.ended_at)}
+            initialWindow={
+              windowSpan
+                ? { from: new Date(windowSpan[0]).toISOString(), to: new Date(windowSpan[1]).toISOString() }
+                : spanWindow(record.started_at, record.ended_at)
+            }
           />
         </Panel>
       )}
@@ -458,20 +420,30 @@ export default function AgentiflowDetail() {
           notLiveReason={running ? null : `This agentiflow is ${record.status}: messages only reach a running flow.`}
           openInTranscript={(m) => (transcriptOf(m.from) ? () => messageLinks.openParticipant?.(m.from, m.id) : null)}
           highlightId={parseMsgHash(hash)}
+          within={windowSpan}
         />
       )}
 
       {tab === 'transcript' && (
         <section>
           <MessageLinksContext.Provider value={messageLinks}>
-            <TranscriptBrowser detail={detail} running={running} focus={transcriptFocus} />
+            {turnWin ? (
+              <WindowTranscripts
+                window={turnWin}
+                labelOf={(path) => flowTranscriptLabel(detail, path)}
+                preferred={transcriptFocus?.path ?? null}
+                live={running}
+              />
+            ) : (
+              <TranscriptBrowser detail={detail} running={running} focus={transcriptFocus} />
+            )}
           </MessageLinksContext.Provider>
         </section>
       )}
 
       {tab === 'events' && (
         <section className="flex flex-col" style={{ height: '65vh' }}>
-          <AgentiflowEventFeed id={id} codename={record.codename} running={running} />
+          <AgentiflowEventFeed id={id} codename={record.codename} running={running} within={windowSpan} />
         </section>
       )}
     </div>
@@ -678,3 +650,211 @@ function UnitRow({ unit, afId }: { unit: AgentiflowUnit; afId: string }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// The summary line, the objective, the Engagement tab, the Token flow window
+// ---------------------------------------------------------------------------
+
+type Tone = 'ok' | 'warn' | 'err' | 'plain';
+const TONE_TEXT: Record<Tone, string> = { ok: 'text-ok', warn: 'text-warn', err: 'text-err', plain: 'text-ink' };
+
+/** One line under the header: goals met, then each budget cap as used / cap,
+ *  amber at the soft limit and red at or past the cap. Opens the Engagement tab. */
+function EngagementSummary({ detail, goals, onOpen }: { detail: AgentiflowDetailData; goals: ReturnType<typeof goalViews>; onOpen: () => void }) {
+  const { record, def } = detail;
+  const uses = budgetUses(def?.budget, record);
+  const met = goals.filter((g) => g.met).length;
+  const items: { key: string; tone: Tone; value: string; of?: string; unit: string }[] = [];
+  if (goals.length) items.push({ key: 'goals', tone: met === goals.length ? 'ok' : 'plain', value: `${met}/${goals.length}`, unit: 'goals met' });
+  for (const u of uses) {
+    const tone: Tone = u.over ? 'err' : u.soft ? 'warn' : 'plain';
+    const unit = u.dim === 'usd' ? 'spent' : u.dim === 'wall_clock' ? 'running' : u.dim;
+    items.push({ key: u.dim, tone, value: briefUse(u.dim, u.used), of: briefUse(u.dim, u.cap), unit });
+  }
+  if (!uses.some((u) => u.dim === 'usd')) items.push({ key: 'usd', tone: 'plain', value: formatSpendUsd(record.spent_usd), unit: 'spent' });
+  if (!uses.some((u) => u.dim === 'tokens')) {
+    items.push({ key: 'tok', tone: 'plain', value: formatTokens(record.spent_tokens), unit: 'tokens' });
+  }
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="group mt-2 inline-flex max-w-full flex-wrap items-baseline gap-x-1 gap-y-0.5 rounded-md px-1.5 py-1 -ml-1.5 text-note text-ink-dim transition-colors hover:bg-surface-hover"
+      title="Goals and budget: open the Engagement tab"
+      data-testid="af-summary"
+    >
+      {items.map((it, i) => (
+        <span key={it.key} className="inline-flex items-baseline gap-1 whitespace-nowrap">
+          {i > 0 && <span className="mx-1 text-ink-mute">·</span>}
+          <span className={cn('font-medium tabular-nums', TONE_TEXT[it.tone])}>{it.value}</span>
+          {it.of && <span className="tabular-nums text-ink-mute">of {it.of}</span>}
+          <span>{it.unit}</span>
+        </span>
+      ))}
+      <span className="ml-1 text-ink-mute opacity-0 transition-opacity group-hover:opacity-100">details →</span>
+    </button>
+  );
+}
+
+/** A budget figure as short as it reads: `$766.94`, `$100k`, `4h 22m`, `120h`. */
+function briefUse(dim: BudgetUse['dim'], n: number): string {
+  if (dim === 'usd') return n >= 1000 ? `$${Number((n / 1000).toFixed(n >= 10_000 ? 0 : 1))}k` : formatCost(n);
+  const text = formatUse(dim, n);
+  return dim === 'wall_clock' && text.endsWith(' 0m') ? text.slice(0, -3) : text;
+}
+
+/** The objective, two lines until asked for more. */
+function Objective({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-2 max-w-3xl text-sm text-ink-dim">
+      <p className={cn(!open && 'line-clamp-2')}>{text}</p>
+      <button type="button" onClick={() => setOpen((v) => !v)} className="mt-0.5 text-note font-medium text-ink-mute hover:text-ink">
+        {open ? 'less' : 'more'}
+      </button>
+    </div>
+  );
+}
+
+/** Goals and budget, and what the engagement was given to work with. */
+function EngagementTab({ detail, goals }: { detail: AgentiflowDetailData; goals: ReturnType<typeof goalViews> }) {
+  const { record, def } = detail;
+  return (
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,7fr)_minmax(0,5fr)]">
+      <Panel title="Goals" meta={<span className="text-note tabular-nums text-ink-dim">{goals.filter((g) => g.met).length}/{goals.length} met</span>}>
+            {goals.length === 0 ? (
+          <Muted>No goals recorded.</Muted>
+        ) : (
+          <ul className="divide-y divide-border">
+            {goals.map((g) => (
+              <li key={g.id} className="flex items-start gap-3 py-2.5 first:pt-0 last:pb-0">
+                {g.met ? (
+                  <CheckCircle2 size={16} className="mt-0.5 shrink-0 text-ok" aria-label="met" />
+                ) : (
+                  <Circle size={16} className="mt-0.5 shrink-0 text-ink-mute" aria-label="not met" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-ink">{g.objective}</span>
+                    {g.objective !== g.id && <span className="font-mono text-note text-ink-mute">{g.id}</span>}
+                    {!g.required && <Badge tone="neutral">optional</Badge>}
+                  </div>
+                  {g.predicate && (
+                    <div className="mt-0.5 break-words font-mono text-note text-ink-mute">{g.predicate}</div>
+                  )}
+                  <div className="mt-1.5 flex items-center gap-3">
+                    <ProgressBar value={goalProgress(g)} tone={g.met ? 'ok' : 'brand'} label={`${g.id} progress`} />
+                    <span className="shrink-0 text-note tabular-nums text-ink-dim">
+                      {g.current}/{g.target}
+                    </span>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
+      <div className="space-y-4">
+        <Panel
+          title="Budget"
+          meta={
+            detail.budget_state ? (
+              <Badge tone={STOP_TONE_BADGE[budgetStateTone(detail.budget_state)]} ring>
+                {detail.budget_state}
+              </Badge>
+            ) : (
+              <span className="text-note text-ink-mute">not evaluated yet</span>
+            )
+          }
+        >
+          <BudgetBody detail={detail} />
+        </Panel>
+        <Panel title="Definition">
+          <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1.5 text-note">
+            <dt className="text-ink-mute">lead</dt>
+            <dd className="font-mono text-ink">{def?.lead ?? '—'}</dd>
+            <dt className="text-ink-mute">profiles</dt>
+            <dd className="text-ink">{record.engagement_profiles.join(', ') || 'none'}</dd>
+            <dt className="text-ink-mute">pool</dt>
+            <dd className="text-ink">
+              {def ? `${def.pool.agents.length} agents · workflows ${def.pool.workflows === 'all' ? 'all' : def.pool.workflows.length}` : '—'}
+            </dd>
+            <dt className="text-ink-mute">lead turns</dt>
+            <dd className="tabular-nums text-ink">{def?.round?.lead_max_turns ?? '—'} per round</dd>
+          </dl>
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+/** The flow's per-call token series (lead + units), re-read while it runs.
+ *  `null` until the first answer; a failed read keeps the last one. */
+function useFlowUsage(id: string, running: boolean): UsageTimelinePoint[] | null {
+  const [points, setPoints] = useState<UsageTimelinePoint[] | null>(null);
+  useEffect(() => {
+    setPoints(null);
+  }, [id]);
+  useEffect(() => {
+    let alive = true;
+    const ctl = new AbortController();
+    const read = () =>
+      api.getAgentiflowUsageTimeline(id, { signal: ctl.signal }).then(
+        (p) => alive && setPoints(p),
+        () => alive && setPoints((cur) => cur ?? []),
+      );
+    void read();
+    const t = running ? setInterval(() => void read(), POLL_MS) : undefined;
+    return () => {
+      alive = false;
+      ctl.abort();
+      if (t) clearInterval(t);
+    };
+  }, [id, running]);
+  return points;
+}
+
+/** What a transcript in the window is: a lead round's, or a unit's codename. */
+function flowTranscriptLabel(detail: AgentiflowDetailData, path: string): string {
+  const lead = detail.lead_transcripts.find((t) => t.path === path);
+  if (lead) return `lead · round ${lead.round}`;
+  const unit = detail.units.find((u) => u.transcript_path === path);
+  if (unit) return parseCodename(unit.codename).leaf;
+  const base = path.split('/').pop() ?? path;
+  return base.replace(/\.jsonl$/, '');
+}
+
+/** The window a Token flow selection opens: which calls, when, and what each
+ *  tab narrows to, with a Clear. */
+function FlowWindowBar({ window: w, onClear }: { window: TurnWindow; onClear: () => void }) {
+  const rounds = w.labels.map((l) => l.replace(/^round /, ''));
+  return (
+    <div
+      role="status"
+      data-testid="turn-window"
+      className="gx-window flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-brand-500/30 bg-brand-500/5 px-3 py-1.5 text-note text-ink-dim"
+    >
+      <span className="font-medium text-ink">
+        Turns {w.turns[0].toLocaleString()}–{w.turns[1].toLocaleString()}
+      </span>
+      {w.span && <span className="tabular-nums">{spanLabel(w.span)}</span>}
+      {rounds.length > 0 && (
+        <span>
+          {rounds.length === 1 ? 'round' : 'rounds'} <span className="font-mono text-ink">{rounds.join(', ')}</span>
+        </span>
+      )}
+      <span className="text-ink-mute">
+        {w.span
+          ? 'transcript: these turns · events, findings, messages, network: this time'
+          : 'no times recorded for these turns · transcript: these turns'}
+      </span>
+      <button
+        type="button"
+        onClick={onClear}
+        className="ml-auto inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-medium text-ink transition-colors hover:bg-surface-hover"
+      >
+        <X size={12} aria-hidden />
+        Clear
+      </button>
+    </div>
+  );
+}
