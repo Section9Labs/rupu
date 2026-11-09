@@ -148,6 +148,10 @@ pub fn ops() -> &'static [OpSpec] {
 /// `tests/it/mcp_routes.rs` holds this list and `ops()` in lockstep with the
 /// registered routes.
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
+    ("GET", "/api/config/scoped/project/:id", "versioned operator UI config CAS; existing config tools retain their legacy contract"),
+    ("PUT", "/api/config/scoped/project/:id", "versioned operator UI config CAS; existing config tools retain their legacy contract"),
+    ("GET", "/api/config/scoped/customer/:slug", "versioned operator UI config CAS; existing config tools retain their legacy contract"),
+    ("PUT", "/api/config/scoped/customer/:slug", "versioned operator UI config CAS; existing config tools retain their legacy contract"),
     (
         "GET",
         "/api/mcp/servers",
