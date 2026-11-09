@@ -175,6 +175,7 @@ async fn launch_mints_the_id_and_hands_the_launcher_the_definition_and_directory
         seen,
         [AgentiflowLaunchRequest {
             definition: "itest".into(),
+            global_definition_only: false,
             run_id: id.into(),
             working_dir: workspace_dir(&global),
         }]
@@ -217,6 +218,7 @@ async fn a_project_scope_starts_the_run_in_that_workspace() {
     .await;
     assert_eq!(status, 202, "{body}");
     assert_eq!(launcher.requests()[0].working_dir, repo);
+    assert!(!launcher.requests()[0].global_definition_only);
 
     // The same scope without that definition is a 404, before any spawn.
     let (status, _) = post(
@@ -226,6 +228,89 @@ async fn a_project_scope_starts_the_run_in_that_workspace() {
     )
     .await;
     assert_eq!(status, 404);
+    assert_eq!(launcher.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn global_scope_pins_custom_rupu_home_despite_a_competing_project_definition() {
+    let (tmp, global) = home(); // The configured global directory is `home`, not `.rupu`.
+    write(&global.join("agentiflows/itest.yaml"), DEF);
+    // The unchanged global-parent cwd sees this project layer. It must not
+    // override the explicit global definition, even if its YAML is broken.
+    write(
+        &tmp.path().join(".rupu/agentiflows/itest.yaml"),
+        "name: [\n",
+    );
+    let launcher = FakeLauncher::started();
+    let addr = serve(state(&global, true, Some(launcher.clone()))).await;
+    let (status, body) = post(
+        addr,
+        "/api/agentiflows",
+        json!({"definition": "itest", "scope_kind": "global"}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let requests = launcher.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].global_definition_only);
+    assert_eq!(requests[0].working_dir, global.parent().unwrap());
+    assert_eq!(requests[0].definition, "itest");
+    assert_eq!(requests[0].run_id, body["id"].as_str().unwrap());
+
+    // Removing the selected global source cannot select the project instead.
+    std::fs::remove_file(global.join("agentiflows/itest.yaml")).unwrap();
+    write(&tmp.path().join(".rupu/agentiflows/itest.yaml"), DEF);
+    let (status, body) = post(
+        addr,
+        "/api/agentiflows",
+        json!({"definition": "itest", "scope_kind": "global"}),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(launcher.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn global_scope_does_not_fall_back_from_invalid_selected_definition() {
+    let (tmp, global) = home();
+    write(&global.join("agentiflows/itest.yaml"), "name: [\n");
+    write(&tmp.path().join(".rupu/agentiflows/itest.yaml"), DEF);
+    let launcher = FakeLauncher::started();
+    let addr = serve(state(&global, true, Some(launcher.clone()))).await;
+    let (status, body) = post(
+        addr,
+        "/api/agentiflows",
+        json!({"definition": "itest", "scope_kind": "global"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(launcher.requests().is_empty());
+}
+
+#[tokio::test]
+async fn global_scope_keeps_default_home_parent_and_rejects_definition_paths() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join(".rupu");
+    write(&global.join("agentiflows/itest.yaml"), DEF);
+    let launcher = FakeLauncher::started();
+    let addr = serve(state(&global, true, Some(launcher.clone()))).await;
+    let (status, body) = post(
+        addr,
+        "/api/agentiflows",
+        json!({"definition": "itest", "scope_kind": "global"}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(launcher.requests()[0].working_dir, tmp.path());
+    assert!(launcher.requests()[0].global_definition_only);
+    write(&global.join("outside.yaml"), DEF);
+    let (status, body) = post(
+        addr,
+        "/api/agentiflows",
+        json!({"definition": "../outside", "scope_kind": "global"}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
     assert_eq!(launcher.requests().len(), 1);
 }
 

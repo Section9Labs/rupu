@@ -211,9 +211,10 @@ fn resolve_for(s: &AppState, name: &str, q: &DefQuery) -> ApiResult<Resolved> {
     }
 }
 
-/// The launch directory a scope-pinned agentiflow launch starts in, so the
-/// child's own lookup finds the definition `scope_kind`/`scope_id` picked
-/// (`repo_scope::launch_dir_for`). 404 when `name` is not in that scope.
+/// The scope-pinned working directory. Global keeps the existing global-parent
+/// rule, even for a configured directory not named `.rupu`: the launcher now
+/// pins definition lookup explicitly instead of relying on cwd shadowing.
+/// Project keeps `repo_scope::launch_dir_for`. Missing selected files are 404.
 pub(crate) fn launch_dir(
     s: &AppState,
     name: &str,
@@ -225,8 +226,11 @@ pub(crate) fn launch_dir(
             "agentiflow definition {name} not found in the requested scope"
         ))
     })?;
-    crate::api::repo_scope::launch_dir_for(&r.dir, r.scope_kind)?
-        .ok_or_else(|| ApiError::internal("the definition's directory has no workspace root"))
+    match r.scope_kind {
+        ScopeKind::Global => s.global_dir.parent().map(FsPath::to_path_buf),
+        ScopeKind::Project => crate::api::repo_scope::launch_dir_for(&r.dir, r.scope_kind)?,
+    }
+    .ok_or_else(|| ApiError::internal("the definition's directory has no workspace root"))
 }
 
 /// One row of `GET /api/agentiflow-defs`.

@@ -79,6 +79,10 @@ pub enum Action {
         /// the id it printed is the run this process records.
         #[arg(long, hide = true, value_name = "ID", conflicts_with = "detach")]
         run_id: Option<String>,
+        /// Internal: pin the definition to configured RUPU_HOME without
+        /// changing the run's working directory or other configuration layers.
+        #[arg(long, hide = true)]
+        global_definition_only: bool,
     },
     /// List agentiflow runs, newest first.
     ///
@@ -169,7 +173,8 @@ pub async fn handle(
             def,
             detach,
             run_id,
-        } => run_cmd(&def, detach, run_id, global_format).await,
+            global_definition_only,
+        } => run_cmd(&def, detach, run_id, global_definition_only, global_format).await,
         Action::List => list_cmd(global_format, absolute, all_columns),
         Action::Status { id } => status_cmd(&id, global_format),
         Action::Send { id, message, now } => send_cmd(&id, &message, now),
@@ -201,6 +206,7 @@ async fn run_cmd(
     def_name: &str,
     detach: bool,
     run_id: Option<String>,
+    global_definition_only: bool,
     format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let global = paths::global_dir()?;
@@ -218,7 +224,12 @@ async fn run_cmd(
     let cfg = rupu_config::layer_files_locked(cfg_paths.layers())?;
 
     // ---- the definition, validated before anything is built -----------------
-    let (_, def) = locate_agentiflow_def(&global, project_rupu.as_deref(), def_name)?;
+    let (_, def) = locate_run_definition(
+        &global,
+        project_rupu.as_deref(),
+        def_name,
+        global_definition_only,
+    )?;
     // The same overlay-aware registry every other entry point resolves
     // engagement profiles through (`findings_opts::resolve_engagement`):
     // built-ins, then `<global>/profiles`, then `<workspace>/.rupu/profiles`.
@@ -256,7 +267,15 @@ async fn run_cmd(
         None => new_run_id(),
     };
     if detach {
-        return spawn_detached(def_name, &def.name, &run_id, &global, format).await;
+        return spawn_detached(
+            def_name,
+            &def.name,
+            &run_id,
+            &global,
+            global_definition_only,
+            format,
+        )
+        .await;
     }
     let run_dir = agentiflow_dir(&global).join(&run_id);
 
@@ -319,6 +338,25 @@ async fn run_cmd(
     Ok(())
 }
 
+/// The hidden detached-child pin narrows only definition lookup. A missing
+/// global file is an error even when a project has a same-named definition.
+fn locate_run_definition(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    global_definition_only: bool,
+) -> Result<(PathBuf, AgentiflowDef), rupu_agentiflow::DefLookupError> {
+    locate_agentiflow_def(
+        global,
+        if global_definition_only {
+            None
+        } else {
+            project
+        },
+        name,
+    )
+}
+
 /// A run id a caller supplied (`--run-id`) names a directory under
 /// `<global>/agentiflows/`, so it must look like one `new_run_id` mints: `af_`
 /// and a plain token, never a path.
@@ -333,10 +371,11 @@ fn validate_run_id(id: &str) -> anyhow::Result<()> {
 /// What the re-exec'd child of `run --detach` is invoked with: the plain
 /// foreground `run`, under the id the parent minted. `--` keeps a definition
 /// name from being read as a flag.
-fn detached_argv(def_name: &str, run_id: &str) -> RunArgv {
+fn detached_argv(def_name: &str, run_id: &str, global_definition_only: bool) -> RunArgv {
     RunArgv::Agentiflow(AgentiflowRun {
         definition: def_name.to_string(),
         run_id: run_id.to_string(),
+        global_definition_only,
     })
 }
 
@@ -424,11 +463,12 @@ async fn spawn_detached(
     name: &str,
     run_id: &str,
     global: &Path,
+    global_definition_only: bool,
     format: Option<OutputFormat>,
 ) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locate the rupu binary to detach")?;
     let run_dir = agentiflow_dir(global).join(run_id);
-    match start_detached(&exe, def_name, run_id, global, None).await? {
+    match start_detached(&exe, def_name, run_id, global, None, global_definition_only).await? {
         DetachedStart::Started => {}
         DetachedStart::Pending { log } => eprintln!(
             "agentiflow {name}: run {run_id} had not started after {}s; it is still going in \
@@ -485,8 +525,9 @@ pub(crate) fn detached_spawn_spec(
     run_id: &str,
     global: &Path,
     cwd: Option<&Path>,
+    global_definition_only: bool,
 ) -> SpawnSpec {
-    let mut launch = SpawnSpec::new(exe, detached_argv(def_name, run_id));
+    let mut launch = SpawnSpec::new(exe, detached_argv(def_name, run_id, global_definition_only));
     launch.env = vec![("RUPU_HOME".into(), global.as_os_str().to_owned())];
     launch.stdio = SpawnStdio::Log(agentiflow_dir(global).join(run_id).join(DETACH_LOG));
     launch.keep_child = true;
@@ -520,13 +561,14 @@ pub(crate) async fn start_detached(
     run_id: &str,
     global: &Path,
     cwd: Option<&Path>,
+    global_definition_only: bool,
 ) -> Result<DetachedStart, DetachError> {
     let run_dir = agentiflow_dir(global).join(run_id);
     std::fs::create_dir_all(&run_dir)
         .map_err(|e| DetachError::Spawn(format!("create {}: {e}", run_dir.display())))?;
     let log_path = run_dir.join(DETACH_LOG);
 
-    let launch = detached_spawn_spec(exe, def_name, run_id, global, cwd);
+    let launch = detached_spawn_spec(exe, def_name, run_id, global, cwd, global_definition_only);
     // Owned by the guard from here on: whichever way this returns, or if the
     // caller drops it mid-wait (a client that hung up), the child is reaped
     // when it ends.
@@ -2205,7 +2247,9 @@ mod tests {
                 def,
                 detach,
                 run_id,
+                global_definition_only,
             } => {
+                assert!(!global_definition_only);
                 assert_eq!(def, "acme");
                 assert!(!detach, "foreground unless asked");
                 assert_eq!(run_id, &None);
@@ -2261,11 +2305,74 @@ mod tests {
         let help = run.render_long_help().to_string();
         assert!(help.contains("--detach"), "{help}");
         assert!(!help.contains("--run-id"), "{help}");
+        assert!(!help.contains("--global-definition-only"), "{help}");
+    }
+
+    #[test]
+    fn the_detached_global_pin_parses_and_survives_reexec() {
+        let mut argv = vec!["rupu".to_owned()];
+        argv.extend(
+            detached_argv("acme", "af_01X", true)
+                .to_args()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned()),
+        );
+        assert!(
+            matches!(parse_vec(argv), Action::Run { def, detach: false, run_id: Some(id), global_definition_only: true } if def == "acme" && id == "af_01X")
+        );
+        assert!(matches!(
+            parse([
+                "rupu",
+                "agentiflow",
+                "run",
+                "acme",
+                "--detach",
+                "--global-definition-only"
+            ]),
+            Action::Run {
+                detach: true,
+                global_definition_only: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pinned_definition_uses_custom_home_without_project_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("custom-runtime-home");
+        let project = tmp.path().join("project/.rupu");
+        write(&global.join("agentiflows/acme.yaml"), DEF_YAML);
+        write(&project.join("agentiflows/acme.yaml"), "name: [\n");
+        let (path, def) = locate_run_definition(&global, Some(&project), "acme", true).unwrap();
+        assert_eq!(path, global.join("agentiflows/acme.yaml"));
+        assert_eq!(def.name, "acme");
+        // Default CLI resolution still honors project shadowing (even invalid
+        // project YAML), while a pin never silently reads that source.
+        assert!(matches!(
+            locate_run_definition(&global, Some(&project), "acme", false),
+            Err(rupu_agentiflow::DefLookupError::Unloadable { .. })
+        ));
+        std::fs::remove_file(global.join("agentiflows/acme.yaml")).unwrap();
+        write(&project.join("agentiflows/acme.yaml"), DEF_YAML);
+        assert!(matches!(
+            locate_run_definition(&global, Some(&project), "acme", true),
+            Err(rupu_agentiflow::DefLookupError::NotFound { .. })
+        ));
+        write(&global.join("agentiflows/acme.yaml"), "name: [\n");
+        assert!(matches!(
+            locate_run_definition(&global, Some(&project), "acme", true),
+            Err(rupu_agentiflow::DefLookupError::Unloadable { .. })
+        ));
+        assert!(matches!(
+            locate_run_definition(&global, Some(&project), "../acme", true),
+            Err(rupu_agentiflow::DefLookupError::InvalidName(_))
+        ));
     }
 
     #[test]
     fn the_detached_child_runs_the_foreground_path_under_the_parents_id() {
-        let argv: Vec<String> = detached_argv("acme", "af_01X")
+        let argv: Vec<String> = detached_argv("acme", "af_01X", false)
             .to_args()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -2283,7 +2390,9 @@ mod tests {
                 def,
                 detach,
                 run_id,
+                global_definition_only,
             } => {
+                assert!(!global_definition_only);
                 assert_eq!(def, "acme");
                 assert!(!detach);
                 assert_eq!(run_id.as_deref(), Some("af_01X"));
@@ -2293,7 +2402,7 @@ mod tests {
         // A definition name that looks like a flag stays a name.
         let mut full = vec!["rupu".to_string()];
         full.extend(
-            detached_argv("-x", "af_01X")
+            detached_argv("-x", "af_01X", false)
                 .to_args()
                 .iter()
                 .map(|a| a.to_string_lossy().into_owned()),
@@ -2335,7 +2444,7 @@ mod tests {
             &format!("echo $$ > {}\nsleep 0.3\n", pid_file.display()),
         );
         let global = tmp.path().join("home");
-        let start = start_detached(&exe, "acme", "af_01DROP", &global, None);
+        let start = start_detached(&exe, "acme", "af_01DROP", &global, None, false);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(150), start)
                 .await

@@ -9,6 +9,9 @@ use std::path::PathBuf;
 pub struct AgentiflowLaunchRequest {
     /// The definition's name (`agentiflows/<definition>.yaml`).
     pub definition: String,
+    /// Resolve the definition only under the configured RUPU_HOME. This pins
+    /// source selection; it does not change cwd, config, profiles or lead agents.
+    pub global_definition_only: bool,
     /// The run id, minted by the caller (`rupu_agentiflow::new_run_id`) so it
     /// can answer with it; the run records itself under it.
     pub run_id: String,

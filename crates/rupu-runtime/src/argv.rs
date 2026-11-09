@@ -397,6 +397,8 @@ pub struct SessionCompact {
 pub struct AgentiflowRun {
     pub definition: String,
     pub run_id: String,
+    /// A CP-selected global definition, without changing the child's cwd.
+    pub global_definition_only: bool,
 }
 
 /// `rupu autoflow run [--repo <repo>] [--mode <mode>] -- <name> <target>`.
@@ -738,6 +740,9 @@ impl RunArgv {
                 a.push("agentiflow");
                 a.push("run");
                 a.flag_value("--run-id", &f.run_id);
+                if f.global_definition_only {
+                    a.push("--global-definition-only");
+                }
                 // `--` keeps a definition name from being read as a flag.
                 a.push("--");
                 a.push(&f.definition);
