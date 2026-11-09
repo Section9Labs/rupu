@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use rupu_agent::AgentRunOpts;
 use rupu_scm::Platform;
-use rupu_tools::{Effect, PermissionMode, ToolCatalog};
+use rupu_tools::{Effect, PermissionMode};
 use serde::{Deserialize, Serialize};
 
 /// Owned wire representation suitable for storing beside a session record.
@@ -33,6 +33,10 @@ pub struct RunReadiness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolReadiness {
     pub name: String,
+    /// Exact identity from this assembled catalog, never current discovery.
+    /// Absent for builtins and readiness records written before MCP support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<rupu_transcript::RemoteToolIdentity>,
     pub effect: String,
     /// Present in an offered, narrowed, unavailable, or skipped grant entry.
     /// This includes ambient grants; it does not mean explicitly declared.
@@ -85,30 +89,32 @@ pub struct SkillReadiness {
 /// Inspect the actual grant, services, and permission policy of an assembled
 /// run. No speculative service handles are substituted for absent services.
 pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
-    let catalog = ToolCatalog::builtin();
+    let catalog = &opts.grant.catalog;
     let services = opts.tool_context.services.provided(opts.concerns.is_some());
     // Include unselected builtins so the distinction between selection and
     // model exposure remains visible. An offered descriptor is authoritative
     // even when a caller supplied a smaller or extended test catalog.
     let mut descriptors: BTreeMap<_, _> = catalog
-        .descriptors()
-        .map(|descriptor| (descriptor.name, descriptor))
+        .definitions()
+        .map(|descriptor| (descriptor.name.clone(), descriptor))
         .collect();
     for entry in opts.grant.entries.values() {
-        descriptors.insert(entry.canonical, entry.descriptor);
+        descriptors.insert(entry.canonical.clone(), entry.descriptor.clone());
     }
     let mode = opts.permission.mode();
     let approval_channel_available = opts.permission.prompter().is_some();
     let tools = descriptors
         .into_iter()
         .map(|(name, descriptor)| {
-            let entry = opts.grant.entries.get(name);
+            let entry = opts.grant.entries.get(&name);
             let narrowed = opts.grant.narrowed.contains(&name);
             let unavailable = opts.grant.unavailable.iter().any(|u| u.tool == name);
             let skipped = opts.grant.skipped.iter().any(|u| u.tool == name);
-            let missing_services: Vec<_> = services
-                .missing_for(descriptor)
-                .into_iter()
+            let missing_services: Vec<_> = descriptor
+                .needs
+                .iter()
+                .copied()
+                .filter(|service| !services.contains(*service))
                 .map(|service| service.as_str().to_owned())
                 .collect();
             // Do not use PermissionPolicy::decide: Ask may invoke a prompter.
@@ -126,6 +132,12 @@ pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
             };
             ToolReadiness {
                 name: name.to_owned(),
+                remote: descriptor.remote_identity().map(|identity| {
+                    rupu_transcript::RemoteToolIdentity {
+                        server: identity.server.clone(),
+                        tool: identity.tool.clone(),
+                    }
+                }),
                 effect: descriptor.effect.as_str().to_owned(),
                 selected: entry.is_some() || narrowed || unavailable || skipped,
                 offered: entry.is_some(),

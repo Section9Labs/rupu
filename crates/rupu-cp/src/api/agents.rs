@@ -1545,6 +1545,8 @@ impl SessionStartBody {
     /// The request for agent `name`, its skill entries checked.
     fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
         Ok(SessionStartRequest {
+            mcp_tools: None,
+            mcp_catalog_revision: None,
             skill_preset: None,
             tools: None,
             agent: name.to_string(),
@@ -1571,6 +1573,7 @@ async fn start_session_with(
     let req = body.into_request(name)?;
     starter.start(req).await.map_err(|e| match e {
         SessionStartError::Invalid(m) => ApiError::bad_request(m),
+        SessionStartError::Conflict(m) => ApiError::conflict(m),
         SessionStartError::Spawn(m) => ApiError::internal(m),
     })
 }

@@ -152,6 +152,12 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StartArgs {
+    /// Exact configured MCP tool identities as a JSON array; omit for host defaults.
+    #[arg(long)]
+    pub mcp_tools: Option<String>,
+    /// Opaque discovery revision required with a nonempty explicit MCP selection.
+    #[arg(long)]
+    pub mcp_catalog_revision: Option<String>,
     /// Declared runtime tool grant for every turn, replacing the agent's list. Repeatable.
     #[arg(long = "tool", value_name = "TOOL", conflicts_with = "no_tools")]
     pub tools: Vec<String>,
@@ -1050,6 +1056,15 @@ pub async fn handle(
     };
     match result {
         Ok(()) => ExitCode::from(0),
+        Err(e)
+            if matches!(
+                e.downcast_ref::<rupu_runtime::session_mcp::Error>(),
+                Some(rupu_runtime::session_mcp::Error::Stale)
+            ) =>
+        {
+            let _ = crate::output::diag::fail(e);
+            ExitCode::from(75)
+        }
         Err(e) => crate::output::diag::fail(e),
     }
 }
@@ -1625,6 +1640,35 @@ async fn prepare_start(
         );
     }
 
+    // Freeze before writing a session or starting a provider worker. Explicit
+    // empty performs no registry reads or metadata/credential requests.
+    let requested_mcp = args
+        .mcp_tools
+        .as_deref()
+        .map(
+            |text| -> anyhow::Result<Vec<rupu_runtime::session_mcp::ToolRef>> {
+                anyhow::ensure!(text.len() <= 65536, "MCP selection is too large");
+                Ok(serde_json::from_str(text)?)
+            },
+        )
+        .transpose()?;
+    rupu_runtime::session_mcp::validate_request(
+        requested_mcp.as_deref(),
+        args.mcp_catalog_revision.as_deref(),
+    )?;
+    let mcp_tools = if requested_mcp.as_ref().is_some_and(Vec::is_empty) {
+        rupu_runtime::session_mcp::FrozenSelection::default()
+    } else {
+        let registry = rupu_config::mcp::Registry::load(&global)?;
+        rupu_runtime::session_mcp::freeze(
+            &registry,
+            &rupu_mcp_client::EnvironmentCredentials,
+            requested_mcp.as_deref(),
+            args.mcp_catalog_revision.as_deref(),
+        )
+        .await?
+    };
+
     let mode_str = mode.as_str().to_string();
 
     let repo_ref = standalone_repo_ref(run_target.as_ref(), &workspace_path);
@@ -1656,6 +1700,7 @@ async fn prepare_start(
         model,
         agent_system_prompt,
         agent_tools: spec.tools.clone(),
+        mcp_tools: Some(mcp_tools),
         messaging: spec.messaging,
         max_turns: spec.max_turns.unwrap_or(50),
         permission_mode: mode_str,
@@ -8128,6 +8173,8 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
     // may exit right after an early `?` return; without this, whatever
     // this turn's sink had buffered — including a `Dropped` accounting
     // line, which has no other way to reach disk — stays unflushed.
+    let mut mcp_cleanup = None;
+    let mcp_cleanup_slot = &mut mcp_cleanup;
     let body_result: anyhow::Result<()> = async move {
         let scm_registry = Arc::new(
             rupu_scm::Registry::discover(resolver.as_ref(), &cfg, netflow_sink.clone()).await,
@@ -8166,6 +8213,33 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         let mut agent = session_agent_spec(&global, &session)?;
         workflow_context::append(&mut agent, &global, scope, &session)?;
         let model_overridden = settings.apply(&mut agent);
+        let mcp_selection = settings
+            .mcp
+            .as_ref()
+            .or(session.mcp_tools.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let mcp_registry = if mcp_selection.tools.is_empty() {
+            rupu_config::mcp::Registry::default()
+        } else {
+            rupu_config::mcp::Registry::load(&global)?
+        };
+        let mcp_tools = rupu_runtime::session_mcp::assemble(
+            &mcp_registry,
+            &rupu_mcp_client::EnvironmentCredentials,
+            &mcp_selection,
+            rupu_runtime::session_mcp::Owner {
+                run_id: args.run_id.clone(),
+                workspace_id: session.workspace_id.clone(),
+                workspace_path: session.workspace_path.clone(),
+            },
+            netflow_sink.clone(),
+        )
+        .await?;
+        *mcp_cleanup_slot = Some(mcp_tools.cleanup());
+        let tool_catalog = mcp_tools.catalog.clone();
+        mcp_selection.append_to(&mut agent.tools);
+
         // The session's frozen skills as installed now, joined by the skills
         // the operator invoked in this turn (spec 2026-10-12 §5.2); one that
         // can't be given is reported and the turn runs without it. The skills
@@ -8373,6 +8447,7 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
             services: rupu_runtime::assembly::LaunchServices {
                 session_orchestration: orchestration.enabled,
                 builtin_session_harness: session.builtin_harness,
+                tool_catalog,
                 launcher: Some(launcher.clone()),
                 workflow_generator: Some(launcher),
                 netflow: Some(netflow_sink.clone()),
@@ -8596,6 +8671,10 @@ async fn run_turn_inner(args: RunTurnArgs) -> anyhow::Result<()> {
         Ok(())
     }
     .await;
+
+    if let Some(cleanup) = mcp_cleanup {
+        cleanup.close().await;
+    }
 
     // Flush this turn's ledger — including a `Dropped` line if the
     // writer channel overflowed — whether the block above succeeded or
@@ -9315,6 +9394,10 @@ use rupu_orchestrator::runs::{pid_is_running, terminate_pid};
 mod session_command_tests;
 #[path = "session_workflow_context.rs"]
 mod workflow_context;
+
+#[cfg(test)]
+#[path = "session_mcp_tests.rs"]
+mod session_mcp_tests;
 
 #[cfg(test)]
 #[path = "session_harness_tests.rs"]
@@ -10243,6 +10326,7 @@ mod tests {
         );
         state.push_transcript_event(&TranscriptEvent::ToolGrant {
             entries: vec![rupu_transcript::ToolGrantEntry {
+                remote: None,
                 tool: "read_file".into(),
                 reasons: vec!["declared".into()],
             }],
@@ -11133,6 +11217,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             agent_system_prompt: "You are a test agent.".into(),
             agent_tools: Some(vec!["read_file".into()]),
+            mcp_tools: None,
             messaging: None,
             max_turns: 50,
             permission_mode: "bypass".into(),

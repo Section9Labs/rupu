@@ -1232,6 +1232,8 @@ async fn serve_session_cp(
 
 fn skilled_session_start() -> rupu_cp::session_starter::SessionStartRequest {
     rupu_cp::session_starter::SessionStartRequest {
+        mcp_tools: None,
+        mcp_catalog_revision: None,
         skill_preset: None,
         tools: None,
         agent: "triage".into(),

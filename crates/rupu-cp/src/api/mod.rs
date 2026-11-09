@@ -46,6 +46,7 @@ pub mod runs;
 pub mod scm;
 pub(crate) mod session_capabilities;
 pub mod session_commands;
+pub(crate) mod session_mcp;
 pub(crate) mod session_workflows;
 pub mod sessions;
 pub mod skills;

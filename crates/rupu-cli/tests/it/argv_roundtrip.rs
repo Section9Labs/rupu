@@ -321,6 +321,8 @@ fn sessions() -> Vec<RunArgv> {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
+            mcp_tools: None,
+            mcp_catalog_revision: None,
             skill_preset: None,
             tools: None,
             agent: "triage".into(),
@@ -341,6 +343,8 @@ fn sessions() -> Vec<RunArgv> {
         }));
     }
     out.push(RunArgv::SessionStart(SessionStart {
+        mcp_tools: None,
+        mcp_catalog_revision: None,
         skill_preset: Some("none".into()),
         tools: None,
         agent: "rupu-session".into(),
@@ -371,6 +375,22 @@ fn sessions() -> Vec<RunArgv> {
                 selected.tools = tools.clone();
                 out.push(RunArgv::SessionStart(selected));
             }
+        }
+    }
+    // MCP is separate from builtin grants: preserve empty and exact identities,
+    // including remote names that contain punctuation/spaces.
+    if let RunArgv::SessionStart(base) = out[0].clone() {
+        for tools in [
+            vec![],
+            vec![rupu_runtime::session_mcp::ToolRef {
+                server: "fixture".into(),
+                tool: "search.records / exact".into(),
+            }],
+        ] {
+            let mut selected = base.clone();
+            selected.mcp_catalog_revision = (!tools.is_empty()).then(|| "opaque-revision".into());
+            selected.mcp_tools = Some(tools);
+            out.push(RunArgv::SessionStart(selected));
         }
     }
     let skill_sets = [skills(0), skills(1), skills(2)];
@@ -568,6 +588,11 @@ fn back(cli: Cli) -> RunArgv {
             cmd::session::Action::Start(s) => {
                 assert_eq!(s.prompt, None, "the prompt is never positional");
                 RunArgv::SessionStart(SessionStart {
+                    mcp_tools: s
+                        .mcp_tools
+                        .as_deref()
+                        .map(|v| serde_json::from_str(v).unwrap()),
+                    mcp_catalog_revision: s.mcp_catalog_revision,
                     tools: if s.no_tools || !s.tools.is_empty() {
                         Some(s.tools)
                     } else {

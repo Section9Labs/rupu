@@ -21,6 +21,7 @@ members = [
     "crates/rupu-orchestrator",
     "crates/rupu-autoflow",
     "crates/rupu-mcp",
+    "crates/rupu-mcp-client",
     "crates/rupu-webhook",
     "crates/rupu-cp",
     "crates/rupu-cli",

@@ -106,6 +106,9 @@ pub struct SessionRecord {
     pub agent_system_prompt: String,
     #[serde(default)]
     pub agent_tools: Option<Vec<String>>,
+    /// Exact configured MCP selection frozen at creation; absent in old sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<crate::session_mcp::FrozenSelection>,
     /// The agent's `messaging:` key (spec F1d D4), frozen with its tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messaging: Option<bool>,
@@ -285,17 +288,19 @@ pub struct SessionRecord {
 impl SessionRecord {
     /// The newest record version this rupu reads. A record is written at
     /// [`Self::written_version`].
-    pub const VERSION: u32 = 4;
+    pub const VERSION: u32 = 5;
 
     /// The lowest version a rupu must understand to keep the record whole on
-    /// its next write: 4 for a bundled harness, 3 for an agent's
+    /// its next write: 5 for frozen MCP selection, 4 for a bundled harness, 3 for an agent's
     /// `messaging: false`, 2 for skills, else 1. Older runtimes must not
     /// erase the marker that distinguishes the bundled launch policy.
     pub fn written_version(&self) -> u32 {
         let skills = !self.skill_index.is_empty()
             || self.skill_prompt.is_some()
             || !self.loaded_skills.is_empty();
-        if self.builtin_harness {
+        if self.mcp_tools.is_some() {
+            5
+        } else if self.builtin_harness {
             4
         } else if self.messaging == Some(false) {
             3

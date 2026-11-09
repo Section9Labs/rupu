@@ -14,6 +14,7 @@ pub mod coverage_config;
 // `layer_files` is implemented in Task 8 (TDD); the module exists here so
 // that the lib re-export shape is stable from skeleton onward.
 pub mod layer;
+pub mod mcp;
 
 pub mod findings_config;
 

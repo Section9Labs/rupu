@@ -7,6 +7,8 @@ pub struct SessionStartRequest {
     /// First-turn declared tools; None inherits the agent, Some([]) removes
     /// declared tools while ambient/origin grants remain.
     pub tools: Option<Vec<String>>,
+    pub mcp_tools: Option<Vec<rupu_runtime::session_mcp::ToolRef>>,
+    pub mcp_catalog_revision: Option<String>,
     /// Expected registered workspace identity; checked before creating the session.
     pub workspace_id: Option<String>,
     /// Persist an idle session without creating a turn or spawning a worker.
@@ -31,6 +33,8 @@ pub struct SessionStartRequest {
 pub enum SessionStartError {
     #[error("invalid session start request: {0}")]
     Invalid(String),
+    #[error("session selection changed: {0}")]
+    Conflict(String),
     #[error("failed to start session: {0}")]
     Spawn(String),
 }
@@ -39,6 +43,10 @@ pub enum SessionStartError {
 /// provides the subprocess-spawning adapter. Returns the new session id.
 #[async_trait::async_trait]
 pub trait SessionStarter: Send + Sync {
+    /// Both creation and the worker enforce frozen configured MCP selections.
+    fn supports_session_mcp(&self) -> bool {
+        false
+    }
     fn supports_session_capabilities(&self) -> bool {
         false
     }

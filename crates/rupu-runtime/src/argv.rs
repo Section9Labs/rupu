@@ -322,6 +322,8 @@ pub enum WorkflowControl {
 /// `rupu session start <agent> …`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStart {
+    pub mcp_tools: Option<Vec<crate::session_mcp::ToolRef>>,
+    pub mcp_catalog_revision: Option<String>,
     /// None inherits the agent; an empty selection renders --no-tools.
     pub tools: Option<Vec<String>>,
     pub skill_preset: Option<String>,
@@ -623,6 +625,13 @@ impl RunArgv {
                 a.push("session");
                 a.push("start");
                 a.push(&s.agent);
+                if let Some(tools) = &s.mcp_tools {
+                    a.flag_value(
+                        "--mcp-tools",
+                        &serde_json::to_string(tools).expect("tool identities serialize"),
+                    );
+                }
+                a.opt_flag_value("--mcp-catalog-revision", s.mcp_catalog_revision.as_deref());
                 a.opt_flag_value("--skill-preset", s.skill_preset.as_deref());
                 if let Some(tools) = &s.tools {
                     if tools.is_empty() {
@@ -1142,6 +1151,8 @@ mod tests {
             ]
         );
         let start = RunArgv::SessionStart(SessionStart {
+            mcp_tools: None,
+            mcp_catalog_revision: None,
             skill_preset: None,
             tools: None,
             agent: "triage".into(),

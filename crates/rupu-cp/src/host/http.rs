@@ -656,6 +656,8 @@ impl HostConnector for HttpHostConnector {
             || req.workspace_id.is_some()
             || req.skill_preset.is_some()
             || req.tools.is_some()
+            || req.mcp_tools.is_some()
+            || req.mcp_catalog_revision.is_some()
         {
             return Err(HostConnectorError::Unsupported(
                 "skill presets, idle creation, first-turn model/tool selection and project-owned sessions require a direct connection to the owning host".into(),

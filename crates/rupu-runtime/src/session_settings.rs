@@ -18,6 +18,10 @@ pub struct SessionSettings {
     pub model: Option<String>,
     /// None inherits the frozen agent grant; [] explicitly declares no tools (ambient runtime grants still apply).
     pub tools: Option<Vec<String>>,
+    /// None inherits the creation snapshot; Some(empty) disables MCP tools.
+    /// Changed only through the explicit MCP selection endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<crate::session_mcp::FrozenSelection>,
 }
 impl SessionSettings {
     pub fn read(dir: &Path) -> anyhow::Result<Self> {
@@ -28,6 +32,11 @@ impl SessionSettings {
         }
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_catalog(&rupu_tools::ToolCatalog::builtin())
+    }
+    /// Validate against the exact snapshot a caller will use for assembly.
+    /// Existing HTTP/settings paths continue to use the builtin-only contract.
+    pub fn validate_with_catalog(&self, catalog: &rupu_tools::ToolCatalog) -> anyhow::Result<()> {
         for (name, value) in [("provider", &self.provider), ("model", &self.model)] {
             if let Some(value) = value {
                 anyhow::ensure!(
@@ -43,9 +52,12 @@ impl SessionSettings {
             self.provider.is_none() || self.model.is_some(),
             "a provider override requires an explicit model"
         );
+        if let Some(selection) = &self.mcp {
+            selection.validate()?;
+        }
         if let Some(tools) = &self.tools {
             anyhow::ensure!(tools.len() <= 256, "too many tool grants");
-            rupu_tools::ToolCatalog::builtin().validate_names(tools)?;
+            catalog.validate_names(tools)?;
         }
         Ok(())
     }

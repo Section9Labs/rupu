@@ -31,6 +31,7 @@ rupu-providers = { path = "../rupu-providers" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
+rupu-mcp-client = { path = "../rupu-mcp-client" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-fleet = { workspace = true }
 rupu-coverage = { path = "../rupu-coverage" }

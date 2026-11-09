@@ -849,7 +849,7 @@ async fn agent_messaging_off_wins_under_every_origin() {
             .grant
             .entries
             .keys()
-            .copied()
+            .map(String::as_str)
             .filter(|t| t.starts_with("board.") || t.starts_with("msg."))
             .collect();
         assert!(offered.is_empty(), "{name}: {offered:?}");
@@ -898,7 +898,7 @@ async fn workflow_messaging_off_reaches_the_steps_children() {
             .grant
             .unavailable
             .iter()
-            .map(|u| (u.tool, u.missing.clone()))
+            .map(|u| (u.tool.as_str(), u.missing.clone()))
             .collect::<Vec<_>>(),
         vec![("msg.send", vec![rupu_tools::Service::MessageBus])]
     );
@@ -983,7 +983,7 @@ async fn a_process_child_of_an_opted_out_run_has_messaging_off() {
     let off = assembler.assemble(l).await.unwrap();
     assert_eq!(messaging_of(&off), (true, false, false));
     assert_eq!(
-        off.opts.grant.unavailable.iter().map(|u| u.tool).collect::<Vec<_>>(),
+        off.opts.grant.unavailable.iter().map(|u| u.tool.as_str()).collect::<Vec<_>>(),
         vec!["msg.send"]
     );
     assert!(off.opts.identity().launch.messaging_off);
@@ -1014,7 +1014,7 @@ async fn a_no_messaging_launch_has_messaging_off_and_caps_its_children() {
     let run = assembler.assemble(l).await.unwrap();
     assert_eq!(messaging_of(&run), (true, false, false));
     assert_eq!(
-        run.opts.grant.unavailable.iter().map(|u| u.tool).collect::<Vec<_>>(),
+        run.opts.grant.unavailable.iter().map(|u| u.tool.as_str()).collect::<Vec<_>>(),
         vec!["msg.send"]
     );
     assert!(run.opts.identity().launch.messaging_off);
@@ -1176,4 +1176,67 @@ async fn agentiflow_messaging_off_reaches_lead_and_units() {
     let unit = assembler.assemble(u).await.unwrap();
     assert_eq!(messaging_of(&unit), (true, false, false));
     assert!(!unit.opts.grant.offers("board.claim"));
+}
+
+/// An explicit per-launch catalog reaches production assembly; a subsequent
+/// launch starts from builtins and cannot inherit that remote authority.
+#[tokio::test]
+#[serial]
+async fn owned_catalog_is_per_launch_and_uses_the_same_grant_snapshot() {
+    struct NeverInvoke;
+    #[async_trait::async_trait]
+    impl rupu_tools::ToolInvoker for NeverInvoke {
+        async fn invoke(
+            &self,
+            _: serde_json::Value,
+            _: &rupu_tools::ToolContext,
+        ) -> Result<rupu_tools::ToolOutput, rupu_tools::ToolError> {
+            panic!("assembly must not invoke the tool")
+        }
+    }
+    let home = Home::new();
+    let assembler = home.assembler(config());
+    let mut spec = agent(
+        &home,
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ntools: []",
+    );
+    spec.tools = Some(vec!["mcp.fixture".into()]);
+    let mut request = launch(&home, spec.clone(), Origin::Standalone, "run_owned");
+    request.services.tool_catalog = rupu_tools::ToolCatalog::builtin()
+        .with_owned(
+            rupu_tools::BoundTool::owned(
+                rupu_tools::ToolDefinition::remote(
+                    "mcp.fixture".into(),
+                    rupu_tools::RemoteToolIdentity {
+                        server: "fixture-server".into(),
+                        tool: "query".into(),
+                    },
+                    "fixture".into(),
+                    serde_json::json!({"type":"object"}),
+                    rupu_tools::Effect::External,
+                )
+                .unwrap(),
+                Arc::new(NeverInvoke),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let _mock = MockScript::set(DONE);
+    let assembled = assembler.assemble(request).await.unwrap();
+    let entry = assembled.opts.grant.entry("mcp.fixture").unwrap();
+    assert_eq!(
+        entry.descriptor.remote_identity().unwrap().server,
+        "fixture-server"
+    );
+    let body = assembled
+        .opts
+        .grant
+        .catalog
+        .body("mcp.fixture", &assembled.opts.tool_context)
+        .unwrap();
+    assert!(Arc::ptr_eq(&entry.descriptor, body.definition()));
+    assert!(assembler
+        .assemble(launch(&home, spec, Origin::Standalone, "run_no_owned"))
+        .await
+        .is_err());
 }

@@ -41,6 +41,8 @@ pub(crate) fn session_start_argv(
         .transpose()
         .map_err(|e| e.to_string())?;
     Ok(RunArgv::SessionStart(SessionStart {
+        mcp_tools: req.mcp_tools.clone(),
+        mcp_catalog_revision: req.mcp_catalog_revision.clone(),
         skill_preset: req.skill_preset.clone(),
         tools: req.tools.clone(),
         agent: req.agent.clone(),
@@ -78,6 +80,9 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl SessionStarter for SubprocessSessionStarter {
+    fn supports_session_mcp(&self) -> bool {
+        true
+    }
     fn supports_session_tool_selection(&self) -> bool {
         true
     }
@@ -125,7 +130,9 @@ impl SessionStarter for SubprocessSessionStarter {
             let msg = crate::cp_session_sender::cli_failure(&out.stderr, "session start failed");
             // Exit 1 is the command refusing the request (a skill that
             // doesn't resolve, an unknown agent): the caller's to fix.
-            return Err(if out.status.code() == Some(1) {
+            return Err(if out.status.code() == Some(75) {
+                SessionStartError::Conflict(msg)
+            } else if out.status.code() == Some(1) {
                 SessionStartError::Invalid(msg)
             } else {
                 SessionStartError::Spawn(msg)
@@ -150,6 +157,8 @@ mod tests {
         wd: Option<&str>,
     ) -> SessionStartRequest {
         SessionStartRequest {
+            mcp_tools: None,
+            mcp_catalog_revision: None,
             skill_preset: None,
             tools: None,
             agent: "triage".into(),
@@ -173,6 +182,25 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn stale_mcp_child_preflight_is_a_conflict_without_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = crate::test_support::exec_ready_script(
+            &tmp.path().join("rupu"),
+            "echo '[error] MCP catalog changed' >&2\nexit 75\n",
+        );
+        let starter = SubprocessSessionStarter { exe };
+        let request = req(
+            None,
+            Some("fixture"),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+        );
+        assert!(
+            matches!(starter.start(request).await, Err(SessionStartError::Conflict(message)) if message.contains("MCP catalog changed"))
+        );
     }
 
     #[test]

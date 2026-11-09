@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
+        .merge(super::session_mcp::routes())
         .merge(orchestration::routes())
         .merge(super::session_workflows::routes())
         .merge(super::session_capabilities::routes())
@@ -2810,7 +2811,12 @@ fn settings_response(
     }
     let dto = active_session(s, id, "settings")?;
     let dir = s.global_dir.join("sessions").join(id);
-    let settings = if let Some(settings) = update {
+    let settings = if let Some(mut settings) = update {
+        // This existing endpoint edits builtin settings only. Older editors
+        // cannot clear or replace a frozen MCP override by omitting its field.
+        settings.mcp = rupu_runtime::session_settings::SessionSettings::read(&dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .mcp;
         settings
             .validate()
             .map_err(|e| ApiError::bad_request(e.to_string()))?;

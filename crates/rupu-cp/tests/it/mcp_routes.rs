@@ -261,6 +261,9 @@ fn every_route_is_a_tool_or_listed() {
 #[test]
 fn excluded_is_exactly_the_spec_list() {
     let spec: BTreeSet<(&str, &str)> = [
+        ("GET", "/api/mcp/tools"),
+        ("GET", "/api/sessions/:id/mcp"),
+        ("PUT", "/api/sessions/:id/mcp"),
         ("GET", "/api/sessions/:id/controls"),
         ("POST", "/api/sessions/:id/commands"),
         ("GET", "/api/sessions/:id/settings"),

@@ -10,6 +10,9 @@ use tower::ServiceExt;
 struct Starter(Mutex<Vec<SessionStartRequest>>);
 #[async_trait::async_trait]
 impl crate::session_starter::SessionStarter for Starter {
+    fn supports_session_mcp(&self) -> bool {
+        true
+    }
     fn supports_session_tool_selection(&self) -> bool {
         true
     }
@@ -488,4 +491,71 @@ async fn first_turn_tool_feature_requires_the_matching_writable_starter() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn mcp_creation_dispatches_once_and_keeps_default_empty_and_exact_selection() {
+    let (_tmp, state, id, starter) = setup();
+    for (body, expected) in [
+        (json!({"prompt":"inspect"}), None),
+        (json!({"prompt":"inspect","mcp_tools":null}), None),
+        (json!({"prompt":"inspect","mcp_tools":[]}), Some(vec![])),
+        (
+            json!({"prompt":"inspect","mcp_tools":[{"server":"docs","tool":"search"}],"mcp_catalog_revision":"opaque"}),
+            Some(vec![rupu_runtime::session_mcp::ToolRef {
+                server: "docs".into(),
+                tool: "search".into(),
+            }]),
+        ),
+    ] {
+        let count = starter.0.lock().unwrap().len();
+        let (status, response) = post(state.clone(), &id, "?host=local", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let calls = starter.0.lock().unwrap();
+        assert_eq!(calls.len(), count + 1);
+        assert_eq!(calls[count].mcp_tools, expected);
+        assert_eq!(calls[count].mode.as_deref(), Some("readonly"));
+    }
+}
+#[tokio::test]
+async fn mcp_creation_requires_supported_starter_and_maps_catalog_conflict() {
+    struct Conflict;
+    #[async_trait::async_trait]
+    impl crate::session_starter::SessionStarter for Conflict {
+        fn supports_builtin_harness(&self) -> bool {
+            true
+        }
+        fn supports_session_mcp(&self) -> bool {
+            true
+        }
+        async fn start(&self, _: SessionStartRequest) -> Result<String, SessionStartError> {
+            Err(SessionStartError::Conflict("catalog changed".into()))
+        }
+    }
+    let (_tmp, state, id, _) = setup();
+    let state = state.with_session_starter(Some(Arc::new(Conflict)));
+    assert_eq!(
+        post(state, &id, "", json!({"prompt":"inspect","mcp_tools":[]}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    struct Old;
+    #[async_trait::async_trait]
+    impl crate::session_starter::SessionStarter for Old {
+        fn supports_builtin_harness(&self) -> bool {
+            true
+        }
+        async fn start(&self, _: SessionStartRequest) -> Result<String, SessionStartError> {
+            panic!("unsupported MCP request cannot dispatch")
+        }
+    }
+    let (_tmp, state, id, _) = setup();
+    let state = state.with_session_starter(Some(Arc::new(Old)));
+    assert_eq!(
+        post(state, &id, "", json!({"prompt":"inspect","mcp_tools":[]}))
+            .await
+            .0,
+        StatusCode::NOT_IMPLEMENTED
+    );
 }

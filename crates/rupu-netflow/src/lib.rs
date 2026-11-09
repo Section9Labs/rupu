@@ -4,9 +4,9 @@
 //! connectors, wired to a per-run sink. Login/OAuth, the update checker,
 //! and CP's own fleet traffic are deliberately captured nowhere (wired to
 //! [`sink::NullSink`]) — see [`ctx::Origin`]'s doc for the full accounting,
-//! including why `Mcp`/`Webhook` variants don't exist at all: the MCP
-//! server's tools dispatch into SCM connectors, which tag their own calls `Scm`, and
-//! `rupu-webhook` is an inbound server that makes no outbound HTTP. It does
+//! including why `Webhook` has no variant: it is an inbound-only server.
+//! The outbound MCP tools client uses `Mcp`; the operator MCP server's
+//! connector tools still tag their own calls `Scm`. It does
 //! NOT cover traffic from the agent's `bash` subprocesses; that arrives
 //! with the microVM backend (spec §9). Every record carries a [`Fidelity`]
 //! so no view ever claims coverage it does not have.

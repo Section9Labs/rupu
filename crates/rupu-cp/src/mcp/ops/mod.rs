@@ -150,6 +150,21 @@ pub fn ops() -> &'static [OpSpec] {
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
     (
         "GET",
+        "/api/mcp/tools",
+        "operator HTTP discovery of trusted host tools; not an implicit session tool catalog",
+    ),
+    (
+        "GET",
+        "/api/sessions/:id/mcp",
+        "operator HTTP view of frozen session MCP selections",
+    ),
+    (
+        "PUT",
+        "/api/sessions/:id/mcp",
+        "operator-only revisioned MCP grant selection; not a self-grant tool",
+    ),
+    (
+        "GET",
         "/api/sessions/:id/controls",
         "interactive session command discovery for the attach client",
     ),

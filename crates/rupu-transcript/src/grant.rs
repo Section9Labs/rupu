@@ -2,6 +2,7 @@
 //! `tool_audit`), so every transcript view says the same thing.
 
 use crate::event::{ToolGrantEntry, ToolGrantMissing};
+use std::borrow::Cow;
 
 /// How many tool names a `tool_grant` line lists before `+N more`.
 const NAMES_SHOWN: usize = 12;
@@ -13,7 +14,13 @@ pub fn tool_grant_line(
     narrowed: &[String],
     unavailable: &[ToolGrantMissing],
 ) -> String {
-    let mut names: Vec<&str> = entries.iter().map(|e| e.tool.as_str()).collect();
+    let mut names: Vec<Cow<'_, str>> = entries
+        .iter()
+        .map(|entry| match &entry.remote {
+            Some(remote) => Cow::Owned(format!("{} / {}", remote.server, remote.tool)),
+            None => Cow::Borrowed(entry.tool.as_str()),
+        })
+        .collect();
     let more = names.len().saturating_sub(NAMES_SHOWN);
     names.truncate(NAMES_SHOWN);
     let mut line = format!(
@@ -73,6 +80,7 @@ mod tests {
     #[test]
     fn grant_line_lists_tools_and_what_was_left_out() {
         let e = |t: &str| ToolGrantEntry {
+            remote: None,
             tool: t.into(),
             reasons: vec!["declared".into()],
         };
@@ -103,5 +111,38 @@ mod tests {
         assert!(tool_audit_notable(false, true, false));
         assert!(!tool_audit_notable(false, false, true));
         assert!(!tool_audit_notable(false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod owned_identity_tests {
+    use crate::{RemoteToolIdentity, ToolGrantEntry};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_grant_entry_stays_unchanged_and_remote_identity_round_trips() {
+        let legacy = json!({"tool":"read_file","reasons":["declared"]});
+        let entry: ToolGrantEntry = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(entry.remote.is_none());
+        assert_eq!(serde_json::to_value(entry).unwrap(), legacy);
+        let entry = ToolGrantEntry {
+            tool: "mcp.fixture".into(),
+            reasons: vec!["declared".into()],
+            remote: Some(RemoteToolIdentity {
+                server: "fixture-server".into(),
+                tool: "query".into(),
+            }),
+        };
+        let decoded: ToolGrantEntry =
+            serde_json::from_value(serde_json::to_value(&entry).unwrap()).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(
+            super::tool_grant_line(&[decoded], &[], &[]),
+            "1 tool: fixture-server / query"
+        );
+        assert_eq!(
+            entry.tool, "mcp.fixture",
+            "presentation must not replace canonical identity"
+        );
     }
 }

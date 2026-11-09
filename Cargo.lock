@@ -4718,6 +4718,7 @@ dependencies = [
  "rupu-fleet",
  "rupu-launch",
  "rupu-mcp",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
@@ -4776,6 +4777,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4835,6 +4837,7 @@ dependencies = [
  "rupu-fleet",
  "rupu-launch",
  "rupu-mcp",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
@@ -4955,6 +4958,22 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rupu-mcp-client"
+version = "0.88.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "reqwest 0.12.28",
+ "reqwest-middleware",
+ "rupu-config",
+ "rupu-netflow",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -5086,6 +5105,7 @@ dependencies = [
  "rupu-config",
  "rupu-coverage",
  "rupu-fleet",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-netwatch",
  "rupu-providers",

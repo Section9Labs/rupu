@@ -347,7 +347,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 let served = rupu_cp::mcp::served_names(Some(&catalog));
                 let unserved: Vec<String> = unavailable
                     .iter()
-                    .filter(|u| !served.contains(u.tool))
+                    .filter(|u| !served.contains(u.tool.as_str()))
                     .map(|u| u.notice_message())
                     .collect();
                 if !unserved.is_empty() {

@@ -32,6 +32,8 @@ pub(crate) struct StartBody {
     /// Runtime tool grants for the first and later turns. Absent/null inherits
     /// the builtin baseline; [] leaves ambient/origin grants in place.
     tools: Option<Vec<String>>,
+    mcp_tools: Option<Vec<super::session_mcp::ToolChoice>>,
+    mcp_catalog_revision: Option<String>,
     mode: Option<String>,
     skill_preset: Option<String>,
     #[serde(default)]
@@ -147,12 +149,22 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
             .as_ref()
             .map(|p| p.default_model.as_str()),
     );
+    let mcp_tools: Option<Vec<rupu_runtime::session_mcp::ToolRef>> = body
+        .mcp_tools
+        .map(|tools| tools.into_iter().map(Into::into).collect());
+    rupu_runtime::session_mcp::validate_request(
+        mcp_tools.as_deref(),
+        body.mcp_catalog_revision.as_deref(),
+    )
+    .map_err(super::session_mcp::error)?;
     Ok(SessionStartRequest {
         skill_preset: body.skill_preset,
         agent: SESSION_AGENT_NAME.into(),
         provider: Some(provider),
         model: Some(model),
         tools: settings.tools,
+        mcp_tools,
+        mcp_catalog_revision: body.mcp_catalog_revision,
         workspace_id: Some(id.into()),
         idle: body.idle,
         prompt: body.prompt,
@@ -183,6 +195,13 @@ pub(crate) async fn start(
                 "the bundled session harness requires an updated `rupu cp serve` session starter",
             )
         })?;
+    if (body.mcp_tools.is_some() || body.mcp_catalog_revision.is_some())
+        && !starter.supports_session_mcp()
+    {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply configured MCP selections",
+        ));
+    }
     if body.tools.is_some() && !starter.supports_session_tool_selection() {
         return Err(ApiError::not_available(
             "this session starter cannot apply first-turn tool selections",
@@ -204,6 +223,7 @@ pub(crate) async fn start(
     let (provider, model) = (request.provider.clone(), request.model.clone());
     let session_id = starter.start(request).await.map_err(|e| match e {
         SessionStartError::Invalid(message) => ApiError::bad_request(message),
+        SessionStartError::Conflict(message) => ApiError::conflict(message),
         SessionStartError::Spawn(message) => ApiError::internal(message),
     })?;
     Ok(Json(

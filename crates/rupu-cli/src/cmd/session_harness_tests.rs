@@ -1,6 +1,7 @@
 //! First-turn creation is checked without starting provider work or a worker.
 use super::*;
 use clap::Parser;
+use serde_json::json;
 
 fn args(extra: &[&str]) -> StartArgs {
     let mut argv = vec![
@@ -63,7 +64,7 @@ async fn builtin_first_turn_is_selected_before_any_worker_or_settings_patch() {
     assert_eq!(record.model, "deliberate-model");
     assert_eq!(record.agent_name, "rupu-session");
     assert!(record.builtin_harness);
-    assert_eq!(record.written_version(), 4);
+    assert_eq!(record.written_version(), 5);
     assert_eq!(record.workspace_id, ws.id);
     assert_eq!(record.workspace_path, project.canonicalize().unwrap());
     assert_eq!(record.project_root, Some(project.canonicalize().unwrap()));
@@ -269,8 +270,9 @@ async fn first_turn_tool_selection_is_frozen_before_the_worker_and_keeps_readonl
         let policy = rupu_tools::PermissionPolicy::unattended(rupu_tools::PermissionMode::Readonly);
         if let Some(entry) = grant.entries.get("write_file") {
             assert!(matches!(
-                policy.decide(
-                    entry.descriptor,
+                policy.decide_call(
+                    &entry.descriptor.name,
+                    entry.descriptor.effect,
                     &serde_json::json!({}),
                     &mut rupu_tools::AllowAlways::default()
                 ),
@@ -279,8 +281,9 @@ async fn first_turn_tool_selection_is_frozen_before_the_worker_and_keeps_readonl
         }
         if let Some(entry) = grant.entries.get("dispatch") {
             assert!(matches!(
-                policy.decide(
-                    entry.descriptor,
+                policy.decide_call(
+                    &entry.descriptor.name,
+                    entry.descriptor.effect,
                     &serde_json::json!({}),
                     &mut rupu_tools::AllowAlways::default()
                 ),
@@ -323,4 +326,98 @@ async fn invalid_first_turn_tools_never_create_a_session_or_worker() {
         "read_file"
     ])
     .is_err());
+}
+
+#[tokio::test]
+async fn mcp_empty_skips_bad_host_registry_and_legacy_records_keep_empty_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(global.join("mcp.toml"), "invalid host registry").unwrap();
+    let (record, _) = prepare_start(
+        &args(&["--mcp-tools", "[]"]),
+        global.clone(),
+        project.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.mcp_tools.as_ref().unwrap().tools.len(), 0);
+    assert_eq!(record.written_version(), 5);
+    assert!(!global.join("sessions").join(&record.session_id).exists());
+    let legacy = super::tests::test_session_record();
+    assert!(legacy.mcp_tools.is_none());
+    assert!(legacy.written_version() < 5);
+    assert!(prepare_start(&args(&[]), global, project).await.is_err());
+}
+
+#[tokio::test]
+async fn configured_mcp_defaults_freeze_before_creation_and_stale_choice_never_writes_session() {
+    use httpmock::{Method::POST, MockServer};
+    let server = MockServer::start_async().await;
+    for (method, id, result) in [
+        (
+            "initialize",
+            1,
+            json!({"protocolVersion":rupu_mcp_client::PROTOCOL_VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}),
+        ),
+        (
+            "tools/list",
+            2,
+            json!({"tools":[{"name":"query","description":"Fixture","inputSchema":{"type":"object"}}]}),
+        ),
+    ] {
+        server.mock(|when, then| {
+            when.method(POST)
+                .json_body_partial(json!({"method":method}).to_string());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"jsonrpc":"2.0","id":id,"result":result}));
+        });
+    }
+    server.mock(|when, then| {
+        when.method(POST)
+            .json_body_partial(r#"{"method":"notifications/initialized"}"#);
+        then.status(202);
+    });
+    let calls = server.mock(|when, then| {
+        when.method(POST)
+            .json_body_partial(r#"{"method":"tools/call"}"#);
+        then.status(500);
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        global.join("mcp.toml"),
+        format!(
+            "version=1\n[servers.fixture]\nlabel='Fixture'\nurl='{}'\nenabled=true",
+            server.url("/mcp")
+        ),
+    )
+    .unwrap();
+    let (record, _) = prepare_start(&args(&[]), global.clone(), project.clone())
+        .await
+        .unwrap();
+    let frozen = record.mcp_tools.as_ref().unwrap();
+    assert_eq!(frozen.tools.len(), 1);
+    assert_eq!(frozen.tools[0].identity.tool, "query");
+    let stale = args(&[
+        "--mcp-tools",
+        r#"[{"server":"fixture","tool":"query"}]"#,
+        "--mcp-catalog-revision",
+        "old",
+    ]);
+    let error = prepare_start(&stale, global.clone(), project)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<rupu_runtime::session_mcp::Error>(),
+        Some(rupu_runtime::session_mcp::Error::Stale)
+    ));
+    assert_eq!(fs::read_dir(global.join("sessions")).unwrap().count(), 0);
+    calls.assert_hits(0);
 }
