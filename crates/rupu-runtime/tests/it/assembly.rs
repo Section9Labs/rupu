@@ -898,7 +898,7 @@ async fn workflow_messaging_off_reaches_the_steps_children() {
             .grant
             .unavailable
             .iter()
-            .map(|u| (u.tool, u.missing.clone()))
+            .map(|u| (u.tool.as_str(), u.missing.clone()))
             .collect::<Vec<_>>(),
         vec![("msg.send", vec![rupu_tools::Service::MessageBus])]
     );
