@@ -150,6 +150,21 @@ pub fn ops() -> &'static [OpSpec] {
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
     (
         "GET",
+        "/api/mcp/servers",
+        "operator HTTP inventory of trusted host MCP server configuration",
+    ),
+    (
+        "PUT",
+        "/api/mcp/servers/:id",
+        "operator-only host MCP endpoint and effect-policy configuration",
+    ),
+    (
+        "DELETE",
+        "/api/mcp/servers/:id",
+        "operator-only removal of trusted host MCP server configuration",
+    ),
+    (
+        "GET",
         "/api/mcp/tools",
         "operator HTTP discovery of trusted host tools; not an implicit session tool catalog",
     ),

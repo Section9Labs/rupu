@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
         .merge(super::session_mcp::routes())
+        .merge(super::mcp_servers::routes())
         .merge(orchestration::routes())
         .merge(super::session_workflows::routes())
         .merge(super::session_capabilities::routes())

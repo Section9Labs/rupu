@@ -53,6 +53,47 @@ All routes require a direct connection to the owning local host (`host=local` or
 - `GET /api/sessions/:id/mcp`: `{session_id, host_id, workspace_id, revision, tools, defaults, effective, permission_mode, applies:"next_turn"}`. Arrays contain exact `{server,tool}` pairs. `tools:null` inherits the frozen creation selection in `defaults`; it never rediscovers host defaults. `[]` explicitly disables. `effective` is the resolved selection.
 - `PUT /api/sessions/:id/mcp`: `{revision, tools, catalog_revision?}`. `tools` must be present: null resets to the frozen creation selection, empty disables, and a nonempty list freezes current metadata only with a matching catalog revision. This shares the existing settings revision/CAS. A builtin-settings PUT preserves the MCP override even when an older editor omits it. Edits apply next turn and can be made while a turn is running; the active turn retains its captured settings/catalog.
 
-Wrong host or unsupported starter returns 501; invalid selection returns 400 (malformed JSON extraction can return 422); a stale catalog/settings revision or archived session returns 409; registry/discovery failure returns 502. Requests never retry a tool invocation. Native editors should retain drafts on conflict or uncertain transport outcomes and refresh explicitly.
+Wrong host or unsupported starter returns 501; invalid selection returns 400 (malformed JSON extraction can return 422); a stale catalog/settings revision or archived session returns 409; registry/discovery failure on the discovery/edit endpoints returns 502. The existing CLI creation adapter reports non-stale preflight failures as 400; stale creation remains 409. Requests never retry a tool invocation. Native editors should retain drafts on conflict or uncertain transport outcomes and refresh explicitly.
 
 A version-5 session record preserves the creation snapshot. Older workers refuse that record rather than erasing it. Next-turn overrides use `settings.json` with its existing atomic replacement and shared revision lock; old settings readers reject unknown fields rather than silently discarding MCP state. New sessions freeze at most 256 remote tools across at most 32 configured servers; total discovery has a 30-second deadline. General operator MCP features require scoped runtime adapters and remain outside this transport.
+
+## Trusted-host server settings
+
+`mcp.server_configuration.v1` advertises the host registry settings API. Read-only deployments can inspect it; their receipts have `writable:false`, and mutations return 501. Every route is local-only and uses the normal CP authentication. Registry writes do not connect to a server, resolve an environment value, discover tools, or affect a running client's captured configuration.
+
+`GET /api/mcp/servers?host=local` returns:
+
+```json
+{
+  "host_id": "local",
+  "scope": "trusted_host",
+  "revision": "opaque SHA-256 revision",
+  "writable": true,
+  "servers": [{
+    "id": "example",
+    "label": "Example tools",
+    "url": "https://example.invalid/mcp",
+    "enabled": true,
+    "credential": {"kind": "bearer_env", "configured": true},
+    "tool_effects": {"search": "read"},
+    "status": "configured_unverified"
+  }],
+  "applies": "new_sessions_and_next_turn_validation"
+}
+```
+
+The credential reference and its value are never returned. `configured` means a reference exists, not that its environment value is present or that authentication worked. Secure credential enrollment is outside this profile; the supported authentication choices are no authentication or a dedicated host-provisioned `RUPU_MCP_*` environment reference. Native Settings must not substitute an app-local token or Keychain item for the owning CP process's environment.
+
+`PUT /api/mcp/servers/:id` requires `revision`, `label`, `url`, `enabled`, `tool_effects`, and one explicit `credential` edit: `{"action":"preserve"}`, `{"action":"clear"}`, or `{"action":"set_reference","reference":"RUPU_MCP_EXAMPLE_TOKEN"}`. The identifier is an environment-variable name, never a token. This is an upsert; an Add UI should reject duplicate IDs from its captured inventory, with the revision protecting against a concurrent addition. `DELETE` on the same route requires a JSON body `{"revision":"..."}`.
+
+Mutation success returns the canonical inventory plus `mutation:{action:"upsert"|"delete",server_id:"..."}`. Revisions are opaque hashes of exact file bytes with a missing/present marker, not counters. A semantically unchanged save can retain its revision. After a lost response, refresh can reconcile visible fields, but `configured:true` cannot prove that a particular replacement reference was saved; retain that uncertainty rather than retrying automatically.
+
+Writes validate the complete typed registry under a registry-specific advisory lock, then sync a unique temporary sibling and rename it atomically. Stale or busy revisions and invalid existing files return 409; unknown input and invalid new configuration return 400; deleting a missing ID returns 404. Unknown existing fields are refused, never silently discarded. Malformed mutation JSON gets a generic error without echoing submitted values. Direct non-file/symlink targets are refused; this is static protection in a trusted local root, not descriptor-anchored protection against hostile filesystem races. Configuring a server or effect changes future new-session defaults; an existing frozen selection must be explicitly reselected if its captured configuration changes.
+
+Registry mutation JSON bodies are bounded to 256 KiB; the persisted registry is
+also bounded to 256 KiB, with at most 32 servers and 256 exact effect entries per
+server. Invalid or oversized mutation bodies return a sanitized 400 response.
+
+Registry inventory and mutations are intentionally operator HTTP controls,
+excluded from the operator MCP tool inventory. They do not expose endpoint
+configuration, effect-policy edits, or server removal as session-callable tools.
