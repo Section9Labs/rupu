@@ -17,6 +17,7 @@
   "agentiflows.steer",
   "agentiflows.stop",
   "agentiflows.unit_output",
+  "agentiflows.usage_timeline",
   "agents.create",
   "agents.delete",
   "agents.generate",

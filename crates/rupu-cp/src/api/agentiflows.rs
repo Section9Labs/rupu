@@ -66,6 +66,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/agentiflows/:id", get(get_agentiflow))
         .route("/api/agentiflows/:id/events", get(get_agentiflow_events))
         .route(
+            "/api/agentiflows/:id/usage-timeline",
+            get(get_agentiflow_usage_timeline),
+        )
+        .route(
             "/api/agentiflows/:id/children",
             get(get_agentiflow_children),
         )
@@ -953,6 +957,35 @@ async fn get_agentiflow_events(
     .map_err(|e| ApiError::internal(format!("reading agentiflow {id} events panicked: {e}")))?;
     resp.map(Json)
         .ok_or_else(|| ApiError::not_found(format!("no agentiflow run `{id}`")))
+}
+
+/// `GET /api/agentiflows/:id/usage-timeline` — every model call the flow
+/// made (the lead's and every unit's) as one per-turn series, labelled by
+/// lead round: the agentiflow page's Token flow. Local reads only.
+async fn get_agentiflow_usage_timeline(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Vec<crate::usage::TurnPoint>>> {
+    if !valid_run_id(&id) {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let run_dir = agentiflow_dir(&s.global_dir).join(&id);
+    if !run_dir.is_dir() {
+        return Err(ApiError::not_found(format!("no agentiflow run `{id}`")));
+    }
+    let points = tokio::task::spawn_blocking({
+        let id = id.clone();
+        move || {
+            let rounds = crate::api::children::ledger_units(&run_dir, &id)
+                .into_iter()
+                .filter_map(|c| c.round.map(|r| (c.run_id, r)))
+                .collect();
+            crate::api::agentiflow_usage::timeline(&run_dir, &rounds)
+        }
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("reading agentiflow {id} usage panicked: {e}")))?;
+    Ok(Json(points))
 }
 
 /// `GET /api/agentiflows/:id/children` — every child under the flow, of every

@@ -25,6 +25,12 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Read an agentiflow's recorded events.\n\n`id` is the agentiflow id. Returns `{events}`, the recorded events oldest first.",
         ),
         op(
+            "agentiflows.usage_timeline",
+            Method::GET,
+            "/api/agentiflows/:id/usage-timeline",
+            "Read an agentiflow's per-call token series: every model call the lead and its units made.\n\n`id` is the agentiflow id. Returns an array of points in call order: `{turn, label, tokens_in, tokens_out, tokens_cached, tokens_cache_write, at, transcript, transcript_turn}`, where `label` is the lead round the call belongs to (`round N`) and `transcript_turn` is the call's ordinal in its transcript (absent for a compaction call).",
+        ),
+        op(
             "agentiflows.children",
             Method::GET,
             "/api/agentiflows/:id/children",

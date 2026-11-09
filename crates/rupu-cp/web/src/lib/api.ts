@@ -3489,6 +3489,13 @@ export const api = {
   /** The engagement's granular event feed: the coordinator lifecycle merged with
    *  per-unit lifecycle (`af_unit_started` / `af_unit_completed`), oldest first.
    *  Rendered through the shared RunEventFeed / EventCard. */
+  /** Tokens per model call across the lead and every unit, in call order,
+   *  labelled by lead round (`round N`). Local only. */
+  getAgentiflowUsageTimeline(id: string, opts?: Cancellable): Promise<UsageTimelinePoint[]> {
+    return request<UsageTimelinePoint[]>(`/api/agentiflows/${encodeURIComponent(id)}/usage-timeline`, {
+      signal: opts?.signal,
+    });
+  },
   getAgentiflowEvents(id: string, opts?: Cancellable): Promise<{ events: AgentiflowEvent[] }> {
     return request<{ events: AgentiflowEvent[] }>(`/api/agentiflows/${encodeURIComponent(id)}/events`, { signal: opts?.signal });
   },

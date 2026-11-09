@@ -1,4 +1,5 @@
 pub mod agentiflow_defs;
+pub mod agentiflow_usage;
 pub mod agentiflows;
 pub mod agents;
 pub mod assets;
