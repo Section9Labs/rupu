@@ -228,7 +228,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: false,
             include_state_in_token_body: false,
-            headless: None,
+            headless: Some(HeadlessFlow::OpenAiDeviceAuth),
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -369,11 +369,18 @@ mod tests {
     }
 
     #[test]
+    fn openai_headless_is_codex_device_auth() {
+        assert_eq!(
+            provider_oauth(ProviderId::Openai).unwrap().headless,
+            Some(HeadlessFlow::OpenAiDeviceAuth)
+        );
+    }
+
+    #[test]
     fn vendors_without_a_headless_flow_yet_say_so() {
-        // Filled in by later tasks: OpenAI (Task 2), Anthropic (3), GitLab (4), Gemini (5).
+        // Filled in by later tasks: Anthropic (3), GitLab (4), Gemini (5).
         for p in [
             ProviderId::Anthropic,
-            ProviderId::Openai,
             ProviderId::Gemini,
             ProviderId::Gitlab,
         ] {

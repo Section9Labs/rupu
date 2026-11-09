@@ -1,7 +1,9 @@
-//! OAuth flows for Slice B-1 SSO. Two shapes:
+//! OAuth flows for Slice B-1 SSO. Three shapes:
 //!
 //! - `callback`: PKCE browser-redirect flow (Anthropic, OpenAI, Gemini, GitLab).
 //! - `device`: device-code polling flow (GitHub Copilot).
+//! - `openai_device`: OpenAI's device auth (Codex CLI's `--device-auth`),
+//!   `--mode device` for OpenAI.
 //!
 //! `common` is what they share: the token response, the stored credential,
 //! the HTTP client, the authorize URL and the code exchange.
@@ -11,6 +13,7 @@ mod common;
 pub mod device;
 pub mod gemini;
 pub mod gitlab;
+pub mod openai_device;
 pub mod pkce;
 pub mod providers;
 

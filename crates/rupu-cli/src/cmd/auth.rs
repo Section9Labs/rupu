@@ -517,7 +517,7 @@ async fn login(
                     anyhow::bail!("{kind} device login is not available in this build")
                 }
                 Some(HeadlessFlow::OpenAiDeviceAuth) => {
-                    anyhow::bail!("{kind} device login is not available in this build")
+                    rupu_auth::oauth::openai_device::run().await?
                 }
                 None => anyhow::bail!("{kind} has no device login; use --mode api-key"),
             };

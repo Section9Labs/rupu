@@ -205,3 +205,69 @@ fn login_sso_headless_refusal_names_device_mode() {
             "Run with --mode device to log in from any browser, or --mode api-key.",
         ));
 }
+
+#[test]
+fn login_device_for_openai_stores_an_sso_credential() {
+    let server = httpmock::MockServer::start();
+    let usercode = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/api/accounts/deviceauth/usercode")
+            .json_body(serde_json::json!({ "client_id": "app_EMoamEEZ73f0CkXaXp7hrann" }));
+        then.status(200).json_body(serde_json::json!({
+            "device_auth_id": "da-1",
+            "user_code": "ABCD-1234",
+            "interval": "0",
+        }));
+    });
+    let poll = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/api/accounts/deviceauth/token")
+            .json_body(serde_json::json!({ "device_auth_id": "da-1", "user_code": "ABCD-1234" }));
+        then.status(200).json_body(serde_json::json!({
+            "authorization_code": "ac-1",
+            "code_verifier": "srv-verifier",
+            "code_challenge": "srv-challenge",
+        }));
+    });
+    let exchange = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/oauth/token")
+            .body_contains("code=ac-1")
+            .body_contains("code_verifier=srv-verifier");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "at",
+            "refresh_token": "rt",
+            "id_token": "idt",
+            "expires_in": 3600,
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .env("RUPU_OPENAI_DEVICE_ISSUER_OVERRIDE", server.base_url())
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["auth", "login", "--account", "openai", "--mode", "device"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains(format!("{}/codex/device", server.base_url()))
+                .and(predicate::str::contains("enter code: ABCD-1234"))
+                .and(predicate::str::contains("da-1").not())
+                .and(predicate::str::contains("ac-1").not()),
+        )
+        .stdout(predicate::str::contains("stored openai sso credential"));
+
+    usercode.assert_hits(1);
+    poll.assert_hits(1);
+    exchange.assert_hits(1);
+    assert_eq!(stored_keys(tmp.path()), ["openai/sso"]);
+    let auth: std::collections::HashMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("auth.json")).unwrap())
+            .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&auth["openai/sso"]).unwrap();
+    assert_eq!(stored["credentials"]["id_token"], "idt", "{stored}");
+}

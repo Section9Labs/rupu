@@ -7,7 +7,7 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 | Provider           | API key | SSO  | Device | SSO flow         | Notes                                                                                      |
 | ------------------ | :-----: | :--: | :----: | ---------------- | ------------------------------------------------------------------------------------------ |
 | anthropic          |   ✓     |  ✓   |   —    | Browser callback | Console API key OR Claude.ai SSO.                                                          |
-| openai             |   ✓     |  ✓   |   —    | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
+| openai             |   ✓     |  ✓   | ✓ (Codex device auth) | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
 | gemini             |   ✓     |  ✓   |   —    | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
 | copilot            |   ✓     |  ✓   |   ✓    | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
 | openai-compatible  |   ✓     |  —   |   —    | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
@@ -92,9 +92,28 @@ For a machine with no browser (a server, a VM, an SSH session): rupu prints what
 
 Vendors with a device login:
 
+- **openai**: Codex CLI's device auth (see below).
 - **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
 
 Any other vendor refuses with `<kind> has no device login; use --mode api-key`.
+
+#### OpenAI
+
+```sh
+rupu auth login --account openai --mode device
+# Visit https://auth.openai.com/codex/device and enter code: ABCD-1234
+# Only continue if you started this login yourself. The code expires in 15 minutes.
+# Waiting for approval…
+# rupu: stored openai sso credential
+```
+
+1. rupu asks `auth.openai.com` for a one-time code (the login Codex CLI runs for `codex login --device-auth`).
+2. Open `https://auth.openai.com/codex/device` in a browser on any machine, sign in with your ChatGPT account and enter the code.
+3. rupu polls until you approve it, then exchanges the approval for tokens and stores them as `--mode sso` does. A login nobody approves ends after 15 minutes with `device login timed out`.
+
+Device login is off by default for a ChatGPT account. If rupu says `device login is not enabled for this ChatGPT account`, turn it on in ChatGPT settings → Security (for a workspace, an admin turns it on under workspace permissions) and retry, or log in from a desktop with `--mode sso`.
+
+Only enter a code from a login you started yourself: whoever started the login gets the account the code is approved for.
 
 ### Default precedence
 

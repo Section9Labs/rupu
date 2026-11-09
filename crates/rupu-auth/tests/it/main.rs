@@ -15,5 +15,6 @@ mod keychain_resolver;
 mod netflow_capture;
 mod oauth_callback;
 mod oauth_device;
+mod openai_device;
 mod resolver_default_pref;
 mod resolver_refresh;
