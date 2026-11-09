@@ -644,3 +644,70 @@ fn children_opt_in_live_session_ownership_capture_is_read_only() {
     assert_eq!(owner.runs.join(&run).exists(), before);
     assert!(snapshot.rows.iter().all(|row| row.parent_run_id == run));
 }
+
+#[test]
+fn archived_workflow_keeps_active_step_descendants_and_pages_exact_membership() {
+    let (_tmp, state, owner) = fixture(0);
+    let step = json!({"step_id":"review", "run_id":"run_step", "transcript_path":"/fixture", "output":"", "success":true,"skipped":false,"rendered_prompt":"", "finished_at":"2026-11-06T10:00:00Z"});
+    fs::write(
+        owner.runs.join("run_root/step_results.jsonl"),
+        format!("{step}\n"),
+    )
+    .unwrap();
+    append(&owner, "run_step", "child", "run_child");
+    append(&owner, "run_child", "grandchild", "run_grandchild");
+    append(&owner, "run_grandchild", "leaf", "sub_leaf");
+    let expected = capture::capture(owner.clone(), "run_root", None)
+        .unwrap()
+        .rows;
+    assert_eq!(expected.len(), 3);
+    state.run_store.archive("run_root").unwrap(); // The actual lifecycle moves only the root.
+    assert!(owner.runs.join("run_step/children.jsonl").is_file());
+    assert!(owner.runs.join("run_child/children.jsonl").is_file());
+    let snapshot = capture::capture(owner.clone(), "run_root", None).unwrap();
+    assert_eq!(snapshot.rows, expected);
+    assert_eq!(snapshot.evidence.run_directories_scanned, 5);
+    let mut cache = Cache::default();
+    let mut cursor = Some(cache.insert(snapshot).unwrap());
+    let mut observed = Vec::new();
+    while let Some(position) = cursor {
+        let page = cache.page(&owner, "run_root", &None, 1, position).unwrap();
+        assert_eq!(page.snapshot_matching_total, 3);
+        observed.extend(page.children);
+        cursor = page.next_cursor.map(|token| cache.decode(&token).unwrap());
+    }
+    assert_eq!(observed, expected);
+    let filtered = capture::capture(owner.clone(), "run_root", Some("run_child".into())).unwrap();
+    assert_eq!(filtered.rows.len(), 1);
+    assert_eq!(filtered.rows[0].run_id, "run_grandchild");
+    // A recorded descendant may itself be archived while another stays active.
+    fs::rename(
+        owner.runs.join("run_child"),
+        state.run_store.archive_root().join("run_child"),
+    )
+    .unwrap();
+    assert_eq!(
+        capture::capture(owner, "run_root", None).unwrap().rows,
+        expected
+    );
+}
+
+#[test]
+fn recorded_descendant_store_collision_is_explicit_and_foreign_stores_are_not_searched() {
+    let (_tmp, state, owner) = fixture(1);
+    append(&owner, "run_0", "nested", "sub_nested");
+    let archive = state.run_store.archive_root();
+    fs::create_dir_all(archive.join("run_0")).unwrap();
+    assert_eq!(
+        status(capture::capture(owner.clone(), "run_root", None)),
+        StatusCode::CONFLICT
+    );
+    fs::remove_dir_all(archive.join("run_0")).unwrap();
+    fs::remove_dir_all(owner.runs.join("run_0")).unwrap();
+    let foreign = owner.global.join("other-owner/runs/run_0");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(foreign.join("children.jsonl"), "foreign\n").unwrap();
+    let snapshot = capture::capture(owner, "run_root", None).unwrap();
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.evidence.malformed_rows, 0);
+}

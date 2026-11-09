@@ -325,14 +325,78 @@ fn enqueue(queue: &mut VecDeque<Parent>, parent: Parent) -> ApiResult<()> {
     Ok(())
 }
 
+/// Only stores belonging to this connected owner are candidates. Archiving a
+/// workflow moves its root directory, not its separately stored step agents.
+fn child_stores(owner: &Owner) -> ApiResult<[PathBuf; 2]> {
+    let stores = [
+        owner.runs.clone(),
+        owner.runs.with_file_name("runs-archive"),
+    ];
+    for store in &stores {
+        match fs::symlink_metadata(store) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(ApiError::bad_request(
+                    "child run store must be a directory without symlinks",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ApiError::internal(error.to_string())),
+        }
+    }
+    Ok(stores)
+}
+
+fn select_child_store(
+    reader: &mut Reader,
+    stores: &[PathBuf; 2],
+    run: &str,
+) -> ApiResult<Option<(PathBuf, Identity)>> {
+    let mut selected = None;
+    for store in stores {
+        reader.root = store.clone();
+        let directory = store.join(run);
+        let Some(metadata) = reader.checked_metadata(&directory)? else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            return Err(ApiError::bad_request(
+                "recorded child source is not a directory",
+            ));
+        }
+        if selected.is_some() {
+            return Err(ApiError::conflict("recorded child exists in both active and archive stores; refresh after the ownership conflict is resolved"));
+        }
+        selected = Some((directory, Identity::of(&metadata)));
+    }
+    reader.root = selected
+        .as_ref()
+        .and_then(|(directory, _)| directory.parent())
+        .map_or_else(|| stores[0].clone(), Path::to_path_buf);
+    Ok(selected)
+}
+
+fn validate_child_directory(selected: Option<&(PathBuf, Identity)>) -> ApiResult<()> {
+    if let Some((directory, identity)) = selected {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|_| stale("child directory moved during capture"))?;
+        if !metadata.is_dir() || Identity::of(&metadata) != *identity {
+            return Err(stale("child directory was replaced during capture"));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn capture(
     owner: Owner,
     id: &str,
     parent_filter: Option<String>,
 ) -> ApiResult<Snapshot> {
     valid_id(id)?;
+    let stores = child_stores(&owner)?;
     let (mut reader, proof) = root::resolve(&owner, id)?;
-    let root = reader.root.join(id);
+    let root_store = reader.root.clone();
+    let root = root_store.join(id);
     let mut queue = VecDeque::from([Parent::root(id)]);
     if let Some(text) = reader.lines(&root.join("step_results.jsonl"))? {
         for line in text.lines().filter(|s| !s.trim().is_empty()) {
@@ -376,6 +440,16 @@ pub(super) fn capture(
         if seen.len() > MAX_DIRECTORIES {
             return Err(too_large("run directory budget exceeded"));
         }
+        let selected = if run_id == id {
+            // The requested root remains pinned to the store whose canonical
+            // ownership proof was validated; it is never replaced by a sibling.
+            reader.root = root_store.clone();
+            reader
+                .checked_metadata(&root)?
+                .map(|metadata| (root.clone(), Identity::of(&metadata)))
+        } else {
+            select_child_store(&mut reader, &stores, &run_id)?
+        };
         let text = reader
             .lines(&reader.root.join(&run_id).join("children.jsonl"))?
             .unwrap_or_default();
@@ -420,6 +494,7 @@ pub(super) fn capture(
             }
             out.push(child);
         }
+        validate_child_directory(selected.as_ref())?;
     }
     if parent_filter
         .as_ref()
@@ -462,6 +537,23 @@ pub(super) fn capture(
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    #[test]
+    fn selected_child_directory_move_or_replacement_invalidates_capture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("runs");
+        let archive = tmp.path().join("runs-archive");
+        fs::create_dir_all(active.join("run_child")).unwrap();
+        let mut reader = Reader::new(active.clone());
+        let selected =
+            select_child_store(&mut reader, &[active.clone(), archive], "run_child").unwrap();
+        fs::rename(active.join("run_child"), active.join("moved")).unwrap();
+        fs::create_dir(active.join("run_child")).unwrap();
+        assert_eq!(
+            validate_child_directory(selected.as_ref()).unwrap_err().0,
+            axum::http::StatusCode::CONFLICT
+        );
+    }
+
     #[test]
     fn cumulative_bytes_rows_and_directory_entries_are_bounded() {
         let tmp = tempfile::tempdir().unwrap();
