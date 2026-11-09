@@ -59,6 +59,7 @@ pub fn oauth_client(
         client_id,
         authorize_url: format!("{instance}/oauth/authorize"),
         token_url: format!("{instance}/oauth/token"),
+        device_url: Some(format!("{instance}/oauth/authorize_device")),
     })
 }
 
@@ -89,6 +90,10 @@ mod tests {
         assert_eq!(c.client_id, GITLAB_COM_CLIENT_ID);
         assert_eq!(c.authorize_url, "https://gitlab.com/oauth/authorize");
         assert_eq!(c.token_url, "https://gitlab.com/oauth/token");
+        assert_eq!(
+            c.device_url.as_deref(),
+            Some("https://gitlab.com/oauth/authorize_device")
+        );
     }
 
     #[test]
@@ -124,6 +129,10 @@ mod tests {
             "https://gitlab.example.com/oauth/authorize"
         );
         assert_eq!(c.token_url, "https://gitlab.example.com/oauth/token");
+        assert_eq!(
+            c.device_url.as_deref(),
+            Some("https://gitlab.example.com/oauth/authorize_device")
+        );
     }
 
     /// GitLab can be served under a relative URL root

@@ -40,6 +40,23 @@ pub enum OAuthFlow {
     Device,
 }
 
+/// How a vendor logs in from a machine with no browser
+/// (`rupu auth login --mode device`). The credential is stored as `sso`,
+/// the same slot the browser flow fills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessFlow {
+    /// RFC 8628 device code (GitHub, Copilot, GitLab).
+    DeviceCode,
+    /// Authorization code shown on a vendor-hosted page the user copies from.
+    PasteCode {
+        redirect_uri: &'static str,
+        /// Appended after `ProviderOAuth::extra_authorize_params`.
+        extra_authorize_params: &'static [(&'static str, &'static str)],
+    },
+    /// Codex CLI's `--device-auth` (OpenAI accounts endpoints).
+    OpenAiDeviceAuth,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenBodyFormat {
     /// `application/x-www-form-urlencoded` body. Used by OpenAI / Codex.
@@ -91,6 +108,9 @@ pub struct ProviderOAuth {
     /// standard doesn't require it at exchange time, but Anthropic's
     /// server seems to want it.
     pub include_state_in_token_body: bool,
+    /// The flow `--mode device` runs, or `None` when the vendor has no
+    /// login a browser on another machine can complete.
+    pub headless: Option<HeadlessFlow>,
 }
 
 /// An OAuth application chosen at login rather than built in: a GitLab
@@ -103,6 +123,9 @@ pub struct OAuthClient {
     pub client_id: String,
     pub authorize_url: String,
     pub token_url: String,
+    /// The application's RFC 8628 device-authorization endpoint, for a
+    /// `--mode device` login. `None` when it has none to offer.
+    pub device_url: Option<String>,
 }
 
 /// The `extra` key a credential records its [`OAuthClient::client_id`] under.
@@ -161,6 +184,12 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: true,
             include_state_in_token_body: true,
+            // Claude Code's headless login: the hosted page shows
+            // `code#state` for the operator to paste back (`oauth::paste`).
+            headless: Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://platform.claude.com/oauth/code/callback",
+                extra_authorize_params: &[],
+            }),
         }),
         ProviderId::Openai => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -204,6 +233,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Json,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::OpenAiDeviceAuth),
         }),
         ProviderId::Gemini => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -231,6 +261,13 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            // Gemini CLI's `NO_BROWSER` login: Google's hosted page shows the
+            // code. `prompt=consent` makes Google issue a refresh token on
+            // every login, not only an account's first consent.
+            headless: Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://codeassist.google.com/authcode",
+                extra_authorize_params: &[("access_type", "offline"), ("prompt", "consent")],
+            }),
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
@@ -248,6 +285,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Local => None,
         ProviderId::Github => Some(ProviderOAuth {
@@ -282,6 +320,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Gitlab => Some(ProviderOAuth {
             flow: OAuthFlow::Callback,
@@ -305,6 +344,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Linear => None,
         ProviderId::Jira => None,
@@ -326,6 +366,58 @@ mod tests {
             let cfg = provider_oauth(p).unwrap_or_else(|| panic!("missing oauth config for {p}"));
             assert!(!cfg.client_id.is_empty(), "{p}: empty client_id");
         }
+    }
+
+    #[test]
+    fn github_and_copilot_headless_is_the_device_code_flow() {
+        for p in [ProviderId::Github, ProviderId::Copilot] {
+            assert_eq!(
+                provider_oauth(p).unwrap().headless,
+                Some(HeadlessFlow::DeviceCode),
+                "{p}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_headless_is_codex_device_auth() {
+        assert_eq!(
+            provider_oauth(ProviderId::Openai).unwrap().headless,
+            Some(HeadlessFlow::OpenAiDeviceAuth)
+        );
+    }
+
+    #[test]
+    fn anthropic_headless_is_the_paste_flow() {
+        assert_eq!(
+            provider_oauth(ProviderId::Anthropic).unwrap().headless,
+            Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://platform.claude.com/oauth/code/callback",
+                extra_authorize_params: &[],
+            })
+        );
+    }
+
+    #[test]
+    fn gitlab_headless_is_the_device_code_flow() {
+        assert_eq!(
+            provider_oauth(ProviderId::Gitlab).unwrap().headless,
+            Some(HeadlessFlow::DeviceCode)
+        );
+    }
+
+    #[test]
+    fn gemini_headless_is_the_paste_flow_with_consent() {
+        let Some(HeadlessFlow::PasteCode {
+            redirect_uri,
+            extra_authorize_params,
+        }) = provider_oauth(ProviderId::Gemini).unwrap().headless
+        else {
+            panic!("gemini headless is not the paste flow");
+        };
+        assert_eq!(redirect_uri, "https://codeassist.google.com/authcode");
+        assert!(extra_authorize_params.contains(&("access_type", "offline")));
+        assert!(extra_authorize_params.contains(&("prompt", "consent")));
     }
 
     #[test]

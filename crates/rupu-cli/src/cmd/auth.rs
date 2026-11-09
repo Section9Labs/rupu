@@ -79,16 +79,22 @@ pub enum Action {
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum AuthModeArg {
+    /// an API key from the vendor's console
     #[clap(name = "api-key")]
     ApiKey,
+    /// log in in a browser on this machine
     Sso,
+    /// log in from a browser on another machine
+    Device,
 }
 
+/// `device` is a way to log in, not a storage slot: its credential is the
+/// `sso` one, so `logout --mode device` forgets that.
 impl From<AuthModeArg> for rupu_providers::AuthMode {
     fn from(a: AuthModeArg) -> Self {
         match a {
             AuthModeArg::ApiKey => Self::ApiKey,
-            AuthModeArg::Sso => Self::Sso,
+            AuthModeArg::Sso | AuthModeArg::Device => Self::Sso,
         }
     }
 }
@@ -487,13 +493,7 @@ async fn login(
                 .ok_or_else(|| anyhow::anyhow!("vendor {kind} has no SSO flow"))?;
             let stored = match oauth.flow {
                 rupu_auth::oauth::providers::OAuthFlow::Callback => {
-                    if let (ProviderId::Gitlab, Some(e)) = (pid, &cfg_error) {
-                        anyhow::bail!(
-                            "can't read {}: {e}. A GitLab login takes its instance and OAuth \
-                             application from [scm.{account}] there; fix the file and retry",
-                            cfg_path.display()
-                        );
-                    }
+                    gitlab_config_guard(pid, cfg_error.as_deref(), &cfg_path, account)?;
                     let app = sso_client(&cfg, account, pid)?;
                     rupu_auth::oauth::callback::run_with_client(pid, app).await?
                 }
@@ -501,12 +501,69 @@ async fn login(
                     rupu_auth::oauth::device::run(pid).await?
                 }
             };
-            resolver.store_named(account, mode_neutral, &stored).await?;
-            println!("rupu: stored {account} sso credential");
-            if pid == ProviderId::Gemini {
-                rupu_auth::oauth::gemini::set_up_code_assist(&resolver, account, &stored).await;
-            }
+            store_sso_login(&resolver, account, pid, stored).await?;
         }
+        AuthModeArg::Device => {
+            use rupu_auth::oauth::providers::HeadlessFlow;
+            let headless =
+                rupu_auth::oauth::providers::provider_oauth(pid).and_then(|oauth| oauth.headless);
+            let stored = match headless {
+                Some(HeadlessFlow::DeviceCode) => {
+                    gitlab_config_guard(pid, cfg_error.as_deref(), &cfg_path, account)?;
+                    let app = sso_client(&cfg, account, pid)?;
+                    rupu_auth::oauth::device::run_with_client(pid, app).await?
+                }
+                Some(HeadlessFlow::PasteCode { .. }) => {
+                    let app = sso_client(&cfg, account, pid)?;
+                    rupu_auth::oauth::paste::run(pid, app).await?
+                }
+                Some(HeadlessFlow::OpenAiDeviceAuth) => {
+                    rupu_auth::oauth::openai_device::run().await?
+                }
+                None => anyhow::bail!("{kind} has no device login; use --mode api-key"),
+            };
+            store_sso_login(&resolver, account, pid, stored).await?;
+        }
+    }
+    Ok(())
+}
+
+/// What every SSO login (`--mode sso` and `--mode device`) does once its
+/// flow returns a credential: store it in the account's `sso` slot, say so,
+/// and — for Gemini — set up the account's Code Assist project.
+async fn store_sso_login(
+    resolver: &rupu_auth::KeychainResolver,
+    account: &str,
+    pid: ProviderId,
+    stored: rupu_auth::stored::StoredCredential,
+) -> anyhow::Result<()> {
+    resolver
+        .store_named(account, rupu_providers::AuthMode::Sso, &stored)
+        .await?;
+    println!("rupu: stored {account} sso credential");
+    if pid == ProviderId::Gemini {
+        rupu_auth::oauth::gemini::set_up_code_assist(resolver, account, &stored).await;
+    }
+    Ok(())
+}
+
+/// Refuses a GitLab login (`--mode sso` or `--mode device`) when the
+/// global config can't be read: its instance and OAuth application come
+/// from `[scm.<account>]` there, and falling back to gitlab.com and glab's
+/// application would store a token under the account's name for the wrong
+/// instance.
+fn gitlab_config_guard(
+    pid: ProviderId,
+    cfg_error: Option<&str>,
+    cfg_path: &std::path::Path,
+    account: &str,
+) -> anyhow::Result<()> {
+    if let (ProviderId::Gitlab, Some(e)) = (pid, cfg_error) {
+        anyhow::bail!(
+            "can't read {}: {e}. A GitLab login takes its instance and OAuth \
+             application from [scm.{account}] there; fix the file and retry",
+            cfg_path.display()
+        );
     }
     Ok(())
 }
@@ -651,10 +708,7 @@ async fn logout(opts: LogoutOpts) -> anyhow::Result<()> {
             );
         }
         if !matches!(opts.mode, None | Some(AuthModeArg::ApiKey)) {
-            anyhow::bail!(
-                "openai-compatible providers only support api-key credentials; \
-                 --mode sso is not valid"
-            );
+            anyhow::bail!("openai-compatible providers only support api-key credentials");
         }
         let resolver = rupu_auth::resolver::KeychainResolver::new();
         resolver

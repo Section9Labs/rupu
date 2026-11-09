@@ -34,6 +34,18 @@ A browser opens to `auth.openai.com/oauth/authorize`. Sign in with your ChatGPT 
 
 The token includes a `chatgpt_account_id` JWT claim that tells the client to use the ChatGPT backend URL instead of the platform API. This is automatic — rupu detects the difference and routes accordingly.
 
+## Device login
+
+On a machine with no browser (a server, a VM, an SSH session):
+
+```sh
+rupu auth login --account openai --mode device
+```
+
+rupu prints `Visit https://auth.openai.com/codex/device and enter code: ABCD-1234`. Open that page in a browser on any machine, sign in with your ChatGPT account and enter the code; rupu stores the same credential as `--mode sso`, in the account's `sso` entry. This is Codex CLI's `--device-auth` login. The code expires in 15 minutes; only enter a code from a login you started yourself.
+
+Device login has to be enabled for the account first: ChatGPT settings → Security (a workspace admin enables it under workspace permissions). Until it is, rupu reports `device login is not enabled for this ChatGPT account`.
+
 ## Example agent file
 
 ```markdown

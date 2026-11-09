@@ -361,12 +361,16 @@ versions.
 
 rupu ships five LLM providers. Four support both API-key and SSO auth:
 
-| Provider  | API key                              | SSO                                |
-| --------- | ------------------------------------ | ---------------------------------- |
-| anthropic | `console.anthropic.com` → API Keys   | Claude.ai login (browser callback) |
-| openai    | `platform.openai.com` → API Keys     | ChatGPT login (browser callback)   |
-| gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |
-| copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |
+| Provider  | API key                              | SSO                                | Device |
+| --------- | ------------------------------------ | ---------------------------------- | :----: |
+| anthropic | `console.anthropic.com` → API Keys   | Claude.ai login (browser callback) |   ✓    |
+| openai    | `platform.openai.com` → API Keys     | ChatGPT login (browser callback)   |   ✓    |
+| gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |   ✓    |
+| copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |   ✓    |
+
+**Device** is `--mode device`: log in from a browser on another machine (for a
+server or VM with no browser); the credential is stored as `sso`. See
+`docs/providers.md`'s "Device login".
 
 A fifth, `openai-compatible`, is a user-declared generic adapter for any
 `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …) — API-key
