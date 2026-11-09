@@ -491,13 +491,7 @@ async fn login(
                 .ok_or_else(|| anyhow::anyhow!("vendor {kind} has no SSO flow"))?;
             let stored = match oauth.flow {
                 rupu_auth::oauth::providers::OAuthFlow::Callback => {
-                    if let (ProviderId::Gitlab, Some(e)) = (pid, &cfg_error) {
-                        anyhow::bail!(
-                            "can't read {}: {e}. A GitLab login takes its instance and OAuth \
-                             application from [scm.{account}] there; fix the file and retry",
-                            cfg_path.display()
-                        );
-                    }
+                    gitlab_config_guard(pid, cfg_error.as_deref(), &cfg_path, account)?;
                     let app = sso_client(&cfg, account, pid)?;
                     rupu_auth::oauth::callback::run_with_client(pid, app).await?
                 }
@@ -512,7 +506,11 @@ async fn login(
             let headless =
                 rupu_auth::oauth::providers::provider_oauth(pid).and_then(|oauth| oauth.headless);
             let stored = match headless {
-                Some(HeadlessFlow::DeviceCode) => rupu_auth::oauth::device::run(pid).await?,
+                Some(HeadlessFlow::DeviceCode) => {
+                    gitlab_config_guard(pid, cfg_error.as_deref(), &cfg_path, account)?;
+                    let app = sso_client(&cfg, account, pid)?;
+                    rupu_auth::oauth::device::run_with_client(pid, app).await?
+                }
                 Some(HeadlessFlow::PasteCode { .. }) => {
                     let app = sso_client(&cfg, account, pid)?;
                     rupu_auth::oauth::paste::run(pid, app).await?
@@ -543,6 +541,27 @@ async fn store_sso_login(
     println!("rupu: stored {account} sso credential");
     if pid == ProviderId::Gemini {
         rupu_auth::oauth::gemini::set_up_code_assist(resolver, account, &stored).await;
+    }
+    Ok(())
+}
+
+/// Refuses a GitLab login (`--mode sso` or `--mode device`) when the
+/// global config can't be read: its instance and OAuth application come
+/// from `[scm.<account>]` there, and falling back to gitlab.com and glab's
+/// application would store a token under the account's name for the wrong
+/// instance.
+fn gitlab_config_guard(
+    pid: ProviderId,
+    cfg_error: Option<&str>,
+    cfg_path: &std::path::Path,
+    account: &str,
+) -> anyhow::Result<()> {
+    if let (ProviderId::Gitlab, Some(e)) = (pid, cfg_error) {
+        anyhow::bail!(
+            "can't read {}: {e}. A GitLab login takes its instance and OAuth \
+             application from [scm.{account}] there; fix the file and retry",
+            cfg_path.display()
+        );
     }
     Ok(())
 }

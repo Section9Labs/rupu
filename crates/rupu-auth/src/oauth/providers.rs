@@ -338,7 +338,7 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
-            headless: None,
+            headless: Some(HeadlessFlow::DeviceCode),
         }),
         ProviderId::Linear => None,
         ProviderId::Jira => None,
@@ -393,11 +393,17 @@ mod tests {
     }
 
     #[test]
+    fn gitlab_headless_is_the_device_code_flow() {
+        assert_eq!(
+            provider_oauth(ProviderId::Gitlab).unwrap().headless,
+            Some(HeadlessFlow::DeviceCode)
+        );
+    }
+
+    #[test]
     fn vendors_without_a_headless_flow_yet_say_so() {
-        // Filled in by later tasks: GitLab (4), Gemini (5).
-        for p in [ProviderId::Gemini, ProviderId::Gitlab] {
-            assert_eq!(provider_oauth(p).unwrap().headless, None, "{p}");
-        }
+        // Filled in by a later task: Gemini (5).
+        assert_eq!(provider_oauth(ProviderId::Gemini).unwrap().headless, None);
     }
 
     #[test]

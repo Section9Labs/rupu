@@ -95,6 +95,7 @@ Vendors with a device login:
 - **anthropic**: Claude Code's paste-the-code login (see below).
 - **openai**: Codex CLI's device auth (see below).
 - **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
+- **gitlab**: GitLab's device authorization grant (see below).
 
 Any other vendor refuses with `<kind> has no device login; use --mode api-key`.
 
@@ -133,6 +134,21 @@ rupu auth login --account openai --mode device
 Device login is off by default for a ChatGPT account. If rupu says `device login is not enabled for this ChatGPT account`, turn it on in ChatGPT settings → Security (for a workspace, an admin turns it on under workspace permissions) and retry, or log in from a desktop with `--mode sso`.
 
 Only enter a code from a login you started yourself: whoever started the login gets the account the code is approved for.
+
+#### GitLab
+
+```sh
+rupu auth login --account gitlab --mode device
+# Visit https://gitlab.com/oauth/device and enter code: 0A44L90H
+# Waiting for approval…
+# rupu: stored gitlab sso credential
+```
+
+1. rupu asks the account's instance (`POST <instance>/oauth/authorize_device`) for a code, as the application `--mode sso` uses: glab's on gitlab.com, else the `[scm.<account>] oauth_client_id` the instance needs (see `docs/scm.md`).
+2. Open the URL rupu prints in a browser on any machine, sign in and enter the code.
+3. rupu polls until you approve it and stores the tokens as `--mode sso` does; they refresh the same way. A code nobody approves expires after five minutes.
+
+The device grant needs GitLab 17.9 or later. An older instance answers with a 404, and rupu says `this GitLab does not offer device login (it needs GitLab 17.9 or later)`: log in from a desktop with `--mode sso`, or use `--mode api-key` with a personal access token.
 
 ### Default precedence
 

@@ -41,7 +41,11 @@ named accounts (`--account gh-work --kind github`, `--account gh-personal
 --kind github`); see `docs/providers.md`'s "Accounts vs. vendor kind" for the
 full mechanism.
 
-GitHub uses a device-code SSO flow (`--mode device` is the same flow for GitHub); GitLab uses browser-callback PKCE. Required
+GitHub uses a device-code SSO flow (`--mode device` is the same flow for GitHub); GitLab uses browser-callback PKCE. GitLab's
+`--mode device` is the OAuth device authorization grant (GitLab 17.9 or later; the flow
+`glab auth login --device` runs, as the same gitlab.com application): rupu prints a URL and a
+code to enter in a browser on any machine. A self-managed instance's application serves both
+modes; one used only for `--mode device` needs no redirect URI. Required
 scopes:
 
 | Platform | Scopes                                              |
