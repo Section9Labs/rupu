@@ -130,15 +130,15 @@ pub enum Decision {
 /// this run. Keyed by tool, never by mode: allowing one tool always never
 /// allows another (T4).
 #[derive(Debug, Clone, Default)]
-pub struct AllowAlways(BTreeSet<&'static str>);
+pub struct AllowAlways(BTreeSet<String>);
 
 impl AllowAlways {
     pub fn contains(&self, tool: &str) -> bool {
         self.0.contains(tool)
     }
 
-    pub fn insert(&mut self, tool: &'static str) {
-        self.0.insert(tool);
+    pub fn insert(&mut self, tool: &str) {
+        self.0.insert(tool.to_owned());
     }
 }
 
@@ -193,7 +193,7 @@ impl PermissionPolicy {
     /// than by descriptor.
     pub fn decide_call(
         &self,
-        tool: &'static str,
+        tool: &str,
         effect: Effect,
         input: &Value,
         always: &mut AllowAlways,

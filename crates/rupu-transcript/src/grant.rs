@@ -73,6 +73,7 @@ mod tests {
     #[test]
     fn grant_line_lists_tools_and_what_was_left_out() {
         let e = |t: &str| ToolGrantEntry {
+            remote: None,
             tool: t.into(),
             reasons: vec!["declared".into()],
         };
@@ -103,5 +104,30 @@ mod tests {
         assert!(tool_audit_notable(false, true, false));
         assert!(!tool_audit_notable(false, false, true));
         assert!(!tool_audit_notable(false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod owned_identity_tests {
+    use crate::{RemoteToolIdentity, ToolGrantEntry};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_grant_entry_stays_unchanged_and_remote_identity_round_trips() {
+        let legacy = json!({"tool":"read_file","reasons":["declared"]});
+        let entry: ToolGrantEntry = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(entry.remote.is_none());
+        assert_eq!(serde_json::to_value(entry).unwrap(), legacy);
+        let entry = ToolGrantEntry {
+            tool: "mcp.fixture".into(),
+            reasons: vec!["declared".into()],
+            remote: Some(RemoteToolIdentity {
+                server: "fixture-server".into(),
+                tool: "query".into(),
+            }),
+        };
+        let decoded: ToolGrantEntry =
+            serde_json::from_value(serde_json::to_value(&entry).unwrap()).unwrap();
+        assert_eq!(decoded, entry);
     }
 }

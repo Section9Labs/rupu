@@ -3,7 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use rupu_tools::{
     AliasScope, AllowAlways, Decision, DenyReason, PermissionPolicy, PromptAnswer, PromptRequest,
-    Prompter, ToolContext, ToolServices,
+    Prompter, ToolCatalog, ToolContext, ToolServices,
 };
 
 // Explicitly test-only for the workspace's source-level assembly guard.
@@ -80,7 +80,7 @@ fn absent_services_preserve_explicit_and_wildcard_failures_without_inventing_han
         .all(|connector| !connector.registry_service_constructed));
     // A projection must not silently drop offered tools or grant provenance.
     for entry in opts.grant.entries.values() {
-        let tool = row(&snapshot, entry.canonical);
+        let tool = row(&snapshot, &entry.canonical);
         assert!(tool.selected && tool.offered && tool.service_available);
         assert_eq!(
             tool.grant_reasons,
@@ -343,4 +343,75 @@ async fn constructed_account_stays_unverified_and_owned_snapshot_omits_private_i
     assert_eq!(snapshot.applies, "assembled_turn");
     assert_eq!(snapshot.run_id, "run_readiness");
     assert!(chrono::DateTime::parse_from_rfc3339(&snapshot.observed_at).is_ok());
+}
+
+struct NeverInvokeOwned;
+#[async_trait::async_trait]
+impl rupu_tools::ToolInvoker for NeverInvokeOwned {
+    async fn invoke(
+        &self,
+        _: serde_json::Value,
+        _: &ToolContext,
+    ) -> Result<rupu_tools::ToolOutput, rupu_tools::ToolError> {
+        panic!("readiness and validation must never invoke an owned tool")
+    }
+}
+fn owned_catalog() -> ToolCatalog {
+    ToolCatalog::builtin()
+        .with_owned(
+            rupu_tools::BoundTool::owned(
+                rupu_tools::ToolDefinition::remote(
+                    "mcp.fixture".into(),
+                    rupu_tools::RemoteToolIdentity {
+                        server: "fixture-server".into(),
+                        tool: "query".into(),
+                    },
+                    "fixture".into(),
+                    serde_json::json!({"type":"object"}),
+                    Effect::External,
+                )
+                .unwrap(),
+                Arc::new(NeverInvokeOwned),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn owned_readiness_uses_the_resolved_snapshot_without_probing_or_claiming_permission() {
+    let mut opts = options(
+        ToolServices {
+            tool_catalog: owned_catalog(),
+            ..Default::default()
+        },
+        PermissionPolicy::unattended(PermissionMode::Readonly),
+    );
+    resolve(&mut opts, &["mcp.fixture"], None);
+    // The original context can disappear; the assembled grant owns its evidence.
+    opts.tool_context.services.tool_catalog = ToolCatalog::builtin();
+    let snapshot = inspect(&opts);
+    let tool = row(&snapshot, "mcp.fixture");
+    assert!(tool.selected && tool.offered);
+    assert_eq!(tool.effect, "external");
+    assert_eq!(tool.permission, "denied_readonly");
+    assert_eq!(tool.grant_reasons, ["declared"]);
+}
+
+#[test]
+fn owned_settings_validation_is_explicit_and_does_not_expand_the_legacy_wire_contract() {
+    let settings = crate::session_settings::SessionSettings {
+        tools: Some(vec!["mcp.fixture".into()]),
+        ..Default::default()
+    };
+    assert!(settings.validate().is_err());
+    assert!(settings.validate_with_catalog(&owned_catalog()).is_ok());
+    let invalid = crate::session_settings::SessionSettings {
+        tools: Some(vec!["mcp.other".into()]),
+        ..Default::default()
+    };
+    assert!(invalid.validate_with_catalog(&owned_catalog()).is_err());
+    assert!(crate::session_settings::SessionSettings::default()
+        .validate_with_catalog(&owned_catalog())
+        .is_ok());
 }

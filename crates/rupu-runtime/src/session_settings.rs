@@ -28,6 +28,11 @@ impl SessionSettings {
         }
     }
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_with_catalog(&rupu_tools::ToolCatalog::builtin())
+    }
+    /// Validate against the exact snapshot a caller will use for assembly.
+    /// Existing HTTP/settings paths continue to use the builtin-only contract.
+    pub fn validate_with_catalog(&self, catalog: &rupu_tools::ToolCatalog) -> anyhow::Result<()> {
         for (name, value) in [("provider", &self.provider), ("model", &self.model)] {
             if let Some(value) = value {
                 anyhow::ensure!(
@@ -45,7 +50,7 @@ impl SessionSettings {
         );
         if let Some(tools) = &self.tools {
             anyhow::ensure!(tools.len() <= 256, "too many tool grants");
-            rupu_tools::ToolCatalog::builtin().validate_names(tools)?;
+            catalog.validate_names(tools)?;
         }
         Ok(())
     }

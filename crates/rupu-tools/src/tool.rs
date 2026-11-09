@@ -259,6 +259,9 @@ impl Default for WorkspaceScope {
 /// and concern catalog it owns.
 #[derive(Clone, Default)]
 pub struct ToolServices {
+    /// Exact per-launch tool metadata and body snapshot; builtin by default.
+    /// Owned tools are never inherited implicitly by child launch assembly.
+    pub tool_catalog: crate::ToolCatalog,
     /// The launcher behind `dispatch` / `join`. `None` = this run can't
     /// start children.
     pub launcher: Option<Arc<dyn crate::ports::Launcher>>,

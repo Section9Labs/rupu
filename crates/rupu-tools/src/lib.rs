@@ -13,7 +13,7 @@
 //!   catalog through the [`ports::CatalogPort`] port: [`roster`];
 //! - a run's granted skills: [`skills`].
 //!
-//! All tools implement the [`Tool`] trait and declare a
+//! Builtin tools implement the [`Tool`] trait and declare a
 //! [`ToolDescriptor`] (name, aliases, [`Effect`], needs). [`catalog`] lists
 //! every descriptor rupu defines; [`bodies::body`] builds a run's tool from
 //! its [`ToolContext`]. Permission is [`PermissionPolicy`]: a pure function of
@@ -42,6 +42,8 @@ pub mod launch;
 pub mod ledger;
 pub mod msg;
 pub mod output;
+pub mod owned;
+pub use owned::{BoundTool, CatalogError, RemoteToolIdentity, ToolDefinition, ToolInvoker};
 pub mod ports;
 pub mod roster;
 pub mod scm;

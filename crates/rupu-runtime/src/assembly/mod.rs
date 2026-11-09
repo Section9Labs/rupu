@@ -801,6 +801,7 @@ impl RunAssembler {
                 read_roots: skills.as_ref().map(|s| s.read_roots()).unwrap_or_default(),
             },
             services: ToolServices {
+                tool_catalog: spec.services.tool_catalog.clone(),
                 launcher: spec.services.launcher.clone().filter(|_| d.launcher),
                 workflow_generator: spec
                     .services

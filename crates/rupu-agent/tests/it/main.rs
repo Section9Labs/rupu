@@ -23,6 +23,7 @@ mod injected_replay;
 mod loader;
 mod mcp_attach;
 mod mock_provider_outcomes;
+mod owned_catalog;
 mod permission_policy;
 mod permission_resolution;
 mod prompt_pty;

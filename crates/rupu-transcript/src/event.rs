@@ -53,6 +53,15 @@ const KNOWN_EVENT_TAGS: &[&str] = &[
 pub struct ToolGrantEntry {
     pub tool: String,
     pub reasons: Vec<String>,
+    /// Exact remote identity, absent for builtins and older transcripts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteToolIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteToolIdentity {
+    pub server: String,
+    pub tool: String,
 }
 
 /// A tool a [`Event::ToolGrant`] could not offer, and the services it
@@ -839,6 +848,7 @@ mod tests {
             (
                 Event::ToolGrant {
                     entries: vec![ToolGrantEntry {
+                        remote: None,
                         tool: "findings.report".into(),
                         reasons: vec!["declared".into(), "ambient:concerns".into()],
                     }],

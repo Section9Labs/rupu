@@ -17,6 +17,7 @@ mod glob;
 mod grant;
 mod grep;
 mod launch_tools;
+mod owned_catalog;
 mod permission;
 mod read_file;
 mod read_roots;

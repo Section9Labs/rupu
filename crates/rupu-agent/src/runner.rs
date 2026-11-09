@@ -23,7 +23,7 @@ use rupu_providers::types::{
 use rupu_skills::render::REATTACH_MARKER;
 use rupu_tools::{
     AliasScope, AllowAlways, Decision, DenyReason, DerivedEvent, PermissionMode, PermissionPolicy,
-    ResolvedGrant, RunIdentity, Service, Surface, Tool, ToolContext,
+    ResolvedGrant, RunIdentity, Service, Surface, ToolContext,
 };
 use rupu_transcript::{
     Event, FileEditKind, JsonlWriter, RecoveryAction, RunMode, RunStatus, Severity,
@@ -2135,7 +2135,7 @@ async fn run_agent_inner(
     // The ledger the findings/coverage tools write: ensured once, up front,
     // so a run's first record never races its directory.
     if grant.entries.values().any(|e| {
-        let n = e.descriptor.needs;
+        let n = &e.descriptor.needs;
         n.contains(&Service::Findings) || n.contains(&Service::Coverage)
     }) && coverage.is_none()
     {
@@ -2144,13 +2144,13 @@ async fn run_agent_inner(
             .map_err(|e| RunError::Coverage(format!("ensure findings dir: {e}")))?;
     }
 
-    // The run's tool registry: one loop over the grant, each body from the
-    // catalog (`rupu_tools::bodies`).
+    // The run's tool registry: one loop over the grant and its exact catalog
+    // snapshot, binding metadata and bodies before provider work.
     let mut registry = ToolRegistry::with_alias_scope(opts.alias_scope);
     for entry in grant.entries.values() {
-        let name = entry.canonical;
-        match rupu_tools::bodies::body(name, &opts.tool_context) {
-            Some(t) => registry.insert(t),
+        let name = entry.canonical.as_str();
+        match grant.catalog.body(name, &opts.tool_context) {
+            Some(t) => registry.insert_bound(t),
             None => {
                 // The grant offered a tool whose services this run
                 // provides, yet nothing here can build it: the service
@@ -3186,7 +3186,7 @@ async fn run_agent_inner(
                 // Resolve the name the model used (canonical or a legacy
                 // alias) to the tool and its descriptor. The transcript's
                 // `ToolCall` keeps the name the model actually used.
-                let tool: Arc<dyn Tool> = match registry.get(&tool_name) {
+                let tool = match registry.get(&tool_name) {
                     Some(t) => t,
                     None => {
                         // Not in the grant: a genuinely unknown name, or a
@@ -3202,9 +3202,8 @@ async fn run_agent_inner(
                             duration_ms: 0,
                             structured: None,
                         })?;
-                        let canonical = rupu_tools::ToolCatalog::builtin()
-                            .resolve_name(&tool_name, opts.alias_scope)
-                            .map(|d| d.name);
+                        let definition = grant.catalog.resolve_definition(&tool_name, opts.alias_scope);
+                        let canonical = definition.as_ref().map(|d| d.name.as_str());
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
@@ -3225,7 +3224,7 @@ async fn run_agent_inner(
                 // run's mode (W1). The operator is asked only for a
                 // write/external call under `ask` with a prompter.
                 let mut spawn_ceiling = None;
-                match opts.permission.decide(descriptor, &input, &mut allow_always) {
+                match opts.permission.decide_call(&descriptor.name, descriptor.effect, &input, &mut allow_always) {
                     Decision::Allow => {}
                     Decision::AllowDegraded => {
                         if !degraded_noticed {
@@ -3248,7 +3247,7 @@ async fn run_agent_inner(
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
-                            Some(descriptor.name),
+                            Some(descriptor.name.as_str()),
                             denied(reason),
                         ))?;
                         tool_results.push((
@@ -3266,7 +3265,7 @@ async fn run_agent_inner(
                         writer.write(&tool_audit(
                             &grant,
                             &tool_name,
-                            Some(descriptor.name),
+                            Some(descriptor.name.as_str()),
                             "denied:operator_stop".into(),
                         ))?;
                         writer.write(&Event::RunComplete {
@@ -3405,7 +3404,7 @@ async fn run_agent_inner(
                 writer.write(&tool_audit(
                     &grant,
                     &tool_name,
-                    Some(descriptor.name),
+                    Some(descriptor.name.as_str()),
                     decision,
                 ))?;
                 if let Some(cb) = opts.hooks.on_tool_call.as_ref() {
@@ -3861,6 +3860,12 @@ fn write_tool_grant(writer: &mut JsonlWriter, grant: &ResolvedGrant) -> Result<(
             .entries
             .values()
             .map(|e| rupu_transcript::ToolGrantEntry {
+                remote: e.descriptor.remote_identity().map(|id| {
+                    rupu_transcript::RemoteToolIdentity {
+                        server: id.server.clone(),
+                        tool: id.tool.clone(),
+                    }
+                }),
                 tool: e.canonical.to_string(),
                 reasons: e.reasons.iter().map(ToString::to_string).collect(),
             })

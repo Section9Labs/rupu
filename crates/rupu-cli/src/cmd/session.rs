@@ -10232,6 +10232,7 @@ mod tests {
         );
         state.push_transcript_event(&TranscriptEvent::ToolGrant {
             entries: vec![rupu_transcript::ToolGrantEntry {
+                remote: None,
                 tool: "read_file".into(),
                 reasons: vec!["declared".into()],
             }],
