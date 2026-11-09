@@ -4,6 +4,9 @@ pub struct SessionStartRequest {
     pub agent: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// First-turn declared tools; None inherits the agent, Some([]) removes
+    /// declared tools while ambient/origin grants remain.
+    pub tools: Option<Vec<String>>,
     /// Expected registered workspace identity; checked before creating the session.
     pub workspace_id: Option<String>,
     /// Persist an idle session without creating a turn or spawning a worker.
@@ -37,6 +40,10 @@ pub enum SessionStartError {
 #[async_trait::async_trait]
 pub trait SessionStarter: Send + Sync {
     fn supports_session_capabilities(&self) -> bool {
+        false
+    }
+    /// The adapter freezes explicit tool selections before the first turn.
+    fn supports_session_tool_selection(&self) -> bool {
         false
     }
     /// The adapter preserves project identity and first-turn model selection.

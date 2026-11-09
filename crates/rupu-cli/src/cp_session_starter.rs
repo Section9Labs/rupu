@@ -18,6 +18,12 @@ pub(crate) fn session_start_argv(
     req: &SessionStartRequest,
     clone_dir: Option<&str>,
 ) -> Result<RunArgv, String> {
+    rupu_runtime::session_settings::SessionSettings {
+        tools: req.tools.clone(),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| e.to_string())?;
     if req.idle && (req.prompt.is_some() || req.target.is_some()) {
         return Err("idle session creation cannot include a prompt or target".into());
     }
@@ -36,6 +42,7 @@ pub(crate) fn session_start_argv(
         .map_err(|e| e.to_string())?;
     Ok(RunArgv::SessionStart(SessionStart {
         skill_preset: req.skill_preset.clone(),
+        tools: req.tools.clone(),
         agent: req.agent.clone(),
         provider: req.provider.clone(),
         model: req.model.clone(),
@@ -71,6 +78,9 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl SessionStarter for SubprocessSessionStarter {
+    fn supports_session_tool_selection(&self) -> bool {
+        true
+    }
     fn supports_session_capabilities(&self) -> bool {
         true
     }
@@ -141,6 +151,7 @@ mod tests {
     ) -> SessionStartRequest {
         SessionStartRequest {
             skill_preset: None,
+            tools: None,
             agent: "triage".into(),
             provider: None,
             model: None,
@@ -214,6 +225,24 @@ mod tests {
         assert!(session_start_argv(&r, None).is_err());
         r.prompt = None;
         r.target = Some("github:o/r".into());
+        assert!(session_start_argv(&r, None).is_err());
+    }
+
+    #[test]
+    fn argv_carries_first_turn_tools_without_collapsing_an_empty_selection() {
+        let mut r = req(None, Some("inspect"), Some("readonly"), None);
+        assert!(!argv(&r, None)
+            .iter()
+            .any(|v| v == "--tool" || v == "--no-tools"));
+        r.tools = Some(vec![]);
+        assert!(argv(&r, None).iter().any(|v| v == "--no-tools"));
+        r.tools = Some(vec!["read_file".into(), "scm.*".into()]);
+        let a = argv(&r, None);
+        assert!(a
+            .windows(4)
+            .any(|v| v == ["--tool", "read_file", "--tool", "scm.*"]));
+        assert!(!a.iter().any(|v| v == "--no-tools"));
+        r.tools = Some(vec!["--mode".into()]);
         assert!(session_start_argv(&r, None).is_err());
     }
 

@@ -1546,6 +1546,7 @@ impl SessionStartBody {
     fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
         Ok(SessionStartRequest {
             skill_preset: None,
+            tools: None,
             agent: name.to_string(),
             provider: None,
             model: None,

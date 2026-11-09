@@ -540,6 +540,38 @@ the target is used.
 | POST | `/api/coverage/:target/rerun` | Replay a recorded agent run on its target, what `rupu coverage rerun` launches: a new run appended to the same target. | `ws_id`. Body `{run}`: a full run id from `…/runs`. The run's agent, prompt, permission mode and launch skills start again through the agent launcher, detached, in the workspace the run was recorded in; provider, model and concerns come from the agent's current file and config, as on the CLI. 202 `{run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `…/diff?base=<run>&compare=latest`. 404 unknown target or no manifest for the run; 409 a run that continued another (rerun that one) or was recorded in another workspace; 501 a session, workflow or autoflow run, a `host` other than `local`, or no `rupu cp serve`. |
 | GET | `/api/assets` | Asset inventory (`AssetListResponse`). | `ws_id`, `target`. |
 
+## First-turn session tool selection
+
+`POST /api/projects/:id/sessions?host=local` accepts an optional `tools` array
+when `/api/host/info` advertises `session.tool_selection.v1`. This flag is
+advertised only by a writable control plane whose builtin session starter
+supports first-turn tool selection. The existing session creation response is
+unchanged. The selection travels with the same creation request and is frozen
+before its first turn; clients must not create a session and then patch its
+tools to control that initial turn.
+
+- Omitted or `null`: inherit the builtin agent's existing declared tools.
+- `[]`: no declared tools; ambient and origin grants still apply.
+- An array: replace the declaration with the supplied runtime tool names,
+  aliases, namespace wildcards, `core.*`, or `*`. Validation is the same as
+  session settings (maximum 256 entries). `*` excludes explicit authority
+  tools such as `board.directive` and `board.retract`.
+
+These are `rupu-tools` runtime grants, not the control plane's operator MCP
+catalog. Selection does not change permission mode, construct missing services,
+verify connector credentials, or grant skills. Readonly still denies workspace
+writes and external effects, and spawned children retain the readonly ceiling.
+The assembled-turn capability report remains the evidence of what was offered.
+On supporting starters invalid selections return 400 before launch; an explicit array sent to an old
+starter returns 501. Omitted/null requests remain compatible with old starters.
+The operation remains local-only and keeps the existing first-turn prompt,
+model, skill and permission checks.
+
+CLI equivalents are repeatable `rupu session start <agent> --tool <grant>`
+and `--no-tools` (mutually exclusive). Without either flag, CLI behavior is
+unchanged. Existing sessions continue to use revisioned
+`PUT /api/sessions/:id/settings` for next-turn changes.
+
 ## Query help
 
 What each list's `q` takes, and a check of a query without running it. The

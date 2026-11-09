@@ -2051,6 +2051,7 @@ mod tunnel_connector {
         let err = conn
             .start_session(rupu_cp::session_starter::SessionStartRequest {
                 skill_preset: None,
+                tools: None,
                 agent: "a".into(),
                 provider: None,
                 model: None,

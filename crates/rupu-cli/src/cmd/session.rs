@@ -152,6 +152,12 @@ pub enum Action {
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct StartArgs {
+    /// Declared runtime tool grant for every turn, replacing the agent's list. Repeatable.
+    #[arg(long = "tool", value_name = "TOOL", conflicts_with = "no_tools")]
+    pub tools: Vec<String>,
+    /// Declare no tools; context-owned ambient and origin grants still apply.
+    #[arg(long, conflicts_with = "tools")]
+    pub no_tools: bool,
     /// Installed Rupu skill preset for a new builtin session, or `none`.
     #[arg(long, value_parser = ["rupu-session-v1", "none"])]
     pub skill_preset: Option<String>,
@@ -1446,6 +1452,11 @@ async fn prepare_start(
     let initial_settings = rupu_runtime::session_settings::SessionSettings {
         provider: args.provider.clone(),
         model: args.model.clone(),
+        tools: if args.no_tools || !args.tools.is_empty() {
+            Some(args.tools.clone())
+        } else {
+            None
+        },
         ..Default::default()
     };
     initial_settings.validate()?;

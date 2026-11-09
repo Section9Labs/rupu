@@ -213,3 +213,114 @@ async fn idle_creation_persists_zero_turns_without_spawning_a_worker() {
     assert!(dir.join("settings.json").exists());
     assert!(!global.join("runs").exists());
 }
+
+#[tokio::test]
+async fn first_turn_tool_selection_is_frozen_before_the_worker_and_keeps_readonly_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let defaults = rupu_agent::builtin::session_agent().tools;
+    for (flags, expected) in [
+        (vec![], defaults),
+        (vec!["--no-tools"], Some(vec![])),
+        (
+            vec!["--tool", "read_file", "--tool", "write_file"],
+            Some(vec!["read_file".into(), "write_file".into()]),
+        ),
+        (vec!["--tool", "*"], Some(vec!["*".into()])),
+    ] {
+        let (record, turn) = prepare_start(&args(&flags), global.clone(), project.clone())
+            .await
+            .unwrap();
+        assert_eq!(record.agent_tools, expected);
+        assert_eq!(
+            session_agent_spec(&global, &record).unwrap().tools,
+            expected
+        );
+        assert_eq!(record.permission_mode, "readonly");
+        assert_eq!(turn.prompt, "inspect this project");
+        assert!(record.runs.is_empty() && record.worker_pid.is_none());
+        assert!(!global.join("sessions").join(&record.session_id).exists());
+
+        // Feed the frozen selection to the same resolver assembly uses. An
+        // empty declaration leaves the session's concerns ambient, and '*'
+        // never silently grants the explicit coordination authority tools.
+        let services = rupu_tools::ToolCatalog::all()
+            .iter()
+            .flat_map(|d| d.needs.iter().copied())
+            .collect();
+        let grant = rupu_tools::ToolCatalog::builtin()
+            .resolve_grant(rupu_tools::GrantInputs {
+                declared: record.agent_tools.as_deref(),
+                step_actions: &[],
+                connector_cap: None,
+                ambient: &[rupu_tools::AmbientGrant::concerns()],
+                available: &services,
+                alias_scope: rupu_tools::AliasScope::Everywhere,
+            })
+            .unwrap();
+        assert!(grant.entries.contains_key("coverage.mark"));
+        assert!(!grant.entries.contains_key("board.directive"));
+        assert!(!grant.entries.contains_key("board.retract"));
+        if expected == Some(vec![]) {
+            assert!(!grant.entries.contains_key("read_file"));
+        }
+        let policy = rupu_tools::PermissionPolicy::unattended(rupu_tools::PermissionMode::Readonly);
+        if let Some(entry) = grant.entries.get("write_file") {
+            assert!(matches!(
+                policy.decide(
+                    entry.descriptor,
+                    &serde_json::json!({}),
+                    &rupu_tools::AllowAlways::default()
+                ),
+                rupu_tools::Decision::Deny { .. }
+            ));
+        }
+        if let Some(entry) = grant.entries.get("dispatch") {
+            assert!(matches!(
+                policy.decide(
+                    entry.descriptor,
+                    &serde_json::json!({}),
+                    &rupu_tools::AllowAlways::default()
+                ),
+                rupu_tools::Decision::Spawn {
+                    ceiling: rupu_tools::PermissionMode::Readonly
+                }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_first_turn_tools_never_create_a_session_or_worker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let global = tmp.path().join("global");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    for name in ["unknown_tool", "runs.list", "--mode"] {
+        let error = prepare_start(
+            &args(&[&format!("--tool={name}")]),
+            global.clone(),
+            project.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+    }
+    assert!(
+        rupu_runtime::sessions::load_sessions_in_scope(&global, SessionScope::Active)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(crate::Cli::try_parse_from([
+        "rupu",
+        "session",
+        "start",
+        "rupu-session",
+        "--no-tools",
+        "--tool",
+        "read_file"
+    ])
+    .is_err());
+}

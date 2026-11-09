@@ -77,6 +77,9 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             if super::project_session_start::available(&s) {
                 features.push(super::project_session_start::CAP_BUILTIN_HARNESS.to_string());
             }
+            if super::project_session_start::tool_selection_available(&s) {
+                features.push(super::project_session_start::CAP_TOOL_SELECTION.to_string());
+            }
             if super::project_session_start::idle_available(&s) {
                 features.push(super::project_session_start::CAP_IDLE_HARNESS.to_string());
             }

@@ -10,6 +10,9 @@ use tower::ServiceExt;
 struct Starter(Mutex<Vec<SessionStartRequest>>);
 #[async_trait::async_trait]
 impl crate::session_starter::SessionStarter for Starter {
+    fn supports_session_tool_selection(&self) -> bool {
+        true
+    }
     fn supports_session_capabilities(&self) -> bool {
         true
     }
@@ -348,6 +351,141 @@ async fn skill_options_cannot_be_silently_ignored_by_old_starters() {
         assert_eq!(
             post(state.clone(), &id, "", body).await.0,
             StatusCode::NOT_IMPLEMENTED
+        );
+    }
+}
+
+#[tokio::test]
+async fn first_turn_tools_preserve_default_empty_and_explicit_selections() {
+    let (_tmp, state, id, starter) = setup();
+    for (body, expected) in [
+        (json!({"prompt":"inspect"}), None),
+        (json!({"prompt":"inspect", "tools":null}), None),
+        (json!({"prompt":"inspect", "tools":[]}), Some(vec![])),
+        (
+            json!({"prompt":"inspect", "tools":["read_file", "scm.*"]}),
+            Some(vec!["read_file".to_string(), "scm.*".to_string()]),
+        ),
+        (
+            json!({"prompt":"inspect", "tools":["*"]}),
+            Some(vec!["*".to_string()]),
+        ),
+    ] {
+        let before = starter.0.lock().unwrap().len();
+        let (status, response) = post(state.clone(), &id, "?host=local", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let calls = starter.0.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            before + 1,
+            "one creation dispatch, no follow-up mutation"
+        );
+        assert_eq!(calls[before].tools, expected);
+        assert_eq!(calls[before].mode.as_deref(), Some("readonly"));
+        assert_eq!(calls[before].prompt.as_deref(), Some("inspect"));
+        assert!(!calls[before].idle);
+    }
+}
+
+#[tokio::test]
+async fn first_turn_tool_validation_refuses_before_dispatch() {
+    let (_tmp, state, id, starter) = setup();
+    for tools in [
+        json!(["unknown_tool"]),
+        json!(["runs.list"]),
+        json!(["--mode"]),
+        json!(vec!["read_file"; 257]),
+        json!("read_file"),
+    ] {
+        let (status, response) = post(
+            state.clone(),
+            &id,
+            "",
+            json!({"prompt":"inspect", "tools":tools}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    }
+    assert!(starter.0.lock().unwrap().is_empty());
+}
+
+#[derive(Default)]
+struct LegacyToolStarter(Mutex<Vec<SessionStartRequest>>);
+#[async_trait::async_trait]
+impl crate::session_starter::SessionStarter for LegacyToolStarter {
+    fn supports_builtin_harness(&self) -> bool {
+        true
+    }
+    async fn start(&self, request: SessionStartRequest) -> Result<String, SessionStartError> {
+        assert!(request.tools.is_none());
+        self.0.lock().unwrap().push(request);
+        Ok("ses_legacy".into())
+    }
+}
+
+#[tokio::test]
+async fn old_starters_refuse_explicit_tools_without_breaking_default_requests() {
+    let (_tmp, state, id, _) = setup();
+    let legacy = Arc::new(LegacyToolStarter::default());
+    let state = state.with_session_starter(Some(legacy.clone()));
+    assert!(!tool_selection_available(&state));
+    for tools in [json!([]), json!(["read_file"])] {
+        assert_eq!(
+            post(
+                state.clone(),
+                &id,
+                "",
+                json!({"prompt":"inspect", "tools":tools})
+            )
+            .await
+            .0,
+            StatusCode::NOT_IMPLEMENTED
+        );
+    }
+    assert!(legacy.0.lock().unwrap().is_empty());
+    for body in [
+        json!({"prompt":"inspect"}),
+        json!({"prompt":"inspect", "tools":null}),
+    ] {
+        assert_eq!(post(state.clone(), &id, "", body).await.0, StatusCode::OK);
+    }
+    assert_eq!(legacy.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn first_turn_tool_feature_requires_the_matching_writable_starter() {
+    let (_tmp, state, _id, _) = setup();
+    for (state, expected) in [
+        (state.clone(), true),
+        (state.clone().with_launcher(None), false),
+        (state.clone().with_session_starter(None), false),
+        (
+            state.with_session_starter(Some(Arc::new(LegacyToolStarter::default()))),
+            false,
+        ),
+    ] {
+        assert_eq!(tool_selection_available(&state), expected);
+        let response = super::super::host_info::routes()
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/host/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            response["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == CAP_TOOL_SELECTION),
+            expected
         );
     }
 }

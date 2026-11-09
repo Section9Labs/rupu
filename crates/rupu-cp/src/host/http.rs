@@ -655,9 +655,10 @@ impl HostConnector for HttpHostConnector {
             || req.model.is_some()
             || req.workspace_id.is_some()
             || req.skill_preset.is_some()
+            || req.tools.is_some()
         {
             return Err(HostConnectorError::Unsupported(
-                "skill presets, idle creation, first-turn model selection and project-owned sessions require a direct connection to the owning host".into(),
+                "skill presets, idle creation, first-turn model/tool selection and project-owned sessions require a direct connection to the owning host".into(),
             ));
         }
         if !req.skills.is_empty() || !req.preload_skills.is_empty() {

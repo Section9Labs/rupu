@@ -322,6 +322,7 @@ fn sessions() -> Vec<RunArgv> {
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
             skill_preset: None,
+            tools: None,
             agent: "triage".into(),
             provider: on(4).then(|| "named-account".into()),
             model: on(4).then(|| "deliberate-model".into()),
@@ -341,6 +342,7 @@ fn sessions() -> Vec<RunArgv> {
     }
     out.push(RunArgv::SessionStart(SessionStart {
         skill_preset: Some("none".into()),
+        tools: None,
         agent: "rupu-session".into(),
         provider: Some("openai".into()),
         model: Some("selected-model".into()),
@@ -354,6 +356,23 @@ fn sessions() -> Vec<RunArgv> {
         skills: Vec::new(),
         preload_skills: Vec::new(),
     }));
+    // Exercise absent, explicit empty, and exact/wildcard tool grants against
+    // the real Clap parser, including combinations with idle and skill flags.
+    let tool_cases = [
+        Some(Vec::new()),
+        Some(vec!["read_file".into(), "scm.*".into()]),
+        Some(vec!["*".into()]),
+    ];
+    let starts = out.clone();
+    for start in starts {
+        if let RunArgv::SessionStart(start) = start {
+            for tools in &tool_cases {
+                let mut selected = start.clone();
+                selected.tools = tools.clone();
+                out.push(RunArgv::SessionStart(selected));
+            }
+        }
+    }
     let skill_sets = [skills(0), skills(1), skills(2)];
     for prompt in PROMPTS {
         for detach in [false, true] {
@@ -549,6 +568,11 @@ fn back(cli: Cli) -> RunArgv {
             cmd::session::Action::Start(s) => {
                 assert_eq!(s.prompt, None, "the prompt is never positional");
                 RunArgv::SessionStart(SessionStart {
+                    tools: if s.no_tools || !s.tools.is_empty() {
+                        Some(s.tools)
+                    } else {
+                        None
+                    },
                     skill_preset: s.skill_preset,
                     agent: s.agent,
                     provider: s.provider,

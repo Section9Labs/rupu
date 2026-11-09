@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const CAP_BUILTIN_HARNESS: &str = "session.builtin_harness";
+pub const CAP_TOOL_SELECTION: &str = "session.tool_selection.v1";
 pub const CAP_IDLE_HARNESS: &str = "session.idle_harness";
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -28,6 +29,9 @@ pub(crate) struct StartBody {
     idle: bool,
     provider: Option<String>,
     model: Option<String>,
+    /// Runtime tool grants for the first and later turns. Absent/null inherits
+    /// the builtin baseline; [] leaves ambient/origin grants in place.
+    tools: Option<Vec<String>>,
     mode: Option<String>,
     skill_preset: Option<String>,
     #[serde(default)]
@@ -54,6 +58,13 @@ pub(crate) fn idle_available(s: &AppState) -> bool {
         && s.session_starter
             .as_ref()
             .is_some_and(|s| s.supports_idle_harness())
+}
+
+pub(crate) fn tool_selection_available(s: &AppState) -> bool {
+    available(s)
+        && s.session_starter
+            .as_ref()
+            .is_some_and(|s| s.supports_session_tool_selection())
 }
 
 /// Resolve and pin the selection before the subprocess starts. Configuration
@@ -92,6 +103,7 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
     let settings = SessionSettings {
         provider: body.provider,
         model: body.model,
+        tools: body.tools,
         ..Default::default()
     };
     settings
@@ -140,6 +152,7 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
         agent: SESSION_AGENT_NAME.into(),
         provider: Some(provider),
         model: Some(model),
+        tools: settings.tools,
         workspace_id: Some(id.into()),
         idle: body.idle,
         prompt: body.prompt,
@@ -170,6 +183,11 @@ pub(crate) async fn start(
                 "the bundled session harness requires an updated `rupu cp serve` session starter",
             )
         })?;
+    if body.tools.is_some() && !starter.supports_session_tool_selection() {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply first-turn tool selections",
+        ));
+    }
     if body.idle && !starter.supports_idle_harness() {
         return Err(ApiError::not_available(
             "this session starter cannot create idle sessions",
