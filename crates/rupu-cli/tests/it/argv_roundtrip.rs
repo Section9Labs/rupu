@@ -394,10 +394,13 @@ fn sessions() -> Vec<RunArgv> {
 fn agentiflows() -> Vec<RunArgv> {
     ["acme", "-x"]
         .into_iter()
-        .map(|def| {
-            RunArgv::Agentiflow(AgentiflowRun {
-                definition: def.into(),
-                run_id: "af_01X".into(),
+        .flat_map(|def| {
+            [false, true].map(|global_definition_only| {
+                RunArgv::Agentiflow(AgentiflowRun {
+                    definition: def.into(),
+                    run_id: "af_01X".into(),
+                    global_definition_only,
+                })
             })
         })
         .collect()
@@ -590,12 +593,14 @@ fn back(cli: Cli) -> RunArgv {
                     def,
                     detach,
                     run_id,
+                    global_definition_only,
                 },
         } => {
             assert!(!detach, "the detached child must not detach again");
             RunArgv::Agentiflow(AgentiflowRun {
                 definition: def,
                 run_id: run_id.expect("the detached child carries its id"),
+                global_definition_only,
             })
         }
         Cmd::Autoflow {

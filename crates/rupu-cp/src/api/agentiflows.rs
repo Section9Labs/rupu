@@ -1375,9 +1375,10 @@ pub(crate) fn require_local(host: Option<&str>, what: &str) -> ApiResult<()> {
 pub(crate) struct LaunchRequest {
     /// The definition's name (`agentiflows/<definition>.yaml`).
     definition: String,
-    /// `global` | `project`: start the run where this layer's definition is
-    /// the one it loads (with `scope_id`, the project's workspace id for
-    /// `project`). Exclusive with `working_dir`.
+    /// `global` | `project`: select exactly this definition layer (with
+    /// `scope_id`, the project's workspace id for `project`). Global runs
+    /// retain the configured global directory's parent as working directory;
+    /// the child pins definition lookup explicitly. Exclusive with `working_dir`.
     #[serde(default)]
     scope_kind: Option<String>,
     #[serde(default)]
@@ -1430,8 +1431,8 @@ fn launch_working_dir(s: &AppState, req: &LaunchRequest) -> ApiResult<PathBuf> {
 /// goes to). The run id is minted here and handed to the child, which
 /// records the run under it.
 ///
-/// Before anything is spawned the definition is looked up from the run's
-/// directory the way the CLI looks it up (404 when absent, 400 when it does
+/// Before anything is spawned the definition is looked up using the selected
+/// global pin or the run directory, just as in the CLI child (404 when absent, 400 when it does
 /// not parse) and checked as the CLI checks it (`AgentiflowDef::check`,
 /// 400). A child that exits before the run starts (a lead agent that does
 /// not load, no credential) is a 400 carrying its log, and leaves nothing
@@ -1450,8 +1451,16 @@ async fn launch_agentiflow(
     let project = rupu_workspace::project_root_for(&working_dir)
         .map_err(|e| ApiError::bad_request(format!("{}: {e}", working_dir.display())))?
         .map(|root| root.join(".rupu"));
+    let global_definition_only = req.scope_kind.as_deref() == Some("global");
+    // The selection is explicit, independent of the configured global basename
+    // or a project definition visible from the unchanged working directory.
+    let definition_project = if global_definition_only {
+        None
+    } else {
+        project.as_deref()
+    };
     let (_, def) =
-        rupu_agentiflow::locate_agentiflow_def(&s.global_dir, project.as_deref(), &req.definition)
+        rupu_agentiflow::locate_agentiflow_def(&s.global_dir, definition_project, &req.definition)
             .map_err(|e| match e {
                 rupu_agentiflow::DefLookupError::NotFound { .. } => {
                     ApiError::not_found(e.to_string())
@@ -1465,6 +1474,7 @@ async fn launch_agentiflow(
     let started = launcher
         .launch(crate::agentiflow_launcher::AgentiflowLaunchRequest {
             definition: req.definition,
+            global_definition_only,
             run_id: id.clone(),
             working_dir,
         })
