@@ -67,6 +67,7 @@ async fn runs_tools_are_listed_with_their_required_arguments() {
         ("runs.autoflow", &["id"]),
         ("agent_runs.list", &[]),
         ("transcripts.get", &["path"]),
+        ("transcripts.page", &["path"]),
         ("transcripts.archive", &["id"]),
         ("transcripts.delete", &["id"]),
         ("events.recent", &[]),
@@ -176,6 +177,47 @@ async fn attempts_mcp_preserves_missing_evidence_and_refuses_remote_owners() {
     assert!(page["rows"].as_array().unwrap().is_empty());
     let remote = call_tool(addr, "runs.attempts", json!({"id":OP_RUN,"host":"remote"})).await;
     assert_eq!(remote["isError"], true, "{remote}");
+    assert!(text_of(&remote).starts_with("HTTP 501"));
+}
+
+#[tokio::test]
+async fn transcript_pages_mcp_matches_http_and_preserves_stale_snapshot_errors() {
+    let (addr, tmp) = spawn_operator_with(|_| {}, None).await;
+    let path = tmp.path().join("paged transcript + scope.jsonl");
+    std::fs::write(&path, "{\"type\":\"assistant_message\",\"data\":{\"content\":\"one\"}}\ninvalid\n{\"type\":\"assistant_message\",\"data\":{\"content\":\"three\"}}\n").unwrap();
+    let mut args = json!({"path":path,"host":"local","run":"run_page_owner","limit":1});
+    let first_result = call_tool(addr, "transcripts.page", args.clone()).await;
+    assert_ne!(first_result["isError"], true, "{first_result}");
+    let first = json_of(&first_result);
+    assert_eq!(first["version"], 1);
+    assert_eq!(first["records"][0]["position"], 1);
+    args["cursor"] = first["next_cursor"].clone();
+    let next_result = call_tool(addr, "transcripts.page", args.clone()).await;
+    assert_ne!(next_result["isError"], true, "{next_result}");
+    let next = json_of(&next_result);
+    assert_eq!(next["records"][0]["position"], 2);
+    assert_eq!(next["records"][0]["status"], "malformed");
+    let http = reqwest::Client::new()
+        .get(format!("http://{addr}/api/transcript/page"))
+        .query(&[
+            ("path", path.to_str().unwrap()),
+            ("host", "local"),
+            ("run", "run_page_owner"),
+            ("limit", "1"),
+            ("cursor", args["cursor"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(http.status().as_u16(), 200);
+    assert_eq!(http.json::<Value>().await.unwrap(), next);
+    std::fs::write(&path, "changed\n").unwrap();
+    let stale = call_tool(addr, "transcripts.page", args.clone()).await;
+    assert_eq!(stale["isError"], true);
+    assert!(text_of(&stale).starts_with("HTTP 409"));
+    args["host"] = "remote".into();
+    args.as_object_mut().unwrap().remove("cursor");
+    let remote = call_tool(addr, "transcripts.page", args).await;
     assert!(text_of(&remote).starts_with("HTTP 501"));
 }
 

@@ -184,6 +184,7 @@
   "transcripts.archive",
   "transcripts.delete",
   "transcripts.get",
+  "transcripts.page",
   "usage.get",
   "usage.outliers",
   "usage.runs",

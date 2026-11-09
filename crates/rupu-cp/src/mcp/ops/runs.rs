@@ -175,6 +175,13 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .query::<transcript::PathQ>(),
         op(
+            "transcripts.page",
+            Method::GET,
+            "/api/transcript/page",
+            "Read a bounded page of recorded transcript events without loading the full conversation.\n\n`path` is the recorded transcript path; `run` binds its authorization run. Omit `host` or use `local`; remote paging returns 501. `limit` defaults to 100 and is clamped to 1–200. Return `next_cursor` as `cursor` with the same path/run to continue. Returns {version,path,host_id,run,snapshot,records,next_cursor,has_more}; records retain nonblank positions and explicit event/malformed/oversized status. Pages are capped at 1 MiB including envelope/cursors, lines at 256 KiB; omitted payloads are explicit. At most 8 MiB of file bytes are scanned per call; 413 transcript_page_scan_limit if no complete record fits. Page positions must not become SSE resume cursors. Any file modification returns 409; reload without cursor. A finite page ends at recorded EOF without requiring run_complete. Reads launch no work.",
+        )
+        .query::<transcript::page::PageQuery>(),
+        op(
             "transcripts.archive",
             Method::POST,
             "/api/transcripts/:id/archive",
