@@ -123,11 +123,11 @@ pub async fn run_with_client(
     }
     let dc: DeviceCodeResponse = resp.json().await.context("device-code json")?;
 
-    println!(
+    eprintln!(
         "Visit {} and enter code: {}",
         dc.verification_uri, dc.user_code
     );
-    println!("Waiting for approval…");
+    eprintln!("Waiting for approval…");
 
     // Poll as fast as the test wants.
     let fast_poll = std::env::var_os("RUPU_DEVICE_FAST_POLL").is_some();

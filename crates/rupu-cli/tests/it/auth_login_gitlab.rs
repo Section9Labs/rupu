@@ -116,9 +116,13 @@ fn device_login_for_a_self_managed_account_uses_its_application() {
         .args(["auth", "login", "--account", "gl-corp", "--mode", "device"])
         .assert()
         .success()
-        .stdout(
+        .stderr(
             predicate::str::contains("enter code: 0A44L90H")
-                .and(predicate::str::contains("stored gl-corp sso credential")),
+                .and(predicate::str::contains("Waiting for approval")),
+        )
+        .stdout(
+            predicate::str::contains("stored gl-corp sso credential")
+                .and(predicate::str::contains("enter code").not()),
         );
 
     device.assert_hits(1);

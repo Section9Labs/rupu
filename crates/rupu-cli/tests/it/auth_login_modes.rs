@@ -213,9 +213,13 @@ fn login_device_for_github_runs_the_device_code_flow_and_stores_sso() {
     github_device_login(tmp.path(), &server)
         .assert()
         .success()
-        .stdout(
+        .stderr(
             predicate::str::contains("enter code: ABCD-1234")
-                .and(predicate::str::contains("stored github sso credential")),
+                .and(predicate::str::contains("Waiting for approval")),
+        )
+        .stdout(
+            predicate::str::contains("stored github sso credential")
+                .and(predicate::str::contains("enter code").not()),
         );
 
     device.assert_hits(1);
