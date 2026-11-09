@@ -10,6 +10,9 @@
 //! crash between the two leaves a logged message nobody received (and no
 //! `seen` line says otherwise), never a received message the log lacks.
 
+mod operator_board;
+pub use operator_board::OperatorBoardWrite;
+
 use crate::address::{self, Address};
 use crate::board::Board;
 use crate::error::{BusError, FleetError};
@@ -495,8 +498,8 @@ impl Bus {
     }
 
     /// A write by this run. `from: operator` is the operator's alone
-    /// ([`Bus::operator_send`]): a bus at that address writes nothing else,
-    /// so a log line from `operator` is always the operator's.
+    /// ([`Bus::operator_send`] and [`Bus::operator_board`]): worker writes at
+    /// that address are refused, so operator attribution stays explicit.
     fn write(
         &self,
         draft: Draft<'_>,
@@ -519,7 +522,18 @@ impl Bus {
         draft: Draft<'_>,
         apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
     ) -> Result<SendReceipt, BusError> {
+        self.write_as_checked(from, draft, || Ok(()), apply)
+    }
+
+    fn write_as_checked(
+        &self,
+        from: &str,
+        draft: Draft<'_>,
+        check: impl FnOnce() -> Result<(), FleetError>,
+        apply: impl FnOnce(&LogMessage) -> Result<(), FleetError>,
+    ) -> Result<SendReceipt, BusError> {
         let _lock = self.lock()?;
+        check()?;
         let log_path = self.log_path();
         let size = std::fs::metadata(&log_path).map_or(0, |m| m.len());
         if size >= self.caps.log_max_bytes {

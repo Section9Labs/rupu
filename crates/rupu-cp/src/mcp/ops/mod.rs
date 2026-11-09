@@ -150,6 +150,36 @@ pub fn ops() -> &'static [OpSpec] {
 pub const EXCLUDED: &[(&str, &str, &str)] = &[
     (
         "GET",
+        "/api/runs/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "POST",
+        "/api/runs/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "GET",
+        "/api/sessions/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "POST",
+        "/api/sessions/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "GET",
+        "/api/agentiflows/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "POST",
+        "/api/agentiflows/:id/board/operator",
+        "operator Board inspection and guarded actions are HTTP-only; no MCP tool is exposed",
+    ),
+    (
+        "GET",
         "/api/sessions/:id/controls",
         "interactive session command discovery for the attach client",
     ),

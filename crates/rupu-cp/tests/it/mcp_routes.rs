@@ -231,6 +231,10 @@ fn every_route_is_a_tool_or_listed() {
         found.insert(("GET".into(), base.clone()));
         found.insert(("POST".into(), base.clone()));
         found.insert(("GET".into(), format!("{base}/stream")));
+        // Operator Board routes use the same dynamic owner-family registration.
+        let board = format!("/api/{}/:id/board/operator", r.segment());
+        found.insert(("GET".into(), board.clone()));
+        found.insert(("POST".into(), board));
     }
     println!("scanned {} method+path pairs", found.len());
     assert!(found.len() >= 155, "scanner found only {}", found.len());
@@ -261,6 +265,12 @@ fn every_route_is_a_tool_or_listed() {
 #[test]
 fn excluded_is_exactly_the_spec_list() {
     let spec: BTreeSet<(&str, &str)> = [
+        ("GET", "/api/runs/:id/board/operator"),
+        ("POST", "/api/runs/:id/board/operator"),
+        ("GET", "/api/sessions/:id/board/operator"),
+        ("POST", "/api/sessions/:id/board/operator"),
+        ("GET", "/api/agentiflows/:id/board/operator"),
+        ("POST", "/api/agentiflows/:id/board/operator"),
         ("GET", "/api/sessions/:id/controls"),
         ("POST", "/api/sessions/:id/commands"),
         ("GET", "/api/sessions/:id/settings"),

@@ -11,6 +11,7 @@ mod ast;
 mod auth;
 mod autoflows;
 mod board;
+mod operator_board;
 mod bucket_e2e;
 mod common;
 mod config_api;
