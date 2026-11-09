@@ -57,6 +57,7 @@
   "coverage.get",
   "coverage.list",
   "coverage.rerun",
+  "coverage.rerun_preview",
   "coverage.runs",
   "coverage.template",
   "coverage.templates",

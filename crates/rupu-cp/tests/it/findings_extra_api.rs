@@ -633,6 +633,204 @@ async fn a_rerun_refuses_what_it_cannot_replay() {
     assert_eq!(status, 501, "{body}");
 }
 
+// ── coverage rerun preview ───────────────────────────────────────────────
+
+fn preview_path(run: &str) -> String {
+    format!("/api/coverage/{TARGET}/rerun-preview?ws_id=ws1&host=local&run={run}")
+}
+
+/// Capture every fixture file, so a preview cannot quietly write a launch
+/// record, update the registry, or touch a coverage ledger.
+fn fixture_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(fixture_files(&path));
+        } else {
+            files.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn coverage_rerun_preview_reads_recorded_inputs_without_launching_or_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let launcher = Arc::new(CapturingLauncher::default());
+    let addr = serve(tmp.path(), true, Some(launcher.clone())).await;
+    let before = fixture_files(tmp.path());
+    let (status, body) = get(addr, &preview_path(RUN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["target_id"], TARGET);
+    assert_eq!(body["ws_id"], "ws1");
+    assert_eq!(body["host_id"], "local");
+    assert_eq!(body["replays"], RUN);
+    assert_eq!(
+        body["recorded"],
+        json!({
+            "agent_name": "notes-reviewer",
+            "user_prompt": "Review the notes API for access-control gaps.",
+            "permission_mode": "readonly",
+            "workspace_path": repo(tmp.path()),
+            "skills": ["http-probing"],
+            "preload_skills": ["house-style"],
+            "provider": "anthropic",
+            "model": "m",
+        })
+    );
+    assert!(!body["manifest_fingerprint"].as_str().unwrap().is_empty());
+    assert_eq!(fixture_files(tmp.path()), before);
+    assert!(launcher.seen.lock().unwrap().is_empty());
+
+    // Neither a writable CP nor a configured launcher is necessary to read.
+    let readonly = serve(tmp.path(), false, None).await;
+    let (status, second) = get(readonly, &preview_path(RUN)).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second, body);
+    assert_eq!(fixture_files(tmp.path()), before);
+}
+
+#[tokio::test]
+async fn coverage_rerun_preview_requires_the_existing_api_token() {
+    use tower::ServiceExt;
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let app = router_with(
+        rupu_cp::state::AppState::new(tmp.path().to_path_buf(), Default::default()),
+        Some("fixture-token".into()),
+        RouterOpts {
+            web: false,
+            mcp: None,
+        },
+    );
+    for (token, expected) in [(None, 401), (Some("fixture-token"), 200)] {
+        let mut request = axum::http::Request::builder().uri(preview_path(RUN));
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+}
+
+#[tokio::test]
+async fn coverage_rerun_preview_refuses_unsupported_or_mismatched_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let addr = serve(tmp.path(), false, None).await;
+    for (path, expected) in [
+        (preview_path("run_missing"), 404),
+        (preview_path(SESSION_RUN), 501),
+        (preview_path(CONTINUED_RUN), 409),
+        (preview_path(ELSEWHERE_RUN), 409),
+        (preview_path(RUN).replace("host=local", "host=peer"), 501),
+        (preview_path(RUN).replace("ws_id=ws1", "ws_id=missing"), 404),
+        (preview_path(RUN).replace("ws_id=ws1&", ""), 400),
+        (preview_path(RUN).replace(TARGET, "missing"), 404),
+    ] {
+        let (status, body) = get(addr, &path).await;
+        assert_eq!(status, expected, "{path}: {body}");
+    }
+    for surface in [Surface::Workflow, Surface::Autoflow] {
+        let paths = CoveragePaths::new(&repo(tmp.path()), TARGET);
+        let m = manifest("run_unsupported", surface, &repo(tmp.path()));
+        std::fs::write(&paths.runs, serde_json::to_vec(&m).unwrap()).unwrap();
+        let (status, body) = get(addr, &preview_path("run_unsupported")).await;
+        assert_eq!(status, 501, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn coverage_rerun_preview_scopes_colliding_targets_and_runs_to_the_requested_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let other = tmp.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let other = other.canonicalize().unwrap();
+    std::fs::write(
+        tmp.path().join("workspaces/ws2.toml"),
+        format!(
+            "id = \"ws2\"\npath = \"{}\"\ncreated_at = \"2026-01-01T00:00:00Z\"\n",
+            other.display()
+        ),
+    )
+    .unwrap();
+    let paths = CoveragePaths::new(&other, TARGET);
+    let mut m = manifest(RUN, Surface::Agent, &other);
+    m.user_prompt = "Second workspace's original prompt".into();
+    rupu_coverage::append_manifest(&paths, &m).unwrap();
+    std::fs::write(&paths.concerns, "").unwrap();
+    let addr = serve(tmp.path(), false, None).await;
+    let (status, first) = get(addr, &preview_path(RUN)).await;
+    assert_eq!(status, 200, "{first}");
+    let (status, second) = get(addr, &preview_path(RUN).replace("ws1", "ws2")).await;
+    assert_eq!(status, 200, "{second}");
+    assert_eq!(second["ws_id"], "ws2");
+    assert_eq!(second["recorded"]["workspace_path"], json!(other));
+    assert_eq!(second["recorded"]["user_prompt"], m.user_prompt);
+    assert_ne!(
+        second["manifest_fingerprint"],
+        first["manifest_fingerprint"]
+    );
+}
+
+#[tokio::test]
+async fn coverage_rerun_checks_the_preview_fingerprint_before_dispatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let launcher = Arc::new(CapturingLauncher::default());
+    let addr = serve(tmp.path(), true, Some(launcher.clone())).await;
+    let (status, original) = get(addr, &preview_path(RUN)).await;
+    assert_eq!(status, 200);
+    let paths = CoveragePaths::new(&repo(tmp.path()), TARGET);
+    let mut m = manifest(RUN, Surface::Agent, &repo(tmp.path()));
+    // Even a recorded-only field participates in the precondition.
+    m.model = "different-historical-model".into();
+    std::fs::write(&paths.runs, serde_json::to_vec(&m).unwrap()).unwrap();
+    let rerun = format!("/api/coverage/{TARGET}/rerun?ws_id=ws1&host=local");
+    let (status, body) = post(
+        addr,
+        &rerun,
+        json!({
+            "run": RUN,
+            "expected_manifest_fingerprint": original["manifest_fingerprint"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("manifest changed"));
+    assert!(launcher.seen.lock().unwrap().is_empty());
+    let (status, refreshed) = get(addr, &preview_path(RUN)).await;
+    assert_eq!(status, 200);
+    assert_ne!(
+        original["manifest_fingerprint"],
+        refreshed["manifest_fingerprint"]
+    );
+    let (status, body) = post(
+        addr,
+        &rerun,
+        json!({
+            "run": RUN,
+            "expected_manifest_fingerprint": refreshed["manifest_fingerprint"],
+        }),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let seen = launcher.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    // Historical provider/model never become overrides, and no continuation
+    // or engagement profile is invented by this precondition.
+    assert!(seen[0].model.is_none() && seen[0].provider.is_none());
+    assert!(seen[0].continue_from.is_none() && seen[0].engagement_profiles.is_empty());
+    assert_eq!(seen[0].mode.as_deref(), Some("readonly"));
+}
+
 // ── query help ───────────────────────────────────────────────────────────
 
 fn fixture(path: &str) -> Value {
