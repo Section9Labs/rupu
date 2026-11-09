@@ -233,3 +233,55 @@ async fn a_gitlab_without_the_device_endpoint_names_the_version() {
     device_mock.assert_hits(1);
     token_mock.assert_hits(0);
 }
+
+/// A self-managed GitLab refusing a misconfigured application says why.
+#[tokio::test]
+#[serial]
+async fn a_refused_device_code_request_names_the_vendor_s_error() {
+    let server = MockServer::start();
+    let device_mock = server.mock(|when, then| {
+        when.method(POST).path("/oauth/authorize_device");
+        then.status(401).json_body(serde_json::json!({
+            "error": "invalid_client",
+            "error_description": "Client authentication failed due to unknown client.",
+        }));
+    });
+    let token_mock = server.mock(|when, then| {
+        when.method(POST).path("/oauth/token");
+        then.status(200).json_body(gitlab_token_body());
+    });
+
+    let err = device::run_with_client(ProviderId::Gitlab, Some(corp_app(&server)))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(
+        err,
+        "device-code request failed (401 Unauthorized): invalid_client: \
+         Client authentication failed due to unknown client."
+    );
+    device_mock.assert_hits(1);
+    token_mock.assert_hits(0);
+}
+
+/// A refusal with no RFC 6749 error body names its status.
+#[tokio::test]
+#[serial]
+async fn a_refused_device_code_request_without_an_error_body_names_the_status() {
+    let server = MockServer::start();
+    server.mock(|when, then| {
+        when.method(POST).path("/oauth/authorize_device");
+        then.status(500).body("upstream exploded");
+    });
+
+    let err = device::run_with_client(ProviderId::Gitlab, Some(corp_app(&server)))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(
+        err,
+        "device-code request failed with status 500 Internal Server Error"
+    );
+}

@@ -18,6 +18,10 @@ use crate::stored::StoredCredential;
 /// new one (RFC 8628 §3.5).
 const SLOW_DOWN_STEP_SECS: u64 = 5;
 
+/// The shortest polling interval: a reply's `interval` of 0 never makes
+/// the loop poll with no wait.
+const MIN_INTERVAL_SECS: u64 = 1;
+
 const GITLAB_WITHOUT_DEVICE_LOGIN: &str = "this GitLab does not offer device login (it needs \
      GitLab 17.9 or later); log in from a desktop with --mode sso, or use --mode api-key with a \
      personal access token";
@@ -109,15 +113,15 @@ pub async fn run_with_client(
         .send()
         .await
         .context("device-code request")?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND && provider == ProviderId::Gitlab {
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND && provider == ProviderId::Gitlab {
         anyhow::bail!("{GITLAB_WITHOUT_DEVICE_LOGIN}");
     }
-    let dc: DeviceCodeResponse = resp
-        .error_for_status()
-        .context("device-code status")?
-        .json()
-        .await
-        .context("device-code json")?;
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("{}", device_code_failure(status, &body));
+    }
+    let dc: DeviceCodeResponse = resp.json().await.context("device-code json")?;
 
     println!(
         "Visit {} and enter code: {}",
@@ -127,11 +131,14 @@ pub async fn run_with_client(
 
     // Poll as fast as the test wants.
     let fast_poll = std::env::var_os("RUPU_DEVICE_FAST_POLL").is_some();
-    let mut interval = dc.interval.unwrap_or(SLOW_DOWN_STEP_SECS);
+    let mut interval = dc
+        .interval
+        .unwrap_or(SLOW_DOWN_STEP_SECS)
+        .max(MIN_INTERVAL_SECS);
     let deadline = Utc::now() + chrono::Duration::seconds(dc.expires_in.unwrap_or(900) as i64);
 
     let token = loop {
-        if interval > 0 && !fast_poll {
+        if !fast_poll {
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
         if Utc::now() >= deadline {
@@ -180,10 +187,28 @@ pub async fn run_with_client(
     })
 }
 
+/// What a refused device-code request reports: the vendor's RFC 6749
+/// `error` (and `error_description`) when the body carries one — GitLab's
+/// `invalid_client` for a misconfigured application —, else the status.
+fn device_code_failure(status: reqwest::StatusCode, body: &str) -> String {
+    let reply = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+    let error = reply["error"].as_str().filter(|e| !e.is_empty());
+    let description = reply["error_description"]
+        .as_str()
+        .filter(|d| !d.is_empty());
+    match (error, description) {
+        (Some(e), Some(d)) => format!("device-code request failed ({status}): {e}: {d}"),
+        (Some(e), None) => format!("device-code request failed ({status}): {e}"),
+        _ => format!("device-code request failed with status {status}"),
+    }
+}
+
 /// RFC 8628 §3.5: `slow_down` with no new interval adds 5 s; a reply's
-/// `interval` replaces the current one.
+/// `interval` replaces the current one. Never below 1 s.
 pub fn next_interval(current: u64, reply: Option<u64>) -> u64 {
-    reply.unwrap_or(current + SLOW_DOWN_STEP_SECS)
+    reply
+        .unwrap_or(current + SLOW_DOWN_STEP_SECS)
+        .max(MIN_INTERVAL_SECS)
 }
 
 /// What the loop polling at `interval` does after `reply`:
@@ -223,6 +248,44 @@ mod tests {
     #[test]
     fn a_reply_interval_replaces_the_current_one() {
         assert_eq!(next_interval(5, Some(7)), 7);
+    }
+
+    /// A `slow_down` naming 0 never resets a grown interval to no wait.
+    #[test]
+    fn the_interval_is_never_below_one_second() {
+        assert_eq!(next_interval(10, Some(0)), 1);
+        assert_eq!(next_interval(0, Some(0)), 1);
+        assert_eq!(
+            again(
+                10,
+                serde_json::json!({ "error": "slow_down", "interval": 0 })
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_refused_device_code_request_reports_the_vendor_s_error_else_the_status() {
+        let unauthorized = reqwest::StatusCode::UNAUTHORIZED;
+        assert_eq!(
+            device_code_failure(
+                unauthorized,
+                r#"{"error":"invalid_client","error_description":"Client authentication failed"}"#
+            ),
+            "device-code request failed (401 Unauthorized): invalid_client: \
+             Client authentication failed"
+        );
+        assert_eq!(
+            device_code_failure(unauthorized, r#"{"error":"invalid_client"}"#),
+            "device-code request failed (401 Unauthorized): invalid_client"
+        );
+        for body in ["", "<html>nope</html>", "{}", r#"{"error":""}"#] {
+            assert_eq!(
+                device_code_failure(unauthorized, body),
+                "device-code request failed with status 401 Unauthorized",
+                "{body}"
+            );
+        }
     }
 
     /// GitLab's `slow_down` names no interval; GitHub's does.

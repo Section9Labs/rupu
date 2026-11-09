@@ -24,6 +24,9 @@ pub const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 /// the first poll (Codex's 15 minutes).
 const BUDGET: Duration = Duration::from_secs(15 * 60);
 
+/// The poll interval when the reply names none (or 0): Codex's 5 s.
+const DEFAULT_INTERVAL_SECS: u64 = 5;
+
 const NOT_ENABLED: &str = "device login is not enabled for this ChatGPT account. Turn it on in \
      ChatGPT settings → Security (a workspace admin does it under workspace permissions), then \
      retry; or log in from a desktop with --mode sso";
@@ -37,6 +40,9 @@ pub struct Options {
     pub client_id: String,
     /// How long to poll for approval before giving up.
     pub budget: Duration,
+    /// Polls at this interval instead of the one the reply asks for (a
+    /// test seam; [`Options::from_env`] sets none).
+    pub interval_override: Option<Duration>,
 }
 
 impl Options {
@@ -52,6 +58,7 @@ impl Options {
             issuer: issuer.trim_end_matches('/').to_string(),
             client_id: client_id.to_string(),
             budget: BUDGET,
+            interval_override: None,
         }
     }
 }
@@ -67,22 +74,27 @@ struct UserCodeResponse {
     #[serde(alias = "usercode")]
     user_code: String,
     #[serde(default, deserialize_with = "interval_secs")]
-    interval: u64,
+    interval: Option<u64>,
 }
 
-/// The poll interval, which OpenAI sends as a string (`"5"`); a number is
-/// accepted too, and `null` is 0.
-fn interval_secs<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Interval {
-        Number(u64),
-        Text(String),
-    }
-    match Option::<Interval>::deserialize(d)? {
-        None => Ok(0),
-        Some(Interval::Number(n)) => Ok(n),
-        Some(Interval::Text(s)) => s.trim().parse().map_err(serde::de::Error::custom),
+/// The poll interval, which OpenAI sends as a string (`"5"`); a whole
+/// number is accepted too. Anything else (`null`, `""`, `"5.0"`, `5.0`, a
+/// negative number) reads as no interval, never as a failed login.
+fn interval_secs<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// How long the loop waits between polls when the reply asks for
+/// `interval` seconds: [`DEFAULT_INTERVAL_SECS`] when it names none or 0,
+/// so a poll never follows another with no wait.
+fn poll_interval(interval: Option<u64>) -> Duration {
+    match interval {
+        None | Some(0) => Duration::from_secs(DEFAULT_INTERVAL_SECS),
+        Some(secs) => Duration::from_secs(secs),
     }
 }
 
@@ -128,7 +140,10 @@ pub async fn run_with(opts: Options) -> Result<StoredCredential> {
     eprintln!("Only continue if you started this login yourself. The code expires in 15 minutes.");
     eprintln!("Waiting for approval…");
 
-    let approval = poll(&client, &api_base, &code, opts.budget).await?;
+    let interval = opts
+        .interval_override
+        .unwrap_or_else(|| poll_interval(code.interval));
+    let approval = poll(&client, &api_base, &code, interval, opts.budget).await?;
 
     let oauth =
         provider_oauth(ProviderId::Openai).ok_or_else(|| anyhow!("no oauth config for openai"))?;
@@ -155,12 +170,14 @@ pub async fn run_with(opts: Options) -> Result<StoredCredential> {
     Ok(common::stored_credential_for(ProviderId::Openai, token))
 }
 
-/// Polls `{api_base}/deviceauth/token` until the code is approved. A 403
-/// or 404 is "not yet"; `budget` from the first poll ends the wait.
+/// Polls `{api_base}/deviceauth/token` every `interval` until the code is
+/// approved. A 403 or 404 is "not yet"; `budget` from the first poll ends
+/// the wait (a wait never outlasts it).
 async fn poll(
     client: &reqwest_middleware::ClientWithMiddleware,
     api_base: &str,
     code: &UserCodeResponse,
+    interval: Duration,
     budget: Duration,
 ) -> Result<Approval> {
     let url = format!("{api_base}/deviceauth/token");
@@ -168,7 +185,6 @@ async fn poll(
         "device_auth_id": code.device_auth_id,
         "user_code": code.user_code,
     });
-    let interval = Duration::from_secs(code.interval);
     let started = Instant::now();
     loop {
         let resp = client
@@ -191,5 +207,61 @@ async fn poll(
             bail!("device login timed out");
         };
         tokio::time::sleep(interval.min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interval_of(json: serde_json::Value) -> Duration {
+        let mut reply = serde_json::json!({ "device_auth_id": "da-1", "user_code": "ABCD-1234" });
+        if !json.is_null() {
+            reply["interval"] = json;
+        }
+        let code: UserCodeResponse = serde_json::from_value(reply).expect("usercode reply");
+        poll_interval(code.interval)
+    }
+
+    #[test]
+    fn the_reply_s_interval_is_used_as_a_string_or_a_number() {
+        assert_eq!(interval_of(serde_json::json!("7")), Duration::from_secs(7));
+        assert_eq!(
+            interval_of(serde_json::json!(" 3 ")),
+            Duration::from_secs(3)
+        );
+        assert_eq!(interval_of(serde_json::json!(9)), Duration::from_secs(9));
+    }
+
+    #[test]
+    fn a_missing_or_zero_interval_polls_every_five_seconds() {
+        assert_eq!(interval_of(serde_json::Value::Null), Duration::from_secs(5));
+        assert_eq!(interval_of(serde_json::json!("0")), Duration::from_secs(5));
+        assert_eq!(interval_of(serde_json::json!(0)), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn an_unparsable_interval_reads_as_none() {
+        for odd in [
+            serde_json::json!(""),
+            serde_json::json!("5.0"),
+            serde_json::json!("soon"),
+            serde_json::json!(5.5),
+            serde_json::json!(-3),
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(interval_of(odd.clone()), Duration::from_secs(5), "{odd}");
+        }
+    }
+
+    #[test]
+    fn the_interval_is_never_below_one_second() {
+        for interval in [None, Some(0), Some(1)] {
+            assert!(
+                poll_interval(interval) >= Duration::from_secs(1),
+                "{interval:?}"
+            );
+        }
     }
 }

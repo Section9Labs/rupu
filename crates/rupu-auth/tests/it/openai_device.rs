@@ -15,6 +15,15 @@ fn options(server: &MockServer) -> Options {
         issuer: server.base_url(),
         client_id: CLIENT_ID.into(),
         budget: Duration::from_secs(30),
+        interval_override: None,
+    }
+}
+
+/// [`options`] polling with no wait, for the tests that poll more than once.
+fn fast_options(server: &MockServer) -> Options {
+    Options {
+        interval_override: Some(Duration::ZERO),
+        ..options(server)
     }
 }
 
@@ -113,7 +122,7 @@ async fn pending_replies_are_polled_until_approval() {
     let exchange = exchange_mock(&server);
     let pending = pending_poll_mock(&server);
 
-    let login = tokio::spawn(run_with(options(&server)));
+    let login = tokio::spawn(run_with(fast_options(&server)));
     while pending.hits_async().await < 2 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -142,7 +151,7 @@ async fn a_404_poll_is_pending_too() {
         then.status(404);
     });
 
-    let login = tokio::spawn(run_with(options(&server)));
+    let login = tokio::spawn(run_with(fast_options(&server)));
     while pending.hits_async().await < 2 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -168,7 +177,7 @@ async fn interval_as_a_number_is_accepted() {
 }
 
 #[tokio::test]
-async fn a_missing_interval_defaults_to_zero() {
+async fn a_missing_interval_is_accepted() {
     let server = MockServer::start();
     usercode_mock(
         &server,
@@ -178,6 +187,34 @@ async fn a_missing_interval_defaults_to_zero() {
     exchange_mock(&server);
 
     assert_stored(&run_with(options(&server)).await.expect("login"));
+}
+
+/// An interval rupu can't read means "none" (the 5 s default), never a
+/// failed login.
+#[tokio::test]
+async fn an_unparsable_interval_does_not_fail_the_login() {
+    for interval in [
+        serde_json::json!(""),
+        serde_json::json!("5.0"),
+        serde_json::json!(5.0),
+        serde_json::json!(-1),
+    ] {
+        let server = MockServer::start();
+        usercode_mock(
+            &server,
+            serde_json::json!({ "device_auth_id": "da-1", "user_code": "ABCD-1234", "interval": interval }),
+        );
+        let poll = approved_poll_mock(&server);
+        let exchange = exchange_mock(&server);
+
+        let stored = run_with(options(&server))
+            .await
+            .unwrap_or_else(|e| panic!("interval {interval}: {e}"));
+
+        assert_stored(&stored);
+        poll.assert_hits(1);
+        exchange.assert_hits(1);
+    }
 }
 
 #[tokio::test]
@@ -223,6 +260,9 @@ async fn the_budget_ends_a_login_nobody_approves() {
     let pending = pending_poll_mock(&server);
     let exchange = exchange_mock(&server);
 
+    // A "0" interval waits the 5 s default between polls; the budget cuts
+    // that wait short.
+    let started = std::time::Instant::now();
     let err = run_with(Options {
         budget: Duration::from_millis(300),
         ..options(&server)
@@ -232,6 +272,11 @@ async fn the_budget_ends_a_login_nobody_approves() {
     .to_string();
 
     assert!(err.contains("device login timed out"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(pending.hits() >= 1);
     exchange.assert_hits(0);
 }
