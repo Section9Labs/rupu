@@ -517,12 +517,12 @@ async fn enrollment_equality_preserves_epochs_but_publication_guard_detects_aba(
 async fn fifo_credential_and_config_paths_are_refused_without_a_writer() {
     let f = Fixture::new();
     let auth = f.home.path().join("auth.json");
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        &auth,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )
-    .unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(&auth)
+        .status()
+        .expect("mkfifo must be available for FIFO regression coverage")
+        .success());
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), f.source.current()).await;
     if result.is_err() {
         // Unblock a regressed reader before runtime shutdown.
@@ -534,12 +534,12 @@ async fn fifo_credential_and_config_paths_are_refused_without_a_writer() {
     }
     assert!(result.is_ok_and(|value| value.is_err()));
     std::fs::remove_file(auth).unwrap();
-    rustix::fs::mkfifoat(
-        rustix::fs::CWD,
-        f.home.path().join("config.toml"),
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-    )
-    .unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .args(["-m", "600"])
+        .arg(f.home.path().join("config.toml"))
+        .status()
+        .expect("mkfifo must be available for FIFO regression coverage")
+        .success());
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), f.source.current()).await;
     if result.is_err() {
         drop(rustix::fs::open(
