@@ -106,17 +106,30 @@ fn github_device_login(home: &std::path::Path, server: &httpmock::MockServer) ->
 #[test]
 fn login_device_for_a_vendor_without_a_headless_flow_refuses() {
     let tmp = assert_fs::TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("config.toml"),
+        "[providers.oai-local]\nkind = \"openai-compatible\"\n\
+         base_url = \"http://127.0.0.1:9\"\ndefault_model = \"m\"\n",
+    )
+    .unwrap();
     Command::cargo_bin("rupu")
         .unwrap()
         .env("RUPU_HOME", tmp.path())
         .env_remove("RUPU_AUTH_FILE")
         .env_remove("RUPU_AUTH_BACKEND")
         .timeout(std::time::Duration::from_secs(30))
-        .args(["auth", "login", "--account", "gemini", "--mode", "device"])
+        .args([
+            "auth",
+            "login",
+            "--account",
+            "oai-local",
+            "--mode",
+            "device",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "gemini has no device login; use --mode api-key",
+            "openai-compatible providers only support --mode api-key",
         ));
     assert!(!tmp.path().join("auth.json").exists());
 }

@@ -261,7 +261,13 @@ pub fn provider_oauth(p: ProviderId) -> Option<ProviderOAuth> {
             refresh_body_format: TokenBodyFormat::Form,
             state_is_verifier: false,
             include_state_in_token_body: false,
-            headless: None,
+            // Gemini CLI's `NO_BROWSER` login: Google's hosted page shows the
+            // code. `prompt=consent` makes Google issue a refresh token on
+            // every login, not only an account's first consent.
+            headless: Some(HeadlessFlow::PasteCode {
+                redirect_uri: "https://codeassist.google.com/authcode",
+                extra_authorize_params: &[("access_type", "offline"), ("prompt", "consent")],
+            }),
         }),
         ProviderId::Copilot => Some(ProviderOAuth {
             flow: OAuthFlow::Device,
@@ -401,9 +407,17 @@ mod tests {
     }
 
     #[test]
-    fn vendors_without_a_headless_flow_yet_say_so() {
-        // Filled in by a later task: Gemini (5).
-        assert_eq!(provider_oauth(ProviderId::Gemini).unwrap().headless, None);
+    fn gemini_headless_is_the_paste_flow_with_consent() {
+        let Some(HeadlessFlow::PasteCode {
+            redirect_uri,
+            extra_authorize_params,
+        }) = provider_oauth(ProviderId::Gemini).unwrap().headless
+        else {
+            panic!("gemini headless is not the paste flow");
+        };
+        assert_eq!(redirect_uri, "https://codeassist.google.com/authcode");
+        assert!(extra_authorize_params.contains(&("access_type", "offline")));
+        assert!(extra_authorize_params.contains(&("prompt", "consent")));
     }
 
     #[test]

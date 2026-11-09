@@ -174,3 +174,101 @@ async fn a_failed_exchange_surfaces_the_vendor_message_and_stores_nothing() {
     assert!(err.contains("Invalid code"), "{err}");
     token.assert_hits(1);
 }
+
+const GEMINI_REDIRECT: &str = "https://codeassist.google.com/authcode";
+
+#[tokio::test]
+#[serial]
+async fn gemini_paste_login_sends_consent_params_and_the_client_secret() {
+    let server = MockServer::start();
+    let _url = TokenUrl::at(&server);
+    let token = server.mock(|when, then| {
+        when.method(POST)
+            .path("/token")
+            .x_www_form_urlencoded_tuple("grant_type", "authorization_code")
+            .x_www_form_urlencoded_tuple("code", "4/0Acode")
+            .x_www_form_urlencoded_tuple("redirect_uri", GEMINI_REDIRECT)
+            .x_www_form_urlencoded_tuple(
+                "client_secret",
+                rupu_providers::google_gemini::GEMINI_CLI_CLIENT_SECRET,
+            )
+            .x_www_form_urlencoded_key_exists("code_verifier");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "ya29",
+            "refresh_token": "1//rt",
+            "expires_in": 3599,
+            "id_token": "x",
+        }));
+    });
+    let stored = {
+        let mut input = Paste(|url: &str, _: &str| {
+            assert!(
+                url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+                "{url}"
+            );
+            assert!(url.contains("access_type=offline"), "{url}");
+            assert!(url.contains("prompt=consent"), "{url}");
+            assert!(
+                url.contains("redirect_uri=https%3A%2F%2Fcodeassist.google.com%2Fauthcode"),
+                "{url}"
+            );
+            assert!(url.contains("code_challenge_method=S256"), "{url}");
+            Ok("4/0Acode".to_string())
+        });
+        run_with_input(ProviderId::Gemini, None, &mut input)
+            .await
+            .expect("login")
+    };
+
+    token.assert_hits(1);
+    assert_eq!(stored.refresh_token.as_deref(), Some("1//rt"));
+    match &stored.credentials {
+        AuthCredentials::OAuth { access, extra, .. } => {
+            assert_eq!(access, "ya29");
+            assert_eq!(
+                extra[rupu_providers::google_gemini::code_assist::EXTRA_VARIANT],
+                "gemini-cli"
+            );
+            assert!(!extra.contains_key("id_token"), "{extra:?}");
+        }
+        other => panic!("expected OAuth, got {other:?}"),
+    }
+}
+
+async fn gemini_login_with_reply(reply: serde_json::Value) -> String {
+    let server = MockServer::start();
+    let _url = TokenUrl::at(&server);
+    let token = server.mock(move |when, then| {
+        when.method(POST).path("/token");
+        then.status(200).json_body(reply);
+    });
+    let mut input = Paste(|_: &str, _: &str| Ok("4/0Acode".to_string()));
+    let err = run_with_input(ProviderId::Gemini, None, &mut input)
+        .await
+        .unwrap_err()
+        .to_string();
+    token.assert_hits(1);
+    err
+}
+
+#[tokio::test]
+#[serial]
+async fn a_gemini_reply_without_a_refresh_token_is_refused() {
+    let err =
+        gemini_login_with_reply(serde_json::json!({"access_token": "ya29", "expires_in": 3599}))
+            .await;
+    assert!(err.contains("Google returned no refresh token"), "{err}");
+    assert!(err.contains("myaccount.google.com/permissions"), "{err}");
+    assert!(!err.contains("ya29"), "{err}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_gemini_reply_with_an_empty_refresh_token_is_refused() {
+    let err = gemini_login_with_reply(
+        serde_json::json!({"access_token": "ya29", "refresh_token": "", "expires_in": 3599}),
+    )
+    .await;
+    assert!(err.contains("Google returned no refresh token"), "{err}");
+    assert!(err.contains("myaccount.google.com/permissions"), "{err}");
+}

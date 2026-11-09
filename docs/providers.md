@@ -8,7 +8,7 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 | ------------------ | :-----: | :--: | :----: | ---------------- | ------------------------------------------------------------------------------------------ |
 | anthropic          |   ✓     |  ✓   | ✓ (paste the code) | Browser callback | Console API key OR Claude.ai SSO.                                                          |
 | openai             |   ✓     |  ✓   | ✓ (Codex device auth) | Browser callback | Platform API key OR ChatGPT SSO. Different endpoints under hood.                           |
-| gemini             |   ✓     |  ✓   |   —    | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
+| gemini             |   ✓     |  ✓   | ✓ (paste the code) | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
 | copilot            |   ✓     |  ✓   |   ✓    | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
 | openai-compatible  |   ✓     |  —   |   —    | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
 
@@ -94,6 +94,7 @@ Vendors with a device login:
 
 - **anthropic**: Claude Code's paste-the-code login (see below).
 - **openai**: Codex CLI's device auth (see below).
+- **gemini**: Gemini CLI's paste-the-code login (see below).
 - **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
 - **gitlab**: GitLab's device authorization grant (see below).
 
@@ -116,6 +117,26 @@ rupu auth login --account anthropic --mode device
 3. rupu exchanges the code for tokens and stores them as `--mode sso` does.
 
 A pasted state that isn't this login's ends it with `pasted state does not match this login; start again`. The code expires within minutes and works once: if the exchange fails, rupu shows Anthropic's message and stores nothing — run the command again for a new URL.
+
+#### Gemini
+
+```sh
+rupu auth login --account gemini --mode device
+# Open this URL in any browser and sign in:
+#
+#   https://accounts.google.com/o/oauth2/v2/auth?…
+#
+# Paste the code the page shows: <paste, then Enter>
+# rupu: stored gemini sso credential
+```
+
+1. Open the URL rupu prints in a browser on any machine and sign in with your Google account (the login Gemini CLI runs with `NO_BROWSER` set).
+2. Google's page (`codeassist.google.com/authcode`) shows an authorization code. Paste it at the prompt of the run that printed the URL (each run makes a new one); the page's full address is accepted too.
+3. rupu exchanges the code for tokens, stores them as `--mode sso` does and sets up the account's Code Assist project (see [gemini.md](providers/gemini.md#code-assist-project)).
+
+The URL asks Google to show its consent screen on every device login, so that Google always issues a refresh token (without it, an account that had already consented once would get a one-hour token). If Google still returns no refresh token, rupu says `Google returned no refresh token. Revoke "Gemini CLI" at https://myaccount.google.com/permissions and log in again, or use --mode api-key` and stores nothing. The code works once and expires within minutes; if the exchange fails, run the command again for a new URL.
+
+> Not yet verified against Google: this flow is built from Gemini CLI's own manual login and has not been run against a live Google account.
 
 #### OpenAI
 

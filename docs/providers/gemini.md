@@ -42,6 +42,20 @@ rupu: signed in, but Gemini Code Assist setup failed: … Set GOOGLE_CLOUD_PROJE
 rupu: the first Gemini request retries the setup.
 ```
 
+## Device login
+
+On a machine with no browser:
+
+```sh
+rupu auth login --account gemini --mode device
+```
+
+rupu prints a Google sign-in URL. Open it in a browser on any machine, sign in, and paste the code Google's page (`codeassist.google.com/authcode`) shows. rupu stores the result as the account's `sso` credential, exactly as `--mode sso` does, and sets up the Code Assist project afterwards.
+
+Google's consent screen appears on every device login: the URL carries `prompt=consent` and `access_type=offline` so that Google always returns a refresh token. If it returns none, the login fails with a message to revoke "Gemini CLI" at https://myaccount.google.com/permissions and retry, and nothing is stored.
+
+> Not yet verified against Google: this flow follows Gemini CLI's manual login and has not been run against a live Google account.
+
 ## Configuration
 
 ```toml
@@ -53,7 +67,7 @@ default_model = "gemini-2.5-pro"
 for a Vertex AI regional endpoint, and none of rupu's Gemini paths (AI Studio,
 Gemini CLI, Antigravity) is region-scoped. See `docs/providers.md`.
 
-For headless setups where you can't run the SSO flow, use the AI Studio API-key path.
+For headless setups where you can't run the browser SSO flow, use `rupu auth login --account gemini --mode device` (see below) or the AI Studio API-key path.
 
 ## Example agent file
 

@@ -133,3 +133,69 @@ fn a_gemini_sso_login_stores_the_code_assist_project() {
     );
     assert_eq!(stored["credentials"]["variant"], "gemini-cli", "{stored}");
 }
+
+#[test]
+fn a_gemini_device_login_reads_the_code_and_stores_the_code_assist_project() {
+    let server = httpmock::MockServer::start();
+    let token = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/token")
+            .x_www_form_urlencoded_tuple("code", "4/0Acode")
+            .x_www_form_urlencoded_tuple("redirect_uri", "https://codeassist.google.com/authcode");
+        then.status(200).json_body(serde_json::json!({
+            "access_token": "g-access",
+            "refresh_token": "g-refresh",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        }));
+    });
+    let load = server.mock(|when, then| {
+        when.method(httpmock::Method::POST)
+            .path("/v1internal:loadCodeAssist")
+            .header("authorization", "Bearer g-access");
+        then.status(200).json_body(serde_json::json!({
+            "currentTier": { "id": "free-tier" },
+            "cloudaicompanionProject": "managed-cli",
+        }));
+    });
+    let tmp = assert_fs::TempDir::new().unwrap();
+
+    let out = assert_cmd::Command::cargo_bin("rupu")
+        .unwrap()
+        .env("RUPU_HOME", tmp.path())
+        .env_remove("RUPU_AUTH_FILE")
+        .env_remove("RUPU_AUTH_BACKEND")
+        .env_remove("GOOGLE_CLOUD_PROJECT")
+        .env_remove("GOOGLE_CLOUD_PROJECT_ID")
+        .env("RUPU_OAUTH_TOKEN_URL_OVERRIDE", server.url("/token"))
+        .env("RUPU_CODE_ASSIST_ENDPOINT_OVERRIDE", server.url(""))
+        .write_stdin("4/0Acode\n")
+        .timeout(Duration::from_secs(30))
+        .args(["auth", "login", "--account", "gemini", "--mode", "device"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("accounts.google.com"), "{stderr}");
+    assert!(stderr.contains("Paste the code"), "{stderr}");
+    assert!(
+        !stderr.contains("g-access") && !stderr.contains("4/0Acode"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Gemini Code Assist project: managed-cli"),
+        "{stderr}"
+    );
+    token.assert_hits(1);
+    load.assert_hits(1);
+    let auth: std::collections::HashMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("auth.json")).unwrap())
+            .unwrap();
+    let stored: serde_json::Value = serde_json::from_str(&auth["gemini/sso"]).unwrap();
+    assert_eq!(
+        stored["credentials"]["project_id"], "managed-cli",
+        "{stored}"
+    );
+    assert_eq!(stored["refresh_token"], "g-refresh", "{stored}");
+}

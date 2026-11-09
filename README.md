@@ -365,7 +365,7 @@ rupu ships five LLM providers. Four support both API-key and SSO auth:
 | --------- | ------------------------------------ | ---------------------------------- | :----: |
 | anthropic | `console.anthropic.com` → API Keys   | Claude.ai login (browser callback) |   ✓    |
 | openai    | `platform.openai.com` → API Keys     | ChatGPT login (browser callback)   |   ✓    |
-| gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |   —    |
+| gemini    | `aistudio.google.com` → Get API Key  | Google account (browser callback)  |   ✓    |
 | copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |   ✓    |
 
 **Device** is `--mode device`: log in from a browser on another machine (for a
