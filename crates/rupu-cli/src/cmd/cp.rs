@@ -1,5 +1,7 @@
 //! `rupu cp` — control-plane HTTP server subcommand.
 
+mod bootstrap;
+
 use crate::paths;
 use clap::Subcommand;
 use rupu_cp::host::bucket::{poll_bucket_run, ObjectStoreBucket};
@@ -41,9 +43,22 @@ pub enum Action {
         /// the browser is signed in.
         #[arg(long)]
         token: Option<String>,
+        /// Read the access token from a private owner-only file for a managed
+        /// desktop launch. Requires --ready-file and --launch-id; never prints
+        /// a token-bearing URL. The native client removes its token file.
+        #[arg(long, conflicts_with = "token", requires_all = ["ready_file", "launch_id"])]
+        token_file: Option<std::path::PathBuf>,
+        /// Publish a new private rupu.cp.bootstrap.v1 JSON receipt after bind.
+        /// The parent directory must already exist, be owned by this user, and
+        /// have mode 0700. An existing receipt is never overwritten.
+        #[arg(long, requires_all = ["token_file", "launch_id"])]
+        ready_file: Option<std::path::PathBuf>,
+        /// Unique UUID supplied by the native app for this exact launch.
+        #[arg(long, requires_all = ["token_file", "ready_file"])]
+        launch_id: Option<String>,
         /// Do not open the served URL in a browser on startup. By default the
         /// URL is opened when running interactively (a terminal); the URL is
-        /// always printed regardless.
+        /// printed unless this is a managed desktop launch.
         #[arg(long)]
         no_open: bool,
         /// Serve no web UI or page shell: `/api/*`, `/healthz` and `/mcp`
@@ -70,6 +85,9 @@ pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
     handle(Action::Serve {
         bind: DEFAULT_BIND.parse().expect("default bind"),
         token: None,
+        token_file: None,
+        ready_file: None,
+        launch_id: None,
         no_open: true,
         no_web: true,
         no_mcp: false,
@@ -284,6 +302,9 @@ pub async fn handle(action: Action) -> ExitCode {
         Action::Serve {
             bind,
             token,
+            token_file,
+            ready_file,
+            launch_id,
             no_open,
             no_web,
             no_mcp,
@@ -298,6 +319,14 @@ pub async fn handle(action: Action) -> ExitCode {
                 eprintln!("error: nothing to serve: --no-web and --no-mcp together");
                 return ExitCode::FAILURE;
             }
+            let mut managed = match bootstrap::prepare(bind, token_file, ready_file, launch_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("error: managed control-plane startup: {error:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let token = token.or_else(|| managed.as_ref().map(|value| value.token().to_owned()));
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -388,6 +417,17 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            if let Some(bootstrap) = &mut managed {
+                if let Err(error) = listener
+                    .local_addr()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|address| bootstrap.publish(address))
+                {
+                    eprintln!("error: managed control-plane readiness: {error:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
 
             // `cp serve`'s own traffic (fleet HTTP to remote hosts, the ASN
             // refresh download, the SCM registry built below) is
@@ -849,31 +889,32 @@ pub async fn handle(action: Action) -> ExitCode {
                 })
             };
 
-            let serve_result = rupu_cp::serve_on(
-                listener,
-                rupu_cp::ServeOpts {
-                    bind,
-                    token,
-                    global_dir,
-                    open_browser: !no_open && !no_web,
-                    launcher: Some(launcher),
-                    session_sender: Some(session_sender),
-                    repos,
-                    model_catalog,
-                    agent_launcher,
-                    session_starter,
-                    generator,
-                    session_mutator,
-                    transcript_mutator,
-                    inventory: Some(inventory),
-                    web: !no_web,
-                    mcp,
-                    agentiflow_launcher,
-                    skill_installer,
-                    admin_ops: Some(admin_ops),
-                },
-            )
-            .await;
+            let options = rupu_cp::ServeOpts {
+                bind,
+                token,
+                global_dir,
+                open_browser: managed.is_none() && !no_open && !no_web,
+                launcher: Some(launcher),
+                session_sender: Some(session_sender),
+                repos,
+                model_catalog,
+                agent_launcher,
+                session_starter,
+                generator,
+                session_mutator,
+                transcript_mutator,
+                inventory: Some(inventory),
+                web: !no_web,
+                mcp,
+                agentiflow_launcher,
+                skill_installer,
+                admin_ops: Some(admin_ops),
+            };
+            let serve_result = if let Some(bootstrap) = &managed {
+                rupu_cp::serve_on_managed(listener, options, bootstrap.launch_id()).await
+            } else {
+                rupu_cp::serve_on(listener, options).await
+            };
 
             // Signal every background loop to stop and wait for them to drain.
             let _ = shutdown_tx.send(true);

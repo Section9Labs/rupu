@@ -27,6 +27,7 @@ mod cli_ui;
 mod cli_update_platform;
 mod cli_usage;
 mod cli_workflow_summary;
+mod cp_managed_bootstrap;
 mod cp_serve_mcp_smoke;
 mod findings_export;
 mod findings_import;
