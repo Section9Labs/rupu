@@ -97,3 +97,14 @@ server. Invalid or oversized mutation bodies return a sanitized 400 response.
 Registry inventory and mutations are intentionally operator HTTP controls,
 excluded from the operator MCP tool inventory. They do not expose endpoint
 configuration, effect-policy edits, or server removal as session-callable tools.
+
+Host credential enrollment preparation adds an optional `bearer_store` binding
+generation, mutually exclusive with `bearer_env`. The generation is opaque
+identity metadata, omitted from old configuration and from registry inventory.
+`credential.action = "use_host_store"` selects this mechanism; `preserve` retains
+its generation only for the same canonical endpoint. Endpoint changes, mechanism
+replacement, and delete/recreate produce a fresh generation. Clearing or deleting
+registry configuration does not silently delete stored credentials. These changes
+participate in frozen tool fingerprints. The schema preparation alone advertises
+no credential-enrollment capability and refuses host-store transport until the
+dedicated identity-aware credential resolver is installed.

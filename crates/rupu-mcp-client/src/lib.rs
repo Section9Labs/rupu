@@ -191,6 +191,11 @@ impl HttpToolsClient {
         let config = registry
             .enabled_server(server_id)
             .map_err(|_| Error::Configuration)?;
+        // A host-store binding must never silently fall back to anonymous
+        // transport before the dedicated identity-aware resolver is installed.
+        if config.bearer_store.is_some() {
+            return Err(Error::Credential);
+        }
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,

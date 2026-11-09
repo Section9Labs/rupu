@@ -1,6 +1,6 @@
 //! Trusted-host MCP registry settings. Saving configuration does not connect
 //! to servers, resolve credentials, discover tools, or alter running clients.
-mod store;
+pub(crate) mod store;
 use crate::{
     error::{ApiError, ApiResult},
     state::AppState,
@@ -32,6 +32,7 @@ struct LocalQuery {
 enum CredentialEdit {
     Preserve,
     Clear,
+    UseHostStore,
     SetReference { reference: String },
 }
 #[derive(Deserialize)]
@@ -78,8 +79,8 @@ fn inventory(
                 "url": server.url,
                 "enabled": server.enabled,
                 "credential": {
-                    "kind": if server.bearer_env.is_some() { "bearer_env" } else { "none" },
-                    "configured": server.bearer_env.is_some()
+                    "kind": if server.bearer_store.is_some() { "host_store" } else if server.bearer_env.is_some() { "bearer_env" } else { "none" },
+                    "configured": server.bearer_env.is_some() || server.bearer_store.is_some()
                 },
                 "tool_effects": server.tool_effects,
                 "status": "configured_unverified"
@@ -125,19 +126,38 @@ async fn upsert(
         body.map_err(|_| ApiError::bad_request("invalid MCP server configuration request"))?;
     super::runs::blocking(move || {
         let saved = store::mutate(&s.global_dir, &update.revision, |registry| {
-            let bearer_env = match update.credential {
-                CredentialEdit::Preserve => registry
-                    .servers
-                    .get(&id)
-                    .and_then(|server| server.bearer_env.clone()),
-                CredentialEdit::Clear => None,
-                CredentialEdit::SetReference { reference } => Some(reference),
+            let previous = registry.servers.get(&id);
+            let same_endpoint = previous.is_some_and(|server| {
+                match (url::Url::parse(&server.url), url::Url::parse(&update.url)) {
+                    (Ok(old), Ok(new)) => old == new,
+                    _ => false,
+                }
+            });
+            let host_binding = || {
+                if same_endpoint {
+                    previous.and_then(|server| server.bearer_store.clone())
+                } else {
+                    None
+                }
+                .unwrap_or_else(|| ulid::Ulid::new().to_string())
+            };
+            let (bearer_env, bearer_store) = match update.credential {
+                CredentialEdit::Preserve => (
+                    previous.and_then(|server| server.bearer_env.clone()),
+                    previous
+                        .filter(|server| server.bearer_store.is_some())
+                        .map(|_| host_binding()),
+                ),
+                CredentialEdit::Clear => (None, None),
+                CredentialEdit::SetReference { reference } => (Some(reference), None),
+                CredentialEdit::UseHostStore => (None, Some(host_binding())),
             };
             let server = ServerConfig {
                 label: update.label,
                 url: update.url,
                 enabled: update.enabled,
                 bearer_env,
+                bearer_store,
                 tool_effects: update.tool_effects,
             };
             server

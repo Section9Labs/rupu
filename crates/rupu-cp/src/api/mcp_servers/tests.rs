@@ -279,6 +279,7 @@ fn concurrent_writers_have_one_cas_winner_and_preserve_the_winner() {
                             url: "https://fixture.invalid/mcp".into(),
                             enabled: false,
                             bearer_env: None,
+                            bearer_store: None,
                             tool_effects: Default::default(),
                         },
                     );
@@ -308,4 +309,89 @@ async fn symlink_registry_is_refused_without_reading_or_writing_target() {
         std::fs::read_to_string(outside).unwrap(),
         "DO_NOT_ECHO_SECRET"
     );
+}
+
+#[tokio::test]
+async fn host_store_binding_rotates_only_with_endpoint_or_mechanism_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = state(&tmp, true);
+    let (_, mut snapshot) = request(s.clone(), "GET", "/api/mcp/servers", Value::Null).await;
+    let mut generations = Vec::new();
+    for (action, url, changes) in [
+        ("use_host_store", "https://fixture.invalid/mcp", true),
+        ("preserve", "https://FIXTURE.invalid:443/mcp", false),
+        ("use_host_store", "https://fixture.invalid/mcp", false),
+        ("preserve", "https://fixture.invalid/other", true),
+        ("clear", "https://fixture.invalid/other", true),
+        ("use_host_store", "https://fixture.invalid/other", true),
+        ("set_reference", "https://fixture.invalid/other", true),
+        ("use_host_store", "https://fixture.invalid/other", true),
+    ] {
+        let mut body = edit(&snapshot["revision"]);
+        body["url"] = json!(url);
+        body["credential"] = if action == "set_reference" {
+            json!({"action":action,"reference":"RUPU_MCP_FIXTURE_REFERENCE"})
+        } else {
+            json!({"action":action})
+        };
+        let (status, saved) = request(s.clone(), "PUT", "/api/mcp/servers/fixture", body).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let config = Registry::load(tmp.path()).unwrap();
+        let generation = config.servers["fixture"].bearer_store.clone();
+        if let Some(previous) = generations.last() {
+            assert_eq!(generation != *previous, changes, "{action}: {url}");
+        }
+        if let Some(generation) = &generation {
+            assert!(!saved.to_string().contains(generation));
+            assert_eq!(
+                saved["servers"][0]["credential"],
+                json!({"kind":"host_store","configured":true})
+            );
+            assert!(config.servers["fixture"].bearer_env.is_none());
+        }
+        generations.push(generation);
+        snapshot = saved;
+    }
+    let original = generations.last().unwrap().clone().unwrap();
+    let (status, removed) = request(
+        s.clone(),
+        "DELETE",
+        "/api/mcp/servers/fixture",
+        json!({"revision":snapshot["revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut body = edit(&removed["revision"]);
+    body["credential"] = json!({"action":"use_host_store"});
+    let (status, _) = request(s, "PUT", "/api/mcp/servers/fixture", body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        Registry::load(tmp.path()).unwrap().servers["fixture"]
+            .bearer_store
+            .as_deref(),
+        Some(original.as_str())
+    );
+    assert!(!tmp.path().join("mcp-credentials.json").exists());
+}
+
+#[test]
+fn credential_transaction_holds_registry_snapshot_lock_without_rewriting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let revision = store::read(tmp.path()).unwrap().revision;
+    store::with_snapshot_locked(tmp.path(), &revision, |snapshot| {
+        assert_eq!(snapshot.revision, revision);
+        assert!(
+            store::mutate(tmp.path(), &revision, |_| panic!("lock must prevent edit")).is_err()
+        );
+        Ok(())
+    })
+    .unwrap();
+    assert!(!tmp.path().join("mcp.toml").exists());
+    assert!(
+        store::with_snapshot_locked::<()>(tmp.path(), "stale", |_| panic!(
+            "CAS must prevent credential write"
+        ))
+        .is_err()
+    );
+    assert!(store::mutate(tmp.path(), &revision, |_| Ok(())).is_ok());
 }

@@ -23,6 +23,10 @@ pub struct ServerConfig {
     pub enabled: bool,
     /// A dedicated MCP environment variable, never a provider/CP credential source.
     pub bearer_env: Option<String>,
+    /// Opaque binding generation for the dedicated host MCP credential store.
+    /// This is identity metadata, never a token or a provider auth-file path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_store: Option<String>,
     #[serde(default)]
     pub tool_effects: BTreeMap<String, ToolEffect>,
 }
@@ -30,7 +34,10 @@ impl std::fmt::Debug for ServerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerConfig")
             .field("enabled", &self.enabled)
-            .field("authenticated", &self.bearer_env.is_some())
+            .field(
+                "authenticated",
+                &(self.bearer_env.is_some() || self.bearer_store.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -63,6 +70,19 @@ impl ServerConfig {
             || !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && loopback)
         {
             return Err(RegistryError::Invalid("endpoint must be HTTPS or literal loopback HTTP, without userinfo, query or fragment"));
+        }
+        if let Some(generation) = &self.bearer_store {
+            if self.bearer_env.is_some()
+                || generation.len() != 26
+                || generation.as_bytes()[0] > b'7'
+                || !generation
+                    .bytes()
+                    .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b))
+            {
+                return Err(RegistryError::Invalid(
+                    "invalid or ambiguous MCP credential binding",
+                ));
+            }
         }
         if let Some(name) = &self.bearer_env {
             if !name.starts_with("RUPU_MCP_")
@@ -223,6 +243,30 @@ mod tests {
         assert!(
             Registry::parse(&source("enabled=true\nbearer_env='RUPU_MCP_FIXTURE_TOKEN'")).is_ok()
         );
+    }
+    #[test]
+    fn host_credential_binding_is_typed_exclusive_and_absent_backcompatible() {
+        let generation = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let registry = Registry::parse(&source(&format!("bearer_store='{generation}'"))).unwrap();
+        assert_eq!(
+            registry.servers["fixture"].bearer_store.as_deref(),
+            Some(generation)
+        );
+        for extra in [
+            "bearer_store=''",
+            "bearer_store='DO_NOT_ECHO_SECRET'",
+            "bearer_store='ZZZZZZZZZZZZZZZZZZZZZZZZZZ'",
+            "bearer_store='01ARZ3NDEKTSV4RRFFQ69G5FAI'",
+            "bearer_store='01ARZ3NDEKTSV4RRFFQ69G5FAV'\nbearer_env='RUPU_MCP_FIXTURE'",
+        ] {
+            let error = Registry::parse(&source(extra)).unwrap_err().to_string();
+            assert!(!error.contains("DO_NOT_ECHO_SECRET"));
+        }
+        let legacy = Registry::parse(&source("")).unwrap();
+        assert!(legacy.servers["fixture"].bearer_store.is_none());
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("bearer_store"));
     }
     #[test]
     fn ordinary_layered_config_does_not_accept_mcp_server_registry() {
