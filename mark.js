@@ -117,6 +117,18 @@
   }
   function introView() { var size = Math.min(vw * 0.74, 820), s = size / (markK * 40); return { x: vw / 2, y: vh * 0.5, s: s }; }
   var view = introView();
+  /* once the mark has landed in the hero panel the view is re-read every
+     frame, so a scroll, a resize or a font-size change moves the light with
+     the graph instead of leaving it at the viewport position it was sampled
+     at; while the panel is off screen nothing is drawn at all */
+  var anchored = false, visible = true;
+  function panelRect() { return canvasEl.getBoundingClientRect(); }
+  function clipToPanel(c) {
+    var r = panelRect(), rad = parseFloat(getComputedStyle(canvasEl).borderRadius) || 0;
+    c.beginPath();
+    if (c.roundRect) c.roundRect(r.left, r.top, r.width, r.height, rad); else c.rect(r.left, r.top, r.width, r.height);
+    c.clip();
+  }
   function toScreen(pts) { var o = new Array(pts.length); for (var i = 0; i < pts.length; i++) o[i] = [(pts[i][0] - markCx) * view.s + view.x, (pts[i][1] - markCy) * view.s + view.y]; return o; }
 
   /* ── one material: light particles orbiting the path ───────── */
@@ -174,13 +186,16 @@
   }
 
   var last = 0, raf = 0;
+  function clearAll() { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalCompositeOperation = "source-over"; ctx.clearRect(0, 0, cv.width, cv.height); }
   function frame(now) {
     var dt = last ? Math.min(40, now - last) : 16; last = now;
+    if (anchored) view = stageView();
     var pts = toScreen(state.shape), nrm = normals(pts), R = Math.max(2.2, state.w * view.s / 2), A = state.alpha, E = state.energy;
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.globalCompositeOperation = "destination-out"; ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(0, 0, vw, vh);
     ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1;
-    if (A <= 0.003) { raf = requestAnimationFrame(frame); return; }
+    if (A <= 0.003 || (anchored && !visible)) { raf = requestAnimationFrame(frame); return; }
+    if (anchored) { ctx.save(); clipToPanel(ctx); }
     /* the field: a few of the particles drawn large and soft into a small canvas, blurred back up */
     gctx.setTransform(DPR * GS, 0, 0, DPR * GS, 0, 0); gctx.clearRect(0, 0, vw, vh);
     particlePass(gctx, pts, nrm, R, now, dt, 3.2, 0.9 * (0.3 + 0.7 * E) * state.form, 5);
@@ -192,6 +207,7 @@
     ctx.restore(); ctx.filter = "none"; ctx.globalAlpha = 1;
     corePath(ctx, pts, R, now, A * E * state.form);
     particlePass(ctx, pts, nrm, R, now, dt, 1, 1, 1);
+    if (anchored) ctx.restore();
     raf = requestAnimationFrame(frame);
   }
 
@@ -214,11 +230,11 @@
   function playIntro(done) {
     stage.setAttribute("data-phase", "mark");
     gather(function () {
-      var from = { x: view.x, y: view.y, s: view.s }, to = stageView();
+      var from = { x: view.x, y: view.y, s: view.s };
       document.documentElement.classList.add("intro-reveal");
       intro.setAttribute("data-lift", "");
-      tween(T.fly, easeInOut, function (e) { view.x = from.x + (to.x - from.x) * e; view.y = from.y + (to.y - from.y) * e; view.s = from.s + (to.s - from.s) * e; }, function () {
-        view = stageView();
+      tween(T.fly, easeInOut, function (e) { var to = stageView(); view.x = from.x + (to.x - from.x) * e; view.y = from.y + (to.y - from.y) * e; view.s = from.s + (to.s - from.s) * e; }, function () {
+        view = stageView(); anchored = true;
         document.documentElement.classList.add("intro-done");
         intro.remove();
         try { sessionStorage.setItem("rupu.intro", "1"); } catch (e) {}
@@ -226,7 +242,7 @@
       });
     }, 1);
   }
-  function playMarkOnly(done) { stage.setAttribute("data-phase", "mark"); view = stageView(); gather(done, 0.8); }
+  function playMarkOnly(done) { stage.setAttribute("data-phase", "mark"); view = stageView(); anchored = true; gather(done, 0.8); }
   function unwind() {
     stage.setAttribute("data-phase", "morph");
     var landed = false;
@@ -247,12 +263,13 @@
   var started = false;
   var io = new IntersectionObserver(function (entries) {
     entries.forEach(function (en) {
+      visible = en.isIntersecting;
       if (en.isIntersecting) {
         if (!raf) { last = 0; raf = requestAnimationFrame(frame); }
         if (!started) { started = true; if (introOn) playIntro(unwind); else playMarkOnly(unwind); }
-      } else if (raf && started && stage.getAttribute("data-phase") === "run") { cancelAnimationFrame(raf); raf = 0; }
+      } else if (raf && started && anchored) { cancelAnimationFrame(raf); raf = 0; clearAll(); }
     });
-  }, { threshold: 0.1 });
+  }, { threshold: 0 });
   io.observe(canvasEl);
   raf = requestAnimationFrame(frame);
 })();
