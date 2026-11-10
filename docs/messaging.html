@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item active" href="/docs/messaging.html">Messaging</a>
@@ -267,6 +269,18 @@ rupu message participants &lt;run-id&gt;</pre>
       hosts answer over HTTP and SSH when their rupu advertises <code class="inline">run.messages</code>; tunnel and
       bucket hosts answer 501. An MCP client sends through <code class="inline">messages.send</code>
       (<a class="link" href="/docs/mcp.html">MCP &amp; tools</a>).
+    </p>
+    <p>
+      A send over the API can carry <code class="inline">expected_run_id</code>: the id of the run the operator
+      believes owns the recipient. The bus then takes the message only if <code class="inline">to</code> is one exact
+      participant address (not a role, a codename alias or a group), that participant is live, and the run that
+      joined under it is the one named; otherwise the send is refused (the control plane answers 409) and nothing is
+      logged or queued. The check happens under the same lock as the join, the resolution and the log append, so a
+      recipient that was taken over by a later run (a session's next turn, a continued child) between a read and the
+      send is caught. A host advertises the guard as <code class="inline">run.messages.expected_run</code>: an HTTP
+      host that lists it is forwarded such a send, one that doesn't is a 501, and SSH is always a 501 for it (the
+      <code class="inline">rupu __message</code> helper has no guard). <code class="inline">rupu message send</code>
+      never sets it. See the <a class="link" href="/docs/api.html#messages">HTTP API</a>.
     </p>
 
     <h2>The claim journal</h2>

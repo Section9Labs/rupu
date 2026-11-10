@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -157,7 +159,7 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
         <tr><td><code>max_retries</code></td><td>integer</td><td><code>1</code></td><td>Retries after the first attempt on a retryable error.</td></tr>
         <tr><td><code>max_concurrency</code></td><td>integer</td><td>anthropic 4, openai 8, gemini 4, copilot 4</td><td>In-flight requests per account; <code>0</code> counts as unset.</td></tr>
         <tr><td><code>prompt_cache</code></td><td>bool</td><td><code>true</code></td><td>Anthropic only. <code>false</code> for gateways that reject <code>cache_control</code>; an agent's <code>anthropicPromptCache</code> overrides it.</td></tr>
-        <tr><td><code>models</code></td><td>array of tables</td><td><code>[]</code></td><td>Each entry: <code>id</code> (required), <code>context_window</code> and <code>max_output</code> (optional; when unset or <code>0</code> the limit is discovered from the provider's model list).</td></tr>
+        <tr><td><code>models</code></td><td>array of tables</td><td><code>[]</code></td><td>Each entry: <code>id</code> (required), <code>context_window</code> and <code>max_output</code> (optional; when unset or <code>0</code> the limit is discovered from the provider's model list) and, on an OpenAI account, <code>cyber</code> (see <a class="link" href="#cyber">cyber access programs</a>).</td></tr>
       </tbody>
     </table>
     <pre class="code"><span class="v">[providers.anthropic]</span>
@@ -170,6 +172,15 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
 <span class="k">default_model</span> = <span class="s">"qwen3-coder"</span>
 <span class="k">models</span> = [{ <span class="k">id</span> = <span class="s">"qwen3-coder"</span>, <span class="k">context_window</span> = <span class="v">131072</span>, <span class="k">max_output</span> = <span class="v">8192</span> }]</pre>
     <p>An <code class="inline">openai-compatible</code> account must set <code class="inline">base_url</code> and <code class="inline">default_model</code>, and may not reuse a reserved name (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>, <code class="inline">local</code>, <code class="inline">github</code>, <code class="inline">gitlab</code>, <code class="inline">linear</code>, <code class="inline">jira</code>).</p>
+
+    <h3 id="cyber"><code class="inline">cyber</code> access programs</h3>
+    <p>On an OpenAI account (<code class="inline">[providers.openai]</code>, or an account whose <code class="inline">kind</code> is <code class="inline">openai</code>, <code class="inline">openai_codex</code> or <code class="inline">codex</code>), a <code class="inline">[[providers.&lt;account&gt;.models]]</code> entry may set <code class="inline">cyber</code> to default OpenAI's <a class="link" href="https://developers.openai.com/api/docs/guides/daybreak" target="_blank" rel="noopener">Daybreak</a> access program for that model: <code class="inline">standard</code>, <code class="inline">daybreak_blue</code> or <code class="inline">daybreak_red</code>. A run whose model <code class="inline">id</code> matches the entry then emits the Responses API <code class="inline">access_programs: { cyber: &lt;value&gt; }</code> unless an agent's <a class="link" href="/docs/agents.html#cyber"><code class="inline">cyber:</code> frontmatter</a> or <code class="inline">rupu run --cyber</code> overrides it (precedence: flag, then frontmatter, then this config default). The organization/project must already be approved for the program, and the value must match the model. An unknown token here is ignored with a warning when the run is assembled (unlike the frontmatter key, where an unknown value is a parse error). Ignored by every other provider. See <a class="link" href="/docs/providers.html">Providers &amp; Auth</a> for what a fallback hop, a session or a placed unit does with it.</p>
+    <pre class="code"><span class="v">[[providers.openai.models]]</span>
+<span class="k">id</span> = <span class="s">"gpt-5.6-cyber"</span>
+<span class="k">cyber</span> = <span class="s">"daybreak_red"</span></pre>
+    <p><code class="inline">openai-codex</code> with a hyphen is the display id rupu uses in transcripts and pricing, not a built-in provider name. To use it as an account name, declare it and log in under it:</p>
+    <pre class="code"><span class="v">[providers.openai-codex]</span>
+<span class="k">kind</span> = <span class="s">"openai_codex"</span></pre>
 
     <h2 id="scm">SCM and trackers — <code class="inline">[scm.*]</code>, <code class="inline">[[scm.rules]]</code>, <code class="inline">[issues]</code></h2>
     <table>
@@ -284,7 +295,7 @@ rupu config set <span class="v">update.channel</span> <span class="s">beta</span
     <pre class="code"><span class="v">[recovery]</span>
 <span class="k">fallbacks</span> = [
   { <span class="k">model</span> = <span class="s">"claude-sonnet-5-5"</span> },
-  { <span class="k">provider</span> = <span class="s">"openai-codex"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
+  { <span class="k">provider</span> = <span class="s">"openai"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
 ]
 <span class="k">server_side_fallback</span> = <span class="v">true</span></pre>
 

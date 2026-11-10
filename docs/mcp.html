@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rupu docs — MCP &amp; tools</title>
-<meta name="description" content="rupu cp serve exposes an MCP endpoint at /mcp: 188 operator tools over the control plane's routes, a wait tool, the tool catalog, built-in docs as resources and four prompts — so an external agent can operate rupu.">
+<meta name="description" content="rupu cp serve exposes an MCP endpoint at /mcp: 198 operator tools over the control plane's routes, a wait tool, the tool catalog, built-in docs as resources and four prompts — so an external agent can operate rupu.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
 <link rel="stylesheet" href="/docs.css">
@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -180,7 +182,7 @@ claude mcp add --transport http rupu http://127.0.0.1:7878/mcp \
 
     <h2 id="operator-tools">Operator tools</h2>
     <p>
-      188 tools over the control plane's own endpoints, one per route (<code class="inline">GET /api/tools</code> and
+      198 tools over the control plane's own endpoints, one per route (<code class="inline">GET /api/tools</code> and
       <code class="inline">tools/list</code> give each tool's full input schema). Each takes the arguments of the
       endpoint it wraps (path parameters, the handler's query struct, the JSON body), an optional
       <code class="inline">host</code> where the API takes <code class="inline">?host=</code>, refuses unknown arguments,
@@ -192,19 +194,36 @@ claude mcp add --transport http rupu http://127.0.0.1:7878/mcp \
     <table>
       <thead><tr><th>Area</th><th>Tools</th></tr></thead>
       <tbody>
-        <tr><td>Workflow runs</td><td><code>runs.list</code> <code>runs.list_all</code> <code>runs.archived</code> <code>runs.get</code> <code>runs.approve</code> <code>runs.reject</code> <code>runs.cancel</code> <code>runs.pause</code> <code>runs.resume</code> <code>runs.archive</code> <code>runs.restore</code> <code>runs.delete</code> <code>runs.graph</code> <code>runs.children</code> <code>runs.board</code> <code>runs.usage</code> <code>runs.usage_timeline</code> <code>runs.source</code> <code>runs.ast</code> <code>runs.autoflow</code> <code>runs.retry</code></td></tr>
+        <tr><td>Workflow runs</td><td><code>runs.list</code> <code>runs.list_all</code> <code>runs.archived</code> <code>runs.get</code> <code>runs.approve</code> <code>runs.reject</code> <code>runs.cancel</code> <code>runs.pause</code> <code>runs.resume</code> <code>runs.archive</code> <code>runs.restore</code> <code>runs.delete</code> <code>runs.graph</code> <code>runs.children</code> <code>runs.board</code> <code>runs.usage</code> <code>runs.usage_timeline</code> <code>runs.attempts</code> <code>runs.source</code> <code>runs.ast</code> <code>runs.autoflow</code> <code>runs.retry</code></td></tr>
         <tr><td>Agent runs and transcripts</td><td><code>agent_runs.list</code> <code>agent_runs.continue</code> <code>transcripts.get</code> <code>transcripts.archive</code> <code>transcripts.delete</code> <code>events.recent</code></td></tr>
         <tr><td>Autoflow runs</td><td><code>autoflow_runs.list</code> <code>autoflow_runs.problems</code> <code>autoflow_runs.cycles</code> <code>autoflow_runs.events</code></td></tr>
-        <tr><td>Sessions and messages</td><td><code>sessions.list</code> <code>sessions.get</code> <code>sessions.turns</code> <code>sessions.usage_timeline</code> <code>sessions.start</code> <code>sessions.send</code> <code>sessions.archive</code> <code>sessions.restore</code> <code>sessions.delete</code> <code>sessions.stop</code> <code>sessions.compact</code> <code>messages.list</code> <code>messages.send</code></td></tr>
-        <tr><td>Agentiflows</td><td><code>agentiflows.list</code> <code>agentiflows.get</code> <code>agentiflows.events</code> <code>agentiflows.children</code> <code>agentiflows.unit_output</code> <code>agentiflows.board</code> <code>agentiflows.generated</code> <code>agentiflows.steer</code> <code>agentiflows.run</code> <code>agentiflows.stop</code> <code>agentiflow_defs.list</code> <code>agentiflow_defs.get</code> <code>agentiflow_defs.create</code> <code>agentiflow_defs.save</code> <code>agentiflow_defs.delete</code> <code>agentiflow_defs.validate</code></td></tr>
+        <tr><td>Sessions and messages</td><td><code>sessions.list</code> <code>sessions.get</code> <code>sessions.turns</code> <code>sessions.usage_timeline</code> <code>sessions.capabilities</code> <code>sessions.workflows</code> <code>sessions.attach_workflow</code> <code>sessions.start</code> <code>sessions.send</code> <code>sessions.archive</code> <code>sessions.restore</code> <code>sessions.delete</code> <code>sessions.stop</code> <code>sessions.compact</code> <code>messages.list</code> <code>messages.send</code></td></tr>
+        <tr><td>Agentiflows</td><td><code>agentiflows.list</code> <code>agentiflows.get</code> <code>agentiflows.events</code> <code>agentiflows.children</code> <code>agentiflows.unit_output</code> <code>agentiflows.usage_timeline</code> <code>agentiflows.board</code> <code>agentiflows.generated</code> <code>agentiflows.steer</code> <code>agentiflows.run</code> <code>agentiflows.stop</code> <code>agentiflow_defs.list</code> <code>agentiflow_defs.get</code> <code>agentiflow_defs.create</code> <code>agentiflow_defs.save</code> <code>agentiflow_defs.delete</code> <code>agentiflow_defs.validate</code></td></tr>
         <tr><td>Definitions</td><td><code>workflows.list</code> <code>workflows.get</code> <code>workflows.create</code> <code>workflows.save</code> <code>workflows.delete</code> <code>workflows.validate</code> <code>workflows.generate</code> <code>workflows.run</code> <code>workflows.run_yaml</code> <code>agents.list</code> <code>agents.get</code> <code>agents.create</code> <code>agents.save</code> <code>agents.delete</code> <code>agents.generate</code> <code>agents.run</code> <code>agents.validate</code> <code>agents.validate_all</code> <code>generate.models</code> <code>autoflows.list</code> <code>autoflows.get</code> <code>autoflows.enable</code> <code>autoflows.disable</code> <code>autoflows.run</code> <code>autoflows.explain</code> <code>autoflows.doctor</code> <code>autoflows.wakes</code> <code>claims.list</code> <code>claims.release</code> <code>claims.requeue</code> <code>claims.repair</code> <code>skills.list</code> <code>skills.get</code> <code>skills.install</code> <code>skills.update</code> <code>skills.validate</code> <code>tools.list</code> <code>models.list</code> <code>models.refresh</code></td></tr>
         <tr><td>Findings, coverage, assets</td><td><code>findings.list</code> <code>findings.get</code> <code>findings.tags</code> <code>findings.tag</code> <code>findings.export</code> <code>findings.export_many</code> <code>findings.artifact</code> <code>findings.import</code> <code>findings.schema</code> <code>coverage.list</code> <code>coverage.get</code> <code>coverage.audit</code> <code>coverage.catalog</code> <code>coverage.runs</code> <code>coverage.diff</code> <code>coverage.templates</code> <code>coverage.template</code> <code>coverage.gap</code> <code>coverage.rerun</code> <code>assets.list</code> <code>query.fields</code> <code>query.check</code></td></tr>
         <tr><td>Observability</td><td><code>netflow.run</code> <code>netflow.agentiflow</code> <code>netflow.project</code> <code>netflow.global</code> <code>netflow.graph</code> <code>netflow.explorer</code> <code>netflow.index</code> <code>netflow.latest</code> <code>usage.get</code> <code>usage.timeline</code> <code>usage.runs</code> <code>usage.outliers</code> <code>dashboard.get</code></td></tr>
         <tr><td>Fleet, config, customers</td><td><code>hosts.list</code> <code>hosts.registered</code> <code>hosts.add</code> <code>hosts.add_ssh</code> <code>hosts.add_bucket</code> <code>hosts.enroll_node</code> <code>hosts.remove</code> <code>host.info</code> <code>workers.list</code> <code>config.get</code> <code>config.put_global</code> <code>config.put_customer</code> <code>config.put_project</code> <code>config.put_policy</code> <code>customers.list</code> <code>customers.create</code> <code>customers.get</code> <code>customers.update</code> <code>customers.delete</code> <code>customers.archive</code> <code>customers.unarchive</code> <code>customers.assign_project</code> <code>customers.unassign_project</code> <code>launch.preview</code> <code>repos.list</code> <code>repos.tracked</code> <code>repos.attach</code> <code>repos.prefer</code> <code>repos.forget</code> <code>scm_accounts.list</code> <code>scm_rules.list</code> <code>scm_rules.bind</code> <code>auth.status</code></td></tr>
-        <tr><td>Projects</td><td><code>projects.list</code> <code>projects.get</code> <code>projects.runs</code> <code>projects.sessions</code> <code>projects.agents</code> <code>projects.workflows</code> <code>projects.autoflows</code> <code>projects.coverage</code> <code>projects.coverage_assessed</code> <code>projects.tree</code> <code>projects.source</code> <code>projects.files</code> <code>projects.init</code></td></tr>
+        <tr><td>Projects</td><td><code>projects.list</code> <code>projects.get</code> <code>projects.register</code> <code>projects.scm</code> <code>projects.runs</code> <code>projects.sessions</code> <code>projects.start_session</code> <code>projects.session_capabilities</code> <code>projects.workflow_history</code> <code>projects.agents</code> <code>projects.workflows</code> <code>projects.autoflows</code> <code>projects.coverage</code> <code>projects.coverage_assessed</code> <code>projects.tree</code> <code>projects.source</code> <code>projects.files</code> <code>projects.init</code></td></tr>
         <tr><td>Setup and housekeeping</td><td><code>fleet.list</code> <code>fleet.install</code> <code>engagement_profiles.list</code> <code>engagement_profiles.get</code> <code>cron.list</code> <code>cron.events</code> <code>cron.tick</code> <code>maintenance.prune</code></td></tr>
       </tbody>
     </table>
+    <p>
+      The newest of them, from the session and workflow work of November 2026:
+      <code class="inline">projects.register</code> (<code class="inline">POST /api/projects</code>: register a
+      directory as a project, starting nothing), <code class="inline">projects.scm</code> (a checkout's branch,
+      diffs and, with <code class="inline">include_review</code>, its current-branch reviews; marked open-world),
+      <code class="inline">projects.start_session</code> (a session on the built-in
+      <code class="inline">rupu-session</code> harness; <code class="inline">idle</code> creates one with no turn),
+      <code class="inline">projects.session_capabilities</code> and <code class="inline">sessions.capabilities</code>
+      (what a session gets: preset, skills, declared tools, revisions, the last turn's effective readiness),
+      <code class="inline">sessions.workflows</code> and <code class="inline">sessions.attach_workflow</code> (the
+      workflow runs linked to a session; attaching runs nothing),
+      <code class="inline">projects.workflow_history</code> (a project's recorded runs, archived included),
+      <code class="inline">runs.attempts</code> (a run's attempt ledger, paged by cursor, with explicit evidence
+      limits) and <code class="inline">agentiflows.usage_timeline</code> (every model call of a flow's lead and
+      units, by round). Each is the route of the same name in the
+      <a class="link" href="/docs/api.html">HTTP API</a>.
+    </p>
     <p>
       Every control-plane route is a tool except the SSE streams (<code class="inline">wait</code> replaces them), the
       host-to-host transfer routes (workspace sync, skill bundles, coverage, netflow and artifact pulls), the node
@@ -322,7 +341,7 @@ rupu cp serve --no-web --tools read_file,grep</pre>
     <table>
       <thead><tr><th>URI</th><th>Content</th></tr></thead>
       <tbody>
-        <tr><td><code>rupu://docs/&lt;name&gt;</code></td><td>The 18 docs under <code>docs/</code>: <code>using-rupu</code>, <code>agent-format</code>, <code>agent-authoring</code>, <code>workflow-format</code>, <code>workflow-authoring</code>, <code>agentiflows</code>, <code>triggers</code>, <code>engagement-profiles</code>, <code>coverage</code>, <code>messaging</code>, <code>skills</code>, <code>transcript-schema</code>, <code>cp-api</code>, <code>control-plane</code>, <code>response-outcomes</code>, <code>netflow</code>, <code>configuration</code>, <code>mcp</code> (Markdown)</td></tr>
+        <tr><td><code>rupu://docs/&lt;name&gt;</code></td><td>The 20 docs under <code>docs/</code>: <code>using-rupu</code>, <code>agent-format</code>, <code>agent-authoring</code>, <code>workflow-format</code>, <code>workflow-authoring</code>, <code>agentiflows</code>, <code>agentiflow-tutorial</code>, <code>agentiflow-authoring</code>, <code>triggers</code>, <code>engagement-profiles</code>, <code>coverage</code>, <code>messaging</code>, <code>skills</code>, <code>transcript-schema</code>, <code>cp-api</code>, <code>control-plane</code>, <code>response-outcomes</code>, <code>netflow</code>, <code>configuration</code>, <code>mcp</code> (Markdown)</td></tr>
         <tr><td><code>rupu://schema/finding-report</code></td><td>The finding report JSON Schema (what <code>findings.schema</code> answers)</td></tr>
         <tr><td><code>rupu://query/&lt;list&gt;</code></td><td>A list query's field registry: <code>findings</code>, <code>workflow_runs</code>, <code>agent_runs</code>, <code>sessions</code>, <code>autoflow_runs</code>, <code>events</code> (what <code>query.fields</code> answers)</td></tr>
         <tr><td><code>rupu://profiles/&lt;id&gt;</code></td><td>Each built-in engagement profile, as TOML. <code>engagement_profiles.list</code> also lists layered ones</td></tr>
@@ -389,6 +408,17 @@ rupu cp serve --no-web --tools read_file,grep</pre>
         <tr><td><code>--tools</code> fails at startup with a "did you mean"</td><td>A name matches no tool; use the suggestion</td></tr>
       </tbody>
     </table>
+
+    <h2 id="native-session-controls">Native session controls</h2>
+    <p>
+      The session client's command discovery and execution
+      (<code class="inline">GET /api/sessions/:id/controls</code>, <code class="inline">POST …/commands</code>), its
+      model, provider and tool settings (<code class="inline">…/settings</code>) and its orchestration switch
+      (<code class="inline">…/orchestration</code>) are not exposed as MCP tools. Use the native client or their HTTP
+      routes on the owning host (<a class="link" href="/docs/api.html#sessions">HTTP API: Sessions</a>). The typed
+      MCP session operations, <code class="inline">sessions.stop</code> and <code class="inline">sessions.compact</code>
+      included, remain available.
+    </p>
 
     <h2 id="tools-inside">Tools inside rupu</h2>
     <p>

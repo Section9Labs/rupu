@@ -82,6 +82,8 @@ figure.diagram figcaption { margin-top: 14px; font-size: 13px; color: var(--ink-
   transition: background .18s, color .18s; }
 .docs-side a.item:hover { background: rgba(245,245,245,0.05); color: var(--ink); }
 .docs-side a.item.active { background: rgba(124,58,237,0.14); color: #fff; }
+.docs-side a.item.sub { padding-left: 26px; font-size: 13px; color: var(--mute, var(--ink-dim)); }
+.docs-side a.item.sub::before { content: "\2514 "; opacity: 0.6; }
 .docs-main { min-width: 0; padding: 64px clamp(28px, 6vw, 88px) 100px; max-width: 920px; }
 .docs-main h1 { font-size: clamp(2rem, 5vw, 3rem); font-weight: 600; letter-spacing: -0.03em; margin: 0 0 8px; }
 .docs-main h2 { font-size: 1.5rem; font-weight: 600; letter-spacing: -0.02em; margin: 52px 0 8px; padding-top: 12px; }

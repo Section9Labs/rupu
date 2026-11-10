@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -61,7 +63,7 @@
 
     <div class="callout"><strong>Don't code it, rupu it.</strong> Define agents as plain Markdown, compose them into workflows, run them by hand or on triggers, and review everything with full transcripts and approvals.</div>
 
-    <h2>Install</h2>
+    <h2 id="install">Install</h2>
     <p>rupu is open source and no longer macOS-only. Every release ships prebuilt binaries for <strong>macOS (Apple Silicon)</strong> and <strong>Linux (x86_64 and aarch64)</strong>, native <code class="inline">.deb</code> and <code class="inline">.rpm</code> packages, community packages (AUR, Homebrew, Nix), and a from-source build with Cargo on any platform with a Rust toolchain.</p>
     <table>
       <thead><tr><th>Method</th><th>Platform</th><th>Command / asset</th></tr></thead>
@@ -216,6 +218,16 @@ rupu run code-reviewer --prompt "Review the diff on this branch"</pre>
         <div class="ic" aria-hidden="true">&#10035;</div>
         <h3>Agentiflows &#8594;</h3>
         <p>Goal-directed fleets — a lead agent coordinates agent and workflow units over a shared board until measurable goals are met or the budget runs out.</p>
+      </a>
+      <a class="card" href="/docs/agentiflow-tutorial.html">
+        <div class="ic" aria-hidden="true">&#9654;</div>
+        <h3>Agentiflow tutorial &#8594;</h3>
+        <p>One run end to end: install the fleet, write a lead and two pool agents, write the definition, run it, steer it, and read the findings.</p>
+      </a>
+      <a class="card" href="/docs/agentiflow-authoring.html">
+        <div class="ic" aria-hidden="true">&#9997;</div>
+        <h3>Authoring agentiflows &#8594;</h3>
+        <p>Writing a lead prompt, goal-target recipes, budget tuning, verifier setup, a pool-design checklist and how to steer a running flow.</p>
       </a>
       <a class="card" href="/docs/sessions.html">
         <div class="ic" aria-hidden="true">&#9636;</div>

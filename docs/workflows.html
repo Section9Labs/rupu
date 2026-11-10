@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -686,6 +688,28 @@ rupu workflow run investigate-then-fix --input prompt=<span class="s">"NPE on em
 rupu workflow run <span class="v">--file</span> <span class="s">./drafts/edge-sweep.yaml</span> \
   <span class="v">--engagement-profile</span> <span class="s">network</span> \
   <span class="v">--input</span> scope=<span class="s">"10.20.0.0/24"</span> <span class="v">--mode</span> <span class="s">readonly</span></pre>
+
+    <h3 id="scoped-definitions">Scoped definitions and revision-pinned launches</h3>
+    <p>
+      A workflow saved under <code class="inline">&lt;repo&gt;/.rupu/workflows/</code> shadows a global one of the
+      same <code class="inline">name:</code> for that project, so a project can carry its own version of a shared
+      workflow. The control plane addresses the two layers explicitly: <code class="inline">scope_kind: project</code>
+      with the project's <code class="inline">scope_id</code> selects that definition and only that one,
+      <code class="inline">scope_kind: global</code> the global one, and a missing selected definition is a 404 rather
+      than a fallback to the other layer. Each definition carries a <code class="inline">revision</code>
+      (<code class="inline">sha256:</code> of its raw YAML).
+    </p>
+    <p>
+      A save with <code class="inline">expected_revision</code> is refused with a 409 when the file changed since you
+      read it, before anything is written, so two editors cannot overwrite each other. A launch with
+      <code class="inline">expected_revision</code> (and the explicit scope) is refused the same way, and otherwise
+      pins the exact YAML it read into <code class="inline">&lt;global&gt;/cp/workflow-launches/</code> and runs that
+      file, so the run executes the definition you reviewed even if the catalog file changes a moment later. The pin
+      covers the workflow only: the agents it names, provider and model configuration and any files the steps read
+      resolve from the execution workspace at run time. Contract and request shapes:
+      <a class="link" href="https://github.com/Section9Labs/rupu/blob/main/docs/workflow-scoped-revision-api.md">workflow-scoped-revision-api.md</a>;
+      routes: <a class="link" href="/docs/api.html#launch-agents-and-workflows">HTTP API: Launch, agents and workflows</a>.
+    </p>
 
     <h3>The live view</h3>
     <p>
