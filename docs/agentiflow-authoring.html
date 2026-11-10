@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Authoring agentiflows</title>
+<meta name="description" content="How to write the two things an agentiflow run turns on: the lead agent that plans the work, and the definition that says when it is done. Lead prompts, goal-target recipes, budget tuning, verifier setup, a pool-design checklist and steering.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub active" href="/docs/agentiflow-authoring.html">Authoring</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Authoring agentiflows</h1>
+    <p class="intro">How to write the two things an agentiflow run turns on: the <strong>lead</strong> agent that plans the work, and the <strong>definition</strong> that says when it is done. This is the practical companion to the <a class="link" href="/docs/agentiflows.html">reference</a>; for a start-to-finish run see the <a class="link" href="/docs/agentiflow-tutorial.html">tutorial</a>.</p>
+
+    <h2 id="writing-a-lead-prompt">Writing a lead prompt</h2>
+    <p>
+      The lead is an ordinary agent file (<a class="link" href="/docs/agents.html">Agents</a>) that happens to be handed orchestration
+      tools. Three things make a good lead.
+    </p>
+
+    <h3 id="what-the-lead-sees-each-round">What the lead sees each round</h3>
+    <p>
+      At the top of every round the envelope hands the lead a digest, rendered as a plain message (section 4 of the
+      <a class="link" href="/docs/agentiflows.html#the-round-digest-what-the-lead-sees">reference</a> has the full shape). Round 0 adds the
+      mission framing, the mission objective, and the authorized scope. Every round then shows:
+    </p>
+    <ul>
+      <li>each goal as <code class="inline">[MET]/[UNMET] &lt;id&gt;: &lt;current&gt;/&lt;target&gt; (&lt;detail&gt;) - &lt;objective&gt;</code>;</li>
+      <li>the coverage fraction, if a coverage target is set;</li>
+      <li>the budget stage (<code class="inline">ok</code> / <code class="inline">soft cap reached (converge)</code> / <code class="inline">hard</code>), with a converge instruction when the budget is soft;</li>
+      <li>a recap of operator messages since the last round;</li>
+      <li>any evaluator warnings, quoted as data.</li>
+    </ul>
+    <p>
+      Between rounds the lead's conversation carries over, so it remembers what it dispatched. Write the prompt so the lead reads the goal
+      lines and the budget stage and acts on them: dispatch toward the unmet goals, and converge when told.
+    </p>
+
+    <h3 id="the-leads-tools">The lead's tools</h3>
+    <p>
+      The lead gets exactly the tools its <code class="inline">tools:</code> lists, plus the fleet tools (<code class="inline">dispatch</code>,
+      <code class="inline">join</code>, <code class="inline">workflows.generate</code>, the board, mailbox, status and roster tools) and the
+      engagement's <code class="inline">findings.report</code> / <code class="inline">assets.mark</code>.
+      <strong><code class="inline">tools:</code> is the whole of its own grant</strong>: an absent <code class="inline">tools:</code> grants no
+      built-ins, so give the lead the read tools it needs to orient (<code class="inline">read_file</code>, <code class="inline">grep</code>,
+      <code class="inline">glob</code>, maybe <code class="inline">bash</code>). Keep it lean: the lead orchestrates, the units do the work.
+    </p>
+    <p>
+      Tell the lead in the prompt which fleet tools it has and what they are for. A lead that doesn't know it can
+      <code class="inline">dispatch</code> will try to do everything itself.
+    </p>
+
+    <h3 id="the-round-shape-dispatch-then-join">The round shape: dispatch, then join</h3>
+    <p>The core loop is dispatch-then-join:</p>
+    <ol>
+      <li><strong>Fan out.</strong> <code class="inline">dispatch</code> the specialists at tightly-scoped, independent pieces of work, in parallel. Each <code class="inline">dispatch</code> returns a handle at once.</li>
+      <li><strong>Collect.</strong> <code class="inline">join</code> the handles and read what came back. <code class="inline">join { until: any }</code> returns as soon as one finishes if you want to react early; the default waits for all. Each <code class="inline">join</code> waits up to <code class="inline">timeout_secs</code> (default 300, max 3600); call it again to keep waiting on a unit that is still running.</li>
+      <li><strong>Decide.</strong> Check <code class="inline">goal.status</code> and <code class="inline">budget.status</code>, record what you verified, and dispatch the next batch.</li>
+    </ol>
+    <p>
+      A lead that dispatches everything in round 1 and never joins will hit its <code class="inline">lead_max_turns</code> with units still
+      running; they carry into the next round, but the lead should join them deliberately rather than by accident.
+    </p>
+
+    <h3 id="claims-avoid-duplicate-work">Claims: avoid duplicate work</h3>
+    <p>
+      When two units could pick up the same piece of work (two reviewers over overlapping files, two testers over the same host), have the
+      lead or the units <code class="inline">board.claim</code> a work unit first. A claim is a one-hour lease;
+      <code class="inline">board.release</code> frees it. The claim journal (<code class="inline">board/claims.jsonl</code>) records who held
+      what. Claims persist across rounds, since the lead keeps one board for the whole run.
+    </p>
+
+    <h3 id="directives-standing-scope-rules">Directives: standing scope rules</h3>
+    <p>
+      <code class="inline">board.directive</code> writes a standing instruction every agent unit sees on every turn until it is lifted with
+      <code class="inline">board.retract</code>. Use it for a rule that must hold for the rest of the run, not a one-off instruction:
+    </p>
+    <pre class="code">board.directive { body: "Stay inside 10.20.0.0/24. Never touch .1 (the gateway)." }</pre>
+    <p>
+      Directives are the lead's alone (units cannot write them). Post sparingly and keep each short: every unit re-reads every live
+      directive each turn. Retract one once it is obsolete; the id comes back from <code class="inline">board.directive</code> and is shown in
+      brackets on each directive the lead sees.
+    </p>
+
+    <h3 id="mid-round-status-checks">Mid-round status checks</h3>
+    <p>The lead doesn't have to wait for the next round's digest. It can call, any time:</p>
+    <ul>
+      <li><code class="inline">goal.status</code>: every goal's <code class="inline">satisfied</code>, <code class="inline">current</code>, <code class="inline">target</code>, <code class="inline">detail</code>;</li>
+      <li><code class="inline">goal.coverage</code> (alias <code class="inline">coverage.status</code> inside a lead): the coverage <code class="inline">fraction</code>, <code class="inline">satisfied</code>, and <code class="inline">per_kind</code>;</li>
+      <li><code class="inline">budget.status</code>: the <code class="inline">stage</code>, and each dimension's <code class="inline">cap</code>, <code class="inline">spent</code> / <code class="inline">elapsed</code>, <code class="inline">remaining</code> and <code class="inline">state</code>.</li>
+    </ul>
+    <p>
+      These use the exact evaluators and meter the envelope's next round-boundary check will use, so "<code class="inline">goal.status</code>
+      says met" and "the envelope stops the run" agree. Have the lead check <code class="inline">goal.status</code> before deciding it is
+      done, and <code class="inline">budget.status</code> before opening a new line of work.
+    </p>
+
+    <h3 id="end-each-round-with-a-summary">End each round with a summary</h3>
+    <p>
+      Have the lead finish each round with a short summary of what it did that round. That last assistant message becomes the
+      <code class="inline">decision</code> recorded on the round's event, and it is what the control plane's flow map shows on the round
+      card. A lead that ends a round mid-tool-call or with no reply leaves the round card blank. The default prompt tail ("finish the round
+      with a short summary of what you did") asks for exactly this; keep it.
+    </p>
+
+    <h2 id="goal-target-recipes">Goal-target recipes</h2>
+    <p>Every goal is a predicate over recorded evidence. Pick the target shape that matches what "done" means.</p>
+
+    <h3 id="n-findings-of-a-classification">N findings of a classification</h3>
+    <pre class="code">- <span class="k">id</span>: <span class="s">xss</span>
+  <span class="k">objective</span>: <span class="s">"Find three reflected XSS issues."</span>
+  <span class="k">target</span>: { <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-79"</span> }, <span class="k">count_gte</span>: <span class="v">3</span> }
+  <span class="k">required</span>: <span class="v">true</span></pre>
+    <p>
+      The <code class="inline">classification</code> must match a classification on the finding's <strong>report</strong>
+      (<code class="inline">CWE-79</code>, <code class="inline">OWASP-A03</code>, ...). A summary-profile finding has no report, so it matches
+      nothing when a classification is set. Omit <code class="inline">classification</code> to count any finding.
+    </p>
+
+    <h3 id="n-findings-verified-with-a-poc-by-a-named-verifier">N findings, verified with a PoC, by a named verifier</h3>
+    <pre class="code">- <span class="k">id</span>: <span class="s">confirmed-rce</span>
+  <span class="k">objective</span>: <span class="s">"Confirm two RCEs with a proof of concept."</span>
+  <span class="k">target</span>:
+    <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-78"</span> }
+    <span class="k">count_gte</span>: <span class="v">2</span>
+    <span class="k">verified</span>: <span class="v">true</span>
+    <span class="k">verify_check</span>: <span class="s">with_poc</span>
+  <span class="k">verify_with</span>: <span class="s">exploit-verifier</span>
+  <span class="k">required</span>: <span class="v">true</span></pre>
+    <p>
+      A finding counts only when a <em>different</em> run records a <code class="inline">confirmed</code> verdict, the verifier is
+      <code class="inline">exploit-verifier</code>, and the report lists at least one artifact (<code class="inline">with_poc</code>). The
+      reviewers that file must use <code class="inline">findingsProfile: full</code>. See
+      <a class="link" href="#verifier-setup">verifier setup</a>.
+    </p>
+
+    <h3 id="a-specific-host-or-path-or-url-reached-a-depth">A specific host (or path, or URL) reached a depth</h3>
+    <pre class="code">- <span class="k">id</span>: <span class="s">host-tested</span>
+  <span class="k">objective</span>: <span class="s">"Test 10.0.0.5 to the `tested` rung."</span>
+  <span class="k">target</span>:
+    <span class="k">asset</span>: { <span class="k">kind</span>: <span class="s">"network:host"</span>, <span class="k">locator</span>: { <span class="k">host</span>: <span class="s">"10.0.0.5"</span> } }
+    <span class="k">depth_at_least</span>: <span class="s">tested</span>
+  <span class="k">required</span>: <span class="v">true</span></pre>
+    <p>
+      An asset goal counts assets of <code class="inline">kind</code> matching the <code class="inline">locator</code> at or above
+      <code class="inline">depth_at_least</code> on that profile's ladder. <code class="inline">count_gte</code> defaults to 1. Locator keys
+      are the string coordinates <code class="inline">host</code>, <code class="inline">url</code>, <code class="inline">path</code>,
+      <code class="inline">symbol</code>, <code class="inline">sha256</code>, <code class="inline">commit</code>, <code class="inline">param</code>.
+      Omit <code class="inline">locator</code> to match any asset of that kind, with <code class="inline">count_gte</code> for "N of them".
+    </p>
+
+    <h3 id="every-route-enumerated-n-of-a-kind">Every route enumerated (N of a kind)</h3>
+    <pre class="code">- <span class="k">id</span>: <span class="s">routes</span>
+  <span class="k">objective</span>: <span class="s">"Enumerate at least twenty web routes."</span>
+  <span class="k">target</span>:
+    <span class="k">asset</span>: { <span class="k">kind</span>: <span class="s">"web:route"</span> }
+    <span class="k">depth_at_least</span>: <span class="s">enumerated</span>
+  <span class="k">count_gte</span>: <span class="v">20</span>
+  <span class="k">required</span>: <span class="v">true</span></pre>
+
+    <h3 id="80-of-files-reviewed-coverage-not-a-goal">80% of files reviewed (coverage, not a goal)</h3>
+    <p>Coverage is an engagement-wide stop, separate from goals:</p>
+    <pre class="code"><span class="k">coverage</span>:
+  <span class="k">reach</span>: <span class="v">0.8</span>          <span class="c"># 80% of...</span>
+  <span class="k">depth</span>: <span class="s">reviewed</span>     <span class="c"># ...files at `reviewed` or deeper</span>
+  <span class="k">kinds</span>: [<span class="s">code</span>:<span class="s">file</span>]</pre>
+    <p>
+      Without <code class="inline">kinds</code>, the profiles' enumerated kinds are used; without <code class="inline">depth</code>, each
+      profile's last ladder rung. <code class="inline">0/0</code> is <code class="inline">0%</code>, so a coverage stop never fires before
+      assets exist.
+    </p>
+
+    <h3 id="gotchas">Gotchas</h3>
+    <ul>
+      <li><strong>Classification must match the report, exactly.</strong> <code class="inline">CWE-89</code> does not match a report classified only <code class="inline">CWE-564</code>. Agree on the classification the filers use.</li>
+      <li><strong>Verifiers need the full profile.</strong> A finding without a full report cannot be verified; a summary-profile finding never counts toward a verified goal.</li>
+      <li><strong>A run with only optional goals never ends as <code class="inline">goals_met</code>.</strong> At least one goal must be <code class="inline">required: true</code>, or the run is governed only by coverage, the budget, the operator and the ceilings.</li>
+      <li><strong><code class="inline">count_gte</code> is a floor, not a ceiling.</strong> The run stops the first round the floor is met; tell the lead in its prompt to keep recording real findings past the floor if that is what you want, but know the envelope stops at the floor.</li>
+    </ul>
+
+    <h2 id="tuning-budgets">Tuning budgets</h2>
+    <p>
+      Budgets bound a lead that would otherwise run forever. The subtlety is <strong>caps are checked only at round boundaries</strong>
+      (section 4 of the <a class="link" href="/docs/agentiflows.html#caps-are-checked-only-at-round-boundaries">reference</a>): nothing
+      enforces a cap mid-round.
+    </p>
+
+    <h3 id="worked-example-the-overshoot">Worked example: the overshoot</h3>
+    <p>
+      Say <code class="inline">budget.usd: 20</code>, <code class="inline">lead_max_turns: 40</code>, and a round averages $3. The envelope
+      checks spend before each round:
+    </p>
+    <ul>
+      <li>The run reaches round 7 at $18 (below $20): the check passes, round 7 runs.</li>
+      <li>Round 7 spends another $4, reaching $22. The run is now over cap.</li>
+      <li>The <em>next</em> check (top of round 8) sees $22, trips <code class="inline">hard</code>, and stops the run as <code class="inline">budget_exhausted:usd</code>.</li>
+    </ul>
+    <p>
+      So a <code class="inline">usd: 20</code> cap can land anywhere up to one round's spend over. If that overshoot matters, lower the cap,
+      lower <code class="inline">lead_max_turns</code> (so a round can spend less before the next check), or cap the units' own
+      <code class="inline">maxTurns</code>. A <code class="inline">join</code> inside a round can wait up to 3600 seconds, so
+      <code class="inline">wall_clock</code> overshoots the same way.
+    </p>
+
+    <h3 id="soft-at-and-converging">soft_at and converging</h3>
+    <p>
+      <code class="inline">soft_at</code> (default <code class="inline">0.8</code>) is the fraction of any cap at which the budget turns
+      <strong>soft</strong>: the lead's digest tells it to converge, that is, finish the highest-value work, verify and record what it already
+      has, and open no new lines. Lower <code class="inline">soft_at</code> (<code class="inline">0.6</code>) to make the lead wind down
+      earlier relative to the cap; the earlier it converges, the smaller the final overshoot.
+    </p>
+    <pre class="code"><span class="k">budget</span>:
+  <span class="k">usd</span>: <span class="v">30</span>
+  <span class="k">tokens</span>: <span class="v">8000000</span>
+  <span class="k">wall_clock</span>: <span class="s">"4h"</span>
+  <span class="k">soft_at</span>: <span class="v">0.7</span></pre>
+
+    <h3 id="budget-rounds-versus-ceiling-rounds">budget.rounds versus ceiling.rounds</h3>
+    <p>
+      Both cap the round count. <code class="inline">budget.rounds</code> produces <code class="inline">budget_exhausted:rounds</code>,
+      contributes to the soft stage (the lead is warned as it nears the cap), and is checked before an operator stop.
+      <code class="inline">ceiling.rounds</code> produces <code class="inline">ceiling</code>, has no soft stage, and is checked after an
+      operator stop. Use <code class="inline">budget.rounds</code> when you want the lead to converge toward the end; use
+      <code class="inline">ceiling.rounds</code> as a plain backstop. The same holds for <code class="inline">budget.wall_clock</code> versus
+      <code class="inline">ceiling.wall_clock</code>.
+    </p>
+
+    <h3 id="budget-usd-and-pricing">budget.usd and pricing</h3>
+    <p>
+      <code class="inline">budget.usd</code> is enforced only when the <strong>lead's</strong> model has a price (in the built-in table or
+      <code class="inline">[pricing.&lt;provider&gt;."&lt;model&gt;"]</code>). Otherwise the cap is dropped at launch, with a warning, since it
+      would read <code class="inline">$0</code> forever; <code class="inline">tokens</code>, <code class="inline">wall_clock</code> and
+      <code class="inline">rounds</code> still apply. A <strong>unit</strong> on an unpriced model counts its tokens but adds
+      <code class="inline">$0</code> to the usd meter, so a <code class="inline">usd</code> cap under-counts when units run unpriced models.
+      <code class="inline">rupu agentiflow status</code> names the unpriced models when a usd cap is set. The fix is a price entry; see
+      <a class="link" href="/docs/configuration.html#pricing">Configuration: pricing</a>.
+    </p>
+
+    <h3 id="a-belt-and-braces-budget">A belt-and-braces budget</h3>
+    <p>For an unattended run you want to really end:</p>
+    <pre class="code"><span class="k">budget</span>: { <span class="k">tokens</span>: <span class="v">10000000</span>, <span class="k">wall_clock</span>: <span class="s">"6h"</span>, <span class="k">soft_at</span>: <span class="v">0.75</span> }
+<span class="k">round</span>:
+  <span class="k">lead_max_turns</span>: <span class="v">40</span>
+  <span class="k">ceiling</span>: { <span class="k">rounds</span>: <span class="v">40</span>, <span class="k">wall_clock</span>: <span class="s">"8h"</span> }</pre>
+    <p>
+      <code class="inline">tokens</code> and <code class="inline">wall_clock</code> always enforce (no pricing needed); the
+      <code class="inline">ceiling</code> is a hard backstop above the budget. The launch warns if <em>nothing</em> can end the run.
+    </p>
+
+    <h2 id="verifier-setup">Verifier setup</h2>
+    <p>Verification counts only findings an independent run confirmed. To set it up:</p>
+    <ol>
+      <li>
+        <p><strong>Write a verifier agent</strong> that lists <code class="inline">findings.verify</code> (or its alias <code class="inline">finding.verify</code>) in <code class="inline">tools:</code> and uses <code class="inline">findingsProfile: full</code>:</p>
+        <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">finding-verifier</span>
+<span class="k">description</span>: <span class="s">Independently confirms or refutes a finding another run filed.</span>
+<span class="k">permissionMode</span>: <span class="s">bypass</span>
+<span class="k">maxTurns</span>: <span class="v">80</span>
+<span class="k">findingsProfile</span>: <span class="s">full</span>
+<span class="k">tools</span>: [<span class="s">read_file</span>, <span class="s">grep</span>, <span class="s">glob</span>, <span class="s">bash</span>, <span class="s">findings.verify</span>]
+<span class="c">---</span>
+Reproduce or refute the finding you are given. Record `confirmed` with
+`findings.verify` only if you established it yourself; `disputed` if it is
+wrong; `inconclusive` otherwise. Capture proof.</pre>
+        <p><code class="inline">findings.verify</code> is never granted automatically, not even to a <code class="inline">concerns:</code> agent: the verifier must name it.</p>
+      </li>
+      <li>
+        <p><strong>Put the verifier in the pool</strong> and name it on the goal:</p>
+        <pre class="code"><span class="k">goals</span>:
+  - <span class="k">id</span>: <span class="s">confirmed</span>
+    <span class="k">target</span>: { <span class="k">findings</span>: {}, <span class="k">count_gte</span>: <span class="v">1</span>, <span class="k">verified</span>: <span class="v">true</span> }
+    <span class="k">verify_with</span>: <span class="s">finding-verifier</span>   <span class="c"># must be a pool agent</span>
+<span class="k">pool</span>:
+  <span class="k">agents</span>: [<span class="s">lead</span>, <span class="s">reviewer</span>, <span class="s">finding-verifier</span>]</pre>
+      </li>
+      <li><p><strong>Make the filers use the full profile.</strong> A finding without a full report cannot be verified. The agents that call <code class="inline">findings.report</code> need <code class="inline">findingsProfile: full</code>.</p></li>
+      <li><p><strong>Have the lead dispatch the verifier as a unit.</strong> Its separate run id is the independence: a run can never verify its own finding. In the lead prompt, make verification an explicit step ("dispatch <code class="inline">finding-verifier</code> to confirm each candidate before counting it").</p></li>
+    </ol>
+    <p>
+      <code class="inline">verify_check: with_poc</code> additionally requires an artifact on the report (a proof of concept), not just the
+      verdict.
+    </p>
+
+    <h2 id="pool-design-checklist">Pool design checklist</h2>
+    <p>The <code class="inline">pool</code> is the lead's whole menu: it can dispatch nothing outside it, and neither can the units.</p>
+    <ul>
+      <li><strong>The lead is in <code class="inline">pool.agents</code>.</strong> Validation requires it.</li>
+      <li><strong>Every <code class="inline">verify_with</code> agent is in the pool.</strong> Otherwise the goal can never be met, and the launch is refused.</li>
+      <li><strong>The filers use <code class="inline">findingsProfile: full</code></strong> if any goal is verified.</li>
+      <li><strong>The specialists cover the work.</strong> A code sweep needs a reviewer and a verifier; a network sweep needs recon, analysis and verification. The lead can only dispatch what you list.</li>
+      <li><strong>Workflows the lead may run are in <code class="inline">pool.workflows</code>.</strong> Omit the key for none, or <code class="inline">all</code> for every catalog workflow at launch. A workflow unit must have no approval gate and no <code class="inline">host:</code> / <code class="inline">distribute:</code> placement, and may run only pool agents.</li>
+      <li><strong>Every pool agent is one you'd run unattended under <code class="inline">bypass</code>.</strong> The whole fleet runs with no approval prompts in the workspace you launch from.</li>
+      <li><strong>Agents' own <code class="inline">dispatchableAgents</code> don't fight the pool.</strong> A lead or unit that also declares <code class="inline">dispatchableAgents</code> gets the <em>intersection</em> with the pool, which can leave it unable to dispatch a pool agent. Usually leave <code class="inline">dispatchableAgents</code> unset on pool agents and let the pool be the allowlist.</li>
+      <li><strong>Concurrency fits the work.</strong> At most <code class="inline">[dispatch].max_concurrent_children</code> (default 8) units run at once; more wait as <code class="inline">pending</code>. Raise it in config if the lead fans out wider.</li>
+    </ul>
+
+    <h2 id="steering-a-running-flow">Steering a running flow</h2>
+    <p>Five ways to influence a run, from gentlest to hardest:</p>
+    <table>
+      <thead><tr><th>Action</th><th>Command</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td>Message the lead</td><td><code>rupu agentiflow send &lt;id&gt; "&lt;text&gt;"</code></td><td>The lead gets it before its next model call; the next round recaps it. Use for guidance ("skip <code>third_party/</code>", "focus on the auth module")</td></tr>
+        <tr><td>Message the lead, urgently</td><td><code>rupu agentiflow send &lt;id&gt; "&lt;text&gt;" --now</code></td><td>Same, but it cuts the current round short so the lead turns to it at once</td></tr>
+        <tr><td>A standing scope rule</td><td>the lead writes <code>board.directive</code></td><td>A rule every unit sees every turn. You can't write one as the operator; ask the lead to, or bake it into the definition's goals and the lead prompt</td></tr>
+        <tr><td>Graceful stop</td><td><code>rupu agentiflow stop &lt;id&gt;</code></td><td>The envelope ends the run at the next round boundary as <code>operator_stop</code>; units are stopped with it</td></tr>
+        <tr><td>Hard stop</td><td><code>rupu agentiflow stop &lt;id&gt; --now</code></td><td>SIGTERM the coordinator and every unit now, SIGKILL after ~12s, record <code>failed</code> (<code>operator_stop:now</code>)</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">send</code> versus <code class="inline">send --now</code>: a plain <code class="inline">send</code> is polite; the
+      lead picks it up at its next model call, which may be several tool calls away. <code class="inline">--now</code> is for "stop what
+      you're doing and read this": it ends the round early (an in-flight model call is dropped, a running tool finishes), and the next round
+      starts with the message. The message is framed to the lead as an operator instruction.
+    </p>
+    <p>
+      <code class="inline">stop</code> versus <code class="inline">stop --now</code>: a graceful <code class="inline">stop</code> lets the
+      current round finish and its work land, then stops cleanly as a <code class="inline">completed</code> run.
+      <code class="inline">stop --now</code> kills everything immediately and records a <code class="inline">failed</code> run, losing the
+      current round's unbanked work; use it only when you need the processes gone now.
+    </p>
+    <p>
+      The operator can reach a run only while it is running. A <code class="inline">send</code> or <code class="inline">stop</code> to a
+      finished run, or one whose coordinator died, fails and says why (the control plane answers <code class="inline">409</code>). A
+      <code class="inline">running</code> run whose coordinator is gone is closed out by the orphan reaper, or by
+      <code class="inline">stop --now</code>.
+    </p>
+    <p>
+      On the web, the <strong>Messages</strong> tab has a composer that reaches the lead, and the header has <strong>Stop</strong> and
+      <strong>Stop now</strong> buttons with the same semantics.
+    </p>
+
+    <h2 id="see-also">See also</h2>
+    <ul>
+      <li><a class="link" href="/docs/agentiflows.html">Agentiflows</a>: the full reference</li>
+      <li><a class="link" href="/docs/agentiflow-tutorial.html">Tutorial</a>: an end-to-end walkthrough</li>
+      <li><a class="link" href="/docs/agents.html">Agents</a>: the agent file format and <code class="inline">tools:</code></li>
+      <li><a class="link" href="/docs/findings.html">Findings</a>: finding reports and the full profile</li>
+      <li><a class="link" href="/docs/profiles.html">Engagement profiles</a>: asset kinds and depth ladders</li>
+      <li><a class="link" href="/docs/messaging.html">Messaging</a>: the board, claims, directives and operator messages</li>
+      <li><a class="link" href="/docs/configuration.html#pricing">Configuration</a>: <code class="inline">[pricing]</code> for <code class="inline">budget.usd</code>; <a class="link" href="/docs/configuration.html#dispatch"><code class="inline">[dispatch]</code></a> for concurrency</li>
+    </ul>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/agentiflow-tutorial.html">&#8592; Agentiflow tutorial</a>
+      <a href="/docs/sessions.html">Sessions &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

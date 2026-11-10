@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>rupu docs — Agentiflows</title>
-<meta name="description" content="Agentiflows are goal-directed fleet runs: a lead agent coordinates agent and workflow units over a shared board and mailboxes, round by round, until measurable goals are met or a budget runs out.">
+<meta name="description" content="Agentiflows are goal-directed fleet runs: a lead agent plans the work in rounds, starts agents and workflows as process-isolated units, coordinates them over a shared board and mailboxes, and a deterministic envelope decides when the run is over from evidence on disk.">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
 <link rel="stylesheet" href="/docs.css">
@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item active" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -57,30 +59,16 @@
 
   <main class="docs-main">
     <h1>Agentiflows</h1>
-    <p class="intro">An agentiflow is a goal-directed, budget-bounded fleet run. You state measurable goals, a budget, a pool of agents and workflows, and an authorized scope; a lead agent decides how to reach the goals — dispatching agents, running or generating workflows, and coordinating them in one shared message space — while deterministic code holds the budget and the stop button.</p>
+    <p class="intro">An agentiflow is a goal-directed run of a fleet of agents. You describe what "done" looks like (goals over recorded evidence, a coverage target, a budget) and which agents and workflows may be used. A <strong>lead</strong> agent then plans the work in <strong>rounds</strong>, starts other agents and workflows as process-isolated <strong>units</strong>, coordinates them over a shared <strong>board</strong> and <strong>mailboxes</strong>, and keeps going until a deterministic supervisor, the <strong>envelope</strong>, decides the run is over.</p>
 
-    <h2>What is an agentiflow</h2>
     <p>
-      A <a class="link" href="/docs/workflows.html">workflow</a> is structure you wrote in advance. An
-      <a class="link" href="/docs/autoflows.html">autoflow</a> picks up work items and runs a pre-written workflow on each.
-      Neither can <em>compose</em> new structure in response to what it finds, coordinate a live fleet, or stop itself when a measurable
-      goal is met. That's what an agentiflow is for: open-ended work like “review this service and verify every real injection flaw”,
-      where the plan has to change as the evidence comes in.
+      The envelope never takes the lead's word that it is done. Every stop condition is computed from evidence on disk: findings, assets
+      and coverage depth recorded through the <a class="link" href="/docs/coverage.html">coverage</a> harness.
     </p>
-    <table>
-      <thead><tr><th></th><th>Who decides the steps</th><th>When it stops</th></tr></thead>
-      <tbody>
-        <tr><td><strong>Workflow</strong></td><td>You, in YAML, ahead of time</td><td>When the last step finishes</td></tr>
-        <tr><td><strong>Autoflow</strong></td><td>You, in YAML; the runtime picks which item to run it on</td><td>Per item, when its workflow finishes</td></tr>
-        <tr><td><strong>Agentiflow</strong></td><td>A lead agent, round by round, from a fixed pool</td><td>Goals met, coverage reached, budget or ceiling hit, or an operator stop</td></tr>
-      </tbody>
-    </table>
     <p>
-      The design is deliberately split. A deterministic <strong>envelope</strong> owns the loop: rounds, the budget, the stop conditions
-      and the operator's control queue. Inside each round the <strong>lead</strong> runs as an ordinary rupu agent with a large turn budget,
-      so the work is fully agentic — but code, never the model, decides when the money is spent and when the run is over. The envelope
-      never takes the lead's word that it is done: every stop condition is computed from evidence on disk — findings, assets and coverage
-      depth recorded through the <a class="link" href="/docs/coverage.html">coverage</a> harness.
+      New to agentiflows? Start with the <a class="link" href="/docs/agentiflow-tutorial.html">tutorial</a>, which walks a run from
+      <code class="inline">rupu fleet install</code> to reading the results. Writing a lead or tuning the goals and budget is covered in the
+      <a class="link" href="/docs/agentiflow-authoring.html">authoring guide</a>.
     </p>
 
     <figure class="diagram">
@@ -132,418 +120,816 @@
       <figcaption>The envelope drives rounds; the lead and its units talk through one file-backed message space in the run directory. The operator reaches any of them from the CLI or the control plane.</figcaption>
     </figure>
 
-    <h2 id="rounds">How a run works</h2>
-    <p>
-      <code class="inline">rupu agentiflow run &lt;name&gt;</code> runs from your current directory, which becomes the run's
-      <strong>workspace</strong>: the lead's file and shell tools act there, and units start there. Configuration resolves the way it does
-      for <code class="inline">rupu run</code> (global, then customer, then project layer); the lead agent is loaded, its provider built, and
-      the run id printed to stderr.
-    </p>
-    <p>
-      The run is a loop of <strong>rounds</strong>. At the top of every round the envelope drains the operator's control queue (where a
-      graceful stop waits), evaluates each stop condition against the evidence the fleet has written so far — findings, assets and coverage
-      in the run's pooled coverage scope, plus the metered spend — and either stops the run or hands the lead a <strong>digest</strong>: where
-      every goal stands, the coverage fraction, the budget stage, a recap of the operator's messages since the last round, and any non-fatal
-      warnings. Round&nbsp;0 opens with the mission — each goal's <code class="inline">objective</code>, in order — and the authorized scope:
-      <code class="inline">scope.mode</code> and one line per <code class="inline">scope.roots</code> entry, its <code class="inline">kind</code>
-      followed by its coordinates (<code class="inline">network:host host=10.0.0.5</code>).
-    </p>
-    <p>
-      The lead then takes up to <code class="inline">round.lead_max_turns</code> agentic turns (default <code class="inline">50</code>). It
-      reads the roster, launches units, joins them, posts to the board and checks goal status. When its turns end, the round ends, and the
-      envelope evaluates again. The lead's conversation carries over from round to round; a round that errors is recorded and the loop
-      continues, bounded by the budget and ceilings. Because the check comes before the lead's turn, a run whose goals are already met runs
-      zero rounds. “Done” is never the lead's say-so: a goal is met only when the evidence on disk satisfies its predicate, and an evaluation
-      that fails (an unreadable ledger, say) counts as <em>not met</em> and reaches the lead as a warning. The conditions are checked in the
-      order below; the first match wins.
-    </p>
+    <h2 id="when-to-use-one">1. When to use one</h2>
     <table>
-      <thead><tr><th>Stop reason</th><th>Fires when</th></tr></thead>
+      <thead><tr><th>You want</th><th>Use</th></tr></thead>
       <tbody>
-        <tr><td><code>goals_met</code></td><td>At least one goal is <code>required</code>, and every required goal's predicate holds over the pooled evidence.</td></tr>
-        <tr><td><code>coverage_reached</code></td><td>The <code>coverage:</code> fraction reaches its <code>reach</code>.</td></tr>
-        <tr><td><code>budget_exhausted:&lt;dimension&gt;</code></td><td>A budget dimension — <code>usd</code>, <code>tokens</code>, <code>rounds</code> or <code>wall_clock</code> — hits its cap. The first to trip is named.</td></tr>
-        <tr><td><code>operator_stop</code></td><td>A graceful stop was requested (<code>rupu agentiflow stop</code>, or the control plane). A hard stop (<code>--now</code>) records the run as <code>failed</code> with <code>operator_stop:now</code>.</td></tr>
-        <tr><td><code>ceiling</code></td><td>The hard <code>round.ceiling</code> on rounds or wall-clock time is reached.</td></tr>
+        <tr><td>A fixed sequence or graph of steps you can draw in advance</td><td>a <a class="link" href="/docs/workflow-reference.html">workflow</a></td></tr>
+        <tr><td>A workflow fired by a schedule or an SCM event</td><td>a workflow <code>trigger:</code> (<a class="link" href="/docs/triggers.html">Triggers</a>) or an autoflow</td></tr>
+        <tr><td>An open-ended job where the steps aren't known in advance, measured against evidence, with a spend cap</td><td>an agentiflow</td></tr>
       </tbody>
     </table>
-
-    <h2 id="authoring">Writing an agentiflow</h2>
     <p>
-      An agentiflow is one YAML file. <code class="inline">rupu agentiflow run &lt;name&gt;</code> loads
-      <code class="inline">&lt;project&gt;/.rupu/agentiflows/&lt;name&gt;.yaml</code>, falling back to
-      <code class="inline">~/.rupu/agentiflows/&lt;name&gt;.yaml</code>. A project file shadows the global one even when it fails to parse:
-      a broken project definition is an error, never a silent fallback. Every block rejects unknown keys, and the whole file is validated
-      against its engagement profiles before anything starts — a goal that could never be met is a load error, not a run that burns its budget.
+      Workflows are deterministic: the YAML is the plan. In an agentiflow the lead writes the plan as it goes. It chooses which pool agents
+      to start, with which prompts, and when to run (or write) a workflow. What it cannot do is leave the pool you gave it, run past the
+      budget, or end the run by saying it is done.
     </p>
-    <pre class="code"><span class="c"># .rupu/agentiflows/ledger-review.yaml</span>
-<span class="k">name</span>: <span class="s">ledger-review</span>
-<span class="k">description</span>: <span class="s">Coordinated pre-release review of the ledger service.</span>
-<span class="k">lead</span>: <span class="s">review-lead</span>                    <span class="c"># must be in pool.agents</span>
+    <div class="callout">
+      <strong>An agentiflow always runs unattended.</strong> The lead runs without approval prompts, and every unit is started with
+      <code>--mode bypass</code>. That is why a definition must set <code>scope.authorized: true</code> (<a class="link" href="#the-definition-file">section 3</a>).
+      Give the pool only agents you are happy to run unattended in the workspace you launch from.
+    </div>
+
+    <h2 id="quick-start">2. Quick start</h2>
+    <p>A minimal definition, a lead and two pool agents, run in the foreground:</p>
+    <pre class="code"><span class="c"># .rupu/agentiflows/review-sweep.yaml</span>
+<span class="k">name</span>: <span class="s">review-sweep</span>
+<span class="k">description</span>: <span class="s">Review the service for injection bugs and confirm what is found.</span>
+<span class="k">lead</span>: <span class="s">review-lead</span>
 <span class="k">engagement_profiles</span>: [<span class="s">code</span>]
 
 <span class="k">goals</span>:
-  - <span class="k">id</span>: <span class="s">verified-sqli</span>
-    <span class="k">objective</span>: <span class="s">"Find and independently verify two SQL injection flaws."</span>
+  - <span class="k">id</span>: <span class="s">injection</span>
+    <span class="k">objective</span>: <span class="s">"Find and confirm two SQL injection issues."</span>
     <span class="k">target</span>:
-      <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">CWE-89</span> }
+      <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-89"</span> }
       <span class="k">count_gte</span>: <span class="v">2</span>
       <span class="k">verified</span>: <span class="v">true</span>
-      <span class="k">verify_check</span>: <span class="s">with_poc</span>          <span class="c"># confirmed AND an artifact on the report</span>
-    <span class="k">verify_with</span>: <span class="s">finding-verifier</span>       <span class="c"># only this pool agent's verdict counts</span>
-  - <span class="k">id</span>: <span class="s">core-file-reviewed</span>
-    <span class="k">objective</span>: <span class="s">"Bring the ledger core module to reviewed depth."</span>
-    <span class="k">required</span>: <span class="v">false</span>                  <span class="c"># reported, but doesn't block goals_met</span>
-    <span class="k">target</span>:
-      <span class="k">asset</span>: { <span class="k">kind</span>: <span class="s">"code:file"</span>, <span class="k">locator</span>: { <span class="k">path</span>: <span class="s">src/ledger/core.rs</span> } }
-      <span class="k">depth_at_least</span>: <span class="s">reviewed</span>
-
-<span class="k">coverage</span>: { <span class="k">reach</span>: <span class="v">0.9</span>, <span class="k">depth</span>: <span class="s">reviewed</span>, <span class="k">kinds</span>: [<span class="s">file</span>] }
+    <span class="k">verify_with</span>: <span class="s">finding-verifier</span>      <span class="c"># only this agent's verdict counts</span>
+    <span class="k">required</span>: <span class="v">true</span>
 
 <span class="k">budget</span>:
   <span class="k">usd</span>: <span class="v">20</span>
-  <span class="k">tokens</span>: <span class="v">4000000</span>
-  <span class="k">wall_clock</span>: <span class="s">"2h"</span>
-  <span class="k">rounds</span>: <span class="v">10</span>
-  <span class="k">soft_at</span>: <span class="v">0.8</span>                     <span class="c"># converge once any dimension passes 80%</span>
+  <span class="k">wall_clock</span>: <span class="s">"3h"</span>
 
 <span class="k">scope</span>:
   <span class="k">authorized</span>: <span class="v">true</span>
-  <span class="k">roots</span>:
-    - { <span class="k">kind</span>: <span class="s">"code:repo"</span>, <span class="k">path</span>: <span class="s">"."</span> }
 
 <span class="k">pool</span>:
-  <span class="k">agents</span>: [<span class="s">review-lead</span>, <span class="s">code-reviewer</span>, <span class="s">security-reviewer</span>, <span class="s">finding-verifier</span>]
-  <span class="k">workflows</span>: [<span class="s">deep-review</span>]               <span class="c"># or: all</span>
-
-<span class="k">round</span>:
-  <span class="k">lead_max_turns</span>: <span class="v">80</span>
-  <span class="k">ceiling</span>: { <span class="k">rounds</span>: <span class="v">12</span>, <span class="k">wall_clock</span>: <span class="s">"3h"</span> }</pre>
-
-    <table>
-      <thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead>
-      <tbody>
-        <tr><td><code>name</code></td><td>yes</td><td>The run's definition name, recorded on the run.</td></tr>
-        <tr><td><code>description</code></td><td>no</td><td>Used as the lead's mission text when there are no goals or coverage target.</td></tr>
-        <tr><td><code>lead</code></td><td>yes</td><td>The agent that runs each round. Must be listed in <code>pool.agents</code>.</td></tr>
-        <tr><td><code>engagement_profiles</code></td><td>yes</td><td>The engagement profile set (<code>code</code>, <code>web</code>, <code>network</code>, <code>binary</code>, a composite like <code>pentest</code>, …) that defines the asset kinds, coverage ladders and finding classifications the goals refer to. An unknown profile id fails the load. It's carried to every unit the lead launches. See <a class="link" href="/docs/profiles.html">Engagement profiles</a>.</td></tr>
-        <tr><td><code>goals</code></td><td>one of goals / coverage</td><td>Measurable targets. A <strong>findings</strong> target counts findings (optionally by <code>classification</code>, e.g. <code>CWE-89</code>) and needs <code>count_gte</code>. An <strong>asset</strong> target names a profile-namespaced kind plus a <code>locator</code> (string coordinates <code>host</code>, <code>url</code>, <code>path</code>, <code>symbol</code>, <code>sha256</code>, <code>commit</code>, <code>param</code>) and needs <code>depth_at_least</code>, a rung of that profile's coverage ladder. <code>required</code> defaults to <code>true</code>; only required goals can end the run as <code>goals_met</code>.</td></tr>
-        <tr><td><code>coverage</code></td><td>one of goals / coverage</td><td>An engagement-wide stop: <code>reach</code> in <code>(0, 1]</code>, an optional <code>depth</code> rung, and optional <code>kinds</code> to measure. Validated to be reachable.</td></tr>
-        <tr><td><code>budget</code></td><td>no</td><td><code>usd</code>, <code>tokens</code>, <code>wall_clock</code> (<code>Ns</code>/<code>Nm</code>/<code>Nh</code>/<code>Nd</code>), <code>rounds</code>, and <code>soft_at</code> (default <code>0.8</code>). Every field is optional; an unset one never stops the run. See <a class="link" href="#budget">Budgets</a>.</td></tr>
-        <tr><td><code>scope</code></td><td>yes</td><td><code>authorized: true</code> is mandatory — it's your statement that the fleet may act unattended. Optional <code>roots</code> name root asset kinds of an active profile (<code>code:repo</code>, <code>network:host</code>, <code>web:site</code>) with their coordinates; they are validated and listed, with <code>mode</code>, in the lead&rsquo;s opening-round prompt as the authorized targets. <code>mode</code> is accepted and stored, not acted on.</td></tr>
-        <tr><td><code>pool</code></td><td>yes</td><td>The fixed set of <code>agents</code> and <code>workflows</code> (a list, or <code>all</code> for every workflow in the catalog at launch) the lead may launch. The lead never invents new fleet agents. A lead or unit agent that also declares <code>dispatchableAgents</code> gets the intersection.</td></tr>
-        <tr><td><code>round</code></td><td>no</td><td><code>lead_max_turns</code> per round (default 50, at least 1) and a hard <code>ceiling</code> on <code>rounds</code> / <code>wall_clock</code>.</td></tr>
-        <tr><td><code>messaging</code></td><td>no</td><td><code>false</code> turns the messaging tools (<code>board.*</code>, <code>msg.send</code>) off for the lead and every unit; the operator still reaches them, and the lead keeps its status, roster and launch tools. Default on. See <a class="link" href="/docs/messaging.html">Messaging</a>.</td></tr>
-        <tr><td><code>trigger</code></td><td>no</td><td>Accepted and stored, not acted on: nothing schedules an agentiflow. Use cron to call <code>rupu agentiflow run --detach</code> if you need one.</td></tr>
-      </tbody>
-    </table>
+  <span class="k">agents</span>: [<span class="s">review-lead</span>, <span class="s">file-reviewer</span>, <span class="s">finding-verifier</span>]</pre>
+    <pre class="code">rupu agentiflow run review-sweep</pre>
     <p>
-      <code class="inline">rupu agentiflow run</code> refuses to launch when, for example, <code class="inline">scope.authorized</code> is not
-      <code class="inline">true</code>; there are neither goals nor a coverage target; the lead is not in <code class="inline">pool.agents</code>;
-      a goal names a kind or depth no active profile defines; a <code class="inline">verify_with</code> agent is not in the pool; a scope root is
-      not a root kind; or a budget value is out of range. It warns (but still runs) when nothing except an operator stop can end the run: no
-      required goal, no coverage target, no enforceable budget cap and no ceiling.
-    </p>
-    <div class="callout">
-      <strong>Agentiflows run unattended.</strong> The lead runs without approval prompts and every unit starts in <code>bypass</code> mode,
-      in the directory you launch from. Scope roots are typed, validated and shown to the lead, but rupu does not enforce scope in code: nothing stops an agent from
-      reaching beyond them, so put hard constraints in the goal objectives too. Only put agents in the pool that you're
-      happy to run unattended.
-    </div>
-
-    <h2 id="lead">The lead's toolbox</h2>
-    <p>
-      The lead is a normal agent file (Markdown + YAML) — its system prompt is yours to write. It gets the tools its own
-      <code class="inline">tools:</code> lists (none of the built-ins if <code class="inline">tools:</code> is absent),
-      <code class="inline">findings.report</code> (plus <code class="inline">assets.mark</code> under an engagement profile), and these
-      fleet tools, always on:
-    </p>
-    <table>
-      <thead><tr><th>Group</th><th>Tool</th><th>What it does</th></tr></thead>
-      <tbody>
-        <tr><td rowspan="3">Units</td><td><code>dispatch { kind: "agent", name, prompt }</code></td><td>Start a pool agent as a unit. Refused for an agent outside <code>pool.agents</code>. Returns a handle at once.</td></tr>
-        <tr><td><code>dispatch { kind: "workflow", name | file, inputs? }</code></td><td>Start a pool workflow, or one <code>workflows.generate</code> wrote, as a unit. Vetted before launch: in the pool, parses, no approval gate, no <code>host:</code>/<code>distribute:</code> placement, runs only pool agents, inputs resolve. A refusal comes back as a tool error the lead can react to.</td></tr>
-        <tr><td><code>join { handles?, timeout_secs?, until? }</code></td><td>Wait for units' results. Default 300&nbsp;s, at most 3600&nbsp;s per call.</td></tr>
-        <tr><td>Generation</td><td><code>workflows.generate { description }</code></td><td>Author a <em>new</em> workflow, apply the same checks, save it under the run's <code>generated/</code> directory and return its <code>file</code>; the lead then runs it with <code>dispatch { kind: "workflow", file }</code>. Only offered when a generation provider with an API credential is available; otherwise a warning at launch says why.</td></tr>
-        <tr><td rowspan="3">Message space</td><td><code>board.claim</code> · <code>board.release</code></td><td>Claim a piece of work (a one-hour lease) so two participants don't duplicate it, and give it back.</td></tr>
-        <tr><td><code>board.post</code> · <code>board.read</code></td><td>Shared posts of kind <code>observation</code>, <code>question</code>, <code>answer</code>, <code>vote</code> or <code>note</code>, optionally addressed to one participant or role.</td></tr>
-        <tr><td><code>msg.send</code></td><td>Message a participant, a <code>role:</code>, the <code>lead</code>, <code>parent</code>, or <code>broadcast</code>.</td></tr>
-        <tr><td rowspan="2">Steering</td><td><code>board.directive</code></td><td>Write a standing directive every agent unit sees on every turn. Returns an id.</td></tr>
-        <tr><td><code>board.retract { id }</code></td><td>Lift a directive. The retraction is appended to the log; the board is never rewritten.</td></tr>
-        <tr><td>Status</td><td><code>goal.status</code> · <code>goal.coverage</code> · <code>budget.status</code></td><td>Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses — including, for a verification-gated goal, how many matching findings still await a verdict.</td></tr>
-        <tr><td>Roster</td><td><code>agents.list</code> · <code>agents.get</code> · <code>workflows.list</code> · <code>workflows.get</code> · <code>catalog.search</code></td><td>Browse the agents and workflows it can draw on: what each is for, its tools, its inputs.</td></tr>
-      </tbody>
-    </table>
-    <p>
-      The launch tools are the same catalog <code class="inline">dispatch</code>, <code class="inline">join</code> and
-      <code class="inline">workflows.generate</code> every agent run has, with the pool as the allowlist. The pre-unification names still
-      work as aliases and answer in their old shapes: <code class="inline">dispatch { agent, prompt }</code> (no <code class="inline">kind</code>)
-      starts an agent unit and returns <code class="inline">{handle, participant}</code>, as does <code class="inline">run_workflow { workflow, inputs? }</code>;
-      <code class="inline">generate_workflow { description, inputs? }</code> writes the workflow and starts it in one call; <code class="inline">join { handle }</code>
-      returns the old single-status shape. A <code class="inline">dispatch</code> with no <code class="inline">kind</code> and a <code class="inline">name</code>
-      is a <code class="inline">subagent</code>: it runs inside the coordinator's process, is not a participant in the space, and its usage is
-      charged to the flow's ledger.
-    </p>
-    <p>
-      <code class="inline">board.directive</code> and <code class="inline">board.retract</code> carry authority over other agents, so a
-      <code class="inline">*</code> grant never offers them; an agent gets them by naming them (or <code class="inline">board.*</code>), and the
-      agentiflow lead has them. Dispatch is non-blocking: the lead can start several units in one turn, keep working, and
-      <code class="inline">join</code> them later. Each lead turn also carries its inbox, the standing directives and a short index of the
-      pool, so it knows what it can start without spending a turn on <code class="inline">agents.list</code>.
+      The <a class="link" href="/docs/agentiflow-tutorial.html">tutorial</a> builds this out end to end, including the agent files. The rest
+      of this page is the reference.
     </p>
 
-    <h2 id="space">Units and the message space</h2>
-    <p>
-      Every unit runs as <strong>its own process</strong>, started by the same launcher every <code class="inline">dispatch</code> goes
-      through: an agent unit is a <code class="inline">rupu run &lt;agent&gt; …</code>, a workflow unit a
-      <code class="inline">rupu workflow run &lt;name&gt; --plain …</code> (or <code class="inline">--file &lt;path&gt;</code> for a generated
-      one). A unit runs at the lead's permission mode (<code class="inline">bypass</code>), capped by its own agent's
-      <code class="inline">permissionMode</code> when that is stricter, under the run's engagement profiles. Its findings and assets are pooled
-      with the lead's under one coverage scope — exactly where the envelope looks when it evaluates the goals. A unit may start children of
-      its own with <code class="inline">dispatch</code> when its <code class="inline">tools:</code> grants it (the default grant does); its
-      allowlist is the pool, so it can't reach an agent or workflow the lead couldn't, and the usual depth limit applies. At most
-      <code class="inline">[dispatch].max_concurrent_children</code> (default 8) units run at once, across rounds; more wait as
-      <code class="inline">pending</code>, and a unit started in one round keeps running into the next.
-    </p>
-    <p>
-      The lead and its agent units are <strong>participants of one message space</strong> — the run directory — described in
-      <a class="link" href="/docs/messaging.html">Messaging</a>. Every run joins it as it starts. The lead's address is
-      <code class="inline">lead</code>; a unit's is its codename below the lead, like <code class="inline">lynx#1</code>. Agent units get
-      <code class="inline">board.claim</code> / <code class="inline">board.release</code> / <code class="inline">board.post</code> /
-      <code class="inline">board.read</code> and <code class="inline">msg.send</code>; the lead additionally holds the directive tools.
-      Workflow units are findings-only: their steps get no board tools, and a workflow unit is a message root of its own with a fresh space.
-    </p>
+    <h2 id="the-definition-file">3. The definition file</h2>
+    <p>A definition is one YAML file per agentiflow:</p>
     <ul>
-      <li><strong>Claims.</strong> <code class="inline">board.claim</code> takes a one-hour lease on a piece of work (say, a file or a component) so two units don't duplicate it; <code class="inline">board.release</code> gives it back. A claim journal records who held what and when.</li>
-      <li><strong>Posts.</strong> <code class="inline">board.post</code> appends an observation, question, answer, vote or note — optionally addressed to one participant or role, in which case it also lands in that addressee's inbox. <code class="inline">board.read</code> reads them back.</li>
-      <li><strong>Directives.</strong> Standing instructions from the lead, re-shown to the participants they address on every turn until retracted.</li>
-      <li><strong>Messages.</strong> <code class="inline">msg.send</code> delivers to a participant, a <code class="inline">role:&lt;agent&gt;</code>, <code class="inline">parent</code>, <code class="inline">lead</code>, or <code class="inline">broadcast</code> (each participant sees a broadcast once). A message that reached nobody says why, and is also an error the model sees.</li>
+      <li><code class="inline">&lt;project&gt;/.rupu/agentiflows/&lt;name&gt;.yaml</code> (project), which shadows</li>
+      <li><code class="inline">~/.rupu/agentiflows/&lt;name&gt;.yaml</code> (global).</li>
     </ul>
     <p>
-      Nobody spends a turn polling for messages. Before each model call a participant's inbox, the broadcasts it hasn't seen and the
-      directives that apply to it are delivered into its context, so news arrives at the next loop iteration on its own; a tool call in
-      progress is never interrupted. Every message is written to one append-only log and recorded in both sides' transcripts. Messaging is
-      fire-and-forget; there are no blocking waits between agents.
-    </p>
-    <p>
-      Every unit is recorded in the flow's <strong>children ledger</strong>, <code class="inline">&lt;run dir&gt;/children.jsonl</code> — a
-      <code class="inline">started</code> line per unit (kind, name, run id, codename, participant, process group) and a
-      <code class="inline">finished</code> line when it ends — which the control plane's unit list and the orphan reaper read. When the run
-      stops for any reason, every unit still running is sent SIGTERM (to its process group, then SIGKILL after a grace) and recorded
-      <code class="inline">abandoned</code>.
+      A project file shadows the global one even when it fails to parse: a broken project definition is an error, never a silent fallback to
+      the global copy. The file name (without <code class="inline">.yaml</code>) is what you pass to
+      <code class="inline">rupu agentiflow run</code>. Run directories also live under <code class="inline">~/.rupu/agentiflows/</code> (as
+      <code class="inline">af_&lt;ULID&gt;/</code>); they never collide with definitions, since a definition is a
+      <code class="inline">&lt;name&gt;.yaml</code> file and a run is a directory.
     </p>
 
-    <h2 id="budget">Budgets and metering</h2>
+    <h3 id="top-level-fields">Top-level fields</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Type / default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>name</code></td><td>yes</td><td>string</td><td>Display name, recorded on the run</td></tr>
+        <tr><td><code>description</code></td><td>no</td><td>string</td><td>Shown as the "Objective" line on the control-plane page. (It is also a fallback mission text, but validation makes that path unreachable, since a run must have goals or coverage)</td></tr>
+        <tr><td><code>lead</code></td><td>yes</td><td>string</td><td>Agent name of the lead. Must also appear in <code>pool.agents</code></td></tr>
+        <tr><td><code>engagement_profiles</code></td><td>yes</td><td>list</td><td>Profile ids that type the run's evidence (<code>code</code>, <code>network</code>, <code>web</code>, <code>binary</code>, a composite like <code>pentest</code>, ...). See <a class="link" href="/docs/profiles.html">Engagement profiles</a></td></tr>
+        <tr><td><code>goals</code></td><td>one of <code>goals</code> / <code>coverage</code></td><td>list</td><td>Measurable targets, below</td></tr>
+        <tr><td><code>coverage</code></td><td>one of <code>goals</code> / <code>coverage</code></td><td>object</td><td><code>{ reach, depth?, kinds? }</code>, below</td></tr>
+        <tr><td><code>budget</code></td><td>no</td><td>object</td><td><code>{ usd?, tokens?, wall_clock?, rounds?, soft_at? }</code>, <a class="link" href="#budgets-and-metering">section 6</a></td></tr>
+        <tr><td><code>scope</code></td><td>yes</td><td>object</td><td><code>{ authorized, mode?, roots? }</code>, below</td></tr>
+        <tr><td><code>pool</code></td><td>yes</td><td>object</td><td><code>{ agents, workflows? }</code>, below</td></tr>
+        <tr><td><code>round</code></td><td>no</td><td>object</td><td><code>{ lead_max_turns?, ceiling? }</code>, below</td></tr>
+        <tr><td><code>trigger</code></td><td>no</td><td>string</td><td>Accepted and stored, not acted on (<a class="link" href="#limitations">section 14</a>)</td></tr>
+        <tr><td><code>messaging</code></td><td>no</td><td>bool</td><td><code>false</code> turns the messaging tools (<code>board.*</code>, <code>msg.send</code>) off for the lead and every unit; the operator still reaches them (<a class="link" href="/docs/messaging.html#off">Messaging: turning it off</a>). Default on</td></tr>
+      </tbody>
+    </table>
+    <p>Every struct rejects unknown keys. A typo in any field name fails the launch.</p>
+
+    <h3 id="goals">goals</h3>
+    <p>Each goal is a predicate over the run's own evidence. Fields:</p>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>id</code></td><td>yes</td><td></td><td>A short id, shown on every round line and in <code>goal.status</code></td></tr>
+        <tr><td><code>objective</code></td><td>yes</td><td></td><td>Human text, shown to the lead and on the page</td></tr>
+        <tr><td><code>target</code></td><td>yes</td><td></td><td>Names findings or an asset, never both (below)</td></tr>
+        <tr><td><code>required</code></td><td>no</td><td><code>true</code></td><td>Only required goals can end the run as <code>goals_met</code></td></tr>
+        <tr><td><code>verify_with</code></td><td>no</td><td></td><td>An agent name (must be in the pool) whose verdict gates the goal; see <a class="link" href="#verification">section 7</a></td></tr>
+      </tbody>
+    </table>
+    <p>A target names either findings or an asset:</p>
+    <pre class="code"><span class="c"># Findings: at least N findings, optionally of one classification</span>
+<span class="k">target</span>: { <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-79"</span> }, <span class="k">count_gte</span>: <span class="v">3</span> }
+
+<span class="c"># Asset: specific assets reached a depth rung on their profile's ladder</span>
+<span class="k">target</span>:
+  <span class="k">asset</span>: { <span class="k">kind</span>: <span class="s">"network:host"</span>, <span class="k">locator</span>: { <span class="k">host</span>: <span class="s">"10.0.0.5"</span> } }
+  <span class="k">depth_at_least</span>: <span class="s">tested</span></pre>
+    <p><code class="inline">target</code> keys:</p>
+    <table>
+      <thead><tr><th>Key</th><th>On</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>findings.classification</code></td><td>findings</td><td>(any)</td><td>Matches any classification on the finding's report (<code>CWE-89</code>, <code>OWASP-A03</code>, ...). A finding with no report matches nothing when a classification is given</td></tr>
+        <tr><td><code>count_gte</code></td><td>findings (required), asset (optional)</td><td><code>1</code> for an asset</td><td>How many matching findings (or assets) are needed. <strong>Required on a findings target</strong></td></tr>
+        <tr><td><code>asset.kind</code></td><td>asset (required)</td><td></td><td>A profile-namespaced kind, e.g. <code>network:host</code></td></tr>
+        <tr><td><code>asset.locator</code></td><td>asset</td><td><code>{}</code></td><td><code>tag: value</code> pairs. Omitting it matches any asset of that kind. Keys are limited to the string coordinates <code>host</code>, <code>url</code>, <code>path</code>, <code>symbol</code>, <code>sha256</code>, <code>commit</code> and <code>param</code></td></tr>
+        <tr><td><code>depth_at_least</code></td><td>asset (required)</td><td></td><td>A rung of the owning profile's depth ladder (e.g. <code>tested</code>)</td></tr>
+        <tr><td><code>verified</code></td><td>findings</td><td><code>false</code></td><td>Require an independent <code>confirmed</code> verdict (<a class="link" href="#verification">section 7</a>). Rejected on an asset target</td></tr>
+        <tr><td><code>verify_check</code></td><td>findings</td><td><code>confirmed</code></td><td><code>confirmed</code> or <code>with_poc</code>; only valid with <code>verified: true</code> or <code>verify_with</code>. Rejected on an asset target</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="coverage">coverage</h3>
+    <p>
+      <code class="inline">coverage</code> is an engagement-wide stop: the fraction of discovered assets (of the kinds the profiles
+      enumerate, or of <code class="inline">kinds</code> when given) that reached <code class="inline">depth</code> or deeper.
+    </p>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>reach</code></td><td>yes</td><td></td><td>A fraction in <code>(0, 1]</code>. <code>0.8</code> means 80%</td></tr>
+        <tr><td><code>depth</code></td><td>no</td><td>each profile's last ladder rung</td><td>The minimum rung an asset must reach to count as covered</td></tr>
+        <tr><td><code>kinds</code></td><td>no</td><td>each profile's enumerated kinds</td><td>The asset kinds counted. Bare (<code>host</code>) or namespaced (<code>network:host</code>); duplicates or an empty list are rejected</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">0/0</code> (nothing of the enumerated kinds discovered yet) counts as <code class="inline">0%</code>, so a coverage
+      stop never fires before there is anything to cover.
+    </p>
+
+    <h3 id="scope">scope</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>authorized</code></td><td>yes</td><td>Must be <code>true</code>. It is the operator's statement that the fleet may act on the targets unattended</td></tr>
+        <tr><td><code>mode</code></td><td>no</td><td>Accepted and stored, shown to the lead on round 0, but not enforced (<a class="link" href="#limitations">section 14</a>)</td></tr>
+        <tr><td><code>roots</code></td><td>no</td><td>Root assets of the engagement: <code>kind</code> (a root asset kind of an active profile, such as <code>code:repo</code>, <code>network:host</code>, <code>web:site</code>) plus that kind's coordinates as extra keys</td></tr>
+      </tbody>
+    </table>
+    <pre class="code"><span class="k">scope</span>:
+  <span class="k">authorized</span>: <span class="v">true</span>
+  <span class="k">mode</span>: <span class="s">active</span>
+  <span class="k">roots</span>:
+    - { <span class="k">kind</span>: <span class="s">"network:host"</span>, <span class="k">host</span>: <span class="s">"10.0.0.5"</span> }
+    - { <span class="k">kind</span>: <span class="s">"code:repo"</span>, <span class="k">path</span>: <span class="s">"."</span> }</pre>
+
+    <h3 id="pool">pool</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>agents</code></td><td>yes</td><td>The only agents the lead (and its units) may <code>dispatch</code>. A lead or unit agent that also declares <code>dispatchableAgents</code> gets the intersection</td></tr>
+        <tr><td><code>workflows</code></td><td>no</td><td>A list of workflow names, or <code>all</code> for every workflow in the catalog at launch. The only workflows <code>dispatch {kind: workflow}</code> may start. Defaults to none</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="round">round</h3>
+    <table>
+      <thead><tr><th>Key</th><th>Required</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>lead_max_turns</code></td><td>no</td><td><code>50</code> (minimum <code>1</code>)</td><td>Turns the lead may take per round</td></tr>
+        <tr><td><code>ceiling</code></td><td>no</td><td></td><td><code>{ rounds?, wall_clock? }</code>: a hard end to the run</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="validation">Validation</h3>
+    <p>
+      <code class="inline">rupu agentiflow run</code> validates the definition against the resolved engagement profiles before anything
+      starts, and refuses to launch when:
+    </p>
+    <ul>
+      <li><code class="inline">scope.authorized</code> is not <code class="inline">true</code>;</li>
+      <li>there are neither goals nor a coverage target;</li>
+      <li>the lead is not in <code class="inline">pool.agents</code>;</li>
+      <li>a goal target has both findings and asset, or neither;</li>
+      <li>a findings target has no <code class="inline">count_gte</code>;</li>
+      <li><code class="inline">verify_check</code> is set without <code class="inline">verified: true</code> or <code class="inline">verify_with</code>;</li>
+      <li><code class="inline">verify_with</code> is blank, or names an agent not in <code class="inline">pool.agents</code>;</li>
+      <li>an asset target has no <code class="inline">depth_at_least</code>, or sets <code class="inline">verified</code> / <code class="inline">verify_with</code> / <code class="inline">verify_check</code>;</li>
+      <li>a goal names an asset kind or depth no active profile defines;</li>
+      <li>a goal's <code class="inline">locator</code> key is not a matchable string coordinate;</li>
+      <li>a scope root is not a root kind of an active profile;</li>
+      <li>a coverage target is unreachable (<code class="inline">reach</code> out of <code class="inline">(0, 1]</code>, an empty or undefined <code class="inline">kinds</code>, a <code class="inline">depth</code> not on an evaluated profile's ladder);</li>
+      <li>a budget value is out of range (<code class="inline">usd</code> negative, <code class="inline">soft_at</code> not in <code class="inline">[0, 1]</code>, an unparseable <code class="inline">wall_clock</code>).</li>
+    </ul>
+    <p>
+      The command also <strong>warns</strong> (but still runs) when nothing except an operator stop can end the run: no required goal, no
+      coverage target, no enforceable budget cap and no ceiling. A <code class="inline">usd</code> cap alone does not count when the lead's
+      model has no price (<a class="link" href="#budgets-and-metering">section 6</a>).
+    </p>
+    <p>
+      You can validate a definition without running it from the control plane or MCP
+      (<code class="inline">POST /api/agentiflow-defs/validate</code>, <code class="inline">agentiflow_defs.validate</code>). There is no CLI
+      dry-run subcommand: the CLI validates at launch.
+    </p>
+
+    <h2 id="the-round-loop">4. The round loop</h2>
+    <pre class="code">rupu agentiflow run review-sweep</pre>
+    <p>
+      The command runs from your current directory, which becomes the run's <strong>workspace</strong>: the lead's file and shell tools act
+      there, and units start there. It resolves configuration the same way <code class="inline">rupu run</code> does (global, then customer,
+      then project layer), loads the lead agent, builds its provider, and prints the run id to stderr.
+    </p>
+    <p>The run is a loop of rounds. At the top of each round the envelope:</p>
+    <ol>
+      <li>drains the operator's control queue, where a graceful <code class="inline">stop</code> waits (<a class="link" href="#operating-a-run-from-the-cli">section 8</a>);</li>
+      <li>evaluates every goal, the coverage target and the budget over the run's evidence;</li>
+      <li>stops the run if a stop condition holds, checked in this order (first match wins):
+        <table>
+          <thead><tr><th>Stop reason</th><th>Code</th><th>When</th></tr></thead>
+          <tbody>
+            <tr><td>goals met</td><td><code>goals_met</code></td><td>at least one goal is required, and every required goal is met</td></tr>
+            <tr><td>coverage reached</td><td><code>coverage_reached</code></td><td>the coverage target is met</td></tr>
+            <tr><td>budget exhausted</td><td><code>budget_exhausted:&lt;dimension&gt;</code></td><td>a budget cap is reached (<code>usd</code>, <code>tokens</code>, <code>rounds</code> or <code>wall_clock</code>)</td></tr>
+            <tr><td>operator stop</td><td><code>operator_stop</code></td><td>a graceful stop was requested</td></tr>
+            <tr><td>ceiling</td><td><code>ceiling</code></td><td><code>round.ceiling.rounds</code> or <code>round.ceiling.wall_clock</code> is reached</td></tr>
+          </tbody>
+        </table>
+      </li>
+      <li>otherwise hands the lead a digest (goal progress, coverage, budget stage, a recap of the operator's messages since the last round, warnings) and lets it run one round of up to <code class="inline">lead_max_turns</code> turns.</li>
+    </ol>
+    <p>
+      Because the check comes before the lead's turn, a run whose goals are already met runs zero rounds. The lead's conversation carries over
+      from round to round.
+    </p>
+    <p>
+      A run that completes normally has status <code class="inline">completed</code> whatever the reason; the reason is in
+      <code class="inline">stop_reason</code>. A run that stops as <code class="inline">goals_met</code>,
+      <code class="inline">coverage_reached</code>, <code class="inline">budget_exhausted:*</code>, <code class="inline">operator_stop</code> or
+      <code class="inline">ceiling</code> is <code class="inline">completed</code>. A run that could not start, crashed, was hard-stopped or was
+      reaped is <code class="inline">failed</code>, with a <code class="inline">stop_reason</code> of <code class="inline">error: &lt;message&gt;</code>,
+      <code class="inline">operator_stop:now</code>, or <code class="inline">orphaned: coordinator pid &lt;p&gt; not running</code>.
+    </p>
+
+    <h3 id="caps-are-checked-only-at-round-boundaries">Caps are checked only at round boundaries</h3>
+    <p>
+      <strong>Nothing enforces the budget or the ceilings mid-round.</strong> The envelope checks them once, at the top of each round, before
+      the lead runs. Within a round, the lead may take up to <code class="inline">lead_max_turns</code> model turns, and each
+      <code class="inline">join</code> call may wait up to 3600 seconds. A run can therefore overshoot a <code class="inline">usd</code>,
+      <code class="inline">tokens</code> or <code class="inline">wall_clock</code> cap by one round's worth of work before the next check stops
+      it. Size <code class="inline">lead_max_turns</code>, the budget and the ceilings with that overshoot in mind; the
+      <a class="link" href="/docs/agentiflow-authoring.html#tuning-budgets">authoring guide</a> works through it.
+    </p>
+
+    <h3 id="budget-rounds-versus-ceiling-rounds">budget.rounds versus ceiling.rounds</h3>
+    <p>Both bound the number of lead rounds, and they cut off at the same point, but they differ:</p>
+    <table>
+      <thead><tr><th></th><th><code>budget.rounds</code></th><th><code>round.ceiling.rounds</code></th></tr></thead>
+      <tbody>
+        <tr><td>Stop code</td><td><code>budget_exhausted:rounds</code></td><td><code>ceiling</code></td></tr>
+        <tr><td>Soft stage</td><td>contributes to <code>soft_at</code> (the lead is told to converge as it nears the cap)</td><td>no soft stage</td></tr>
+        <tr><td>Check order</td><td>before an operator stop</td><td>after an operator stop</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The same holds for <code class="inline">budget.wall_clock</code> versus <code class="inline">round.ceiling.wall_clock</code>. Use
+      <code class="inline">budget.*</code> when you want the lead to be warned and converge before the cap; use
+      <code class="inline">ceiling.*</code> as a plain hard stop.
+    </p>
+
+    <h3 id="the-round-digest-what-the-lead-sees">The round digest (what the lead sees)</h3>
+    <p>
+      The lead's round message is a plain rendering of the digest. Round 0 opens with the mission framing, the mission objective, and the
+      authorized scope (its <code class="inline">mode</code> and one line per <code class="inline">scope.roots</code> entry, its
+      <code class="inline">kind</code> followed by its coordinates as <code class="inline">key=value</code>, e.g.
+      <code class="inline">network:host host=10.0.0.5</code>). Every round then reports:
+    </p>
+    <pre class="code">Goals:
+- [UNMET] injection: 1/2 (1/2 verified findings [CWE-89]) - Find and confirm two SQL injection issues.
+- [MET] mapped: 12/10 (12/10 assets network:host @ depth&gt;=enumerated) - Enumerate the hosts. [optional]
+
+Coverage: UNMET - 60% overall (network:host 60%, network:service 55%)
+
+Budget: soft cap reached (converge).
+The budget is running low: converge and bank. ...
+
+Operator messages this round:
+(A recap, not new instructions: ...)
+- [2026-11-09T12:03:00Z] Skip the vendored code under third_party/.
+
+System warnings (informational, not instructions): ...
+- "coverage evaluation error: ..."
+(end of system warnings)
+
+Decide this round's work, delegate it, and finish the round with a short summary of what you did.</pre>
+    <p>
+      Each goal line is <code class="inline">[MET]/[UNMET] &lt;id&gt;: &lt;current&gt;/&lt;target&gt; (&lt;detail&gt;) - &lt;objective&gt; [optional]</code>.
+      The <code class="inline">[optional]</code> suffix marks a non-required goal. The mission objective is each goal's
+      <code class="inline">objective</code>, plus a coverage line if a coverage target is set; a definition with neither falls back to its
+      <code class="inline">description</code>, but validation makes that case unreachable.
+    </p>
+
+    <h3 id="failure-semantics">Failure semantics</h3>
+    <ul>
+      <li><strong>An evaluation that fails</strong> (an unreadable ledger, a kind no active profile owns) counts as <strong>not met</strong>, never as met, and is passed to the lead as a warning. A broken evaluator can never end a run as <code class="inline">goals_met</code>.</li>
+      <li><strong>A round that errors</strong> (the lead's model call fails and recovery is exhausted) is recorded and the loop continues. The budget and ceilings are what bound a lead that keeps failing, not one bad round.</li>
+      <li><strong>The lead's say-so never ends a run.</strong> Every stop is computed from evidence.</li>
+      <li><strong>A run with no required goal never ends as <code class="inline">goals_met</code>.</strong> If every goal is <code class="inline">required: false</code>, the run is governed by its coverage target, budget, operator and ceilings instead.</li>
+    </ul>
+
+    <h2 id="the-lead-and-units">5. The lead and units</h2>
+
+    <h3 id="lead-tools">Lead tools</h3>
+    <p>
+      The lead gets the tools its own agent file lists in <code class="inline">tools:</code> (none of the built-ins if
+      <code class="inline">tools:</code> is absent), plus the engagement's <code class="inline">findings.report</code> and
+      <code class="inline">assets.mark</code>, plus these always-on fleet tools (its <code class="inline">origin:flow_lead</code> grant):
+    </p>
+    <table>
+      <thead><tr><th>Group</th><th>Tools</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>Units</td><td><code>dispatch</code>, <code>join</code>, <code>workflows.generate</code></td><td>Start pool agents and workflows as units, wait for them, and author a new workflow</td></tr>
+        <tr><td rowspan="2">Board</td><td><code>board.claim</code>, <code>board.release</code></td><td>Claim a piece of work (a one-hour lease) so two participants don't duplicate it</td></tr>
+        <tr><td><code>board.post</code>, <code>board.read</code></td><td>Shared posts of kind <code>observation</code>, <code>question</code>, <code>answer</code>, <code>vote</code> or <code>note</code></td></tr>
+        <tr><td rowspan="2">Steering</td><td><code>board.directive</code></td><td>Write a standing directive every agent unit sees on every turn. Returns an id</td></tr>
+        <tr><td><code>board.retract { id }</code></td><td>Lift a directive the lead authored. Retraction is appended to the log; the board is never rewritten</td></tr>
+        <tr><td>Messaging</td><td><code>msg.send</code></td><td>Message a participant, a <code>role:</code>, the <code>lead</code>, <code>parent</code>, or <code>broadcast</code> (see <a class="link" href="/docs/messaging.html">Messaging</a>)</td></tr>
+        <tr><td>Status</td><td><code>goal.status</code>, <code>goal.coverage</code>, <code>budget.status</code></td><td>Re-check goals, coverage and spend mid-round with the same evaluators and meter the envelope uses</td></tr>
+        <tr><td>Roster</td><td><code>agents.list</code>, <code>agents.get</code>, <code>workflows.list</code>, <code>workflows.get</code>, <code>catalog.search</code></td><td>Browse the agents and workflows it can draw on</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Each lead turn also includes the lead's inbox, the standing directives, and a short index of the pool, so it knows what it can start
+      without spending a turn on <code class="inline">agents.list</code>.
+    </p>
+    <p>
+      Inside a lead, <code class="inline">coverage.status</code> is an alias for <code class="inline">goal.coverage</code> (so the stock
+      <code class="inline">assessment-lead</code> can call <code class="inline">coverage.status</code>). The stock fleet agents name tools by
+      their aliases: <code class="inline">report_finding</code> (<code class="inline">findings.report</code>),
+      <code class="inline">asset_mark</code> (<code class="inline">assets.mark</code>), <code class="inline">finding.verify</code>
+      (<code class="inline">findings.verify</code>), <code class="inline">query_findings</code> (<code class="inline">findings.query</code>),
+      <code class="inline">tag_findings</code> (<code class="inline">findings.tag</code>) and <code class="inline">coverage.status</code>.
+    </p>
+
+    <h3 id="dispatch">dispatch</h3>
+    <p>
+      <code class="inline">dispatch</code> starts a child and returns a handle at once; the child works on its own. Call
+      <code class="inline">join</code> to collect its result.
+    </p>
+    <table>
+      <thead><tr><th>Argument</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>kind</code></td><td><code>subagent</code> (default), <code>agent</code>, or <code>workflow</code></td></tr>
+        <tr><td><code>name</code></td><td>The agent, or (for <code>kind: workflow</code>) the workflow, to run</td></tr>
+        <tr><td><code>file</code></td><td><code>kind: workflow</code> only: a file <code>workflows.generate</code> returned, instead of <code>name</code></td></tr>
+        <tr><td><code>prompt</code></td><td>An agent child's task</td></tr>
+        <tr><td><code>inputs</code></td><td>A workflow's declared inputs as <code>name: value</code>; for an agent, structured inputs folded into its prompt</td></tr>
+        <tr><td><code>wait</code></td><td>Wait for the child to finish and return its result too (default <code>false</code>)</td></tr>
+        <tr><td><code>timeout_secs</code></td><td>With <code>wait</code>: how long to wait, in seconds (default 300, maximum 3600)</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><code class="inline">kind: subagent</code> (the default when <code class="inline">kind</code> is omitted and a <code class="inline">name</code> is given) runs <strong>in the coordinator's process</strong>: it is a quick delegation (reviewing one file), is not a participant on the board, and its usage is charged to the flow's ledger.</li>
+      <li><code class="inline">kind: agent</code> is its own <code class="inline">rupu run</code> process, for long or heavy work. It joins the board as a unit.</li>
+      <li><code class="inline">kind: workflow</code> is its own <code class="inline">rupu workflow run --plain</code> process.</li>
+    </ul>
+    <p><code class="inline">dispatch</code> returns <code class="inline">{handle, kind, name, run_id, codename?, address?, transcript?}</code>.</p>
+
+    <h3 id="join">join</h3>
+    <table>
+      <thead><tr><th>Argument</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>handles</code></td><td>Handles <code>dispatch</code> returned; omit for every child not yet collected</td></tr>
+        <tr><td><code>timeout_secs</code></td><td>How long to wait, in seconds (0 = just look); default 300, maximum 3600</td></tr>
+        <tr><td><code>until</code></td><td><code>all</code> (default) or <code>any</code> (return as soon as one finishes)</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">join</code> returns each child's status: <code class="inline">done</code> (with its <code class="inline">output</code>
+      and whether it <code class="inline">success</code>), <code class="inline">failed</code>, <code class="inline">abandoned</code>, or
+      <code class="inline">running</code> / <code class="inline">pending</code> if it has not finished within the timeout (join again to keep
+      waiting).
+    </p>
+
+    <h3 id="workflows-generate">workflows.generate</h3>
+    <p>
+      <code class="inline">workflows.generate { description }</code> writes a new workflow for a described task and saves it as
+      <code class="inline">&lt;run dir&gt;/generated/&lt;name&gt;-&lt;ulid&gt;.yaml</code>, returning its <code class="inline">file</code>. The
+      lead then runs it with <code class="inline">dispatch { kind: workflow, file }</code>. The generated workflow may use only agents the lead
+      can dispatch and runs unattended (no approval gates, no remote placement). The generating provider is the first authenticated one in
+      rupu's default generation order, falling back to the lead's own. When that provider has no credential, or authenticates with Anthropic
+      OAuth (which can't be built where the tool runs), the tool is not offered and a warning says why at launch. An API key enables it.
+    </p>
+
+    <h3 id="the-pre-unification-call-shapes">The pre-unification call shapes</h3>
+    <p>
+      These are the same catalog <code class="inline">dispatch</code>, <code class="inline">join</code> and
+      <code class="inline">workflows.generate</code> every agent run has (see
+      <a class="link" href="/docs/agents.html#sub-agent-dispatch">Agents: launching children</a>), with the pool as the allowlist. The
+      pre-unification calls still work and answer in their old shapes:
+    </p>
+    <ul>
+      <li><code class="inline">dispatch { agent, prompt }</code> (no <code class="inline">kind</code>) inside a flow starts an <strong>agent unit</strong> and returns <code class="inline">{handle, participant}</code>; outside a flow it is a sub-agent run to the end;</li>
+      <li><code class="inline">run_workflow { workflow, inputs? }</code> starts a workflow unit;</li>
+      <li><code class="inline">generate_workflow { description, inputs? }</code> writes the workflow and starts it in one call;</li>
+      <li><code class="inline">join { handle }</code> (one handle, singular) returns the old single-status shape.</li>
+    </ul>
+
+    <h3 id="units">Units</h3>
+    <p>A unit is a separate process, started by the same launcher every <code class="inline">dispatch</code> goes through:</p>
+    <ul>
+      <li>an <strong>agent unit</strong> is <code class="inline">rupu run &lt;agent&gt; ...</code>;</li>
+      <li>a <strong>workflow unit</strong> is <code class="inline">rupu workflow run &lt;name&gt; --plain ...</code> (or <code class="inline">--file &lt;path&gt;</code> for a generated workflow).</li>
+    </ul>
+    <p>
+      A unit runs at the lead's permission mode (<code class="inline">bypass</code>), capped by its own agent's
+      <code class="inline">permissionMode</code> when that is stricter. Each unit gets a participant id, the role part of its codename below
+      the lead (<code class="inline">lynx#1</code>), and the run's engagement profiles. Its findings and assets are pooled with the lead's
+      under one coverage scope, which is what the goals are evaluated against.
+    </p>
+    <ul>
+      <li><strong>Agent units</strong> get the board and mailbox tools (<code class="inline">board.claim</code>, <code class="inline">board.release</code>, <code class="inline">board.post</code>, <code class="inline">board.read</code>, <code class="inline">msg.send</code>) plus <code class="inline">dispatch</code> / <code class="inline">join</code> from the default grant. They <strong>cannot write directives</strong> (<code class="inline">board.directive</code> / <code class="inline">board.retract</code> are the lead's alone). They can <em>see</em> directives the lead wrote.</li>
+      <li><strong>Workflow units</strong> are findings-only: their steps get no board tools.</li>
+    </ul>
+    <p>
+      A unit may start children of its own with <code class="inline">dispatch</code> when its <code class="inline">tools:</code> grants it
+      (the default grant does). Its allowlist is the pool, so it can't reach an agent or workflow the lead couldn't, and the usual depth limit
+      applies (<code class="inline">MAX_LAUNCH_DEPTH</code>, 5). Only the lead starts units directly; there are no sub-leads.
+    </p>
+    <p>
+      <code class="inline">dispatch</code> refuses an agent that is not in <code class="inline">pool.agents</code>. A workflow unit is checked
+      before anything starts: it is in the pool, parses, has no approval gate and no <code class="inline">host:</code> /
+      <code class="inline">distribute:</code> placement, runs only pool agents, and its inputs resolve. A refusal comes back to the lead as a
+      tool error it can react to.
+    </p>
+    <p>
+      At most <code class="inline">[dispatch].max_concurrent_children</code> (default 8) units run at once, across rounds; more wait as
+      <code class="inline">pending</code> until one finishes. A unit started in one round keeps running into the next, and is joined in a
+      later round.
+    </p>
+    <p>
+      Every unit is recorded in the run's children ledger (<code class="inline">&lt;run dir&gt;/children.jsonl</code>), which the control
+      plane's unit list and the orphan reaper read. When the run stops for any reason, every unit still running is sent SIGTERM (to its
+      process group, then SIGKILL after a grace) and recorded <code class="inline">abandoned</code>.
+    </p>
+
+    <h2 id="budgets-and-metering">6. Budgets and metering</h2>
+    <table>
+      <thead><tr><th>Key</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>usd</code></td><td>Spend cap in US dollars, priced through the layered <code>[pricing]</code> config</td></tr>
+        <tr><td><code>tokens</code></td><td>Cap on billable (input + output) tokens</td></tr>
+        <tr><td><code>wall_clock</code></td><td>Duration since launch: <code>Ns</code>, <code>Nm</code>, <code>Nh</code> or <code>Nd</code></td></tr>
+        <tr><td><code>rounds</code></td><td>Cap on lead rounds</td></tr>
+        <tr><td><code>soft_at</code></td><td>Fraction (0 to 1, default <code>0.8</code>) of any cap at which the budget turns <strong>soft</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      Every set dimension is enforced; unset ones never stop the run. A cap of <code class="inline">0</code> is exhausted immediately (it is
+      <code class="inline">hard</code> on the first check). When any dimension passes <code class="inline">soft_at</code>, the lead's digest
+      says to converge: finish the highest-value work instead of opening new lines. Remember that the budget is checked only at round
+      boundaries (<a class="link" href="#caps-are-checked-only-at-round-boundaries">section 4</a>).
+    </p>
     <p>
       Spend is metered once per round from the run's ledger (<code class="inline">&lt;run dir&gt;/usage.jsonl</code>). The lead and any
       in-process sub-agents write it directly; each unit process, and every child it starts, also copies its calls there as rollup rows,
-      besides keeping its own run ledger. Totals are folded per model and priced through your layered
-      <code class="inline">[pricing]</code> config. Each budget dimension is evaluated as a fraction of its cap:
+      besides keeping its own run ledger. Things to know:
     </p>
     <ul>
-      <li><strong>Soft</strong> — once any set dimension passes <code class="inline">soft_at</code>, the digest tells the lead to <em>converge</em>: wrap up and bank the highest-value work rather than open new lines of inquiry.</li>
-      <li><strong>Hard</strong> — the first dimension to reach its cap stops the run before the lead is consulted again. A zero cap is exhausted immediately, never “unlimited”.</li>
+      <li><code class="inline">budget.usd</code> is enforced only when the <strong>lead's</strong> model has a price. If it doesn't, the cap is dropped with a warning at launch (it would read <code class="inline">$0</code> forever), and <code class="inline">tokens</code>, <code class="inline">wall_clock</code> and <code class="inline">rounds</code> still apply. Add a <code class="inline">[pricing.&lt;provider&gt;."&lt;model&gt;"]</code> entry to enforce it (see <a class="link" href="/docs/configuration.html#pricing">Configuration: pricing</a>).</li>
+      <li>A unit on an unpriced model adds <code class="inline">$0</code> (with a warning the first time) but its tokens still count. <code class="inline">rupu agentiflow status</code> names the unpriced models when a <code class="inline">usd</code> cap is set, so the under-count is visible.</li>
     </ul>
     <p>
-      <code class="inline">budget.usd</code> is enforced only when the <strong>lead's</strong> model has a price; if it doesn't, the dollar cap
-      is dropped with a warning at launch and <code class="inline">tokens</code>, <code class="inline">wall_clock</code> and
-      <code class="inline">rounds</code> still apply — add a <code class="inline">[pricing.&lt;provider&gt;."&lt;model&gt;"]</code> entry to
-      enforce it. A unit on an unpriced model adds <code class="inline">$0</code> (with a warning the first time) but its tokens still count.
-      The running spend is written to the run record after every round, so <code class="inline">status</code> and the control plane show it live.
-    </p>
-
-    <h2 id="verify">Verified goals</h2>
-    <p>
-      Verification is opt-in per goal. With <code class="inline">verified: true</code> on a findings target, only findings that carry a
-      <code class="inline">confirmed</code> verdict from a <em>different</em> run than the one that filed them count. Add
-      <code class="inline">verify_with: &lt;agent&gt;</code> to require that verdict come from one named pool agent, and
-      <code class="inline">verify_check: with_poc</code> to also require at least one artifact (a proof of concept) on the finding's report.
-      <code class="inline">verify_with</code> alone turns verification on; <code class="inline">verify_check</code> without either is rejected.
-      Verification applies to findings goals only; an asset goal's depth rung is its own evidence.
+      The running spend is written to the run record after every round, so <code class="inline">rupu agentiflow status</code> and the
+      control plane show it live.
     </p>
     <p>
-      Verdicts are written by the <code class="inline">findings.verify</code> tool — <code class="inline">confirmed</code>,
-      <code class="inline">disputed</code> or <code class="inline">inconclusive</code>. It is never granted automatically, not even to a
-      <code class="inline">concerns:</code> agent: write a verifier agent that lists it in <code class="inline">tools:</code> and put that agent
-      in the pool. It refuses a finding filed by the same run, and it needs a finding with a full report — so the agents that file findings
-      should use <code class="inline">findingsProfile: full</code>. The lead dispatches the verifier as a unit; its separate run id is the
-      independence, and <code class="inline">goal.status</code> shows the lead how many matches are still unverified. See
-      <a class="link" href="/docs/findings.html">Findings</a> for the report format.
+      The lead can re-check spend mid-round with <code class="inline">budget.status</code>, which reports the <code class="inline">stage</code>
+      (<code class="inline">ok</code> / <code class="inline">soft</code> / <code class="inline">hard</code>, with <code class="inline">tripped</code>
+      naming the dimension), and for each set dimension its <code class="inline">cap</code>, what it has used (<code class="inline">spent</code>,
+      <code class="inline">elapsed</code>, <code class="inline">elapsed_secs</code>), what is <code class="inline">remaining</code> and its own
+      <code class="inline">state</code>. A <code class="inline">usd</code> cap nothing can price carries <code class="inline">enforced: false</code>
+      and a note.
     </p>
 
-    <h2 id="operate">Running and steering</h2>
+    <h2 id="verification">7. Verification</h2>
+    <p>By default any recorded finding counts toward a findings goal. To count only findings someone else has confirmed:</p>
+    <pre class="code"><span class="k">goals</span>:
+  - <span class="k">id</span>: <span class="s">injection</span>
+    <span class="k">objective</span>: <span class="s">"Find and confirm two SQL injection issues."</span>
+    <span class="k">target</span>:
+      <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-89"</span> }
+      <span class="k">count_gte</span>: <span class="v">2</span>
+      <span class="k">verified</span>: <span class="v">true</span>          <span class="c"># require an independent Confirmed verdict</span>
+      <span class="k">verify_check</span>: <span class="s">with_poc</span>  <span class="c"># optional: also require an artifact on the report</span>
+    <span class="k">verify_with</span>: <span class="s">finding-verifier</span>   <span class="c"># optional: only this agent's verdict counts</span></pre>
+    <p>A finding counts only when all of these hold:</p>
+    <ul>
+      <li>its report carries a <code class="inline">confirmed</code> verification;</li>
+      <li>the verification was recorded by a <strong>different run</strong> than the one that filed the finding (a run can never verify its own finding);</li>
+      <li>with <code class="inline">verify_with</code>, the verifying agent is exactly that agent;</li>
+      <li>with <code class="inline">verify_check: with_poc</code>, the report lists at least one artifact (<code class="inline">confirmed</code>, the default, needs only the verdict).</li>
+    </ul>
+    <p>
+      Setting <code class="inline">verify_with</code> turns verification on even without <code class="inline">verified: true</code>.
+      <code class="inline">verify_check</code> without either is rejected. Verification applies to findings goals only; an asset goal's depth
+      rung is its own evidence.
+    </p>
+    <p>
+      Verdicts are written by the <code class="inline">findings.verify</code> tool (<code class="inline">finding.verify</code> is its alias).
+      It is never granted automatically, not even to a <code class="inline">concerns:</code> agent. Write a verifier agent that lists it, and
+      put that agent in the pool:
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">finding-verifier</span>
+<span class="k">description</span>: <span class="s">Re-checks a finding another run filed and records a verdict.</span>
+<span class="k">findingsProfile</span>: <span class="s">full</span>
+<span class="k">tools</span>: [<span class="s">read_file</span>, <span class="s">grep</span>, <span class="s">glob</span>, <span class="s">findings.verify</span>]
+<span class="c">---</span>
+Reproduce or refute the finding you are given. Record `confirmed` only if
+you established it yourself.</pre>
+    <p>
+      <code class="inline">findings.verify</code> takes <code class="inline">{ finding_id, status (confirmed | disputed | inconclusive), notes? }</code>;
+      the verifier's run and agent are filled in from the run context, never the tool input. The lead dispatches the verifier as a unit; its
+      separate run id is the independence. A finding can only be verified if it has a full report, so the agents that file findings should
+      use the <code class="inline">full</code> findings profile (<code class="inline">findingsProfile: full</code>; see
+      <a class="link" href="/docs/findings.html">Findings</a>).
+    </p>
+
+    <h2 id="operating-a-run-from-the-cli">8. Operating a run from the CLI</h2>
     <table>
       <thead><tr><th>Command</th><th>What it does</th></tr></thead>
       <tbody>
-        <tr><td><code>rupu agentiflow run &lt;name&gt;</code></td><td>Validate and run in the foreground until a stop, then print the outcome. <code>--detach</code> starts it in its own process group, returns once the run has started, and prints the run id; a run that fails to start reports why and leaves no run directory. <code>--format json</code> for the result.</td></tr>
-        <tr><td><code>rupu agentiflow list</code></td><td>Every run, newest first: id, name, status, stop reason, rounds, goals met, start time. <code>--format json</code> or <code>csv</code>.</td></tr>
-        <tr><td><code>rupu agentiflow status &lt;id&gt;</code></td><td>One run: status, stop reason, rounds, goals, budget and spend.</td></tr>
-        <tr><td><code>rupu agentiflow attach &lt;id&gt;</code></td><td>Follow the run's event log and the lead's transcript for the round in progress. <code>--no-follow</code> (<code>--once</code>) prints what's recorded and returns. Ctrl-C leaves the run going.</td></tr>
-        <tr><td><code>rupu agentiflow send &lt;id&gt; "&lt;message&gt;"</code></td><td>Message the lead as its operator. It arrives before the lead's next model call, mid-round included, and the next round's prompt recaps it. With <code>--now</code> the message is urgent: it goes first, and the lead's current round ends early at a safe point.</td></tr>
-        <tr><td><code>rupu agentiflow stop &lt;id&gt;</code></td><td>Graceful stop at the next round boundary, units included. <code>--now</code> signals the coordinator and every running unit immediately (SIGKILL after a short grace) and records the run as failed (<code>operator_stop:now</code>).</td></tr>
-        <tr><td><code>rupu agentiflow serve</code></td><td>Reap orphans: a run whose coordinator died is recorded as failed and its units are stopped. Runs until SIGTERM / Ctrl-C.</td></tr>
+        <tr><td><code>rupu agentiflow run &lt;name&gt;</code></td><td>Run in the foreground until the envelope stops it, then print the outcome</td></tr>
+        <tr><td><code>rupu agentiflow run &lt;name&gt; --detach</code></td><td>Start the run in its own background process group and return once it has started, printing <code>agentiflow &lt;name&gt;: run &lt;id&gt; (detached)</code> (with <code>--format json</code>, an object with <code>id</code>, <code>name</code> and <code>run_dir</code>)</td></tr>
+        <tr><td><code>rupu agentiflow list</code></td><td>All runs, newest first: id, name, status, stop reason, rounds, goals met, start time</td></tr>
+        <tr><td><code>rupu agentiflow status &lt;id&gt;</code></td><td>One run: status, stop reason, rounds, goals, budget and spend</td></tr>
+        <tr><td><code>rupu agentiflow attach &lt;id&gt;</code></td><td>Follow the run's event log and the lead's current-round transcript until it ends</td></tr>
+        <tr><td><code>rupu agentiflow attach &lt;id&gt; --no-follow</code></td><td>Print what has been recorded so far and return (alias <code>--once</code>)</td></tr>
+        <tr><td><code>rupu agentiflow send &lt;id&gt; "&lt;message&gt;"</code></td><td>Send the lead a message; it gets it before its next model call</td></tr>
+        <tr><td><code>rupu agentiflow send &lt;id&gt; "&lt;message&gt;" --now</code></td><td>Urgent: also cut the lead's current round short</td></tr>
+        <tr><td><code>rupu agentiflow stop &lt;id&gt;</code></td><td>Graceful stop at the next round boundary (units are stopped with it)</td></tr>
+        <tr><td><code>rupu agentiflow stop &lt;id&gt; --now</code></td><td>Hard stop: signal the coordinator and its units immediately</td></tr>
+        <tr><td><code>rupu agentiflow serve</code></td><td>Run the orphan reaper in the foreground (<a class="link" href="#the-orphan-reaper">section 11</a>)</td></tr>
       </tbody>
     </table>
-    <p>Run ids look like <code class="inline">af_…</code>; every command accepts the full id, the compact form <code class="inline">list</code> prints, or a unique prefix or suffix.</p>
-    <pre class="code"><span class="c"># start in the background and watch it</span>
-rupu agentiflow run <span class="v">ledger-review</span> <span class="v">--detach</span>
-rupu agentiflow attach <span class="s">af_01K…</span>
-
-<span class="c"># redirect the lead mid-flight; --now ends its round early</span>
-rupu agentiflow send <span class="s">af_01K…</span> <span class="s">"Skip the CLI wrappers; focus on the query builders."</span>
-rupu agentiflow send <span class="s">af_01K…</span> <span class="s">"Stop probing the staging host."</span> <span class="v">--now</span>
-
-<span class="c"># wind it down</span>
-rupu agentiflow stop <span class="s">af_01K…</span></pre>
     <p>
-      <code class="inline">rupu agentiflow send &lt;id&gt; &lt;text&gt; [--now]</code> is shorthand for
-      <code class="inline">rupu message send &lt;id&gt; --to lead [--urgent]</code>. The <code class="inline">rupu message</code> family
-      reaches <em>any</em> participant of the space, not just the lead: <code class="inline">send --to &lt;unit&gt;</code> (a participant,
-      a codename, <code class="inline">role:&lt;agent&gt;</code> or <code class="inline">broadcast</code>),
-      <code class="inline">rupu message list &lt;id&gt; [--follow] [--kind …] [--json]</code> to read what was said and who saw it, and
-      <code class="inline">rupu message participants &lt;id&gt;</code> for the roster. A run that isn't running, or whose coordinator is
-      gone, takes no messages: the send fails and says why. See <a class="link" href="/docs/messaging.html">Messaging</a>.
+      There is no <code class="inline">rupu agentiflow show</code> (the command is <code class="inline">status</code>) and no
+      <code class="inline">--goal</code> flag on any subcommand. <code class="inline">&lt;id&gt;</code> can be the full
+      <code class="inline">af_...</code> id, the short form <code class="inline">list</code> prints, or any unique prefix or suffix.
+      <code class="inline">run</code> and <code class="inline">status</code> take <code class="inline">--format json</code>;
+      <code class="inline">list</code> takes <code class="inline">--format json</code> or <code class="inline">csv</code>.
     </p>
+    <pre class="code"><span class="c"># Start in the background, watch it, steer it, end it</span>
+rupu agentiflow run review-sweep <span class="v">--detach</span>
+<span class="c"># agentiflow review-sweep: run af_01J... (detached)</span>
+rupu agentiflow attach <span class="s">af_01J...</span>        <span class="c"># Ctrl-C detaches; the run keeps going</span>
+rupu agentiflow send <span class="s">af_01J... "Skip the vendored code under third_party/."</span>
+rupu agentiflow stop <span class="s">af_01J...</span></pre>
     <p>
       <strong>Detaching.</strong> The background process's stderr goes to <code class="inline">&lt;run dir&gt;/detach.log</code>. The
-      launching command waits up to 30 seconds for the run to start; if it is still starting after that, the command says so and returns
-      while the run keeps going. <strong>Stopping.</strong> A plain <code class="inline">stop</code> queues a stop request on the run's
-      control queue, and the envelope ends the run at the next round boundary as <code class="inline">operator_stop</code>.
-      <code class="inline">stop --now</code> sends SIGTERM to the coordinator (and, for a detached run, its whole process group) and to every
-      unit still running, waits up to 12 seconds, sends SIGKILL to whatever is left, and records the run as <code class="inline">failed</code>.
+      launching command waits up to 30 seconds for the run to start. If the run fails before it starts (no credential, an invalid
+      definition), the error is printed by the launching command and no run directory is left behind. If it is still starting after 30
+      seconds, the command says so and returns; the run keeps going in the background.
+    </p>
+    <p>
+      <strong>Messages.</strong> <code class="inline">send</code> writes an operator message to the lead in the run's message space
+      (<a class="link" href="/docs/messaging.html">Messaging</a>) and prints its id. The lead gets it as an operator instruction before its
+      next model call, mid-round included, and the next round's prompt recaps it. With <code class="inline">--now</code> the message is
+      urgent: a watcher sees it within about 200 ms and cuts the lead's round short at a safe point (an in-flight model call is abandoned, a
+      running tool finishes); the next round starts at once and its first model call carries the message. A run that isn't running, or
+      whose coordinator is gone, takes no messages: <code class="inline">send</code> fails and says why.
+      (<code class="inline">rupu message send &lt;id&gt; --to lead</code> is the same thing; <code class="inline">rupu agentiflow send</code>
+      is shorthand.)
+    </p>
+    <p>
+      <strong>Stopping.</strong> A plain <code class="inline">stop</code> queues a stop request: the envelope ends the run at the next round
+      boundary as <code class="inline">operator_stop</code>. <code class="inline">stop --now</code> sends SIGTERM to the coordinator (and,
+      for a detached run, its whole process group) and to every unit still running, waits up to 12 seconds, sends SIGKILL to whatever is
+      left, and records the run as <code class="inline">failed</code> with stop reason <code class="inline">operator_stop:now</code>.
+    </p>
+    <p>
+      <strong>No resume.</strong> There is no agentiflow resume. A run that fails, is hard-stopped, or is reaped is over; start it again with
+      <code class="inline">rupu agentiflow run</code>. (Unlike a workflow, which <code class="inline">rupu workflow resume</code> can
+      continue, an interrupted agentiflow has no continuation path. The lead's per-round transcripts remain on disk to read.)
     </p>
 
-    <h3>The run directory</h3>
-    <p>Each run lives under <code class="inline">~/.rupu/agentiflows/af_&lt;ULID&gt;/</code>, which is also the run's message space:</p>
-    <pre class="code">agentiflow.json            <span class="c"># the run record: status, live spend, stop reason, coordinator pid</span>
-agentiflow.yaml            <span class="c"># the definition it started from</span>
-events.jsonl               <span class="c"># append-only: run_started, one round per finished round, run_stopped</span>
-usage.jsonl                <span class="c"># the run's usage ledger (lead + rollup rows from every unit)</span>
-lead/transcript.r&lt;N&gt;.jsonl <span class="c"># the lead's transcript for round N</span>
-log.jsonl                  <span class="c"># the message log: every message, append-only</span>
-participants.jsonl         <span class="c"># who joined and left the space</span>
-board/                     <span class="c"># posts.jsonl, directives.jsonl, claims/ (+ the claim journal)</span>
-mailboxes/                 <span class="c"># per-participant inboxes + the broadcast log</span>
-children.jsonl             <span class="c"># the children ledger: a started / finished line per unit</span>
-steering/                  <span class="c"># the operator's control queue: a graceful stop waiting for the round boundary</span>
-generated/                 <span class="c"># workflows written by workflows.generate</span>
-units/&lt;run id&gt;/unit.json   <span class="c"># runs from before the children ledger; still read</span>
-detach.log                 <span class="c"># stderr of a --detach run</span></pre>
+    <h2 id="operating-a-run-from-the-control-plane">9. Operating a run from the control plane</h2>
     <p>
-      A run that completes normally has status <code class="inline">completed</code> whatever the reason (the reason is in
-      <code class="inline">stop_reason</code>); <code class="inline">failed</code> means it couldn't start, crashed, was hard-stopped or was
-      reaped. Units' own runs are ordinary rupu runs: agent transcripts under the project's <code class="inline">.rupu/transcripts/</code>
-      (or <code class="inline">~/.rupu/transcripts/</code>), workflow units under <code class="inline">~/.rupu/runs/&lt;id&gt;/</code>. Pooled
-      evidence lives in the workspace under <code class="inline">.rupu/coverage/&lt;target&gt;/</code>, scoped by the run id, so two runs never
-      share a scope.
+      <code class="inline">rupu cp serve</code> shows agentiflow runs under <strong>Runs &#8594; Agentiflows</strong> in the sidebar. You can
+      launch, watch, steer and stop a run from the page, and manage the definitions under <strong>Library &#8594; Agentiflows</strong>. (For
+      the exact routes, see the <a class="link" href="/docs/api.html#agentiflows">Agentiflows section of the HTTP API</a>.)
     </p>
 
-    <h3>Orphan reaping</h3>
+    <h3 id="launching">Launching</h3>
     <p>
-      A coordinator that is killed outright would otherwise leave its run <code class="inline">running</code> and its detached units burning
-      tokens. The reaper finds <code class="inline">running</code> runs whose recorded coordinator pid no longer exists, stops their units the
-      way <code class="inline">stop --now</code> does, and records the run as failed (<code class="inline">orphaned: coordinator pid &lt;p&gt; not running</code>).
-      <code class="inline">rupu cp serve</code> runs it on its gate-sweep tick; on hosts that don't run the control plane,
-      <code class="inline">rupu agentiflow serve</code> does the same job. A run with no recorded pid is never reaped.
+      <code class="inline">POST /api/agentiflows</code> launches a run detached, as <code class="inline">rupu agentiflow run --detach</code>
+      does. On the web, the <strong>New agentiflow</strong> launcher sheet (on the runs list and the definition pages) picks a definition and
+      where the flow runs (the layer the definition lives in, a registered project, or an absolute directory), then opens the new run. A flow
+      is local-only, so there is no host picker. The definition is checked before anything starts (404 unknown, 400 invalid).
     </p>
-    <pre class="code"><span class="k">[agentiflow]</span>
-serve_enabled = <span class="v">true</span>          <span class="c"># whether `rupu agentiflow serve` runs</span>
-serve_interval_secs = <span class="v">60</span>      <span class="c"># seconds between its sweeps</span>
-reaper_enabled = <span class="v">true</span>         <span class="c"># the reap itself, in serve and in cp serve</span></pre>
 
-    <h2 id="control-plane">In the control plane</h2>
+    <h3 id="the-run-page">The run page</h3>
     <p>
-      The <a class="link" href="/docs/control-plane.html">control plane</a> lists agentiflow runs under <strong>Runs → Agentiflows</strong>
-      (status, stop reason, rounds, goals, spend, started) and gives each one a detail page with goals and budget usage in its header. A
-      running run refreshes every 5 seconds. When a run still reads <code class="inline">running</code> but its coordinator process is gone,
-      the header says so: the run died without finishing and the orphan reaper will close it.
+      The header shows a crew chip, the status, the engagement profiles, an <strong>Engagement summary</strong> strip (goals met and budget
+      bars, which open the Engagement tab), the stop reason, and <strong>Stop</strong> / <strong>Stop now</strong> buttons. A
+      <code class="inline">running</code> run whose coordinator process is gone shows a banner saying it died without finalizing and will be
+      closed out by the orphan reaper.
     </p>
+    <ul>
+      <li><strong>Stop</strong> queues a graceful stop (the lead stops at the next round boundary); the page shows a pending state until the run itself stops reading <code class="inline">running</code>.</li>
+      <li><strong>Stop now</strong> asks first, then kills the coordinator and its units and reloads the closed-out run. It is the only option when the coordinator is already gone.</li>
+    </ul>
+    <p>
+      Below the header, the <strong>Flow</strong> panel is always shown (it is not a tab). A <strong>Token flow</strong> strip shows every
+      model call of the lead and its units, grouped by round; selecting a range narrows the Transcript, Events, Findings, Messages and Network
+      tabs to that window.
+    </p>
+    <p>Then the tabs:</p>
     <table>
       <thead><tr><th>Tab</th><th>Shows</th></tr></thead>
       <tbody>
-        <tr><td><strong>Flow</strong></td><td>The unfolding map of the run, described below.</td></tr>
-        <tr><td><strong>Assets</strong></td><td>Engagement assets (hosts, services, sites, routes, files) with their depth rung.</td></tr>
-        <tr><td><strong>Findings</strong></td><td>Findings filed by the lead and its units, in the shared findings table.</td></tr>
-        <tr><td><strong>Messages</strong></td><td>The run's message space — every message, each with its delivery and who saw it — with a composer that reaches any participant; the default recipient is the lead, and an urgent send also ends the lead's round early. The send is refused, with the server's reason, once the run has finished or its coordinator process is gone.</td></tr>
-        <tr><td><strong>Transcript</strong></td><td>The lead's transcript for the latest round, tailing live.</td></tr>
-        <tr><td><strong>Events</strong></td><td><code>events.jsonl</code>, newest first.</td></tr>
+        <tr><td><strong>Engagement</strong></td><td>Goals (with progress bars and the goal predicate), the budget state, and the definition (lead, profiles, pool, lead turns)</td></tr>
+        <tr><td><strong>Transcript</strong></td><td>The lead's per-round transcripts, following the run</td></tr>
+        <tr><td><strong>Events</strong></td><td><code>events.jsonl</code>, with per-unit lifecycle merged in, newest first</td></tr>
+        <tr><td><strong>Findings</strong></td><td>Findings filed by the lead and its units</td></tr>
+        <tr><td><strong>Children</strong></td><td>Every agent, sub-agent and workflow launched under the flow, any depth</td></tr>
+        <tr><td><strong>Fleet</strong></td><td>Every unit the lead dispatched and its status</td></tr>
+        <tr><td><strong>Messages</strong></td><td>The message space, with an operator composer that reaches the lead (refused once the run has finished or its coordinator is gone)</td></tr>
+        <tr><td><strong>Network</strong></td><td>Egress across the fleet (the netflow explorer)</td></tr>
+        <tr><td><strong>Assets</strong></td><td>Engagement assets, scoped to this run (hosts, services, sites, routes, files) with their depth rung</td></tr>
       </tbody>
     </table>
 
-    <h3 id="flow">The Flow tab</h3>
+    <h3 id="the-flow-map">The flow map</h3>
     <p>
-      The Flow tab draws the run as an <strong>unfolding map</strong>, in the same visual language as a workflow run's graph. The lead is a
-      spine down the left with one node per round; a round node carries what the lead decided that round, the round's goals and spend, and
-      a link to that round's lead transcript. Each round branches right into the children it launched, drawn as the run graph's own node
-      cards — codename, agent, kind badge, status, tokens and duration, a one-line result, a transcript link — and a child launched by a
-      child hangs one column further right off its parent. A <strong>workflow child</strong> is framed in place as the workflow it is: its
-      real run graph (steps, fan-outs, panels, gates, actions), built from the same components as the run page; a workflow the lead generated
-      is labelled as written by the lead in that round and links to the definition it wrote. The map grows down (rounds) and to the right
-      (work and depth).
+      The Flow panel is an unfolding map (xyflow). It reads as the lead's spine down the left, a card per round, each round branching right
+      into the children it launched:
     </p>
-    <p>
-      <strong>Messages are drawn on the map</strong> as routed arcs under the cards, from sender to each receiver and coloured by kind
-      (direct, board post, directive, operator); an operator message enters from outside the canvas, a broadcast or role directive fans out
-      to every resolved recipient, and an undelivered message ends in a dead end marked with its reason. Hovering or selecting an arc, a card
-      or a message row lights both ends and shows the body; the toolbar filters by message kind and participant. The <strong>board</strong>
-      is a rail on the right edge: claims as held or released with owner and times, posts where they landed, standing directives with their
-      tail (a retracted one ends where it was retracted), each connected to the card that wrote it. A workflow child's own messages and board
-      are read from that child and drawn inside its frame, since a workflow child is a message root of its own.
-    </p>
-    <p>
-      A <strong>time axis</strong> with round bands and message ticks runs across the top, with a round navigator, a <strong>Replay</strong>
-      control that plays the run's growth from the start, a scrubber on the axis, and a live pill while the run is going; a running run grows
-      as rounds and children arrive. The same timeline engine drives a workflow run's page, so both replay, scrub and go live the same way.
-      At real density, rounds whose children are all finished collapse to a summary card, a round with more children than fit shows the first
-      few and a “+N more” card, and past a threshold arcs are drawn on hover or selection rather than all at once; the Messages list beneath
-      the canvas always reaches every message. Nothing on the map is invented: a run recorded before the round, decision or generated-workflow
-      fields existed shows less, and its children are placed by start time and marked as inferred.
-    </p>
-
-    <h3>API</h3>
-    <p>The API behind it is local to the control plane's own host (<code class="inline">?host=</code> is a 501), except the message space, which takes a host:</p>
-    <table>
-      <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
-      <tbody>
-        <tr><td><code>GET /api/agentiflows</code></td><td>Run list, newest first.</td></tr>
-        <tr><td><code>GET /api/agentiflows/:id</code></td><td>Record, definition snapshot, budget, events (each <code>round</code> with its <code>started_at</code>, <code>decision</code>, <code>goals</code> and <code>warnings</code>), units, lead transcript paths.</td></tr>
-        <tr><td><code>GET /api/agentiflows/:id/children</code></td><td>Every child at every depth, with <code>parent_run_id</code>, <code>depth</code>, <code>round</code>, <code>generated</code> and an output excerpt.</td></tr>
-        <tr><td><code>GET /api/agentiflows/:id/messages</code> · <code>POST …/messages</code> · <code>GET …/messages/stream</code></td><td>The message space: read it, send as the operator (<code>{to?, body, urgent?}</code>; 409 when the run isn't running), tail it over SSE.</td></tr>
-        <tr><td><code>GET /api/agentiflows/:id/board</code></td><td>The board: claims (held, released, expired) from the claim journal, and directives with their retractions.</td></tr>
-        <tr><td><code>GET /api/agentiflows/:id/generated/:handle</code></td><td>The workflow definition the lead wrote and dispatched as child <code>handle</code>.</td></tr>
-        <tr><td><code>POST /api/agentiflows/:id/steer</code></td><td>Kept as an alias: <code>{message, now?}</code> is <code>POST …/messages {to: "lead", urgent: now}</code>; <code>{stop: true}</code> queues a graceful stop.</td></tr>
-        <tr><td><code>POST /api/agentiflows</code> · <code>POST /api/agentiflows/:id/stop</code></td><td>Launch a run detached (as <code>rupu agentiflow run --detach</code>) and stop one (<code>{now?}</code>). Both need <code>rupu cp serve</code>.</td></tr>
-        <tr><td><code>GET /api/runs/:id/graph</code></td><td>A workflow child's own run graph, fetched when its frame comes into view.</td></tr>
-        <tr><td><code>GET /api/findings?run_id=&lt;id&gt;</code></td><td>The run's findings — the lead's and every unit's, down the whole tree.</td></tr>
-      </tbody>
-    </table>
-    <p>
-      <code class="inline">/api/agentiflow-defs</code> lists, reads, writes and validates definition files (global and project layers); see
-      <a class="link" href="/docs/api.html">HTTP API</a>. Over <code class="inline">rupu cp serve</code>'s <a class="link" href="/docs/mcp.html">MCP</a>
-      endpoint the same routes are operator tools (<code class="inline">agentiflows.*</code>, <code class="inline">agentiflow_defs.*</code>),
-      and <code class="inline">wait</code> takes an <code class="inline">agentiflow</code> condition that fires when the run writes a line.
-    </p>
-    <div class="callout">
-      <strong>Start and stop from the CLI.</strong> The web page observes and steers a run; <code>rupu agentiflow run</code> and
-      <code>rupu agentiflow stop</code> (or the API routes above) start and end one. The control plane reads runs on its own host, and
-      units always run locally.
-    </div>
-
-    <h2 id="limits">Limitations</h2>
     <ul>
-      <li><strong>Local only.</strong> The CP reads agentiflow runs on its own host, and units always run locally: workflows with <code class="inline">host:</code> or <code class="inline">distribute:</code> can't be run as units.</li>
-      <li><strong><code class="inline">trigger:</code> is not acted on</strong> and <strong><code class="inline">scope</code> is shown, not enforced.</strong></li>
-      <li><strong>No sub-leads.</strong> Units may dispatch children within the pool, but only the lead plans rounds.</li>
-      <li><strong>Workflows with approval gates can't run as units</strong> — a unit has no terminal to answer the prompt.</li>
+      <li>A <strong>round card</strong> shows what the lead decided that round (its last reply, the <code class="inline">decision</code>), the goals met after it, the spend as it ended, how many children it launched, and a link to that round's lead transcript. A round whose lead call failed is drawn failed with the reason.</li>
+      <li>A <strong>child card</strong> (an agent or sub-agent, any depth) shows its handle or address, the agent's identity, its one-line result or error, and its tokens, duration and transcript.</li>
+      <li>A <strong>workflow child</strong> is drawn as a frame holding its real run graph. A frame the lead generated with <code class="inline">workflows.generate</code> is labelled "written by the lead in round N" with a button to view the YAML it wrote.</li>
+      <li><strong>Messages</strong> are drawn as arcs between cards, with a travelling packet when a message arrives and a red dead end for one that reached nobody.</li>
+      <li>A <strong>board rail</strong> on the right shows claims (held, released, expired), board posts and standing directives.</li>
+      <li>A <strong>time axis</strong> replays the run; <strong>message-kind</strong> and <strong>participant</strong> filters and a <strong>round navigator</strong> move through a long engagement.</li>
+    </ul>
+    <p>Density: the last two finished rounds plus the live one stay expanded; a round shows at most eight cards before "+N more".</p>
+
+    <h3 id="library-agentiflows">Library &#8594; Agentiflows</h3>
+    <p>
+      The definition pages (<code class="inline">/library?tab=agentiflows</code>, or the per-definition page) list the
+      <code class="inline">&lt;name&gt;.yaml</code> files <code class="inline">rupu agentiflow run</code> loads, global and per project. Each
+      row shows its layer, lead and engagement profiles, with a Launch action. A definition page is an editor with a validity badge and Save
+      / Revert / Delete / Launch. <strong>New agentiflow</strong> creates one in the global layer.
+    </p>
+
+    <h2 id="operating-a-run-from-mcp">10. Operating a run from MCP</h2>
+    <p>
+      An external agent operates an agentiflow over <code class="inline">rupu cp serve</code>'s <code class="inline">/mcp</code> endpoint
+      (<a class="link" href="/docs/mcp.html">MCP &amp; tools</a>). The agentiflow tools are:
+    </p>
+    <table>
+      <thead><tr><th>Tool</th><th>Does</th></tr></thead>
+      <tbody>
+        <tr><td><code>agentiflows.list</code></td><td>Runs, newest first</td></tr>
+        <tr><td><code>agentiflows.get</code></td><td>One run's record</td></tr>
+        <tr><td><code>agentiflows.events</code></td><td>The recorded events</td></tr>
+        <tr><td><code>agentiflows.usage_timeline</code></td><td>The per-call token series (lead and units)</td></tr>
+        <tr><td><code>agentiflows.children</code></td><td>The units and their children</td></tr>
+        <tr><td><code>agentiflows.unit_output</code></td><td>One unit's output</td></tr>
+        <tr><td><code>agentiflows.board</code></td><td>The board (claims, directives)</td></tr>
+        <tr><td><code>agentiflows.generated</code></td><td>The YAML the lead wrote for a generated workflow child</td></tr>
+        <tr><td><code>agentiflows.steer</code></td><td>Message the lead, or ask the flow to stop</td></tr>
+        <tr><td><code>agentiflows.run</code></td><td>Launch a run from a definition</td></tr>
+        <tr><td><code>agentiflows.stop</code></td><td>Stop a run, gracefully or (with <code>now</code>) at once</td></tr>
+        <tr><td><code>agentiflow_defs.list</code> / <code>.get</code> / <code>.create</code> / <code>.save</code> / <code>.delete</code> / <code>.validate</code></td><td>Manage the definitions</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <code class="inline">wait { kind: "agentiflow", id, types? }</code> long-polls until the flow writes a line (optionally only certain
+      kinds, such as <code class="inline">round</code> or <code class="inline">run_stopped</code>); it is local only. The
+      <code class="inline">author-agentiflow</code> prompt (<code class="inline">prompts/get</code>) is a short instruction for writing a
+      definition, pointing at this page and the engagement, coverage and messaging docs.
+    </p>
+
+    <h2 id="the-orphan-reaper">11. The orphan reaper</h2>
+    <p>
+      A coordinator that dies without finishing (SIGKILL, a crash, the machine going down) would otherwise leave its run
+      <code class="inline">running</code> forever and its detached units using tokens with nobody steering them. The reaper finds
+      <code class="inline">running</code> runs whose recorded coordinator pid no longer exists, stops their units the same way
+      <code class="inline">stop --now</code> does, and records the run as <code class="inline">failed</code> with stop reason
+      <code class="inline">orphaned: coordinator pid &lt;p&gt; not running</code>.
+    </p>
+    <p>Two things run it:</p>
+    <ul>
+      <li><code class="inline">rupu cp serve</code>, on its gate-sweep tick (every <code class="inline">[cp].gate_sweep_interval_secs</code>);</li>
+      <li><code class="inline">rupu agentiflow serve</code>, a foreground loop for hosts that don't run the control plane. It sweeps at startup and then every <code class="inline">serve_interval_secs</code> until SIGTERM or Ctrl-C.</li>
+    </ul>
+    <p>
+      Both are configured under <code class="inline">[agentiflow]</code> (<code class="inline">serve_enabled</code>,
+      <code class="inline">serve_interval_secs</code>, <code class="inline">reaper_enabled</code>); see
+      <a class="link" href="/docs/configuration.html#agentiflow">Configuration: [agentiflow]</a>. A run with no recorded pid is treated as
+      "owner unknown" and never reaped.
+    </p>
+    <pre class="code"><span class="k">[agentiflow]</span>
+<span class="k">serve_enabled</span> = <span class="v">true</span>          <span class="c"># whether `rupu agentiflow serve` runs</span>
+<span class="k">serve_interval_secs</span> = <span class="v">60</span>      <span class="c"># seconds between its sweeps</span>
+<span class="k">reaper_enabled</span> = <span class="v">true</span>         <span class="c"># the reap itself, in serve and in cp serve</span></pre>
+
+    <h2 id="where-state-lives">12. Where state lives</h2>
+    <p>Each run gets a directory <code class="inline">~/.rupu/agentiflows/af_&lt;ULID&gt;/</code>:</p>
+    <table>
+      <thead><tr><th>Path</th><th>Contents</th></tr></thead>
+      <tbody>
+        <tr><td><code>agentiflow.json</code></td><td>The run record: status (<code>running</code>, <code>completed</code>, <code>failed</code>), stop reason, rounds, goal status, spend, coordinator pid, crew codename. Rewritten atomically after each round and at the end</td></tr>
+        <tr><td><code>agentiflow.yaml</code></td><td>The definition the run started from (re-serialized), so the run stays readable if the file is later edited</td></tr>
+        <tr><td><code>events.jsonl</code></td><td>Append-only events: <code>run_started</code>, one <code>round</code> per finished round (below), <code>run_stopped</code></td></tr>
+        <tr><td><code>usage.jsonl</code></td><td>The run's usage ledger: the lead's calls, plus every unit's and their children's as rollup rows</td></tr>
+        <tr><td><code>lead/transcript.r&lt;N&gt;.jsonl</code></td><td>The lead's transcript for round N (and <code>lead/netflow.jsonl</code> for the launch)</td></tr>
+        <tr><td><code>codenames.json</code></td><td>The crew's role allocation and instance counters, so a round or unit keeps its codename</td></tr>
+        <tr><td><code>steering/</code></td><td>The operator's control queue: a graceful stop waiting for the round boundary</td></tr>
+        <tr><td><code>board/</code></td><td><code>posts.jsonl</code>, <code>directives.jsonl</code>, <code>claims/</code> and the claim journal <code>claims.jsonl</code></td></tr>
+        <tr><td><code>mailboxes/</code></td><td>Per-participant inboxes, the broadcast log and cursors</td></tr>
+        <tr><td><code>log.jsonl</code>, <code>participants.jsonl</code></td><td>The flow's message log and participant registry (<a class="link" href="/docs/messaging.html">Messaging</a>). A flow recorded before they existed has neither</td></tr>
+        <tr><td><code>children.jsonl</code></td><td>The children ledger: a <code>started</code> line per unit (kind, name, run id, codename, address, process group, the round that launched it) and a <code>finished</code> line when it ends</td></tr>
+        <tr><td><code>units/&lt;run id&gt;/unit.json</code></td><td>Runs started before the children ledger existed: one record per unit. Still read</td></tr>
+        <tr><td><code>generated/</code></td><td>Workflows written by <code>workflows.generate</code></td></tr>
+        <tr><td><code>detach.log</code></td><td>stderr of a <code>--detach</code> run</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The <strong><code class="inline">round</code> event</strong> (newest fields last) carries: <code class="inline">round</code>,
+      <code class="inline">budget</code> (<code class="inline">ok</code> / <code class="inline">soft</code> / <code class="inline">hard:&lt;dim&gt;</code>),
+      <code class="inline">converge</code>, <code class="inline">goals_met</code>, <code class="inline">goals_total</code>,
+      <code class="inline">steering</code> (the count of operator messages the round's prompt recapped), <code class="inline">outcome</code>
+      (<code class="inline">yielded</code> / <code class="inline">turn_budget_hit</code> / <code class="inline">error</code>),
+      <code class="inline">spent_usd</code>, <code class="inline">spent_tokens</code>, <code class="inline">started_at</code>,
+      <code class="inline">goals</code> (<code class="inline">[{id, met, current}]</code> as the round <em>started</em>, so the state after
+      round N is round N+1's <code class="inline">goals</code>), and optionally <code class="inline">decision</code> (the lead's last reply
+      that round, trimmed to about 600 characters), <code class="inline">warnings</code> (the digest's warnings) and
+      <code class="inline">error</code> (when the round errored). The <code class="inline">run_stopped</code> event carries
+      <code class="inline">stop_reason</code>, <code class="inline">detail</code>, <code class="inline">rounds</code>,
+      <code class="inline">goals</code>, <code class="inline">summary</code>, <code class="inline">spent_usd</code> and
+      <code class="inline">spent_tokens</code>.
+    </p>
+    <p>
+      Units' own runs are ordinary rupu runs: transcripts under the project's <code class="inline">.rupu/transcripts/</code> (or
+      <code class="inline">~/.rupu/transcripts/</code>), workflow units under <code class="inline">~/.rupu/runs/&lt;id&gt;/</code>. Pooled
+      evidence (findings, assets, coverage) lives in the workspace under <code class="inline">.rupu/coverage/&lt;target&gt;/</code>, where
+      <code class="inline">&lt;target&gt;</code> is a hash of the workspace path and the run id, so two runs never share a scope.
+      <code class="inline">rupu coverage list</code> shows the target ids; <code class="inline">rupu coverage show &lt;target&gt;</code> shows
+      the ledger.
+    </p>
+
+    <h2 id="api">13. API</h2>
+    <p>
+      The HTTP API behind the control plane, all on the local host, is documented in the
+      <a class="link" href="/docs/api.html#agentiflows">HTTP API: agentiflows</a> (the run routes) and
+      <a class="link" href="/docs/api.html#agentiflow-definitions">HTTP API: agentiflow definitions</a> (the definition routes). The board
+      shape is in <a class="link" href="/docs/api.html#board">HTTP API: board</a>. The MCP tools are in
+      <a class="link" href="#operating-a-run-from-mcp">section 10</a> and <a class="link" href="/docs/mcp.html">MCP &amp; tools</a>.
+    </p>
+
+    <h2 id="limitations">14. Limitations</h2>
+    <p>What is not built, or only partly built, today:</p>
+    <ul>
+      <li><strong>No resume.</strong> A run that fails, is hard-stopped, or is reaped cannot be continued; start it again. Its lead transcripts remain on disk.</li>
+      <li><strong>Local only.</strong> The control plane reads runs on its own host, and units always run locally: a workflow with <code class="inline">host:</code> or <code class="inline">distribute:</code> placement is refused as a unit. There is no remote-host listing for agentiflows.</li>
+      <li><strong><code class="inline">trigger:</code> is not acted on.</strong> It is parsed and stored, but nothing schedules an agentiflow. Use cron to call <code class="inline">rupu agentiflow run --detach</code> if you need one.</li>
+      <li><strong><code class="inline">scope</code> is shown, not enforced.</strong> The lead's opening-round prompt lists <code class="inline">scope.mode</code> and every <code class="inline">scope.roots</code> entry as the authorized targets, but nothing stops an agent from reaching beyond them; put hard constraints in the goal objectives too, and give the pool only agents you trust unattended.</li>
+      <li><strong>No sub-leads.</strong> Only the lead starts units.</li>
+      <li><strong>Workflows with approval gates can't run as units.</strong> A unit has no terminal to answer the prompt.</li>
       <li><strong>Verification is findings-only.</strong> Asset goals can't require verification.</li>
-      <li><strong>The CP Assets tab is not scoped to the run</strong>; it lists assets from every registered workspace.</li>
-      <li><strong>No definition listing or dry-run validation on the CLI</strong>; <code class="inline">run</code> validates at launch (the API's <code class="inline">/api/agentiflow-defs/validate</code> does check a file without running it).</li>
+      <li><strong>No CLI definition listing or dry-run.</strong> The CLI validates at launch; listing and validating a definition without running it is on the control plane and MCP only (<code class="inline">/api/agentiflow-defs</code>, <code class="inline">agentiflow_defs.validate</code>).</li>
+      <li><strong>No stock agentiflow definition ships.</strong> <code class="inline">rupu fleet install</code> lays down the pool agents and workflows, but you write the definition. The <a class="link" href="/docs/agentiflow-tutorial.html">tutorial</a> and the repo's <code class="inline">.rupu/agentiflows/*.yaml</code> examples give something to copy.</li>
+    </ul>
+
+    <h2 id="troubleshooting">15. Troubleshooting</h2>
+    <table>
+      <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+      <tbody>
+        <tr><td><code>budget.usd</code> shows <code>$0</code> / under-counts</td><td>The lead's (or a unit's) model has no price. Add a <code>[pricing.&lt;provider&gt;."&lt;model&gt;"]</code> entry; a <code>usd</code> cap on an unpriced lead is dropped at launch. <code>rupu agentiflow status</code> names the unpriced models</td></tr>
+        <tr><td>A warning that the run "has no automatic terminator"</td><td>No required goal, no coverage target, no enforceable budget cap, no ceiling. Only an operator stop can end it. Add a cap or a ceiling</td></tr>
+        <tr><td><code>workflows.generate</code> is not offered</td><td>The generating provider has no credential, or it authenticates with Anthropic OAuth (which can't be built where the tool runs). Use an API-key provider</td></tr>
+        <tr><td><code>dispatch refused: ... is not in this flow's pool</code></td><td>The agent or workflow is not in <code>pool.agents</code> / <code>pool.workflows</code>. Add it to the pool</td></tr>
+        <tr><td><code>v1 cannot run a gated or host/distribute workflow as a child</code></td><td>The workflow has an <code>approval:</code> gate or <code>host:</code> / <code>distribute:</code> placement. Units run unattended and locally</td></tr>
+        <tr><td>Coverage stuck at <code>0%</code></td><td>No assets marked yet, or the kinds enumerated don't match. The agents must call <code>assets.mark</code>; check the Assets tab</td></tr>
+        <tr><td>The run reads <code>running</code> but nothing is happening</td><td>The coordinator died. The page shows a dead-coordinator banner; the orphan reaper (<a class="link" href="#the-orphan-reaper">section 11</a>) will close it as <code>orphaned:</code>, or <code>rupu agentiflow stop &lt;id&gt; --now</code> closes it now</td></tr>
+        <tr><td>A <code>--detach</code> run never printed an id</td><td>It failed before starting. Read <code>&lt;run dir&gt;/detach.log</code>, or the error the launching command printed</td></tr>
+        <tr><td>A goal never reaches <code>met</code> though findings exist</td><td>The <code>classification</code> must match a classification on the finding's <em>report</em>; a summary-profile finding has none. For a verified goal, the verifier needs the <code>full</code> profile and must be a different run</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="see-also">See also</h2>
+    <ul>
+      <li><a class="link" href="/docs/agentiflow-tutorial.html">Tutorial</a>: an end-to-end walkthrough</li>
+      <li><a class="link" href="/docs/agentiflow-authoring.html">Authoring</a>: writing a lead, goal-target recipes, budget tuning, pool design, steering</li>
+      <li><a class="link" href="/docs/configuration.html#agentiflow">Configuration</a>: <code class="inline">[agentiflow]</code> settings; <a class="link" href="/docs/configuration.html#pricing"><code class="inline">[pricing]</code></a> for <code class="inline">budget.usd</code></li>
+      <li><a class="link" href="/docs/profiles.html">Engagement profiles</a>: engagement profiles, asset kinds and the asset ledger</li>
+      <li><a class="link" href="/docs/findings.html">Findings</a> and <a class="link" href="/docs/coverage.html">Coverage</a>: findings and finding reports</li>
+      <li><a class="link" href="/docs/messaging.html">Messaging</a>: the board, mailboxes and operator messages</li>
+      <li><a class="link" href="/docs/agents.html">Agents</a>: agent files, <code class="inline">tools:</code> and <code class="inline">findingsProfile</code></li>
+      <li><a class="link" href="/docs/workflow-reference.html">Authoring reference</a>: workflows a lead can run as units</li>
+      <li><a class="link" href="/docs/api.html#agentiflows">HTTP API</a>: the agentiflow routes</li>
+      <li><a class="link" href="/docs/mcp.html">MCP &amp; tools</a>: operating a run from MCP</li>
     </ul>
 
     <!-- prev / next footer nav -->
     <div class="doc-nav">
       <a href="/docs/autoflows.html">&#8592; Autoflows</a>
-      <a href="/docs/sessions.html">Sessions &#8594;</a>
+      <a href="/docs/agentiflow-tutorial.html">Agentiflow tutorial &#8594;</a>
     </div>
   </main>
 </div>

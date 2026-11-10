@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -118,6 +120,16 @@
       <code class="inline">rupu agent validate &lt;name&gt;</code> / <code class="inline">--all</code> checks that an
       agent file parses, names only tools rupu knows and only skills that are installed.
     </p>
+    <p>
+      <code class="inline">rupu-session</code> is a reserved name: the built-in session harness compiled into the
+      binary (<code class="inline">crates/rupu-agent/src/builtin/rupu-session.md</code>). It resolves before either
+      disk layer, so an <code class="inline">agents/rupu-session.md</code> of your own is never read; do not name an
+      agent that. It is <code class="inline">permissionMode: readonly</code> by default, declares
+      <code class="inline">fallbacks: []</code> and an explicit <code class="inline">tools:</code> list (the core file
+      and shell tools, the catalog and launch tools, coverage, findings, the SCM and issue connectors), and takes
+      its provider and model from the session launch rather than the file. See
+      <a class="link" href="/docs/sessions.html">Sessions</a>.
+    </p>
 
     <h3>Frontmatter fields</h3>
     <table>
@@ -144,6 +156,7 @@
         <tr><td><code>concerns</code></td><td>object</td><td>none</td><td>Coverage-concerns block; injects the coverage tools and the catalog into the system prompt.</td></tr>
         <tr><td><code>findingsProfile</code></td><td><code>full</code> | <code>summary</code></td><td><code>full</code></td><td>Findings contract for <code class="inline">findings.report</code>. A workflow step's <code class="inline">findings_profile</code> or the workflow's <code class="inline">defaults.findings_profile</code> overrides it.</td></tr>
         <tr><td><code>fallbacks</code></td><td>array of <code>{model, provider?}</code></td><td><code>[recovery].fallbacks</code> from config, else none</td><td>Ordered fallback models tried when a reply cannot be used. See <a class="link" href="#fallbacks">Fallbacks</a>.</td></tr>
+        <tr><td><code>cyber</code></td><td><code>standard</code> | <code>daybreak_blue</code> | <code>daybreak_red</code></td><td>none</td><td>OpenAI only: the Daybreak access program sent as <code class="inline">access_programs: { cyber: &lt;value&gt; }</code>. An unknown value is a parse error. See <a class="link" href="#cyber">cyber</a>.</td></tr>
         <tr><td><code>maxTokens</code></td><td>integer</td><td>discovered output cap</td><td>Per-request output-token cap.</td></tr>
         <tr><td><code>contextWindowTokens</code></td><td>integer</td><td>discovered input limit</td><td>Input-token limit used for proactive compaction.</td></tr>
         <tr><td><code>compactAtPercent</code></td><td>integer</td><td><code>80</code></td><td>Percentage of the input limit at which compaction triggers; clamped to 10&ndash;95.</td></tr>
@@ -210,6 +223,65 @@
     </table>
     <p>See <a class="link" href="/docs/coverage.html">Coverage</a> and <a class="link" href="/docs/findings.html">Findings</a>.</p>
 
+    <h3 id="cyber"><code class="inline">cyber</code></h3>
+    <p>
+      Selects OpenAI's <a class="link" href="https://developers.openai.com/api/docs/guides/daybreak" target="_blank" rel="noopener">Daybreak</a>
+      access program for the <code class="inline">cyber</code> capability. OpenAI only: the agent runs on
+      <code class="inline">provider: openai</code> (or an account whose <code class="inline">kind</code> is
+      <code class="inline">openai</code>, <code class="inline">openai_codex</code> or <code class="inline">codex</code>,
+      which all build the same client) with a Daybreak-capable model (e.g. <code class="inline">gpt-5.6-cyber</code>),
+      under an API key or a ChatGPT login alike. The value is emitted on the Responses API request body as
+      <code class="inline">access_programs: { cyber: &lt;value&gt; }</code>. Note that <code class="inline">openai-codex</code>
+      with a hyphen is the display id rupu prints in transcripts and pricing, not a built-in provider name:
+      <code class="inline">provider: openai-codex</code> works only with
+      <code class="inline">[providers.openai-codex] kind = "openai_codex"</code> declared and logged in. See
+      <a class="link" href="/docs/providers.html">Providers &amp; Auth</a> for the org/project scoping and the full
+      behaviour notes.
+    </p>
+    <ul>
+      <li><code class="inline">standard</code>: the ordinary access tier (no cyber program).</li>
+      <li><code class="inline">daybreak_blue</code>: the Daybreak defensive program.</li>
+      <li><code class="inline">daybreak_red</code>: the Daybreak offensive program.</li>
+    </ul>
+    <p>
+      Setting <code class="inline">cyber</code> <strong>selects</strong> a program; it does not <strong>grant</strong>
+      access. Your organization or project must already be approved for it.
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">exploit-verifier</span>
+<span class="k">provider</span>: <span class="s">openai</span>
+<span class="k">model</span>: <span class="s">gpt-5.6-cyber</span>
+<span class="k">cyber</span>: <span class="s">daybreak_red</span>
+<span class="c">---</span></pre>
+    <p><strong>Precedence.</strong> Three surfaces set <code class="inline">cyber</code>, highest first:</p>
+    <ol>
+      <li><code class="inline">rupu run --cyber &lt;program&gt;</code>: a per-run override on the command line.
+        <code class="inline">rupu run --continue &lt;id&gt;</code> restores it with the rest of the original command; a
+        <code class="inline">--cyber</code> given on the continue replaces it.</li>
+      <li>This <code class="inline">cyber:</code> frontmatter key. An unknown value here is a parse error: the agent file
+        does not load.</li>
+      <li>A provider model-config default: a <code class="inline">cyber</code> on the matching
+        <code class="inline">[[providers.openai.models]]</code> entry (see
+        <a class="link" href="/docs/configuration.html#cyber">Configuration</a>). An unknown value there is ignored
+        with a warning, not an error.</li>
+    </ol>
+    <p>
+      A program set at run start follows the run through a model fallback hop only while the model stays the same;
+      a hop to a different model or provider drops it, since the right value is model-specific. The compaction
+      summariser call never carries it, only the turn requests do. A session freezes the program at
+      <code class="inline">session start</code> and applies it to every turn; a session settings override of the
+      provider or model clears it, and <code class="inline">rupu session start</code> has no
+      <code class="inline">--cyber</code> flag.
+    </p>
+    <p>
+      <strong>Remote hosts:</strong> like every frontmatter key, a rupu release that predates
+      <code class="inline">cyber</code> refuses to load an agent file that sets it, so upgrade rupu on any remote host
+      (<code class="inline">host:</code> / <code class="inline">distribute:</code>) before placing a
+      <code class="inline">cyber</code> agent there. A coordinator's <code class="inline">rupu run --cyber</code> is not
+      passed to placed units: a placed unit runs the agent file installed on its host, so the program comes from
+      that file's <code class="inline">cyber:</code> or that host's config.
+    </p>
+
     <h3 id="fallbacks">Fallbacks</h3>
     <p>
       <code class="inline">fallbacks:</code> is an ordered list of models to try when the agent&rsquo;s own model
@@ -223,7 +295,7 @@
     </p>
     <pre class="code"><span class="k">fallbacks</span>:
   - <span class="k">model</span>: <span class="s">claude-sonnet-5-5</span>        <span class="c"># same provider as the agent</span>
-  - <span class="k">provider</span>: <span class="s">openai-codex</span>          <span class="c"># another provider</span>
+  - <span class="k">provider</span>: <span class="s">openai</span>                <span class="c"># another provider (a built-in name, or a declared account)</span>
     <span class="k">model</span>: <span class="s">gpt-5.6-cyber</span></pre>
 
     <h3 id="skills">Skills</h3>
@@ -313,7 +385,7 @@
 <span class="k">messaging</span>: <span class="v">false</span>
 <span class="k">fallbacks</span>:
   - <span class="k">model</span>: <span class="s">claude-sonnet-5-5</span>       <span class="c"># same account</span>
-  - <span class="k">provider</span>: <span class="s">openai-codex</span>       <span class="c"># another provider</span>
+  - <span class="k">provider</span>: <span class="s">openai</span>             <span class="c"># another provider</span>
     <span class="k">model</span>: <span class="s">gpt-5.6-cyber</span>
 <span class="k">anthropicContextManagement</span>: <span class="s">tool_clearing</span>
 <span class="c">---</span>

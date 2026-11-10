@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item active" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -347,15 +349,86 @@ summarise x.pdf</pre>
       missing and stays in the set, so it comes back once it is installed again.
     </p>
     <div class="callout">
-      <strong>Record versions.</strong> A session record that carries skills is written as version 2; one without
-      skills stays version 1. A rupu that knows session skills refuses a record from a newer rupu rather than write
-      it back without the fields it doesn't know; <code class="inline">rupu session list</code> shows such a session
-      with status <code class="inline">newer rupu</code>, and <code class="inline">rupu session prune</code> leaves it alone.
-      A queued turn that invokes skills is turn request version 2, and a worker that knows <code class="inline">--skill</code>
-      fails a turn queued by a newer rupu with a transcript saying so. After upgrading rupu, run
-      <code class="inline">rupu session stop &lt;id&gt;</code> before using <code class="inline">--skill</code> on a running
-      session. More in <a class="link" href="/docs/sessions.html">Sessions</a>.
+      <strong>Record versions.</strong> A session record is written at the lowest version a rupu must understand to
+      keep it whole: version 2 when it carries skills, version 3 when its agent sets
+      <code class="inline">messaging: false</code>, version 4 for a built-in <code class="inline">rupu-session</code>
+      (see <a class="link" href="#preset">Session skill preset</a>), else version 1. A rupu older than session skills
+      doesn't check the version, so it continues a version 2 session but drops its skills the next time it writes the
+      record: the session runs on without them. A rupu that knows session skills refuses a record from a newer rupu
+      ("this session was written by a newer rupu; upgrade rupu to continue it") rather than write it back without the
+      fields it doesn't know; <code class="inline">rupu session list</code> shows such a session with status
+      <code class="inline">newer rupu</code> and a warning, and <code class="inline">rupu session prune</code> leaves it alone.
+      A queued turn is written at the lowest version a worker must understand to run it as asked: version 2 when it
+      invokes skills, version 3 when the session has
+      <a class="link" href="/docs/sessions.html#runtime-settings">runtime settings</a> written (a provider, model or
+      tools override), version 4 when the session has
+      <a class="link" href="/docs/sessions.html#orchestration">orchestration</a> configured, else version 1, so an
+      older worker still runs a plain turn. A worker that knows <code class="inline">--skill</code> fails a turn queued
+      by a newer rupu, with a transcript ("this turn was queued by a newer rupu (turn request version &lt;n&gt;);
+      restart the session worker: rupu session stop &lt;id&gt;"), rather than run it without what it asked for. A
+      worker older than <code class="inline">--skill</code> can't refuse what it predates: it would run the turn
+      without its skills. <code class="inline">session send</code> restarts a worker whose rupu binary is older than
+      its own, judged by the binary's modification time, but it keeps the worker when that can't be read. After
+      upgrading rupu, run <code class="inline">rupu session stop &lt;id&gt;</code> before using
+      <code class="inline">--skill</code>, settings or orchestration on a running session. More in
+      <a class="link" href="/docs/sessions.html">Sessions</a>.
     </div>
+
+    <h2 id="preset">Session skill preset</h2>
+    <p>
+      A built-in <code class="inline">rupu-session</code> session (<a class="link" href="/docs/sessions.html#builtin">Built-in
+      session</a>) starts with a curated set of installed skills, the preset <code class="inline">rupu-session-v1</code>:
+    </p>
+    <table>
+      <thead><tr><th>Member</th><th>Role in the session</th></tr></thead>
+      <tbody>
+        <tr><td><code>global:rupu-session-operations</code></td><td>How to work inside a built-in session: catalog, child runs, messages, coverage, findings. Preloaded.</td></tr>
+        <tr><td><code>global:coverage-assets</code></td><td>Recording the assets the work touches. Indexed.</td></tr>
+        <tr><td><code>global:finding-report</code></td><td>Writing a complete, reproducible finding. Indexed.</td></tr>
+        <tr><td><code>global:work-units</code></td><td>Normalizing results and splitting work into units. Indexed.</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The preset names exact global skills; it installs nothing and grants no tools.
+      <code class="inline">rupu-session-operations</code> is preloaded, so its instructions are in the system prompt from the
+      first turn; the other three stay indexed and the model loads them with <code class="inline">skills.load</code> when a
+      task calls for them, keeping their larger bodies out of the initial prompt. Only an installed, valid, model-loadable
+      member is selected. A member that is missing, invalid, or marked <code class="inline">disable-model-invocation</code> is
+      left out and recorded on the session as a <code class="inline">skill_preset_diagnostics</code> entry
+      (<code class="inline">not_installed</code>, <code class="inline">invalid</code>, <code class="inline">not_model_loadable</code>,
+      with a message naming the skill), and the session still starts. Installing the skill later neither clears the diagnostic
+      nor adds the skill to that session: like every session skill, the set is frozen at start. A skill you name yourself with
+      <code class="inline">--skill</code> or <code class="inline">--preload-skill</code> keeps its own layer and preload flag;
+      the preset never upgrades an explicitly indexed operations skill to preload.
+    </p>
+    <p>
+      <code class="inline">rupu session start rupu-session --skill-preset none</code> starts without the preset additions and
+      keeps any explicit <code class="inline">--skill</code> / <code class="inline">--preload-skill</code> entries.
+      <code class="inline">--skill-preset</code> is refused for any other agent ("skill presets apply only to rupu-session").
+      Over HTTP the project session start takes <code class="inline">skill_preset</code>, <code class="inline">skills</code> and
+      <code class="inline">preload_skills</code> (feature <code class="inline">session.skill_preset.v1</code>), and
+      <code class="inline">GET /api/projects/:id/session-capabilities</code> previews what the preset would select for a
+      project, diagnostics included, while <code class="inline">GET /api/sessions/:id/capabilities</code> shows a session's
+      frozen set, its preset and preset diagnostics. Contract:
+      <a class="link" href="https://github.com/Section9Labs/rupu/blob/main/docs/session-capabilities-v1.md" target="_blank" rel="noopener">session-capabilities-v1.md</a>;
+      routes: <a class="link" href="/docs/api.html#sessions">HTTP API</a>.
+    </p>
+    <p>
+      None of the four members ships inside the binary, so install them into the global layer (the preset reads only
+      <code class="inline">global:</code>) before starting a built-in session. <code class="inline">rupu-session-operations</code>
+      lives in the rupu repository at <code class="inline">skills/rupu-session-operations/</code>; the other three are in
+      <a class="link" href="https://github.com/Section9Labs/rupu-skills" target="_blank" rel="noopener">Section9Labs/rupu-skills</a>:
+    </p>
+    <pre class="code"><span class="c"># from a checkout of the rupu repository</span>
+rupu skill install ./skills/rupu-session-operations
+
+<span class="c"># the other three, from GitHub</span>
+rupu skill install Section9Labs/rupu-skills <span class="k">--skill</span> coverage-assets <span class="k">--skill</span> finding-report <span class="k">--skill</span> work-units</pre>
+    <p>
+      <code class="inline">rupu skill install Section9Labs/rupu --skill rupu-session-operations</code> works too (the
+      repository is public and holds that one <code class="inline">SKILL.md</code>), at the cost of cloning the whole
+      repository. <code class="inline">rupu skill list</code> shows the four installed.
+    </p>
 
     <h2 id="placed">Skills on placed units</h2>
     <p>

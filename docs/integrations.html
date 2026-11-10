@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -184,6 +186,7 @@ gitlab:group/project/issues/9  <span class="c"># issue 9</span></pre>
       </tbody>
     </table>
     <p>The findings tools (<code class="inline">findings.report</code>, <code class="inline">findings.verify</code>, <code class="inline">findings.query</code>, <code class="inline">findings.tag</code>) sit in the same catalog; they are covered on the <a class="link" href="/docs/findings.html#tools">Findings</a> page.</p>
+    <p>Separate from these connector tools, the control plane reads a registered project's own checkout: <code class="inline">GET /api/projects/:ws_id/scm</code> (the MCP operator tool <code class="inline">projects.scm</code>) returns its branch, status and staged and working diffs through libgit2, and with <code class="inline">include_review=true</code> the current branch's PRs / MRs through the account the rules below select for it. See <a class="link" href="/docs/api.html#projects-and-code">HTTP API: Projects and code</a>.</p>
 
     <h3>In an agent</h3>
     <p>An agent gets a connector tool by naming it in its <code class="inline">tools:</code> frontmatter &mdash; an exact name, a namespace (<code class="inline">scm.*</code>, <code class="inline">issues.*</code>) or <code class="inline">*</code>. A call to a tool the agent didn&rsquo;t list fails with <code class="inline">tool not in agent's tools: list</code>. The run&rsquo;s permission mode decides each call from the tool&rsquo;s effect: the read tools (<code class="inline">scm.prs.get</code>, <code class="inline">issues.list</code>, &hellip;) are allowed in every mode, while the write tools act outside this machine (<code class="inline">external</code> effect &mdash; <code class="inline">scm.prs.create</code>, <code class="inline">scm.branches.create</code>, <code class="inline">issues.comment</code>, <code class="inline">issues.create</code>, <code class="inline">github.workflows_dispatch</code>, &hellip;) and are prompted for in <code class="inline">ask</code> and denied in <code class="inline">readonly</code>. See <a class="link" href="/docs/agents.html">Agents</a>.</p>

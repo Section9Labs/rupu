@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -153,20 +155,21 @@
 <span class="k">model</span>: <span class="v">claude-opus-5</span>
 <span class="k">fallbacks</span>:
   - <span class="k">model</span>: <span class="v">claude-sonnet-5-5</span>          <span class="c"># same provider as the run → rung 1</span>
-  - <span class="k">provider</span>: <span class="v">openai-codex</span>            <span class="c"># another provider → rung 2</span>
+  - <span class="k">provider</span>: <span class="v">openai</span>                  <span class="c"># another provider → rung 2</span>
     <span class="k">model</span>: <span class="v">gpt-5.6-cyber</span>
 <span class="c">---</span></pre>
     <p>&hellip;or once, for every agent that declares none, in <code class="inline">config.toml</code>:</p>
     <pre class="code"><span class="v">[recovery]</span>
 <span class="k">fallbacks</span> = [
   { <span class="k">model</span> = <span class="s">"claude-sonnet-5-5"</span> },
-  { <span class="k">provider</span> = <span class="s">"openai-codex"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
+  { <span class="k">provider</span> = <span class="s">"openai"</span>, <span class="k">model</span> = <span class="s">"gpt-5.6-cyber"</span> },
 ]
 <span class="k">server_side_fallback</span> = <span class="v">true</span></pre>
     <ul>
       <li><strong>Precedence.</strong> An agent's <code class="inline">fallbacks:</code> wins over <code class="inline">[recovery].fallbacks</code> (default <code class="inline">[]</code>). They are not merged: when the agent declares a chain, the config table is not consulted for that agent, and <code class="inline">fallbacks: []</code> is an empty chain. No chain in either place means rungs 1 and 2 are unavailable. Both forms reject unknown keys, so a typo in an entry is a load error and not a silent no-op. A rupu release that predates <code class="inline">fallbacks:</code> refuses to load an agent file that sets it, so upgrade remote hosts before adding it.</li>
       <li><strong>Which rung an entry belongs to.</strong> An entry without a <code class="inline">provider</code> means the provider the run started on, even if the run has since moved to another provider; it is a rung-1 candidate, and so is an entry naming that provider. Every other entry is rung 2. Within a rung the chain's order decides. The model the run started on and any entry already tried are never offered again. The split matters because an outcome decides which rungs it may use: a <code class="inline">rate_limited</code> error skips the same-provider models (the provider is the problem) and goes to rung 2; a <code class="inline">refusal</code> may use both.</li>
       <li><strong>What a hop uses.</strong> A hop is built through the same credential resolver, <code class="inline">[providers.&lt;name&gt;]</code> table and network logging as the run's own provider, so a same-provider hop differs only in model. The agent's <code class="inline">anthropicOauthPrefix</code> and <code class="inline">anthropicPromptCache</code> settings carry over to every hop (providers they do not apply to ignore them), and so does <code class="inline">effort</code>. The agent's <code class="inline">auth:</code> mode applies only to a hop on the provider the run started on. A hop does not inherit the agent's <code class="inline">maxTokens</code> or <code class="inline">contextWindowTokens</code>: its limits come from <code class="inline">[[providers.X.models]]</code> and the provider's model list. A hop to a different model does not send <code class="inline">contextWindow</code>, <code class="inline">anthropicSpeed</code>, <code class="inline">anthropicTaskBudget</code> or <code class="inline">anthropicContextManagement</code> either; a hop that keeps the original model's name on another provider keeps them.</li>
+      <li><strong>Naming a provider.</strong> A <code class="inline">provider</code> names a built-in vendor (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>) or an account declared under <code class="inline">[providers.&lt;name&gt;]</code>. <code class="inline">openai-codex</code> with a hyphen is the display id transcripts and pricing use for the OpenAI client, not a built-in name; a chain entry may name it only with <code class="inline">[providers.openai-codex] kind = "openai_codex"</code> declared and logged in. A hop to another model carries none of the agent's model-specific pins, the Daybreak <code class="inline">cyber</code> program included (see <a class="link" href="/docs/agents.html#cyber">Agents: cyber</a>).</li>
     </ul>
     <div class="callout"><strong>Data handling.</strong> A rung-2 hop sends the whole conversation &mdash; including file contents and tool output the agent has read &mdash; to a different company's API under that provider's terms. Put a provider in a chain only when the data in the run is allowed to go there; if it is not, leave it out of <code class="inline">fallbacks:</code>.</div>
 

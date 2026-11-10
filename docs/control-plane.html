@@ -27,6 +27,8 @@
     <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
     <a class="item" href="/docs/autoflows.html">Autoflows</a>
     <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
     <a class="item" href="/docs/sessions.html">Sessions</a>
     <a class="item" href="/docs/skills.html">Skills</a>
     <a class="item" href="/docs/messaging.html">Messaging</a>
@@ -281,8 +283,10 @@ gate_sweep_enabled = <span class="v">false</span>     <span class="c"># no gate 
         paints the workflow's real graph — forks, joins, gates, actions and
         fan-out units, rather than everything flattening into one line — with
         each step's status updating in place, the focused step's transcript as
-        it works, and Events, Findings, Messages and Network tabs plus the run's
-        controls. The Events tab is the same event rail as Live Events, scoped
+        it works, and the run's header actions and tabs: Transcript, Events,
+        Findings, Children, Messages, Network and, on an autoflow run, Cycles
+        (see <a class="link" href="#run-page">The run page</a>). The Events tab
+        is the same event rail as Live Events, scoped
         to the run (an agentiflow's Events tab too). Runs, steps, units and sub-agents carry their
         <a class="link" href="/docs/workflows.html">codenames</a>, tinted per crew.
       </li>
@@ -323,18 +327,41 @@ gate_sweep_enabled = <span class="v">false</span>     <span class="c"># no gate 
         (see <em>Findings</em> below).
       </li>
       <li>
-        <strong>Agentiflows.</strong> A list of
-        <a class="link" href="/docs/agentiflows.html">agentiflow</a> runs and a
-        detail page with <em>Flow</em>, <em>Assets</em>, <em>Findings</em>,
-        <em>Messages</em>, <em>Transcript</em> and <em>Events</em> tabs. The Flow
-        tab draws the lead's rounds as a spine with each round's units branching
-        off it; earlier rounds collapse to a one-line summary, and a workflow unit
-        links to its own run page and expands in place to list its steps with
-        their status. While the run's coordinator is alive, the Messages tab
-        reaches the lead, the same channel as
-        <code class="inline">rupu agentiflow send</code>; it is refused once the
-        coordinator is gone. A <strong>Security &#8594; Assets</strong> page shows
-        the asset inventory across every project.
+        <strong>Agentiflows.</strong> <code class="inline">/runs/agentiflows</code> lists the
+        <a class="link" href="/docs/agentiflows.html">agentiflow</a> runs, with
+        <strong>New agentiflow</strong> to launch one from a definition;
+        <code class="inline">/agentiflows/&lt;id&gt;</code> is a run's page, laid out
+        like a workflow run's. The header carries <strong>Stop</strong> (a graceful
+        stop at the round boundary, shown pending until the run stops),
+        <strong>Stop now</strong> (confirmed first: the current round's work is
+        lost; the only stop that applies once the coordinator process is gone)
+        and <strong>Refresh</strong>. Under the title: the crew chip, status,
+        engagement profile badges, the id and timings, then a one-line
+        <strong>engagement summary</strong> (goals met, each budget cap as
+        <em>used of cap</em>, amber at the soft limit and red at or past the cap,
+        spend and tokens) that opens the Engagement tab when clicked, the stop
+        reason if any, and the objective clamped to two lines with a "more"
+        toggle. The <strong>Flow</strong> panel is always shown, directly under
+        the header: the lead's rounds as a spine with each round's units
+        branching off it, a workflow unit framed as its own run graph with a link
+        to its run page, and the message arcs and board between them.
+        <strong>Token flow</strong> sits under the map: every model call of the
+        lead and all its units, with the lead rounds as its stages. Selecting a
+        range on it narrows the tabs, as on a run page: a window bar shows the
+        turns, their time span and rounds, with <strong>Clear</strong>;
+        Transcript lists the transcripts in the window with their call ranges,
+        and Events, Findings, Messages and Network follow the window's time.
+        The tabs are <strong>Engagement</strong> (the default: Goals with how
+        each is checked, Budget, and the definition's lead, profiles, pool and
+        lead turns per round), <strong>Transcript</strong>,
+        <strong>Events</strong>, <strong>Findings</strong>,
+        <strong>Children</strong>, <strong>Fleet</strong> (the units, with their
+        count), <strong>Messages</strong> (the operator composer lives here; its
+        badge is the unread count), <strong>Network</strong> and
+        <strong>Assets</strong>. See
+        <a class="link" href="/docs/agentiflows.html#operating-a-run-from-the-control-plane">Operating a run from the control plane</a>.
+        A <strong>Security &#8594; Assets</strong> page shows the asset inventory
+        across every project.
       </li>
       <li>
         <strong>Network.</strong> The <a class="link" href="/docs/netflow.html">netflow</a>
@@ -400,6 +427,45 @@ is:active model:sonnet</pre>
       Runs' <code class="inline">source:standalone</code>, Sessions'
       <code class="inline">is:active</code>) apply only while the query doesn't
       name that key.
+    </p>
+
+    <h3 id="run-page">The run page</h3>
+    <p>
+      <code class="inline">/runs/&lt;id&gt;</code> keeps its live actions in the page
+      header. While the run is running: <strong>Pause</strong> (when the host's
+      transport can pause) and <strong>Cancel</strong>. Once it has ended:
+      <strong>Retry &#9662;</strong> on a failed, rejected or cancelled workflow
+      run, <strong>Archive</strong> and <strong>Delete</strong>.
+    </p>
+    <p>
+      <strong>Retry &#9662;</strong> opens a small form: the permission mode,
+      which defaults to the mode the run was launched with ("as launched", so a
+      <code class="inline">readonly</code> run retries
+      <code class="inline">readonly</code> unless you pick otherwise), and a
+      <strong>Restart interrupted steps from scratch</strong> checkbox, which
+      starts the steps and <code class="inline">for_each</code> units that were
+      cut off mid-turn over instead of continuing them. Retrying is local only:
+      on a remote host the control is disabled with the reason (a remote host
+      resumes only paused runs). The request goes to
+      <code class="inline">POST /api/runs/:id/retry</code>
+      (<a class="link" href="/docs/api.html#run-control">Run control</a>); the
+      page then shows a <strong>retry requested</strong> chip until the run's
+      status changes. If the status does not change, the page says the retry
+      was recorded but hasn't started and points at
+      <code class="inline">retry.log</code> in the run's directory, where the
+      spawned <code class="inline">rupu workflow resume</code> left its stderr. A
+      standalone agent run (<code class="inline">agent:&lt;name&gt;</code>) has no
+      Retry; it is continued from its transcript page instead.
+    </p>
+    <p>
+      The tabs are <strong>Transcript</strong>, <strong>Events</strong>,
+      <strong>Findings</strong> (with its count), <strong>Children</strong>
+      (local runs only: every child the run dispatched, from its children
+      ledgers), <strong>Messages</strong> (only when the run has a message
+      space; its badge is the unread count), <strong>Network</strong> and, on an
+      autoflow run, <strong>Cycles</strong>. Selecting a range on the Token flow
+      chart narrows the Transcript, Events, Findings and Messages tabs to the
+      calls in that window.
     </p>
 
     <h3 id="token-flow">Token flow</h3>
@@ -515,6 +581,19 @@ is:active model:sonnet</pre>
       </tbody>
     </table>
     <p>
+      A down SSH host is a 502, <em>offline</em>, on every per-host read: the
+      lists, and the run, session, session runs, usage-timeline and netflow
+      detail routes alike. The one caveat is an old
+      <code class="inline">rupu</code> on an SSH host answering the generic
+      listings (sessions, agent runs, autoflows, usage): it also shows
+      <em>offline</em> (502), not <em>unavailable</em>, because only
+      <code class="inline">rupu run list</code> has the capability gate that
+      tells "too old" from "down". <code class="inline">cp serve</code>'s log
+      names the method and route (with its <code class="inline">?host=</code>)
+      on every failed response; a 501 or 502 is logged as a warning, since it
+      reports a remote host's state, and any other 5xx as an error.
+    </p>
+    <p>
       A per-host freshness strip shows who has answered. The hosts list serves
       each host's last health probe from a cache (fresh for 15 s; a stale answer
       is served while one background refresh runs), so opening a page never waits
@@ -574,7 +653,8 @@ is:active model:sonnet</pre>
       </li>
       <li>
         <strong>Retry.</strong> A failed, rejected or cancelled workflow run has a
-        <em>Retry</em> control in its header. It records the retry on the run and
+        <em>Retry &#9662;</em> control in its header (see
+        <a class="link" href="#run-page">The run page</a>). It records the retry on the run and
         spawns a detached <code class="inline">rupu workflow resume</code> — in the
         run's own launch mode unless you pick another, so a
         <code class="inline">readonly</code> run retries
@@ -746,10 +826,14 @@ is:active model:sonnet</pre>
       written before its skills are installed; only a malformed entry is refused.
     </p>
 
-    <h2 id="library">Library: agents, workflows, autoflows, skills</h2>
+    <h2 id="library">Library: agents, workflows, agentiflows, autoflows, skills</h2>
     <p>
       The Library holds every definition the control plane can see, global or
-      project-scoped, with a <em>Run</em> on each. Its <strong>Skills</strong>
+      project-scoped, with a <em>Run</em> on each: agents, workflows,
+      <a class="link" href="/docs/agentiflows.html">agentiflow</a> definitions
+      (global and per project, with <em>Launch</em> and <em>New</em>; a
+      definition's page edits, saves, reverts, deletes or launches it),
+      autoflows and skills. Its <strong>Skills</strong>
       tab lists the installed <a class="link" href="/docs/skills.html">Agent Skills</a>:
       the global layer, plus the picked project's layer, like
       <code class="inline">rupu skill list</code>. Each row shows its layer, status,
@@ -758,8 +842,10 @@ is:active model:sonnet</pre>
       A skill's page shows its description, compatibility, license,
       <code class="inline">allowed-tools</code> with the rupu tools they map to
       (informational, never a grant), metadata, files, body, content hash and
-      install record. Installing and updating skills stay CLI operations
-      (<code class="inline">rupu skill install</code> / <code class="inline">update</code>).
+      install record. The tab has <em>Install</em>, and a skill's page
+      <em>Update</em> and <em>Validate</em>, the same operations as
+      <code class="inline">rupu skill install</code> / <code class="inline">update</code> /
+      <code class="inline">validate</code>.
     </p>
 
     <h2>Settings &amp; project config</h2>
@@ -829,7 +915,8 @@ max_workspace_bytes = <span class="v">104857600</span></pre>
       browser. A page that can't be filtered says so rather than quietly showing
       everything. The Customers page manages customers and their project
       assignments, shows per-customer rollups priced with that customer's own
-      pricing, and edits each customer's config layer. Before a launch, the
+      pricing, and edits each customer's config layer; a customer's detail has
+      Overview, Projects, Runs, Findings, Usage and Config tabs. Before a launch, the
       launcher shows which customer the run will be attributed to and which
       provider, fallback and SCM accounts it will authenticate as — resolved
       exactly the way the launch itself resolves them. See
@@ -879,20 +966,34 @@ $ claude mcp add <span class="v">--transport</span> http rupu http://127.0.0.1:7
     <h3>Two navigation shells</h3>
     <p>
       The app ships two sidebars over the same pages. The default (<em>v1</em>)
-      shell lists every page in grouped sections — Runs, Security, Build, Fleet.
-      The newer <em>v2</em> shell folds them into seven destinations
-      (<code class="inline">/overview</code>, <code class="inline">/activity</code>,
-      <code class="inline">/projects</code>, <code class="inline">/security</code>,
-      <code class="inline">/library</code>, <code class="inline">/fleet</code>, plus
-      Customers), each a tab bar whose active tab sits in
-      <code class="inline">?tab=</code>. Old links keep working: under v2,
+      shell lists every page in grouped sections: Dashboard, Inbox, Projects,
+      Customers, Live Events and Usage on top; then <strong>Runs</strong>
+      (Agents, Workflows, Autoflows, Agentiflows, Sessions),
+      <strong>Security</strong> (Coverage, Assets, Network, Findings),
+      <strong>Build</strong> (Agents, Workflows, Agentiflows, Autoflows, Skills)
+      and <strong>Fleet</strong> (Hosts, Workers); Settings at the bottom. The
+      newer <em>v2</em> shell folds them into eight destinations, most a tab bar
+      whose active tab sits in <code class="inline">?tab=</code>:
+      <code class="inline">/overview</code>, <code class="inline">/activity</code>,
+      <code class="inline">/projects</code>, <code class="inline">/customers</code>,
+      <code class="inline">/security</code>, <code class="inline">/library</code>,
+      <code class="inline">/fleet</code> and <code class="inline">/usage</code>,
+      with Settings pinned below them. The Inbox has its own route under both
+      shells. Old links keep working: under v2,
       <code class="inline">/agents</code> redirects to
       <code class="inline">/library?tab=agents</code>,
+      <code class="inline">/skills</code> to <code class="inline">/library?tab=skills</code>,
+      <code class="inline">/agentiflows/defs</code> to <code class="inline">/library?tab=agentiflows</code>,
+      <code class="inline">/runs/workflows</code> to <code class="inline">/activity?tab=workflows</code>,
+      <code class="inline">/sessions</code> to <code class="inline">/activity?tab=sessions</code>,
       <code class="inline">/hosts</code> to <code class="inline">/fleet</code>,
+      <code class="inline">/workers</code> to <code class="inline">/fleet?tab=workers</code>, and
       <code class="inline">/findings?q=&hellip;</code> to
-      <code class="inline">/security?tab=findings&amp;q=&hellip;</code>, and so
-      on. Pick the shell in the global config; it is read on every page load, so
-      a browser refresh applies it, no restart needed:
+      <code class="inline">/security?tab=findings&amp;q=&hellip;</code>. The v2
+      destinations are registered under both shells, so a deep link to
+      <code class="inline">/activity</code> or <code class="inline">/library</code>
+      works under v1 too. Pick the shell in the global config; it is read on
+      every page load, so a browser refresh applies it, no restart needed:
     </p>
     <pre class="code"><span class="c"># opt into the v2 navigation shell</span>
 $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <span class="s">v2</span></pre>
@@ -900,10 +1001,12 @@ $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <spa
       <thead><tr><th>v2 destination</th><th>Tabs</th></tr></thead>
       <tbody>
         <tr><td><code class="inline">/overview</code></td><td>The dashboard.</td></tr>
-        <tr><td><code class="inline">/activity</code></td><td>agents &middot; workflows &middot; autoflows &middot; sessions (run lists)</td></tr>
+        <tr><td><code class="inline">/activity</code></td><td>agents &middot; workflows &middot; autoflows &middot; sessions (run lists; opens on workflows)</td></tr>
+        <tr><td><code class="inline">/projects</code>, <code class="inline">/customers</code>, <code class="inline">/usage</code></td><td>Projects, customers and usage, one page each; no tab bar.</td></tr>
         <tr><td><code class="inline">/security</code></td><td>findings &middot; coverage &middot; catalog</td></tr>
-        <tr><td><code class="inline">/library</code></td><td>agents &middot; workflows &middot; autoflows &middot; skills (definitions)</td></tr>
+        <tr><td><code class="inline">/library</code></td><td>agents &middot; workflows &middot; agentiflows &middot; autoflows &middot; skills (definitions)</td></tr>
         <tr><td><code class="inline">/fleet</code></td><td>hosts &middot; workers</td></tr>
+        <tr><td><code class="inline">/inbox</code></td><td>Not a destination but its own route under both shells (below).</td></tr>
       </tbody>
     </table>
 
@@ -911,11 +1014,13 @@ $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <spa
     <table>
       <thead><tr><th>Route</th><th>What it shows</th></tr></thead>
       <tbody>
+        <tr><td><code class="inline">/inbox</code></td><td>The operator action board: every gate, paused run and recent failure waiting on you, filtered All / Gates / Paused / Failed, each with its action (approve, reject, resume, retry), snooze or dismiss, and a ledger of how long the fleet's runs have sat waiting on a human. Its own route under both shells.</td></tr>
+        <tr><td><code class="inline">/activity</code>, <code class="inline">/security</code>, <code class="inline">/library</code>, <code class="inline">/fleet</code></td><td>The v2 composite destinations (tab bars over the pages in these tables; see <em>Two navigation shells</em> above). Served under v1 too.</td></tr>
         <tr><td><code class="inline">/runs/agents</code>, <code class="inline">/runs/workflows</code>, <code class="inline">/runs/autoflows</code>, <code class="inline">/runs/agentiflows</code></td><td>One run list per kind, on the query line (host, status, time window, customer). <code class="inline">/runs</code> redirects.</td></tr>
-        <tr><td><code class="inline">/runs/&lt;id&gt;</code></td><td>The live run view: graph, Token flow, the focused step's transcript, and the Events, Findings, Messages and Network tabs, with the run's controls.</td></tr>
+        <tr><td><code class="inline">/runs/&lt;id&gt;</code></td><td>The live run view: graph, Token flow, the focused step's transcript, and the run's header actions and tabs (see <a class="link" href="#run-page">The run page</a>).</td></tr>
         <tr><td><code class="inline">/transcript?path=&hellip;</code></td><td>A transcript on its own page, for agent runs, sessions and sub-agents that have no workflow graph. It streams while the run is live, and resolves a remote host's transcript when the link carries <code class="inline">host</code> and <code class="inline">run</code>.</td></tr>
         <tr><td><code class="inline">/sessions</code>, <code class="inline">/sessions/&lt;id&gt;</code></td><td>Session list and chat view (Conversation and Messages tabs).</td></tr>
-        <tr><td><code class="inline">/agentiflows/&lt;id&gt;</code></td><td>Agentiflow detail (see <em>Observe</em> above).</td></tr>
+        <tr><td><code class="inline">/agentiflows/&lt;id&gt;</code></td><td>Agentiflow run detail: header actions, the Flow panel, Token flow and the Engagement, Transcript, Events, Findings, Children, Fleet, Messages, Network and Assets tabs (see <em>Observe</em> above).</td></tr>
         <tr><td><code class="inline">/events</code></td><td>Live Events: the vitals strip, the Needs-you deck and the event rail.</td></tr>
         <tr><td><code class="inline">/usage</code></td><td>Spend over time and the outlier panel.</td></tr>
         <tr><td><code class="inline">/netflow</code></td><td>The global network explorer. With no <code class="inline">since:</code> or <code class="inline">until:</code> in its query it opens on the shorter of the last hour and the latest run's span.</td></tr>
@@ -932,7 +1037,8 @@ $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <spa
         <tr><td><code class="inline">/workflows</code></td><td>Workflow definitions. <strong>New workflow</strong> starts one from YAML, or has a model generate it from a description.</td></tr>
         <tr><td><code class="inline">/workflows/&lt;name&gt;</code></td><td>The visual workflow editor (see <em>Author</em> above), with a validity badge and Save, Revert, Delete and Run.</td></tr>
         <tr><td><code class="inline">/autoflows</code></td><td>Workflows that declare autoflow triggers, each with a toggle to enable or disable it.</td></tr>
-        <tr><td><code class="inline">/skills</code>, <code class="inline">/skills/&lt;layer&gt;/&lt;name&gt;</code></td><td>The installed skills (global and project layers) and a skill's page (see <em>Library</em> above).</td></tr>
+        <tr><td><code class="inline">/agentiflows/defs</code>, <code class="inline">/agentiflows/defs/&lt;name&gt;</code></td><td>Agentiflow definitions (global and per project), with Launch and New; a definition page to edit, save, revert, delete or launch one. See <a class="link" href="/docs/agentiflows.html">Agentiflows</a>.</td></tr>
+        <tr><td><code class="inline">/skills</code>, <code class="inline">/skills/&lt;layer&gt;/&lt;name&gt;</code></td><td>The installed skills in both layers, with Install; one skill's page (body, files, install record, Update / Validate). See <em>Library</em> above and <a class="link" href="/docs/skills.html">Skills</a>.</td></tr>
       </tbody>
     </table>
     <div class="callout">
@@ -994,11 +1100,17 @@ $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <spa
     <p>
       <code class="inline">/settings</code> has typed tabs for
       <em>General</em>, <em>Providers</em>, <em>Models</em>, <em>Autoflow</em>,
-      <em>SCM / Issues</em>, <em>Pricing</em> and <em>CP-Runtime</em>, then
+      <em>SCM / Issues</em>, <em>Pricing</em>, <em>CP-Runtime</em>,
+      <em>Automation</em>, <em>Maintenance</em> and <em>Accounts</em>, then
       <em>Raw</em> (the global <code class="inline">config.toml</code>, read-only until
       you click Edit), <em>Policy</em> (every key with a lock checkbox), and
       <em>Runtime status</em>. Each typed field shows its effective value, which layer
-      it came from, and a lock toggle. The control plane's own token is never
+      it came from, and a lock toggle. Automation shows the cron schedules and
+      event triggers with Dry run and Tick now; Maintenance shows dry-run prune
+      counts and a confirmed Prune; Accounts shows each account's credential
+      state (never a credential) and the SCM binding rules with Add rule.
+      Thirteen tabs in all; on a narrow window the tab strip wraps to a second
+      row rather than hide any. The control plane's own token is never
       shown or editable, only whether one is set.
     </p>
 
@@ -1006,7 +1118,10 @@ $ rupu config <span class="k">set</span> <span class="v">ui.cp.shell</span> <spa
     <p>
       <code class="inline">/customers</code> and
       <code class="inline">/customers/&lt;slug&gt;</code> (with a tab per
-      sub-route) manage customers; see <em>Customers</em> above.
+      sub-route: <code class="inline">overview</code>, <code class="inline">projects</code>,
+      <code class="inline">runs</code>, <code class="inline">findings</code>,
+      <code class="inline">usage</code> and <code class="inline">config</code>) manage
+      customers; see <em>Customers</em> above.
     </p>
 
     <!-- prev / next footer nav -->
