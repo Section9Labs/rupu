@@ -229,6 +229,7 @@ rupu run [OPTIONS] <AGENT> [TARGET] [PROMPT]
 | `--tmp` | For `<platform>:<owner>/<repo>` targets: clone into a temporary directory that is auto-deleted on exit. Useful for one-shot agents that produce findings without modifying the repo. Mutually exclusive with `--into` |
 | `--run-id <RUN_ID>` | Pre-assign the run id (so a caller can reference the run before it starts) |
 | `--findings-profile <PROFILE>` | Findings contract for this run (`full` \| `summary`), overriding the agent's `findingsProfile`. A placed workflow unit's coordinator passes its step's resolved profile this way |
+| `--cyber <PROGRAM>` | OpenAI Daybreak `cyber` access program for this run: `standard`, `daybreak_blue`, or `daybreak_red`. Overrides the agent's `cyber:` frontmatter and the provider model-config default. OpenAI only (an account of kind `openai`, `openai_codex` or `codex`); the org/project must already be approved for the program |
 | `--engagement-profile <ID>` | Engagement profile(s) for this run — the asset domain(s) findings are validated against (e.g. `network`, `binary`, or a composite like `pentest`). Repeatable or comma-separated. Empty = the `code` path [aliases: --engagement-profiles] |
 | `--skill <SKILL>` | A skill this run may load, on top of the agent's own; repeat the flag for several. A coordinator passes a workflow step's `skills:` this way. `--continue` keeps the continued run's unless this is given, which replaces the whole list |
 | `--preload-skill <SKILL>` | A skill whose body goes in this run's system prompt; repeat the flag for several |
@@ -1616,7 +1617,7 @@ rupu auth login [OPTIONS] --account <ACCOUNT>
 |---|---|
 | `--account <ACCOUNT>` | Account name — the identity. Use a distinct name per identity (e.g. `anthropic-work`, `anthropic-personal`). A bare vendor name (`anthropic`) is the single-account default |
 | `--kind <KIND>` | Vendor this account authenticates against (anthropic \| openai \| gemini \| copilot \| github \| gitlab \| linear \| jira \| local). Required the first time an account name is used; inferred from config or from the account name afterwards |
-| `--mode <MODE>` | Authentication mode [default: api-key] [possible values: api-key, sso] |
+| `--mode <MODE>` | Authentication mode. Possible values: api-key: an API key from the vendor's console; sso: log in in a browser on this machine; device: log in from a browser on another machine [default: api-key] |
 | `--key <KEY>` | API key (only valid with --mode api-key). If omitted, reads from stdin |
 
 <a id="rupu-auth-logout"></a>
@@ -1631,7 +1632,7 @@ rupu auth logout [OPTIONS]
 | Option | Description |
 |---|---|
 | `--account <ACCOUNT>` | Account name (omit with --all to clear everything) |
-| `--mode <MODE>` | Specific auth mode to remove. If omitted, both api-key and sso for that provider are removed [possible values: api-key, sso] |
+| `--mode <MODE>` | Specific auth mode to remove. If omitted, both api-key and sso for that provider are removed. Possible values: api-key: an API key from the vendor's console; sso: log in in a browser on this machine; device: log in from a browser on another machine |
 | `--all` | Remove every stored credential across all providers and modes |
 | `--yes` | Skip the confirmation prompt for --all |
 
@@ -1910,8 +1911,12 @@ rupu session start [OPTIONS] <AGENT> [TARGET] [PROMPT]
 
 | Option | Description |
 |---|---|
+| `--skill-preset <SKILL_PRESET>` | Installed Rupu skill preset for a new builtin session, or `none` [possible values: rupu-session-v1, none] |
+| `--provider <PROVIDER>` | Provider account for the first and later turns (requires --model) |
+| `--model <MODEL>` | Model identifier for the first and later turns |
+| `--idle` | Create an idle session without a first turn or provider worker |
 | `--prompt <PROMPT_FLAG>` | Initial user message via flag (preferred over the positional `prompt`; lets a caller pass a prompt without it being parsed as a target) |
-| `--mode <MODE>` | Override permission mode (`ask` \| `bypass` \| `readonly`) |
+| `--mode <MODE>` | Override permission mode (`bypass` \| `readonly`; a session cannot run in `ask` mode) |
 | `--no-stream` | Don't render tokens as they arrive, for every turn in this session. The request still streams on the wire, so long responses can't hit the request timeout |
 | `--into <PATH>` | For repo targets: clone into this directory instead of `./<repo>/` |
 | `--detach` | Start the first turn without auto-attaching |

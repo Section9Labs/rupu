@@ -32,6 +32,8 @@ rupu auth login --account anthropic --mode device
 
 rupu prints a `claude.ai/oauth/authorize` URL and waits at `Paste the code the page shows:`. Open the URL in a browser on any machine and sign in with your Claude account; the page it lands on (`platform.claude.com/oauth/code/callback`) shows a code of the form `code#state`. Paste all of it, and rupu stores the same credential as `--mode sso`, in the account's `sso` entry. This is the login Claude Code runs when it can't open a browser. The code expires within minutes and works once; if the login fails, run the command again for a new URL.
 
+The URL and the prompt go to stderr and the code is read from one line of stdin (a terminal or a pipe); the only stdout line is `rupu: stored anthropic sso credential`. A pasted `state` that is not this login's is refused with `pasted state does not match this login; start again`. See [providers.md](../providers.md#device-login---mode-device) for the full contract.
+
 ## Example agent files
 
 `~/.rupu/agents/explain.md` — API-key auth:

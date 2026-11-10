@@ -20,6 +20,8 @@ const DOCS: &[&str] = &[
     "workflow-format",
     "workflow-authoring",
     "agentiflows",
+    "agentiflow-tutorial",
+    "agentiflow-authoring",
     "triggers",
     "engagement-profiles",
     "coverage",

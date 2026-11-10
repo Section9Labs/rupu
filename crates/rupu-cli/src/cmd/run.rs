@@ -99,8 +99,9 @@ pub struct Args {
     pub findings_profile: Option<rupu_coverage::FindingProfile>,
     /// OpenAI Daybreak `cyber` access program for this run: `standard`,
     /// `daybreak_blue`, or `daybreak_red`. Overrides the agent's `cyber:`
-    /// frontmatter and the provider model-config default. openai-codex only;
-    /// the org/project must already be approved for the program.
+    /// frontmatter and the provider model-config default. OpenAI only (an
+    /// account of kind `openai`, `openai_codex` or `codex`); the org/project
+    /// must already be approved for the program.
     #[arg(long, value_name = "PROGRAM", value_parser = parse_cyber)]
     pub cyber: Option<rupu_providers::types::CyberAccessProgram>,
     /// Engagement profile(s) for this run — the asset domain(s) findings are
