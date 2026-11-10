@@ -161,12 +161,18 @@ gate_sweep_enabled = false     # no gate timeouts; reaper and ASN refresh still 
 
 The UI ships two sidebars over the same pages:
 
-- **v1** (default) lists every page in grouped sections.
-- **v2** folds them into seven destinations, each a tab bar whose active tab
+- **v1** (default) lists every page in grouped sections: Dashboard, Inbox,
+  Projects, Customers, Live Events and Usage on top; then **Runs** (Agents,
+  Workflows, Autoflows, Agentiflows, Sessions), **Security** (Coverage,
+  Assets, Network, Findings), **Build** (Agents, Workflows, Agentiflows,
+  Autoflows, Skills) and **Fleet** (Hosts, Workers); Settings at the bottom.
+- **v2** folds them into eight destinations, most a tab bar whose active tab
   lives in `?tab=`: `/overview`, `/activity` (agents · workflows · autoflows ·
-  sessions), `/projects`, `/security` (findings · coverage · catalog),
-  `/library` (agents · workflows · autoflows), `/fleet` (hosts · workers), and
-  `/customers`.
+  sessions; opens on workflows), `/projects`, `/customers`, `/security`
+  (findings · coverage · catalog), `/library` (agents · workflows ·
+  agentiflows · autoflows · skills), `/fleet` (hosts · workers) and `/usage`.
+  Settings is pinned below them. The Inbox has its own route under both
+  shells.
 
 Pick one in the global config. It is read on every page load, so a browser
 refresh applies it:
@@ -175,9 +181,14 @@ refresh applies it:
 rupu config set ui.cp.shell v2
 ```
 
-Under v2 the old URLs redirect (`/agents` → `/library?tab=agents`, `/hosts` →
-`/fleet`, `/findings?q=…` → `/security?tab=findings&q=…`), so bookmarks keep
-working. The ⌘K palette jumps to any page, run or session.
+Under v2 the old URLs redirect (`/agents` → `/library?tab=agents`, `/skills`
+→ `/library?tab=skills`, `/agentiflows/defs` → `/library?tab=agentiflows`,
+`/runs/workflows` → `/activity?tab=workflows`, `/sessions` →
+`/activity?tab=sessions`, `/hosts` → `/fleet`, `/workers` →
+`/fleet?tab=workers`, `/findings?q=…` → `/security?tab=findings&q=…`), so
+bookmarks keep working. The v2 destinations are registered under both shells,
+so a deep link to `/activity` or `/library` works under v1 too. The ⌘K
+palette jumps to any page, run or session.
 
 ---
 
@@ -186,8 +197,10 @@ working. The ⌘K palette jumps to any page, run or session.
 | Route | Page |
 |-------|------|
 | `/dashboard` (v1), `/overview` (v2) | Counts, needs-you items, and token spend over time per model. |
+| `/inbox` | The operator action board: every gate, paused run and recent failure waiting on you, filtered All / Gates / Paused / Failed, each with its action (approve, reject, resume, retry), snooze or dismiss, and a ledger of how long the fleet's runs have sat waiting on a human. Its own route under both shells. |
+| `/activity`, `/security`, `/library`, `/fleet` | The v2 composite destinations (tab bars over the pages below, see [Navigation shells](#navigation-shells)). Served under v1 too. |
 | `/runs/workflows`, `/runs/agents`, `/runs/autoflows`, `/runs/agentiflows` | Run lists per kind, filterable by host, status, time window and customer. `/runs` redirects. |
-| `/runs/:id` | Live run view: the workflow's real graph (forks, joins, gates, actions, fan-out units), the focused step's transcript, events, findings and network tabs, and the run's controls. |
+| `/runs/:id` | Live run view: the workflow's real graph (forks, joins, gates, actions, fan-out units), the focused step's transcript, and the run's header actions and tabs (see [The run page](#the-run-page)). |
 | `/transcript?path=…` | A transcript on its own page, for agent runs, sessions and sub-agents with no workflow graph. Carries `host` and `run` for a remote transcript. |
 | `/sessions`, `/sessions/:id` | Session list and chat view. |
 | `/events` | Live Events: vitals strip, a merged stream of the event firehose and newly filed findings, and a per-project roster. The query line filters the stream (`group:error`, `workflow:nightly`, `agent:recon since:1h`); the server filters the event history by it, so it reaches runs the unfiltered stream never loaded. |
@@ -196,19 +209,49 @@ working. The ⌘K palette jumps to any page, run or session.
 | `/agents`, `/agents/new`, `/agents/:name` | Agent definitions, the Agent Builder, and an agent's detail page (definition, recent runs, Edit / Delete / Run). |
 | `/workflows`, `/workflows/:name` | Workflow definitions and the visual workflow editor. |
 | `/autoflows` | Workflows with autoflow triggers, each with an enable/disable toggle. |
+| `/agentiflows/defs`, `/agentiflows/defs/:name` | Agentiflow definitions (global and per project), with Launch and New; a definition page to edit, save, revert, delete or launch one. |
+| `/skills`, `/skills/:layer/:name` | Installed Agent Skills in both layers, with Install; one skill's page (body, files, install record, Update / Validate). See [`skills.md#in-the-control-plane`](skills.md#in-the-control-plane). |
 | `/projects`, `/projects/:wsId` | Project list; project detail with tabs `runs`, `findings`, `code`, `sessions`, `coverage`, `network`, `config` (each its own sub-route). |
 | `/projects/:wsId/definitions` | Agents, workflows and autoflows the project can use, global and project-scoped. |
 | `/findings`, `/findings/:id` | Findings table and the per-finding report page. |
 | `/coverage`, `/coverage/templates`, `/coverage/:target` (+ `/catalog`, `/audit`, `/gap`, `/diff`) | Coverage status per target and its sub-views; bundled concern templates. |
 | `/assets` | Asset inventory across every project. |
-| `/agentiflows/:id` | Agentiflow run detail. |
+| `/agentiflows/:id` | Agentiflow run detail (see [Customers and agentiflows](#customers-and-agentiflows)). |
 | `/hosts`, `/hosts/:id` | Registered hosts with health; one host's detail and its runs. |
 | `/workers` | Machines and identities that have run something, with capabilities and last-seen. |
-| `/customers`, `/customers/:slug`, `/customers/:slug/:tab` | Customer management. |
+| `/customers`, `/customers/:slug`, `/customers/:slug/:tab` | Customer management; a customer's detail has tabs `overview`, `projects`, `runs`, `findings`, `usage` and `config`. |
 | `/settings` | Settings (see below). |
 
 Every route is bookmarkable. Unknown non-API paths serve the app (the router
 resolves them client-side); an unknown `/api/...` path is a JSON 404.
+
+### The run page
+
+`/runs/:id` keeps its live actions in the page header. While the run is
+running: **Pause** (when the host's transport can pause) and **Cancel**. Once
+it has ended: **Retry ▾** on a failed, rejected or cancelled workflow run,
+**Archive** and **Delete**.
+
+**Retry ▾** opens a small form: the permission mode, which defaults to the
+mode the run was launched with ("as launched", so a `readonly` run retries
+`readonly` unless you pick otherwise), and a **Restart interrupted steps from
+scratch** checkbox, which starts the steps and `for_each` units that were cut
+off mid-turn over instead of continuing them. Retrying is local only: on a
+remote host the control is disabled with the reason (a remote host resumes
+only paused runs). The request goes to `POST /api/runs/:id/retry`
+([`cp-api.md#run-control`](cp-api.md#run-control)); the page then shows a
+**retry requested** chip until the run's status changes. If the status does
+not change, the page says the retry was recorded but hasn't started and
+points at `retry.log` in the run's directory, where the spawned
+`rupu workflow resume` left its stderr. A standalone agent run (`agent:<name>`)
+has no Retry; it is continued from its transcript page instead.
+
+The tabs are **Transcript**, **Events**, **Findings** (with its count),
+**Children** (local runs only: every child the run dispatched, from its
+children ledgers), **Messages** (only when the run has a message space; its
+badge is the unread count), **Network** and, on an autoflow run, **Cycles**.
+Selecting a range on the Token flow chart narrows the Transcript, Events,
+Findings and Messages tabs to the calls in that window.
 
 ---
 
@@ -331,13 +374,20 @@ There are no feature flags: `[cp].agent_authoring_ui` and
 `/settings` edits the **global** `~/.rupu/config.toml`:
 
 - Typed tabs: **General, Providers, Models, Autoflow, SCM / Issues, Pricing,
-  CP-Runtime.** Each field shows its effective value, the layer that won, and a
-  lock toggle.
+  CP-Runtime, Automation, Maintenance, Accounts.** Each field shows its
+  effective value, the layer that won, and a lock toggle. Automation shows
+  the cron schedules and event triggers with Dry run and Tick now;
+  Maintenance shows dry-run prune counts and a confirmed Prune; Accounts
+  shows each account's credential state (never a credential) and the SCM
+  binding rules with Add rule.
 - **Raw** — the whole TOML file, read-only until you click Edit; validated on
   save.
 - **Policy** — every key with a lock checkbox; writes `[policy].lock`.
 - **Runtime status** — restart-required settings (`bind`, `token` — masked to
   "set / not set") and what this server has installed.
+
+Thirteen tabs in all; on a narrow window the tab strip wraps to a second row
+rather than hide any.
 
 Each project's **Config** tab (`/projects/:wsId/config`) edits that project's
 `.rupu/config.toml`; a customer's layer is edited from its Customers page. Keys
@@ -368,6 +418,16 @@ bounded at 45 s. A host that doesn't answer is shown as:
 | *offline* | 502 | The host couldn't be reached or failed (SSH down, connection refused, an error). |
 | *unavailable* | 501 | The host answered but can't serve this listing — typically an older `rupu` that lacks the command. |
 | (row dropped) | 404 | The host id is no longer registered. |
+
+A down SSH host is a 502, *offline*, on every per-host read: the lists, and
+the run, session, session runs, usage-timeline and netflow detail routes
+alike. The one caveat is an old `rupu` on an SSH host answering the generic
+listings (sessions, agent runs, autoflows, usage): it also shows *offline*
+(502), not *unavailable*, because only `rupu run list` has the capability
+gate that tells "too old" from "down". `cp serve`'s log names the method and
+route (with its `?host=`) on every failed response; a 501 or 502 is logged as
+a warning, since it reports a remote host's state, and any other 5xx as an
+error.
 
 `/api/hosts` serves each host's last health probe from a cache (fresh for 15 s;
 stale answers are served while one background refresh runs), so opening a page
@@ -443,15 +503,39 @@ with ASN enrichment. The server keeps a resident index of the netflow ledgers
 
 - **Customers.** A header picker narrows the UI to one customer (or *no
   customer*); pages that can't be filtered say so. The Customers page manages
-  customers, assignments, priced rollups and each customer's config layer. See
-  [`cp-customers-api.md`](cp-customers-api.md).
-- **Agentiflows.** `/runs/agentiflows` and `/agentiflows/:id` (Flow, Assets,
-  Findings, Messages, Transcript, Events tabs; a steering box on Messages while
-  the run is live, refused once its coordinator is gone). The Flow tab draws
-  the lead's rounds as a spine with each round's units branching off it;
-  earlier rounds collapse to a one-line summary, a workflow unit links to its
-  own run page (**open flow →**) and expands in place to list its steps with
-  their status. See [`agentiflows.md#the-flow-graph`](agentiflows.md#the-flow-graph).
+  customers, assignments, priced rollups and each customer's config layer; a
+  customer's detail has Overview, Projects, Runs, Findings, Usage and Config
+  tabs. See [`cp-customers-api.md`](cp-customers-api.md).
+- **Agentiflows.** `/runs/agentiflows` lists the runs (with **New
+  agentiflow** to launch one from a definition); `/agentiflows/:id` is a run's
+  page, laid out like a workflow run's:
+  - The header carries the actions: **Stop** (a graceful stop at the round
+    boundary, shown pending until the run stops), **Stop now** (confirmed
+    first: the current round's work is lost; the only stop that applies once
+    the coordinator process is gone) and **Refresh**. Under the title: the
+    crew chip, status, engagement profile badges, the id and timings, then a
+    one-line **engagement summary** (goals met, each budget cap as *used of
+    cap*, amber at the soft limit and red at or past the cap, spend and
+    tokens) that opens the Engagement tab when clicked, the stop reason if
+    any, and the objective clamped to two lines with a "more" toggle.
+  - The **Flow** panel is always shown, directly under the header: the lead's
+    rounds as a spine with each round's units branching off it, a workflow
+    unit framed as its own run graph with a link to its run page, and the
+    message arcs and board between them.
+  - **Token flow** sits under the map: every model call of the lead and all
+    its units, with the lead rounds as its stages. Selecting a range on it
+    narrows the tabs, as on a run page: a window bar shows the turns, their
+    time span and rounds, with **Clear**; Transcript lists the transcripts in
+    the window with their call ranges, and Events, Findings, Messages and
+    Network follow the window's time.
+  - The tabs are **Engagement** (the default: Goals with how each is checked,
+    Budget, and the definition's lead, profiles, pool and lead turns per
+    round), **Transcript**, **Events**, **Findings**, **Children**,
+    **Fleet** (the units, with their count), **Messages** (the operator
+    composer lives here; its badge is the unread count), **Network** and
+    **Assets**.
+
+  See [`agentiflows.md#9-operating-a-run-from-the-control-plane`](agentiflows.md#9-operating-a-run-from-the-control-plane).
 
 ## See also
 

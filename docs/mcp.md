@@ -105,7 +105,7 @@ catalog tools for everything.
 
 ## Operator tools
 
-188 tools over the CP's own endpoints, one per route (`GET /api/tools` and
+198 tools over the CP's own endpoints, one per route (`GET /api/tools` and
 `tools/list` give each tool's full input schema). Each takes the arguments of
 the endpoint it wraps (path parameters, the handler's query struct, the JSON
 body), an optional `host` where the API takes `?host=`, refuses unknown
@@ -117,17 +117,32 @@ gate nothing.
 
 | Area | Tools |
 |---|---|
-| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.board` `runs.usage` `runs.usage_timeline` `runs.source` `runs.ast` `runs.autoflow` `runs.retry` |
+| Workflow runs | `runs.list` `runs.list_all` `runs.archived` `runs.get` `runs.approve` `runs.reject` `runs.cancel` `runs.pause` `runs.resume` `runs.archive` `runs.restore` `runs.delete` `runs.graph` `runs.children` `runs.board` `runs.usage` `runs.usage_timeline` `runs.attempts` `runs.source` `runs.ast` `runs.autoflow` `runs.retry` |
 | Agent runs and transcripts | `agent_runs.list` `agent_runs.continue` `transcripts.get` `transcripts.archive` `transcripts.delete` `events.recent` |
 | Autoflow runs | `autoflow_runs.list` `autoflow_runs.problems` `autoflow_runs.cycles` `autoflow_runs.events` |
-| Sessions and messages | `sessions.list` `sessions.get` `sessions.turns` `sessions.usage_timeline` `sessions.start` `sessions.send` `sessions.archive` `sessions.restore` `sessions.delete` `sessions.stop` `sessions.compact` `messages.list` `messages.send` |
-| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.board` `agentiflows.generated` `agentiflows.steer` `agentiflows.run` `agentiflows.stop` `agentiflow_defs.list` `agentiflow_defs.get` `agentiflow_defs.create` `agentiflow_defs.save` `agentiflow_defs.delete` `agentiflow_defs.validate` |
+| Sessions and messages | `sessions.list` `sessions.get` `sessions.turns` `sessions.usage_timeline` `sessions.capabilities` `sessions.workflows` `sessions.attach_workflow` `sessions.start` `sessions.send` `sessions.archive` `sessions.restore` `sessions.delete` `sessions.stop` `sessions.compact` `messages.list` `messages.send` |
+| Agentiflows | `agentiflows.list` `agentiflows.get` `agentiflows.events` `agentiflows.children` `agentiflows.unit_output` `agentiflows.usage_timeline` `agentiflows.board` `agentiflows.generated` `agentiflows.steer` `agentiflows.run` `agentiflows.stop` `agentiflow_defs.list` `agentiflow_defs.get` `agentiflow_defs.create` `agentiflow_defs.save` `agentiflow_defs.delete` `agentiflow_defs.validate` |
 | Definitions | `workflows.list` `workflows.get` `workflows.create` `workflows.save` `workflows.delete` `workflows.validate` `workflows.generate` `workflows.run` `workflows.run_yaml` `agents.list` `agents.get` `agents.create` `agents.save` `agents.delete` `agents.generate` `agents.run` `agents.validate` `agents.validate_all` `generate.models` `autoflows.list` `autoflows.get` `autoflows.enable` `autoflows.disable` `autoflows.run` `autoflows.explain` `autoflows.doctor` `autoflows.wakes` `claims.list` `claims.release` `claims.requeue` `claims.repair` `skills.list` `skills.get` `skills.install` `skills.update` `skills.validate` `tools.list` `models.list` `models.refresh` |
 | Findings, coverage, assets | `findings.list` `findings.get` `findings.tags` `findings.tag` `findings.export` `findings.export_many` `findings.artifact` `findings.import` `findings.schema` `coverage.list` `coverage.get` `coverage.audit` `coverage.catalog` `coverage.runs` `coverage.diff` `coverage.templates` `coverage.template` `coverage.gap` `coverage.rerun` `assets.list` `query.fields` `query.check` |
 | Observability | `netflow.run` `netflow.agentiflow` `netflow.project` `netflow.global` `netflow.graph` `netflow.explorer` `netflow.index` `netflow.latest` `usage.get` `usage.timeline` `usage.runs` `usage.outliers` `dashboard.get` |
 | Fleet, config, customers | `hosts.list` `hosts.registered` `hosts.add` `hosts.add_ssh` `hosts.add_bucket` `hosts.enroll_node` `hosts.remove` `host.info` `workers.list` `config.get` `config.put_global` `config.put_customer` `config.put_project` `config.put_policy` `customers.list` `customers.create` `customers.get` `customers.update` `customers.delete` `customers.archive` `customers.unarchive` `customers.assign_project` `customers.unassign_project` `launch.preview` `repos.list` `repos.tracked` `repos.attach` `repos.prefer` `repos.forget` `scm_accounts.list` `scm_rules.list` `scm_rules.bind` `auth.status` |
-| Projects | `projects.list` `projects.get` `projects.runs` `projects.sessions` `projects.agents` `projects.workflows` `projects.autoflows` `projects.coverage` `projects.coverage_assessed` `projects.tree` `projects.source` `projects.files` `projects.init` |
+| Projects | `projects.list` `projects.get` `projects.register` `projects.scm` `projects.runs` `projects.sessions` `projects.start_session` `projects.session_capabilities` `projects.workflow_history` `projects.agents` `projects.workflows` `projects.autoflows` `projects.coverage` `projects.coverage_assessed` `projects.tree` `projects.source` `projects.files` `projects.init` |
 | Setup and housekeeping | `fleet.list` `fleet.install` `engagement_profiles.list` `engagement_profiles.get` `cron.list` `cron.events` `cron.tick` `maintenance.prune` |
+
+The newest of them, from the session and workflow work of November 2026:
+`projects.register` (`POST /api/projects`: register a directory as a project,
+starting nothing), `projects.scm` (a checkout's branch, diffs and, with
+`include_review`, its current-branch reviews; marked open-world),
+`projects.start_session` (a session on the built-in `rupu-session` harness;
+`idle` creates one with no turn), `projects.session_capabilities` and
+`sessions.capabilities` (what a session gets: preset, skills, declared tools,
+revisions, the last turn's effective readiness), `sessions.workflows` and
+`sessions.attach_workflow` (the workflow runs linked to a session; attaching
+runs nothing), `projects.workflow_history` (a project's recorded runs,
+archived included), `runs.attempts` (a run's attempt ledger, paged by cursor,
+with explicit evidence limits) and `agentiflows.usage_timeline` (every model
+call of a flow's lead and units, by round). Each is the route of the same
+name in [cp-api.md](cp-api.md).
 
 The tool names are pinned by `crates/rupu-cp/tests/fixtures/mcp/tool_names.json`.
 Every CP route is a tool except the ones in `EXCLUDED`
@@ -291,7 +306,7 @@ docs of the version it talks to:
 
 | URI | Content |
 |---|---|
-| `rupu://docs/<name>` | The docs under `docs/`: `using-rupu`, `agent-format`, `agent-authoring`, `workflow-format`, `workflow-authoring`, `agentiflows`, `triggers`, `engagement-profiles`, `coverage`, `messaging`, `skills`, `transcript-schema`, `cp-api`, `control-plane`, `response-outcomes`, `netflow`, `configuration`, `mcp` (Markdown) |
+| `rupu://docs/<name>` | The docs under `docs/`: `using-rupu`, `agent-format`, `agent-authoring`, `workflow-format`, `workflow-authoring`, `agentiflows`, `agentiflow-tutorial`, `agentiflow-authoring`, `triggers`, `engagement-profiles`, `coverage`, `messaging`, `skills`, `transcript-schema`, `cp-api`, `control-plane`, `response-outcomes`, `netflow`, `configuration`, `mcp` (Markdown) |
 | `rupu://schema/finding-report` | The finding report JSON Schema (what `findings.schema` answers) |
 | `rupu://query/<list>` | A list query's field registry: `findings`, `workflow_runs`, `agent_runs`, `sessions`, `autoflow_runs`, `events` (what `query.fields` answers) |
 | `rupu://profiles/<id>` | Each built-in engagement profile, as TOML. `engagement_profiles.list` also lists layered ones |
@@ -357,13 +372,19 @@ HTTP URL as above (for a client that only speaks stdio, use `mcp-remote`).
 | Tool is missing from `tools/list` | `--tools` excludes it, or it is a catalog tool whose service the server lacks (logged at `info` level at startup: run with `RUST_LOG=info`) |
 | `--tools` fails at startup with a "did you mean" | A name matches no tool; use the suggestion |
 
+## Native session controls
+
+The session client's command discovery and execution
+(`GET /api/sessions/:id/controls`, `POST …/commands`), its model, provider and
+tool settings (`…/settings`) and its orchestration switch (`…/orchestration`)
+are not exposed as MCP tools. Use the native client or their HTTP routes on
+the owning host ([cp-api.md#sessions](cp-api.md#sessions)). The typed MCP
+session operations, `sessions.stop` and `sessions.compact` included, remain
+available.
+
 ## See also
 
 - [control-plane.md](control-plane.md) - the server, its token and its modes
 - [cp-api.md](cp-api.md) - the JSON the operator tools return
 - [scm.md](scm.md#mcp-tool-catalog) - the SCM and issue tools
 - [messaging.md](messaging.md) - message spaces behind `messages.*`
-
-### Native session controls
-
-The session client's command discovery/execution, model/provider/tool settings, and orchestration configuration endpoints are not exposed as MCP tools. Use the native client or their HTTP APIs on the owning host. Existing typed MCP session operations, including stop and compact, remain available.

@@ -75,6 +75,18 @@ rupu auth login --provider gemini --mode api-key --key ...
 rupu auth login --provider copilot --mode sso
 ```
 
+On a machine with no browser (a server, a VM, an SSH session), log in from a browser on
+another machine instead:
+
+```sh
+rupu auth login --provider openai --mode device
+```
+
+rupu prints a URL and a code (or a URL and a paste-the-code prompt, depending on the vendor),
+you finish the login elsewhere, and the credential lands in the account's `sso` entry, so
+`rupu auth status` shows it as `sso`. Which vendors support it and what each flow looks like:
+[providers.md](providers.md#device-login---mode-device).
+
 Check status:
 
 ```sh
@@ -195,6 +207,20 @@ rupu run review-diff "check staged changes for bugs and missing tests"
 `rupu run pause <run-id>` / `rupu run resume <run-id>` act on workflow runs only. A standalone
 agent run has no pause boundary, so pausing one is refused with an error rather than marking it
 paused while the agent keeps going.
+
+An agent on `provider: openai` can run under an OpenAI Daybreak access program:
+
+```sh
+rupu run recon --cyber daybreak_red "enumerate the exposed services"
+```
+
+`--cyber <program>` takes `standard`, `daybreak_blue` or `daybreak_red` and overrides the agent's
+`cyber:` frontmatter and the `cyber` default on the provider's model entry. It selects a program
+rather than granting one: the organization and project behind the credential must already be
+approved, and the value must match the model, or OpenAI answers with `invalid_access_program`.
+`rupu run --continue` restores the flag with the rest of the original command. See
+[providers/openai.md](providers/openai.md#openai-daybreak-cyber-access) and
+[agent-format.md](agent-format.md#cyber).
 
 ### Run an agent against a PR target
 
@@ -695,7 +721,7 @@ Snapshot views with a custom structured surface:
 
 Persistent agent sessions:
 
-- `rupu session start <agent> [target] [prompt]`
+- `rupu session start <agent> [target] [prompt] [--provider <account> --model <id>] [--idle] [--skill-preset rupu-session-v1|none]`
 - `rupu session list [--all|--archived]`
 - `rupu session show <session-id>`
 - `rupu session send <session-id> <prompt>`
@@ -714,22 +740,28 @@ turn. Re-attach later with `rupu session attach <session-id>`.
 
 While attached:
 
-- press `p` or `Enter` to submit the next prompt once the session is idle
-- press `Esc` to cancel local prompt composition without sending
-- press `x` to cancel the active turn and return the session to idle
-- press `q` to leave the viewer while keeping the session alive
-- press `d` or `Ctrl-]` to detach without stopping the worker
-- press `?` for attach help
+- start typing, or press `Enter`, to compose the next prompt; `Enter` sends it (while a
+  turn is running the full-screen view queues it for the worker; the plain line view
+  reports `session busy` instead)
+- press `Tab` with a `/` prompt open to complete slash commands; arrows move through the
+  menu, `Enter` accepts, `Esc` closes it
+- press `Ctrl-U` to clear the prompt and `Ctrl-W` to delete its last word
+- press `Esc` with no prompt open to cancel the active turn (see below)
+- press `Ctrl-F` to cycle the transcript view, `Up`/`Down`, `PageUp`/`PageDown`, `Home`/`End`
+  to scroll (scrolling up loads older history)
+- press `Ctrl-D` or `Ctrl-]` to detach without stopping the worker
+- press `Ctrl-C` to quit the viewer
+- press `F1` for attach help
 - prompt input also accepts slash commands:
   - `/help`
   - `/status`
   - `/history`
   - `/runs`
   - `/transcript`
-  - `/cancel`
-  - `/compact` — summarize older turns now (see below; the session must be idle)
-  - `/coverage` — the session's coverage progress: concerns complete and gap files
-    (only for an agent with a `concerns:` block, after its first turn)
+  - `/cancel` (asks the running turn to stop; see below)
+  - `/compact` (summarize older turns now; see below; the session must be idle)
+  - `/coverage` (the session's coverage progress: concerns complete and gap files;
+    only for an agent with a `concerns:` block, after its first turn)
   - `/stop`
   - `/detach`
   - `/quit` (or `/exit`)
@@ -738,6 +770,123 @@ While attached:
     example `/workflow show-run current --view full`). Other subcommands are not
     accepted. These work in the full-screen attach view only; the plain line view
     says so instead.
+
+**Cancelling a turn.** `/cancel` and `Esc` do not kill the worker. They write a cancel
+request addressed to the active run, under the session directory, and the turn that owns
+that run picks it up: any running tool finishes, the turn ends at a safe boundary with a
+`run_complete` of `aborted` ("turn cancelled by operator") in its transcript, the
+conversation so far is kept, and the worker goes back to idle for the next prompt. The
+viewer shows `cancel requested`, not `cancelled`, because the request is acknowledged
+before the turn ends; press `Enter` once the status is idle to send the next prompt. A
+request can only ever cancel the run it names, never a later turn. A worker started by a
+rupu that predates cooperative cancel still has to be stopped after its current turn
+(`rupu session stop <id>`) to gain it. The same cancel is available over HTTP as
+`POST /api/sessions/:id/commands` with `{"command": "/cancel", "expected_run_id": "<run>"}`
+(contract: [session-command-api.md](session-command-api.md); routes:
+[cp-api.md](cp-api.md#sessions)).
+
+### Built-in session (`rupu-session`)
+
+`rupu-session` is a session agent compiled into the binary, so a project needs no agent
+file, stock fleet or specialist to open a session on it:
+
+```sh
+rupu session start rupu-session --prompt "explain how the login flow works"
+rupu session start rupu-session --provider openai --model gpt-5 --prompt "review the diff"
+rupu session start rupu-session --idle
+```
+
+- The name is reserved: it resolves before any agent file in `.rupu/agents/` or
+  `~/.rupu/agents/`, including a broken or same-named one.
+- It is `readonly` by default: reads and rupu's own bookkeeping (coverage, findings) are
+  allowed, workspace writes and external effects are denied, and children it dispatches are
+  capped at readonly. Pass `--mode bypass` to let it write. `ask` is refused, as for every
+  session.
+- Its provider, model and auth are unpinned, with `fallbacks: []`, so the selection you
+  make is the one the session runs on. `--provider <account>` (which requires `--model`)
+  and `--model <id>` freeze the selection into the session's settings before the first
+  turn; with neither, the normal config resolution applies. Both flags work for any agent.
+- Its tool list is the core file tools, the catalog reads (`agents.*`, `workflows.*`,
+  `catalog.search`), `dispatch`/`join`/`workflows.generate`, `coverage.*`, `findings.*`,
+  `assets.mark` and the SCM/issue connector namespaces, resolved against the services the
+  run has and the ordinary permission policy. Three bundled concerns (correctness,
+  verification, security and data boundaries) give it a coverage ledger of its own.
+- `--idle` creates the session record with zero turns, prints `session: <id>` and starts
+  no worker and no model call. It conflicts with a target, a prompt and `--into`. Send the
+  first turn later with `rupu session send`.
+- `--skill-preset rupu-session-v1|none` chooses the session's skill preset; it is only
+  accepted for `rupu-session`. The default is the preset. See
+  [skills.md](skills.md#session-skill-preset).
+- The project root is the current directory, canonicalized, even when it has no `.rupu/`
+  marker; the session never borrows an ancestor project's agents or configuration.
+
+The control plane starts the same session with `POST /api/projects/:ws_id/sessions`
+(features `session.builtin_harness` and, for `idle`, `session.idle_harness`), and the
+operator MCP as `projects.start_session`. Contract:
+[session-harness-2026-11-06.md](session-harness-2026-11-06.md); routes:
+[cp-api.md](cp-api.md#projects-and-code).
+
+### Runtime settings
+
+A session's provider, model and declared tools can be changed for its next turn without a
+new session. The settings are revisioned: `GET /api/sessions/:id/settings` returns the
+frozen `defaults`, the current `settings` with their `revision`, the permission mode and
+the tool catalog, and `PUT` to the same path takes the settings object back with that
+revision (a stale revision is a 409; reload and retry). A write needs a writable
+`rupu cp serve` on the host that owns the session; an archived session and a remote host
+are refused. The worker reads the settings at the start of each turn (`applies:
+next_turn`), so a running turn keeps the provider it started on. An explicit model or
+provider turns the agent's and config's fallback chain off, even when it names the
+original model; a tools-only edit keeps the chain. After a model change, `rupu session
+compact` needs an explicit `--window`. `rupu session start --provider/--model` writes the
+same settings at revision 1. Contract:
+[session-runtime-controls.md](session-runtime-controls.md); routes:
+[cp-api.md](cp-api.md#sessions).
+
+### Orchestration
+
+A session can opt into the lead coordination tools an agentiflow lead has, without
+becoming a flow run and without widening its permission mode. `GET`/`PUT
+/api/sessions/:id/orchestration` carry exactly `{"revision": n, "enabled": true|false}`
+(stale revision: 409); the change applies on the next turn. Enabling grants the session
+`dispatch`/`join`, `workflows.generate`, `board.*`, `msg.send`, the catalog reads and
+`findings.report`, over the shared launcher, board, mailbox and catalog services.
+`goal.status`, `goal.coverage` and `budget.status` are deliberately absent: an ordinary
+session has no supervising agentiflow envelope to answer them. Scheduling is turn-bound.
+Nothing runs between turns: children still unfinished when a turn ends are checkpointed
+as interrupted through the normal launcher, and the next enabled turn reopens and
+continues them, even across a worker restart; completed children come back as results
+without rerunning. Disabling suspends that continuation and keeps the records. Contract:
+[session-orchestration.md](session-orchestration.md); routes:
+[cp-api.md](cp-api.md#sessions).
+
+### Sessions and workflow runs
+
+A session can hold links to workflow runs in its project:
+
+- **Launch from a session.** `POST /api/workflows/:name/run` with `session_id`, the
+  definition's `scope_kind`/`scope_id`, its `expected_revision` and the registered
+  `workspace_id` runs the workflow as an ordinary workflow run and records a durable link
+  on the session, pinned to that saved revision. The receipt carries the `association`.
+  The run is not a session turn and gets no invented parent.
+- **Attach an existing run.** `POST /api/sessions/:id/workflows` with `{"run_id": "…"}`
+  links an active or archived run from the same project without executing it. The run's
+  records stay byte-for-byte unchanged; the link carries `origin: "attached"` and no
+  source revision, since the historical source is unknown.
+- **List the links.** `GET /api/sessions/:id/workflows` returns them with their recorded
+  status; a linked run deleted later shows `status: "unavailable"`.
+- **Project history.** `GET /api/projects/:id/workflow-history?offset=&limit=&q=` lists
+  the project's active and archived workflow runs, newest first, with a plain substring
+  `q` over run id, workflow name and codename.
+
+A built-in `rupu-session` sees its linked runs on each turn as bounded reference context
+(run id, workflow name, origin, recorded status and where the records live), never their
+inputs, events or transcripts. The features are `workflow.session_link`,
+`workflow.session_attach` and `workflow.session_history`; the operator MCP tools are
+`sessions.workflows`, `sessions.attach_workflow` and `projects.workflow_history`.
+Contract: [plans/2026-11-06-session-workflow-links-design.md](plans/2026-11-06-session-workflow-links-design.md)
+and [harness-2026-11-06/historical-workflow-contract.md](harness-2026-11-06/historical-workflow-contract.md);
+routes: [cp-api.md](cp-api.md#sessions).
 
 The attach header shows the session's token totals, `Cov <complete>/<total>` when
 the agent declares `concerns:`, and a **context gauge**: the last turn's input

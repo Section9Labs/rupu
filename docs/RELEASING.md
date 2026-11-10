@@ -48,8 +48,12 @@ when it is being released. (Design:
 - **PRs that touch CI itself** still run on the PR: `.github/workflows/`,
   `docker/`, `rust-toolchain.toml` and `.cargo/` run the full suite;
   `packaging/`/`flake.nix`, `scripts/` and the published keyring run just
-  their own check. A broken CI file would otherwise only surface when a
-  release tries to use it.
+  their own check. The packaging check (`community-packaging` in `ci.yml`)
+  does real RPM signing: it installs `rpm` and `createrepo-c`, runs
+  `packaging/test-yum-signing.sh` with a disposable key and a fixture RPM,
+  verifies the repo signature with `gpg --verify` and rejects a fake
+  `rpmsign`. A broken CI file would otherwise only surface when a release
+  tries to use it.
 - **Any branch can opt in** to the full suite: `gh workflow run ci.yml --ref
   <branch>`. The result lands on the branch's head commit, so it shows on the
   PR.
@@ -240,7 +244,13 @@ Set under repo Settings → Secrets and variables → Actions.
   IS stapled (`release-app.yml`'s `macos-app` job staples both the `.app`
   bundle and the DMG after notarization; app bundles and disk images accept
   tickets). Both workflows read the same Apple secrets.
-- `GPG_PRIVATE_KEY`, `GPG_KEY_ID` — signs the apt/yum repository metadata.
+- `GPG_PRIVATE_KEY`, `GPG_KEY_ID` — signs the apt/yum repository metadata,
+  and every RPM: `packaging/build-yum-repo.sh` runs `rpmsign --addsign` on
+  each package with `GPG_KEY_ID`, then verifies them against an isolated
+  rpmdb holding only that key (`rpmkeys --import`, then `rpmkeys --checksig
+  --verbose` per RPM, which must report `signature … : OK`); a package that
+  passes on digests alone fails the publish. `.deb` packages are not signed
+  individually; the signed `Release` file covers them.
 - `AUR_SSH_PRIVATE_KEY`, `AUR_USERNAME`, `AUR_EMAIL` — deploy key and commit
   identity for the `rupuaur` AUR account. `.SRCINFO` is regenerated inside a
   throwaway `archlinux:latest` container (`makepkg --printsrcinfo` only runs
@@ -258,9 +268,14 @@ one repository, none expire, and revoking one touches no other account.
 ## Smoking a release
 
 Assets are bare binaries (`rupu-darwin-arm64`, `rupu-linux-x64`,
-`rupu-linux-arm64`), the macOS app (`rupu-app-darwin-arm64.dmg` and `.zip` —
-signed, notarized, stapled), plus `.deb`/`.rpm` packages, each with a
-`.sha256`. The app assets arrive a few minutes after the CLI ones, from
+`rupu-linux-arm64`), each with a `.sha256`, the macOS app
+(`rupu-app-darwin-arm64.dmg` and `.zip` — signed, notarized, stapled), plus
+`.deb`/`.rpm` packages. Only the three bare binaries carry a `.sha256`: a
+`.deb` is covered by the apt repository's signed `Release`, and an `.rpm` by
+its own `rpmsign` signature (`rpmkeys --checksig` verifies a downloaded one
+after `rpm --import` of the keyring). The RPM's name carries nfpm's release
+field: `rupu-<version>-1.x86_64.rpm`, not `rupu-<version>.x86_64.rpm`. The
+app assets arrive a few minutes after the CLI ones, from
 `release-app.yml`, and only on releases where the app changed (check that
 workflow's run for the "unchanged since" notice if they are absent). When
 they are there, smoke them too: download the DMG, `hdiutil attach` it, and

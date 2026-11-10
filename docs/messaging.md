@@ -221,6 +221,17 @@ The control plane serves the same thing as `GET/POST /api/{runs,sessions,agentif
 and a local SSE stream ([cp-api.md](cp-api.md)). Remote hosts answer over HTTP and SSH when
 their rupu advertises `run.messages`. Tunnel and bucket hosts answer 501.
 
+A send over the API can carry `expected_run_id`: the id of the run the operator believes owns
+the recipient. The bus then takes the message only if `to` is one exact participant address
+(not a role, a codename alias or a group), that participant is live, and the run that joined
+under it is the one named; otherwise the send is refused (the CP answers 409) and nothing is
+logged or queued. The check happens under the same lock as the join, the resolution and the
+log append, so a recipient that was taken over by a later run (a session's next turn, a
+continued child) between a read and the send is caught. A host advertises the guard as
+`run.messages.expected_run`: an HTTP host that lists it is forwarded such a send, one that
+doesn't is a 501, and SSH is always a 501 for it (the `rupu __message` helper has no guard).
+`rupu message send` never sets it.
+
 ## The claim journal
 
 `board/claims.jsonl` records every claim's life, so the board can say who held what and when, not only what is held now. It is append-only, one line per event: `claimed` (key, owner, `at`, `lease_expires_at`, and the claim's token), `released` and `expired` (key, owner, `at`, token). The claim files stay the lock; the journal is the history. Writing it is best-effort: a failed append is logged and the claim still works, so a view can miss an event but never blocks a claim. Retractions in `directives.jsonl` carry the time they were made (`at`).

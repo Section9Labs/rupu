@@ -49,6 +49,14 @@ static DOCS: &[(&str, &str, &str)] = docs![
         "Agentiflows: goal-directed fleet runs, their definition file and envelope."
     ),
     (
+        "agentiflow-tutorial",
+        "Agentiflow tutorial: a goal-directed run from `rupu fleet install` to its findings."
+    ),
+    (
+        "agentiflow-authoring",
+        "How to write a good agentiflow: the lead prompt, goal targets, budgets and steering."
+    ),
+    (
         "triggers",
         "Workflow triggers: cron, polled SCM events and webhooks."
     ),

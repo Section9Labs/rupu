@@ -28,6 +28,7 @@ Resolution rules:
 - project-local agents shadow global agents by `name:`
 - shadowing is all-or-nothing; `rupu` does not merge frontmatter or prompts
 - `rupu agent list` shows whether an agent is coming from project or global scope
+- `rupu-session` is a reserved name: the built-in session harness compiled into the binary (`crates/rupu-agent/src/builtin/rupu-session.md`). It resolves before either disk layer, so an `agents/rupu-session.md` of your own is never read. It is `permissionMode: readonly` by default, declares `fallbacks: []` and an explicit `tools:` list (the core file and shell tools, the catalog and launch tools, coverage, findings, the SCM and issue connectors), and takes its provider and model from the session launch rather than the file.
 
 ---
 
@@ -468,7 +469,7 @@ See `docs/coverage.md` for what a complete report requires. Every field is requi
 
 ### `cyber`
 
-Selects OpenAI's [Daybreak](https://developers.openai.com/api/docs/guides/daybreak) access program for the `cyber` capability. openai-codex only — the agent runs on `provider: openai-codex` with a Daybreak-capable model (e.g. `gpt-5.6-cyber`). The value is emitted on the Responses API request body as `access_programs: { cyber: <value> }`.
+Selects OpenAI's [Daybreak](https://developers.openai.com/api/docs/guides/daybreak) access program for the `cyber` capability. OpenAI only: the agent runs on `provider: openai` (or an account whose `kind` is `openai`, `openai_codex` or `codex`, which all build the same client) with a Daybreak-capable model (e.g. `gpt-5.6-cyber`), under an API key or a ChatGPT login alike. The value is emitted on the Responses API request body as `access_programs: { cyber: <value> }`. Note that `openai-codex` with a hyphen is the display id rupu prints in transcripts and pricing, not a built-in provider name: `provider: openai-codex` works only with `[providers.openai-codex] kind = "openai_codex"` declared and logged in. See [providers/openai.md](providers/openai.md#openai-daybreak-cyber-access) for the org/project scoping and the full behaviour notes.
 
 - `standard` — the ordinary access tier (no cyber program).
 - `daybreak_blue` — the Daybreak defensive program.
@@ -479,7 +480,7 @@ Setting `cyber` **selects** a program; it does not **grant** access. Your organi
 ```yaml
 ---
 name: exploit-verifier
-provider: openai-codex
+provider: openai
 model: gpt-5.6-cyber
 cyber: daybreak_red
 ---
@@ -487,13 +488,13 @@ cyber: daybreak_red
 
 **Precedence.** Three surfaces set `cyber`, highest first:
 
-1. `rupu run --cyber <program>` — a per-run override on the command line.
-2. This `cyber:` frontmatter key.
-3. A provider model-config default: a `cyber` on the matching `[[providers.openai-codex.models]]` entry (see [configuration.md](configuration.md#cyber-access-programs)).
+1. `rupu run --cyber <program>`: a per-run override on the command line. `rupu run --continue <id>` restores it with the rest of the original command; a `--cyber` given on the continue replaces it.
+2. This `cyber:` frontmatter key. An unknown value here is a parse error: the agent file does not load.
+3. A provider model-config default: a `cyber` on the matching `[[providers.openai.models]]` entry (see [configuration.md](configuration.md#cyber-access-programs)). An unknown value there is ignored with a warning, not an error.
 
-A program set at run start follows the run through a model fallback hop only while the model stays the same; a hop to a different model or provider drops it, since the right value is model-specific. A session freezes the program at `session start` and applies it to every turn.
+A program set at run start follows the run through a model fallback hop only while the model stays the same; a hop to a different model or provider drops it, since the right value is model-specific. The compaction summariser call never carries it, only the turn requests do. A session freezes the program at `session start` and applies it to every turn; a session settings override of the provider or model clears it, and `rupu session start` has no `--cyber` flag.
 
-**Remote hosts:** like every frontmatter key, a rupu release that predates `cyber` refuses to load an agent file that sets it, so upgrade rupu on any remote host (`host:` / `distribute:`) before placing a `cyber` agent there.
+**Remote hosts:** like every frontmatter key, a rupu release that predates `cyber` refuses to load an agent file that sets it, so upgrade rupu on any remote host (`host:` / `distribute:`) before placing a `cyber` agent there. A coordinator's `rupu run --cyber` is not passed to placed units: a placed unit runs the agent file installed on its host, so the program comes from that file's `cyber:` or that host's config.
 
 ### `fallbacks`
 
@@ -502,7 +503,7 @@ An ordered list of models to try when the agent's own model cannot give a usable
 ```yaml
 fallbacks:
   - model: claude-sonnet-5-5        # same provider as the agent
-  - provider: openai-codex          # another provider
+  - provider: openai                # another provider (a built-in name, or a declared account)
     model: gpt-5.6-cyber
 ```
 

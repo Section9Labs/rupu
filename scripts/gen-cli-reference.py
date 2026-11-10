@@ -51,7 +51,18 @@ def parse(text):
         if m and 2 <= indent <= 8:
             sections[cur].append([m.group(1).strip(), (m.group(2) or "").strip()])
         elif sections[cur]:
-            sections[cur][-1][1] = (sections[cur][-1][1] + " " + line.strip()).strip()
+            # clap's `Possible values:` block is one `- value: meaning` line per
+            # value; fold it into one sentence instead of a run-on.
+            text = re.sub(r"\s+", " ", line.strip())
+            prev = sections[cur][-1][1]
+            if text.startswith("- ") and ("Possible values:" in prev):
+                sep = " " if prev.endswith("Possible values:") else "; "
+                text = sep + text[2:]
+            elif text == "Possible values:":
+                text = (" " if prev.endswith((".", ":", ";")) else ". ") + text
+            else:
+                text = " " + text
+            sections[cur][-1][1] = (prev + text).strip()
     return {"about": " ".join(about), "usage": usage, **sections}
 
 

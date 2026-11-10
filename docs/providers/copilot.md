@@ -35,9 +35,11 @@ This is the same flow `gh auth login` uses:
    ```
    Visit https://github.com/login/device and enter code: ABCD-1234
    ```
-3. Open the URL in a browser (any browser, anywhere — this works headless / over SSH unlike the other providers' SSO).
+3. Open the URL in a browser (any browser, anywhere: this flow needs no browser on the machine running rupu, so it works headless and over SSH).
 4. Paste the code, authorize the rupu Copilot OAuth app.
 5. rupu polls until you authorize, then exchanges the GitHub token for a Copilot API token. Both are stored in `~/.rupu/auth.json` (mode 0600).
+
+`rupu auth login --provider copilot --mode device` runs exactly the same flow and stores the same `sso` credential; for Copilot and GitHub the two mode words are interchangeable. The other providers have their own device logins now (`--mode device` for Anthropic, OpenAI, Gemini and GitLab), so this is no longer the only headless SSO; see [providers.md](../providers.md#device-login---mode-device) for what each prints and how long it waits.
 
 ## Example agent file
 

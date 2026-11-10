@@ -465,26 +465,90 @@ at their current version: the runner's own compaction during a turn,
 request. A loaded skill uninstalled for a while is named as missing and stays
 in the set, so it comes back once it is installed again.
 
-A session record that carries skills is written as version 2; one without
-skills stays version 1. A rupu older than session skills doesn't check the
-version, so it continues a version 2 session but drops its skills the next
-time it writes the record: the session runs on without them. A rupu that
-knows session skills refuses a record from a newer rupu ("this session was
-written by a newer rupu; upgrade rupu to continue it") rather than write it
-back without the fields it doesn't know. `rupu session list` shows such a
-session with status `newer rupu` and a warning, and `rupu session prune`
-leaves it alone.
+A session record is written at the lowest version a rupu must understand to
+keep it whole: version 2 when it carries skills, version 3 when its agent
+sets `messaging: false`, version 4 for a built-in `rupu-session` (see
+[Session skill preset](#session-skill-preset)), else version 1. A rupu older
+than session skills doesn't check the version, so it continues a version 2
+session but drops its skills the next time it writes the record: the session
+runs on without them. A rupu that knows session skills refuses a record from a
+newer rupu ("this session was written by a newer rupu; upgrade rupu to
+continue it") rather than write it back without the fields it doesn't know.
+`rupu session list` shows such a session with status `newer rupu` and a
+warning, and `rupu session prune` leaves it alone.
 
-A queued turn that invokes skills is written as turn request version 2; any
-other stays version 1, so an older worker still runs it. A worker that knows
-`--skill` fails a turn queued by a newer rupu, with a transcript ("this turn
-was queued by a newer rupu (turn request version <n>); restart the session
-worker: rupu session stop <id>"), rather than run it without what it asked
-for. A worker older than `--skill` can't refuse what it predates: it would run
-the turn without its skills. `session send` restarts a worker whose rupu
-binary is older than its own, judged by the binary's modification time, but
-it keeps the worker when that can't be read. After upgrading rupu, run
-`rupu session stop <id>` before using `--skill` on a running session.
+A queued turn is written at the lowest version a worker must understand to
+run it as asked: version 2 when it invokes skills, version 3 when the session
+has runtime settings written (a provider, model or tools override, see
+[using-rupu.md](using-rupu.md#runtime-settings)), version 4 when the session
+has orchestration configured ([using-rupu.md](using-rupu.md#orchestration)),
+else version 1, so an older worker still runs a plain turn. A worker that
+knows `--skill` fails a turn queued by a newer rupu, with a transcript ("this
+turn was queued by a newer rupu (turn request version <n>); restart the
+session worker: rupu session stop <id>"), rather than run it without what it
+asked for. A worker older than `--skill` can't refuse what it predates: it
+would run the turn without its skills. `session send` restarts a worker whose
+rupu binary is older than its own, judged by the binary's modification time,
+but it keeps the worker when that can't be read. After upgrading rupu, run
+`rupu session stop <id>` before using `--skill`, settings or orchestration on
+a running session.
+
+## Session skill preset
+
+A built-in `rupu-session` session ([using-rupu.md](using-rupu.md#built-in-session-rupu-session))
+starts with a curated set of installed skills, the preset `rupu-session-v1`:
+
+| Member | Role in the session |
+|---|---|
+| `global:rupu-session-operations` | how to work inside a built-in session: catalog, child runs, messages, coverage, findings. Preloaded. |
+| `global:coverage-assets` | recording the assets the work touches. Indexed. |
+| `global:finding-report` | writing a complete, reproducible finding. Indexed. |
+| `global:work-units` | normalizing results and splitting work into units. Indexed. |
+
+The preset names exact global skills; it installs nothing and grants no
+tools. `rupu-session-operations` is preloaded, so its instructions are in the
+system prompt from the first turn; the other three stay indexed and the model
+loads them with `skills.load` when a task calls for them, keeping their larger
+bodies out of the initial prompt. Only an installed, valid, model-loadable
+member is selected. A member that is missing, invalid, or marked
+`disable-model-invocation` is left out and recorded on the session as a
+`skill_preset_diagnostics` entry (`not_installed`, `invalid`,
+`not_model_loadable`, with a message naming the skill), and the session still
+starts. Installing the skill later neither clears the diagnostic nor adds the
+skill to that session: like every session skill, the set is frozen at start.
+A skill you name yourself with `--skill` or `--preload-skill` keeps its own
+layer and preload flag; the preset never upgrades an explicitly indexed
+operations skill to preload.
+
+`rupu session start rupu-session --skill-preset none` starts without the
+preset additions and keeps any explicit `--skill` / `--preload-skill`
+entries. `--skill-preset` is refused for any other agent ("skill presets
+apply only to rupu-session"). Over HTTP the project session start takes
+`skill_preset`, `skills` and `preload_skills` (feature
+`session.skill_preset.v1`), and `GET /api/projects/:id/session-capabilities`
+previews what the preset would select for a project, diagnostics included,
+while `GET /api/sessions/:id/capabilities` shows a session's frozen set, its
+preset and preset diagnostics. Contract:
+[session-capabilities-v1.md](session-capabilities-v1.md); routes:
+[cp-api.md](cp-api.md#sessions).
+
+None of the four members ships inside the binary, so install them into the
+global layer (the preset reads only `global:`) before starting a built-in
+session. `rupu-session-operations` lives in the rupu repository at
+`skills/rupu-session-operations/`; the other three are in
+[Section9Labs/rupu-skills](https://github.com/Section9Labs/rupu-skills):
+
+```sh
+# from a checkout of the rupu repository
+rupu skill install ./skills/rupu-session-operations
+
+# the other three, from GitHub
+rupu skill install Section9Labs/rupu-skills --skill coverage-assets --skill finding-report --skill work-units
+```
+
+`rupu skill install Section9Labs/rupu --skill rupu-session-operations` works
+too (the repository is public and holds that one `SKILL.md`), at the cost of
+cloning the whole repository. `rupu skill list` shows the four installed.
 
 ## In the control plane
 
