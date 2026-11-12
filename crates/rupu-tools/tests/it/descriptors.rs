@@ -43,13 +43,27 @@ fn production_impls() -> usize {
         include_str!("../../src/budget/mod.rs"),
         include_str!("../../src/skills/mod.rs"),
     ];
-    homes
-        .iter()
-        .map(|src| {
-            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-            prod.matches("impl Tool for ").count()
-        })
-        .sum()
+    // SessionReadTool is one parameterized implementation serving four descriptors.
+    let session_bodies = [
+        &rupu_tools::session_reads::CONTEXT,
+        &rupu_tools::session_reads::WORKFLOWS,
+        &rupu_tools::session_reads::INSPECT,
+        &rupu_tools::session_reads::NETFLOWS,
+    ];
+    for descriptor in session_bodies {
+        let tool = rupu_tools::session_reads::SessionReadTool(descriptor);
+        assert!(ToolCatalog::all()
+            .iter()
+            .any(|d| std::ptr::eq(*d, tool.descriptor())));
+    }
+    session_bodies.len()
+        + homes
+            .iter()
+            .map(|src| {
+                let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+                prod.matches("impl Tool for ").count()
+            })
+            .sum::<usize>()
 }
 
 #[test]
@@ -183,6 +197,7 @@ fn provided_services_match_the_bodies_that_build() {
 fn full_context() -> ToolContext {
     let mut ctx = ToolContext::default();
     let s = &mut ctx.services;
+    s.session_reads = Some(Arc::new(FullSessionReads));
     s.scm = Some(Arc::new(rupu_scm::Registry::default()));
     s.launcher = Some(Arc::new(crate::support::ScriptedLauncher::default()));
     s.workflow_generator = Some(Arc::new(crate::support::StubGenerator));
@@ -302,5 +317,25 @@ fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
                 offenders.push(path.display().to_string());
             }
         }
+    }
+}
+
+struct FullSessionReads;
+impl rupu_tools::ports::SessionReadPort for FullSessionReads {
+    fn permits(&self, name: &str) -> bool {
+        [
+            "session.context",
+            "session.workflows",
+            "run.inspect",
+            "run.netflows",
+        ]
+        .contains(&name)
+    }
+    fn read(
+        &self,
+        _: rupu_tools::ports::SessionReadRequest,
+        _: &ToolContext,
+    ) -> Result<serde_json::Value, rupu_tools::ports::PortError> {
+        unreachable!("descriptor tests never invoke tools")
     }
 }

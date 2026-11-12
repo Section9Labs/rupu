@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 use httpmock::{Method::POST, MockServer};
 use rupu_tools::{AliasScope, GrantInputs, PermissionMode, PermissionPolicy, ServiceSet};

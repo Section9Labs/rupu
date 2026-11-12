@@ -38,6 +38,13 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `src` with every `#[cfg(test)]` item (a `mod … { … }`, `fn`, `impl`, …)
 /// replaced by spaces, so line structure survives.
 fn without_test_items(src: &str) -> String {
+    // Out-of-line test modules carry an explicit file-level test gate.
+    if src.trim_start().starts_with("#![cfg(test)]") {
+        return src
+            .chars()
+            .map(|c| if c == '\n' { '\n' } else { ' ' })
+            .collect();
+    }
     let mut bytes = src.as_bytes().to_vec();
     let mut from = 0;
     while let Some(i) = src[from..].find("#[cfg(test)]") {
@@ -192,4 +199,20 @@ fn the_scanner_sees_constructions_only() {
     let src = "pub struct ToolContext {\n}\nimpl ToolContext {\n}\nfn f() {\n    let x = ToolContext {\n    };\n    let AgentRunOpts { a, .. } = o;\n}\n#[cfg(test)]\nmod tests {\n    fn g() { let y = AgentRunOpts { }; }\n}\n";
     let found = hits(&without_test_items(src));
     assert_eq!(found, vec![("ToolContext".to_string(), 6)]);
+}
+
+#[test]
+fn the_scanner_ignores_explicit_test_only_files() {
+    assert!(hits(&without_test_items(
+        "#![cfg(test)]\nfn f() { let x = ToolContext { }; }\n"
+    ))
+    .is_empty());
+    // A nested module's inner attribute must not hide surrounding production code.
+    assert_eq!(
+        hits(&without_test_items(
+            "fn f() { let x = ToolContext { }; }\nmod tests {\n#![cfg(test)]\n}\n"
+        ))
+        .len(),
+        1
+    );
 }
