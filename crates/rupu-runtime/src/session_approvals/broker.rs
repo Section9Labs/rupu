@@ -736,9 +736,9 @@ impl Broker {
                     .live
                     .lock()
                     .map_err(|_| store::Error::Invalid)?;
-                if !live
+                if live
                     .get(&reserve_registration.id)
-                    .is_some_and(|r| r.generation == reserve_registration.generation)
+                    .is_none_or(|r| r.generation != reserve_registration.generation)
                 {
                     return Err(store::Error::Conflict);
                 }
