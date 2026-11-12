@@ -29,6 +29,12 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
     let status = services.run_status.is_some();
     let catalog = services.catalog.is_some();
     let skills = services.skills.as_ref().is_some_and(|s| s.has_loadable());
+    let session_read = |name: &str| {
+        services
+            .session_reads
+            .as_ref()
+            .is_some_and(|reads| reads.permits(name))
+    };
     let t: Arc<dyn Tool> = match name {
         // core
         "bash" => Arc::new(BashTool),
@@ -104,6 +110,18 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
         "budget.status" if status => Arc::new(budget::BudgetStatusTool),
         // a run's skills
         "skills.load" if skills => Arc::new(skills::SkillsLoadTool),
+        "session.context" if session_read("session.context") => Arc::new(
+            crate::session_reads::SessionReadTool(&crate::session_reads::CONTEXT),
+        ),
+        "session.workflows" if session_read("session.workflows") => Arc::new(
+            crate::session_reads::SessionReadTool(&crate::session_reads::WORKFLOWS),
+        ),
+        "run.inspect" if session_read("run.inspect") => Arc::new(
+            crate::session_reads::SessionReadTool(&crate::session_reads::INSPECT),
+        ),
+        "run.netflows" if session_read("run.netflows") => Arc::new(
+            crate::session_reads::SessionReadTool(&crate::session_reads::NETFLOWS),
+        ),
         _ => return None,
     };
     Some(t)

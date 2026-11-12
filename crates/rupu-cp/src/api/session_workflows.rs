@@ -30,6 +30,9 @@ pub(crate) struct Source {
     pub scope_kind: String,
     pub scope_id: Option<String>,
     pub revision: String,
+    /// Actual immutable ad hoc bytes; revision above remains the saved baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -566,6 +569,16 @@ fn load_existing_run(s: &AppState, run_id: &str) -> ApiResult<rupu_orchestrator:
         .map_err(|e| super::runs::run_not_found_or_internal(run_id, e))
 }
 
+pub(crate) const HISTORY_QUERY_CAPABILITY: &str = "workflow.session_history.query.v1";
+
+#[derive(Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HistoryQueryMode {
+    #[default]
+    Literal,
+    Syntax,
+}
+
 #[derive(Default, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HistoryQuery {
@@ -573,42 +586,84 @@ pub(crate) struct HistoryQuery {
     offset: Option<usize>,
     limit: Option<usize>,
     q: Option<String>,
+    /// Omitted/literal preserves substring search. Syntax explicitly opts into workflow_runs grammar.
+    #[serde(default)]
+    query_mode: HistoryQueryMode,
 }
 
-/// Project-scoped history, including archives. Results are recorded executions,
-/// never today's same-named definition and never another host's mirrored run.
+/// Project-scoped history, including archives. Syntax is an explicit opt-in;
+/// neither a colon nor a quote changes the historical literal default.
 async fn history(
     State(s): State<AppState>,
     Path(id): Path<String>,
     query: Result<Query<HistoryQuery>, axum::extract::rejection::QueryRejection>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> Result<Json<serde_json::Value>, crate::query::ListError> {
     let Query(q) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
     super::fleet::require_local(q.host.as_deref(), "project workflow history")?;
     let limit = q.limit.unwrap_or(50);
     if !(1..=100).contains(&limit) {
-        return Err(ApiError::bad_request("limit must be between 1 and 100"));
+        return Err(ApiError::bad_request("limit must be between 1 and 100").into());
     }
-    super::runs::blocking(move || {
+    let syntax = matches!(q.query_mode, HistoryQueryMode::Syntax);
+    let query_text = q.q.unwrap_or_default();
+    let parsed = if syntax {
+        if query_text.len() > 4096 {
+            return Err(ApiError(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "workflow history syntax query exceeds 4096 UTF-8 bytes".into(),
+            )
+            .into());
+        }
+        let parsed =
+            crate::query::ListQuery::parse(Some(&query_text), crate::query::workflow_runs::FIELDS)?;
+        if parsed.as_ref().is_some_and(|p| p.parsed.terms.len() > 128) {
+            return Err(ApiError(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "workflow history syntax query exceeds 128 terms".into(),
+            )
+            .into());
+        }
+        parsed
+    } else {
+        None
+    };
+    Ok(super::runs::blocking(move || {
         super::projects::load_workspace(&s, &id)?;
-        let query = q.q.unwrap_or_default().trim().to_lowercase();
+        let literal = query_text.trim().to_lowercase();
         let mut records = s.run_store.list().map_err(|e| ApiError::internal(e.to_string()))?
             .into_iter().map(|run| (run, false)).collect::<Vec<_>>();
         records.extend(s.run_store.list_archived().map_err(|e| ApiError::internal(e.to_string()))?
             .into_iter().map(|run| (run, true)));
-        records.retain(|(run, _)| run.workspace_id == id && (query.is_empty()
-            || format!("{} {} {}", run.id, run.workflow_name, run.codename.as_deref().unwrap_or_default()).to_lowercase().contains(&query)));
-        records.sort_by(|(a, aa), (b, ba)| b.started_at.cmp(&a.started_at).then(a.id.cmp(&b.id)).then(aa.cmp(ba)));
-        // In an archive race the same ID can be observed on both reads; active
-        // wins so one execution is never presented twice.
+        // Resolve identity before filtering: an active observation wins over an
+        // archived copy even if only that copy matches is:archived or a status.
         let mut seen = std::collections::HashSet::new();
         records.retain(|(run, _)| seen.insert(run.id.clone()));
+        let mut customers = crate::customers::CustomerLookup::new(rupu_workspace::CustomerStore::new(&s.global_dir));
+        let mut matching = Vec::new();
+        let mut ownership = super::workflow_history_owner::Classifier::new();
+        for (run, archived) in records {
+            // Qualify local workers without mistaking remote mirrors for local execution.
+            if run.workspace_id != id { continue; }
+            let Some(origin) = ownership.classify(&s, &run, archived).origin() else { continue; };
+            let keep = if let Some(query) = &parsed {
+                // Match project-run attribution semantics only when requested;
+                // a broken assignment must not turn into customer:none.
+                let who = if query.reads("customer") { customers.attribute_run(&run, true)? } else { None };
+                let probe = super::runs::run_probe(&run, &who, "local", archived);
+                query.matches(&probe).map_err(|e| ApiError::internal(format!("workflow history cannot report query field {}", e.field)))?
+            } else { syntax || literal.is_empty() || format!("{} {} {}", run.id, run.workflow_name, run.codename.as_deref().unwrap_or_default()).to_lowercase().contains(&literal) };
+            if keep { matching.push((run, archived, origin)); }
+        }
+        matching.sort_by(|(a, aa, _), (b, ba, _)| b.started_at.cmp(&a.started_at).then(a.id.cmp(&b.id)).then(aa.cmp(ba)));
         let offset = q.offset.unwrap_or(0);
         let end = offset.saturating_add(limit);
-        let next_offset = (end < records.len()).then_some(end);
-        let runs: Vec<_> = records.into_iter().skip(offset).take(limit).map(|(run, archived)| {
+        let next_offset = (end < matching.len()).then_some(end);
+        let runs: Vec<_> = matching.into_iter().skip(offset).take(limit).map(|(run, archived, origin)| {
             serde_json::json!({"run_id":run.id,"workflow_name":run.workflow_name,"codename":run.codename,
-                "status":run.status.as_str(),"started_at":run.started_at,"finished_at":run.finished_at,"archived":archived})
+                "status":run.status.as_str(),"started_at":run.started_at,"finished_at":run.finished_at,"archived":archived,"worker_id":run.worker_id,"execution_origin":origin})
         }).collect();
-        Ok(Json(serde_json::json!({"workspace_id":id,"host_id":"local","runs":runs,"next_offset":next_offset})))
-    }).await
+        let mut response = serde_json::json!({"workspace_id":id,"host_id":"local","runs":runs,"next_offset":next_offset,"ownership":{"scope":"project_records_before_query","excluded":ownership.excluded,"unavailable":ownership.unavailable,"complete":ownership.excluded==0 && ownership.unavailable==0}});
+        if syntax { response["query_mode"] = "syntax".into(); response["q"] = query_text.into(); }
+        Ok(Json(response))
+    }).await?)
 }

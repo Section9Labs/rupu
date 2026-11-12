@@ -26,6 +26,7 @@ impl AgentiflowLauncher for SubprocessAgentiflowLauncher {
             &req.run_id,
             &self.global_dir,
             Some(&req.working_dir),
+            req.global_definition_only,
         )
         .await
         .map_err(|e| match e {
@@ -60,6 +61,7 @@ mod tests {
             "af_01CP",
             "/home/u/.rupu".as_ref(),
             Some("/work/repo".as_ref()),
+            false,
         );
         assert_eq!(
             args(&spec),
@@ -83,6 +85,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn global_definition_pin_reaches_the_child_without_changing_cwd_or_home() {
+        let spec = detached_spawn_spec(
+            "/bin/rupu".as_ref(),
+            "acme",
+            "af_01CP",
+            "/runtime/custom-home".as_ref(),
+            Some("/runtime".as_ref()),
+            true,
+        );
+        assert_eq!(
+            args(&spec),
+            [
+                "agentiflow",
+                "run",
+                "--run-id",
+                "af_01CP",
+                "--global-definition-only",
+                "--",
+                "acme"
+            ]
+        );
+        assert_eq!(spec.cwd.as_deref(), Some("/runtime".as_ref()));
+        assert_eq!(
+            spec.env,
+            [(
+                "RUPU_HOME".into(),
+                std::ffi::OsString::from("/runtime/custom-home")
+            )]
+        );
+    }
+
     #[tokio::test]
     async fn a_child_that_exits_before_starting_is_not_started_and_leaves_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -98,6 +132,7 @@ mod tests {
         let err = launcher
             .launch(AgentiflowLaunchRequest {
                 definition: "acme".into(),
+                global_definition_only: false,
                 run_id: "af_01CPFAIL".into(),
                 working_dir: tmp.path().to_path_buf(),
             })

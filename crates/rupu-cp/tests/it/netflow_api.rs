@@ -3359,3 +3359,154 @@ async fn run_netflow_reads_the_transcripts_of_the_children_a_run_launched() {
         ]
     );
 }
+
+
+// Strict run topology must never use the federated run resolver, including
+// cached host ownership, and must attest ownership even for an empty graph.
+#[tokio::test]
+async fn netflow_graph_local_only_attests_global_and_project_local_records() {
+    for project_local in [false, true] {
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let run_id = "run_local_graph";
+        let state = new_state(global.path());
+        let record = seed_run(run_id, project.path().to_path_buf());
+        if project_local {
+            let workspaces = rupu_workspace::WorkspaceStore {
+                root: global.path().join("workspaces"),
+            };
+            rupu_workspace::upsert(&workspaces, project.path()).unwrap();
+            rupu_orchestrator::runs::RunStore::new(project.path().join(".rupu/runs"))
+                .create(record, "name: wf\nsteps: []\n")
+                .unwrap();
+        } else {
+            state
+                .run_store
+                .create(record, "name: wf\nsteps: []\n")
+                .unwrap();
+        }
+        let addr = serve(state).await;
+        let response = reqwest::get(format!(
+            "http://{addr}/api/netflow/graph?scope=run:{run_id}&local_only=true"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["scope"], format!("run:{run_id}"));
+        assert_eq!(body["host_id"], "local");
+        assert!(body["nodes"].as_array().unwrap().is_empty());
+        assert!(body["edges"].as_array().unwrap().is_empty());
+        let legacy: serde_json::Value = reqwest::get(format!(
+            "http://{addr}/api/netflow/graph?scope=run:{run_id}"
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert!(legacy.get("scope").is_none());
+        assert!(legacy.get("host_id").is_none());
+        let info: serde_json::Value = reqwest::get(format!("http://{addr}/api/host/info"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            info["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature == "netflow.local_run_graph.v1")
+        );
+    }
+}
+
+#[tokio::test]
+async fn netflow_graph_local_only_rejects_nonrun_and_unsafe_scopes() {
+    let global = tempfile::tempdir().unwrap();
+    let addr = serve(new_state(global.path())).await;
+    for suffix in [
+        "",
+        "&scope=project:ws_a",
+        "&scope=unknown:a",
+        "&scope=run:",
+        "&scope=run:..",
+        "&scope=run:a%2Fb",
+    ] {
+        let response = reqwest::get(format!(
+            "http://{addr}/api/netflow/graph?local_only=true{suffix}"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 400, "scope suffix: {suffix}");
+    }
+}
+
+#[tokio::test]
+async fn netflow_graph_local_only_does_not_probe_or_proxy_remote_records() {
+    use rupu_cp::api::run_resolve::RunLocation;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let remote = axum::Router::new().fallback(move || {
+        let observed = Arc::clone(&observed);
+        async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            axum::Json(serde_json::json!({"id": "run_remote", "flows": []}))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let remote_task = tokio::spawn(async move {
+        axum::serve(listener, remote).await.unwrap();
+    });
+    let global = tempfile::tempdir().unwrap();
+    let state = new_state(global.path());
+    let host = state
+        .hosts
+        .add_host("remote", &format!("http://{remote_addr}"), None)
+        .unwrap();
+    state.run_location_cache.lock().unwrap().insert(
+        "run_cached_remote".into(),
+        (
+            std::time::Instant::now(),
+            RunLocation::Host {
+                host_id: host.id.clone(),
+            },
+        ),
+    );
+    state.run_location_cache.lock().unwrap().insert(
+        "run_unpersisted".into(),
+        (
+            std::time::Instant::now(),
+            RunLocation::Unpersisted {
+                cycle_id: "cycle_missing".into(),
+                status: rupu_orchestrator::runs::RunStatus::Failed,
+                failure: "never recorded".into(),
+                workflow_name: "wf".into(),
+                entity: None,
+                issue_ref: None,
+            },
+        ),
+    );
+    let addr = serve(state).await;
+    for run_id in ["run_remote", "run_cached_remote", "run_unpersisted"] {
+        let response = reqwest::get(format!(
+            "http://{addr}/api/netflow/graph?scope=run:{run_id}&local_only=true"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 404, "{run_id}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no connector reads for {run_id}"
+        );
+    }
+    remote_task.abort();
+}

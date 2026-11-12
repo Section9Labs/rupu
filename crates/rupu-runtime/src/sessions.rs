@@ -85,8 +85,19 @@ pub struct SessionRunRecord {
     pub error: Option<String>,
 }
 
+/// Creation-time exact global definition provenance and fallback policy. Later turns
+/// use this frozen chain rather than resolving a possibly shadowed agent name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactSessionAgent {
+    pub binding: String,
+    pub fallbacks: Option<Vec<rupu_config::FallbackEntry>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_global_agent: Option<ExactSessionAgent>,
     pub version: u32,
     pub session_id: String,
     pub agent_name: String,
@@ -94,6 +105,14 @@ pub struct SessionRecord {
     /// Old sessions keep their frozen agent behavior even on a name collision.
     #[serde(default)]
     pub builtin_harness: bool,
+    /// Creation-time declaration provenance, not permission or current settings.
+    /// None for legacy records and explicit custom/empty tool selections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_tools_preset: Option<String>,
+    /// Scope-reader support at creation, independent of selected tool patterns.
+    /// Legacy sessions cannot acquire new readers through inherited wildcards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_reads_version: Option<u32>,
     /// `crew/role` — one identity across every turn (spec §3). `None` for
     /// sessions created before codenames; readers use `derive_legacy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +126,12 @@ pub struct SessionRecord {
     pub agent_system_prompt: String,
     #[serde(default)]
     pub agent_tools: Option<Vec<String>>,
+    /// Creation-time own-turn upper bound; settings cannot replace or clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ceiling: Option<Vec<String>>,
+    /// Exact configured MCP selection frozen at creation; absent in old sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_tools: Option<crate::session_mcp::FrozenSelection>,
     /// The agent's `messaging:` key (spec F1d D4), frozen with its tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messaging: Option<bool>,
@@ -291,17 +316,29 @@ pub struct SessionRecord {
 impl SessionRecord {
     /// The newest record version this rupu reads. A record is written at
     /// [`Self::written_version`].
-    pub const VERSION: u32 = 4;
+    pub const VERSION: u32 = 8;
 
     /// The lowest version a rupu must understand to keep the record whole on
-    /// its next write: 4 for a bundled harness, 3 for an agent's
+    /// its next write: 8 for exact global definition/frozen fallback provenance,
+    /// 7 for an immutable tool ceiling,
+    /// 6 for builtin tool provenance or scoped reader version,
+    /// 5 for frozen MCP selection,
+    /// 4 for a bundled harness, 3 for an agent's
     /// `messaging: false`, 2 for skills, else 1. Older runtimes must not
     /// erase the marker that distinguishes the bundled launch policy.
     pub fn written_version(&self) -> u32 {
         let skills = !self.skill_index.is_empty()
             || self.skill_prompt.is_some()
             || !self.loaded_skills.is_empty();
-        if self.builtin_harness {
+        if self.exact_global_agent.is_some() {
+            8
+        } else if self.tool_ceiling.is_some() {
+            7
+        } else if self.builtin_tools_preset.is_some() || self.scoped_reads_version.is_some() {
+            6
+        } else if self.mcp_tools.is_some() {
+            5
+        } else if self.builtin_harness {
             4
         } else if self.messaging == Some(false) {
             3
@@ -415,7 +452,28 @@ pub fn parse_stored_session(bytes: &[u8]) -> anyhow::Result<StoredSession> {
 /// fields this one would drop when it writes the record back.
 pub fn parse_session_record(bytes: &[u8]) -> anyhow::Result<SessionRecord> {
     match parse_stored_session(bytes)? {
-        StoredSession::Current(record) => Ok(record),
+        StoredSession::Current(record) => {
+            anyhow::ensure!(
+                record.exact_global_agent.is_none() || record.version >= 8,
+                "exact global conversation requires session record version 8"
+            );
+            if let Some(names) = &record.tool_ceiling {
+                anyhow::ensure!(
+                    record.version >= 7,
+                    "tool ceiling requires session record version 7"
+                );
+                rupu_tools::tool_ceiling::validate_names(
+                    names,
+                    &rupu_tools::ToolCatalog::builtin(),
+                    record
+                        .mcp_tools
+                        .iter()
+                        .flat_map(|selection| &selection.tools)
+                        .map(|tool| tool.identity.local_name()),
+                )?;
+            }
+            Ok(record)
+        }
         StoredSession::Newer { .. } => {
             anyhow::bail!("this session was written by a newer rupu; upgrade rupu to continue it")
         }
@@ -553,6 +611,11 @@ pub fn prune_archived_sessions(
     dry_run: bool,
     on_warning: &mut dyn FnMut(&str),
 ) -> Result<Vec<PrunedSession>, PruneError> {
+    // Acquire only at this public mutation boundary. Lower artifact helpers
+    // remain lock-free so CLI delete and cleanup never acquire it recursively.
+    let _retention_lease = if dry_run { None } else {
+        crate::retention_lease::RetentionLease::for_legacy(global)?
+    };
     let cutoff = session_prune_cutoff(older_than, global)?;
     let mut rows = Vec::new();
     for stored in load_sessions_in_scope(global, SessionScope::Archived).map_err(failed)? {

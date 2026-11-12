@@ -66,8 +66,22 @@ async fn refresh_with(
     port(p)?.refresh(body.provider).await.map_err(map_err)
 }
 
-async fn list_models(State(s): State<AppState>) -> ApiResult<Json<Vec<CatalogProvider>>> {
-    Ok(Json(list_with(s.model_catalog.clone()).await?))
+async fn list_models(State(s): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let catalog = list_with(s.model_catalog.clone()).await?;
+    let mut value =
+        serde_json::to_value(&catalog).map_err(|e| ApiError::internal(e.to_string()))?;
+    for (provider, entry) in catalog.iter().zip(value.as_array_mut().unwrap()) {
+        for (model, row) in provider
+            .models
+            .iter()
+            .zip(entry["models"].as_array_mut().unwrap())
+        {
+            row["reasoning_levels"] = serde_json::json!(
+                rupu_runtime::session_settings::reasoning_levels(&provider.provider, &model.id)
+            );
+        }
+    }
+    Ok(Json(value))
 }
 
 async fn refresh_models(

@@ -49,7 +49,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigWriteError>
 }
 
 /// Take the `<file>.lock` advisory lock [`write_atomic`] writes under.
-fn lock_config(path: &Path) -> Result<std::fs::File, ConfigWriteError> {
+pub(crate) fn lock_config(path: &Path) -> Result<std::fs::File, ConfigWriteError> {
     let parent = path
         .parent()
         .ok_or_else(|| ConfigWriteError::Io("config path has no parent".into()))?;
@@ -69,7 +69,7 @@ fn lock_config(path: &Path) -> Result<std::fs::File, ConfigWriteError> {
 }
 
 /// Back up `path` and rename `contents` over it; the caller holds the lock.
-fn replace_locked(path: &Path, contents: &str) -> Result<(), ConfigWriteError> {
+pub(crate) fn replace_locked(path: &Path, contents: &str) -> Result<(), ConfigWriteError> {
     // Backup existing.
     if path.exists() {
         let bak = path.with_extension("toml.bak");

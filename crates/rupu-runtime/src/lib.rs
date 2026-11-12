@@ -7,6 +7,7 @@ pub mod assembly;
 mod autoflow_history;
 mod backend;
 pub mod children;
+pub mod continuation_options;
 pub mod credential_manifest;
 pub mod file_cache;
 pub mod findings_opts;
@@ -16,8 +17,13 @@ pub mod net_capture;
 pub mod netflow;
 pub mod provider_factory;
 pub mod retention;
+pub mod retention_lease;
 mod run_envelope;
 pub mod services;
+pub mod session_mcp;
+pub mod session_reads;
+#[cfg(unix)]
+pub mod session_approvals;
 pub mod session_settings;
 pub mod sessions;
 pub mod spawn;
@@ -56,3 +62,7 @@ pub mod session_skill_preset;
 
 /// Strict approval policy retained by session-linked workflows.
 pub mod strict_approval;
+
+/// Local exact installed definition and independent execution project binding.
+#[cfg(unix)]
+pub mod exact_agent;

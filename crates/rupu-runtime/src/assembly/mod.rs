@@ -631,9 +631,10 @@ impl RunAssembler {
                 spec.prompter.clone(),
             ),
             None => PermissionPolicy::new(spec.mode, spec.prompter.clone()),
-        };
+        }
+        .with_authorizer(spec.services.authorizer.clone());
         let builtin_session = spec.services.builtin_session_harness
-            && matches!(spec.origin, Origin::SessionTurn { .. })
+            && matches!(&spec.origin, Origin::SessionTurn { .. })
             && spec.agent.name == rupu_agent::builtin::SESSION_AGENT_NAME;
         // Fail before provider construction or any run resources are opened.
         // A process boundary cannot carry a TTY prompter, and an in-process
@@ -644,15 +645,43 @@ impl RunAssembler {
             || matches!(&spec.origin, Origin::SubAgent { parent } if parent.identity.launch.strict_approval);
         if strict_approval
             && permission.mode() == PermissionMode::Ask
-            && permission.prompter().is_none()
+            && !permission.has_approval_channel()
         {
             return Err(AssembleError::ApprovalUnavailable);
+        }
+        if let Some(authorizer) = permission.authorizer() {
+            let mut owner = authorizer.root_owner();
+            if owner.workspace_id != spec.workspace.id
+                || owner.workspace_path != spec.workspace.path.to_string_lossy()
+            {
+                return Err(AssembleError::ApprovalUnavailable);
+            }
+            owner.run_id = spec.run_id.clone();
+            match &spec.origin {
+                Origin::SessionTurn { session_id, .. }
+                    if *session_id == owner.session_id && spec.run_id == owner.root_turn_run_id => {
+                }
+                Origin::SubAgent { parent } => {
+                    owner.parent_run_id = Some(parent.identity.run_id.clone());
+                    owner.root_run_id = parent
+                        .identity
+                        .parent
+                        .as_ref()
+                        .map(|p| p.root_run_id.clone())
+                        .unwrap_or_else(|| parent.identity.run_id.clone());
+                }
+                _ => return Err(AssembleError::ApprovalUnavailable),
+            }
+            authorizer
+                .check_owner(&owner)
+                .await
+                .map_err(|_| AssembleError::ApprovalUnavailable)?;
         }
         if builtin_session {
             self.bind_session_catalog(&mut spec).await;
         }
         let mut d = defaults_for(&spec.origin);
-        if matches!(spec.origin, Origin::SessionTurn { .. }) && spec.services.session_orchestration
+        if matches!(&spec.origin, Origin::SessionTurn { .. }) && spec.services.session_orchestration
         {
             d.origin_grant = Some(crate::session_orchestration::grant());
         }
@@ -841,6 +870,10 @@ impl RunAssembler {
                 read_roots: skills.as_ref().map(|s| s.read_roots()).unwrap_or_default(),
             },
             services: ToolServices {
+                tool_catalog: spec.services.tool_catalog.clone(),
+                session_reads: spec.services.session_reads.clone().filter(|_| {
+                    matches!(&spec.origin, Origin::SessionTurn { .. }) && spec.link.is_none()
+                }),
                 launcher: spec.services.launcher.clone().filter(|_| d.launcher),
                 workflow_generator: spec
                     .services
@@ -860,6 +893,7 @@ impl RunAssembler {
                 customer: self.ctx.customer.clone(),
                 // The agent loop sets it from the permission policy.
                 prompter: None,
+                authorizer: spec.services.authorizer.clone(),
                 message_bus: message_bus.clone().filter(|_| messaging.takes_part()),
                 message_space: message_bus.clone(),
                 run_status: spec.services.run_status.clone(),
@@ -898,7 +932,17 @@ impl RunAssembler {
             tool_context: &tool_context,
             alias_scope: d.alias_scope,
         });
-        let grant = match grant {
+        let grant = match grant.and_then(|mut grant| {
+            rupu_tools::tool_ceiling::apply_with_frozen_remote(
+                &mut grant,
+                spec.overrides.tool_ceiling.as_deref(),
+                spec.overrides
+                    .tool_ceiling_frozen_remote_names
+                    .iter()
+                    .cloned(),
+            )?;
+            Ok(grant)
+        }) {
             Ok(g) => g,
             Err(e) => {
                 // As when the loop resolved it: the run's transcript exists

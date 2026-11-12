@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 pub const CAP_BUILTIN_HARNESS: &str = "session.builtin_harness";
+pub const CAP_TOOL_SELECTION: &str = "session.tool_selection.v1";
 pub const CAP_IDLE_HARNESS: &str = "session.idle_harness";
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -28,6 +29,13 @@ pub(crate) struct StartBody {
     idle: bool,
     provider: Option<String>,
     model: Option<String>,
+    /// Runtime tool grants for the first and later turns. Absent/null inherits
+    /// the builtin baseline; [] leaves ambient/origin grants in place.
+    tools: Option<Vec<String>>,
+    tool_ceiling: Option<Vec<String>>,
+    mcp_tools: Option<Vec<super::session_mcp::ToolChoice>>,
+    mcp_catalog_revision: Option<String>,
+    effort: Option<String>,
     mode: Option<String>,
     skill_preset: Option<String>,
     #[serde(default)]
@@ -56,6 +64,13 @@ pub(crate) fn idle_available(s: &AppState) -> bool {
             .is_some_and(|s| s.supports_idle_harness())
 }
 
+pub(crate) fn tool_selection_available(s: &AppState) -> bool {
+    available(s)
+        && s.session_starter
+            .as_ref()
+            .is_some_and(|s| s.supports_session_tool_selection())
+}
+
 /// Resolve and pin the selection before the subprocess starts. Configuration
 /// comes from the selected instance and exact project, including its customer.
 fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartRequest> {
@@ -75,9 +90,9 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
         ));
     }
     if let Some(preset) = body.skill_preset.as_deref() {
-        if !matches!(preset, "rupu-session-v1" | "none") {
+        if !rupu_runtime::session_skill_preset::valid_preset(preset) {
             return Err(ApiError::bad_request(
-                "skill_preset must be rupu-session-v1 or none",
+                "skill_preset must be rupu-session-v1, rupu-session-full-v1 or none",
             ));
         }
     }
@@ -92,6 +107,8 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
     let settings = SessionSettings {
         provider: body.provider,
         model: body.model,
+        tools: body.tools,
+        effort: body.effort,
         ..Default::default()
     };
     settings
@@ -99,7 +116,11 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let mode = rupu_tools::PermissionMode::parse(body.mode.as_deref().unwrap_or("readonly"))
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    if mode == rupu_tools::PermissionMode::Ask {
+    #[cfg(unix)]
+    let approvals = super::session_approvals::available(s);
+    #[cfg(not(unix))]
+    let approvals = false;
+    if mode == rupu_tools::PermissionMode::Ask && !approvals {
         return Err(ApiError::bad_request(
             "ask mode is unavailable: detached session workers have no interactive approval channel; choose readonly or explicitly choose bypass",
         ));
@@ -135,11 +156,32 @@ fn prepare(s: &AppState, id: &str, body: StartBody) -> ApiResult<SessionStartReq
             .as_ref()
             .map(|p| p.default_model.as_str()),
     );
+    let mcp_tools: Option<Vec<rupu_runtime::session_mcp::ToolRef>> = body
+        .mcp_tools
+        .map(|tools| tools.into_iter().map(Into::into).collect());
+    rupu_runtime::session_mcp::validate_request(
+        mcp_tools.as_deref(),
+        body.mcp_catalog_revision.as_deref(),
+    )
+    .map_err(super::session_mcp::error)?;
+    if let Some(ceiling) = &body.tool_ceiling {
+        rupu_tools::tool_ceiling::validate_names(
+            ceiling,
+            &rupu_tools::ToolCatalog::builtin(),
+            mcp_tools.iter().flatten().map(|tool| tool.local_name()),
+        )
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
     Ok(SessionStartRequest {
+        effort: settings.effort.clone(),
         skill_preset: body.skill_preset,
         agent: SESSION_AGENT_NAME.into(),
         provider: Some(provider),
         model: Some(model),
+        tools: settings.tools,
+        tool_ceiling: body.tool_ceiling,
+        mcp_tools,
+        mcp_catalog_revision: body.mcp_catalog_revision,
         workspace_id: Some(id.into()),
         idle: body.idle,
         prompt: body.prompt,
@@ -170,9 +212,38 @@ pub(crate) async fn start(
                 "the bundled session harness requires an updated `rupu cp serve` session starter",
             )
         })?;
+    if (body.mcp_tools.is_some() || body.mcp_catalog_revision.is_some())
+        && !starter.supports_session_mcp()
+    {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply configured MCP selections",
+        ));
+    }
+    if body.tool_ceiling.is_some() && !starter.supports_session_tool_ceiling() {
+        return Err(ApiError::not_available(
+            "this session starter cannot enforce immutable tool ceilings",
+        ));
+    }
+    if body.tools.is_some() && !starter.supports_session_tool_selection() {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply first-turn tool selections",
+        ));
+    }
+    if body.effort.is_some() && !starter.supports_reasoning_effort() {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply reasoning effort",
+        ));
+    }
     if body.idle && !starter.supports_idle_harness() {
         return Err(ApiError::not_available(
             "this session starter cannot create idle sessions",
+        ));
+    }
+    if body.skill_preset.as_deref() == Some(rupu_runtime::session_skill_preset::FULL_PRESET_ID)
+        && !starter.supports_full_skill_preset()
+    {
+        return Err(ApiError::not_available(
+            "this session starter cannot apply the full Rupu skill preset",
         ));
     }
     if (body.skill_preset.is_some() || !body.skills.is_empty() || !body.preload_skills.is_empty())
@@ -186,6 +257,7 @@ pub(crate) async fn start(
     let (provider, model) = (request.provider.clone(), request.model.clone());
     let session_id = starter.start(request).await.map_err(|e| match e {
         SessionStartError::Invalid(message) => ApiError::bad_request(message),
+        SessionStartError::Conflict(message) => ApiError::conflict(message),
         SessionStartError::Spawn(message) => ApiError::internal(message),
     })?;
     Ok(Json(

@@ -22,8 +22,42 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
+#[cfg(unix)]
+mod exact_run;
+#[cfg(unix)]
+mod exact_session;
+#[cfg(unix)]
+pub(crate) mod source;
+
+fn source_routes() -> Router<AppState> {
+    #[cfg(unix)]
+    {
+        source::routes()
+            .merge(exact_run::routes())
+            .merge(exact_session::routes())
+    }
+    #[cfg(not(unix))]
+    {
+        Router::new()
+    }
+}
+
+async fn agent_writer_lock(dir: &FsPath) -> ApiResult<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        let dir = dir.to_path_buf();
+        crate::api::runs::blocking(move || source::legacy_lock(&dir).map(Some)).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(None)
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(source_routes())
         .route("/api/agents", get(list_agents).post(create_agent))
         .route(
             "/api/agents/:name",
@@ -1015,13 +1049,16 @@ async fn write_agent(
                         ))
                     },
                 )?;
+            let _lock = agent_writer_lock(&dir).await?;
             save_agent_file_at(&name, &body.raw, &dir)?;
         }
         None => match resolve_agent_scoped(&s, &name) {
             Some((_path, dir, _scope, _kind, _scope_id)) => {
+                let _lock = agent_writer_lock(&dir).await?;
                 save_agent_file_at(&name, &body.raw, &dir)?;
             }
             None => {
+                let _lock = agent_writer_lock(&agents_dir(&s)).await?;
                 save_agent_file(&s.global_dir, &name, &body.raw)?;
             }
         },
@@ -1043,6 +1080,10 @@ async fn create_agent(
 ) -> ApiResult<Json<AgentDetailDto>> {
     let spec = parse_agent_for_write(&body.raw)?;
     validate_new_name("agent", &spec.name)?;
+    if resolve_agent_scoped(&s, &spec.name).is_some() {
+        return Err(ApiError::conflict("agent already exists"));
+    }
+    let _lock = agent_writer_lock(&agents_dir(&s)).await?;
     if resolve_agent_scoped(&s, &spec.name).is_some() {
         return Err(ApiError::conflict("agent already exists"));
     }
@@ -1086,6 +1127,7 @@ async fn delete_agent(
             (target, dir, scope, scope_kind)
         }
     };
+    let _lock = agent_writer_lock(&dir).await?;
     // Defense in depth — see `validate_within`'s doc comment.
     validate_within(&target, &dir)?;
     std::fs::remove_file(&target).map_err(|e| ApiError::internal(e.to_string()))?;
@@ -1545,7 +1587,12 @@ impl SessionStartBody {
     /// The request for agent `name`, its skill entries checked.
     fn into_request(self, name: &str) -> Result<SessionStartRequest, ApiError> {
         Ok(SessionStartRequest {
+            tool_ceiling: None,
+            mcp_tools: None,
+            mcp_catalog_revision: None,
+            effort: None,
             skill_preset: None,
+            tools: None,
             agent: name.to_string(),
             provider: None,
             model: None,
@@ -1570,6 +1617,7 @@ async fn start_session_with(
     let req = body.into_request(name)?;
     starter.start(req).await.map_err(|e| match e {
         SessionStartError::Invalid(m) => ApiError::bad_request(m),
+        SessionStartError::Conflict(m) => ApiError::conflict(m),
         SessionStartError::Spawn(m) => ApiError::internal(m),
     })
 }

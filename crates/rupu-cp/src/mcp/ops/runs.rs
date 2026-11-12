@@ -2,7 +2,7 @@
 
 use super::{op, OpSpec};
 use crate::api::{
-    attempt_history, autoflow_runs, board, events, run_streams, runs, source, transcript,
+    attempt_history, autoflow_runs, board, children, events, run_streams, runs, source, transcript,
     transcripts,
 };
 use http::Method;
@@ -114,11 +114,17 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .query::<runs::RunDetailQuery>(),
         op(
+            "runs.transcript_search",
+            Method::GET,
+            "/api/runs/:id/transcripts/search",
+            "Search recorded transcript string values across one local run family.\n\nIncludes canonical Agentiflow lead rounds and ledger-dispatched descendants.\n\n`id` is the canonical root, `project` its exact workspace, and `q` a case-sensitive literal (1–256 bytes). Omit host or use local. Limit defaults to 20, range 1–50. Continue next_cursor with the same root/project/query; captures expire after ten minutes. Each call scans at most 8 MiB and 10000 records and returns at most 1 MiB. A zero-hit page with next_cursor is unfinished search. Hits include actual first RunStart proof, recorded provenance and a direct transcripts.page cursor at the hit using the original root as authorization run. Coverage exposes missing, unverified, malformed, oversized and remote history; historical completeness stays unknown. 409 means changed or expired capture, 413 bounded source limit, 429 busy, 501 unsupported owner. No work is launched or full transcript downloaded.",
+        ).query::<children::search::SearchQuery>(),
+        op(
             "runs.children",
             Method::GET,
             "/api/runs/:id/children",
-            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local runs only. Returns `{children}`, each with its handle, kind, status and tokens.",
-        ),
+            "List the child runs a run launched (sub-agents, agent and workflow children), at any depth.\n\n`id` is the run id; local owner only (omit host or use local). Without paging arguments returns legacy {children,truncated?}. Supply limit (default 50, clamped 1–200) to capture immutable pages for a canonical recorded run, standalone-agent metadata or session-turn ownership record (including roots without child directories). Optional parent_run_id must be a recorded member of that tree. Continue with next_cursor as cursor and the identical parent filter. Returns {schema_version,root_type,owner_host_id,root_run_id,snapshot,children,next_cursor,snapshot_matching_total,evidence}; history completeness remains unknown. A structured children_root_unsupported code with 501 allows explicit legacy selection for unsupported root evidence; never fall back on 404. A 409 means restart without cursor; 413 means the capture exceeded a bounded source or memory budget, with no partial success. Reads never launch work.",
+        ).query::<children::ChildrenQuery>(),
         op(
             "runs.board",
             Method::GET,
@@ -174,6 +180,13 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "Read one run or session transcript as events.\n\n`path` is the transcript file (from a run or session row); `host` picks a remote host, and `run` (the run that recorded `path`) is needed for a remote transcript not yet mirrored. Returns the transcript's events; `partial` is set when a remote host could not be reached to finish collecting.",
         )
         .query::<transcript::PathQ>(),
+        op(
+            "transcripts.page",
+            Method::GET,
+            "/api/transcript/page",
+            "Read a bounded page of recorded transcript events without loading the full conversation.\n\n`path` is the recorded transcript path; `run` binds its authorization run. Omit `host` or use `local`; remote paging returns 501. `limit` defaults to 100 and is clamped to 1–200. Return `next_cursor` as `cursor` with the same path/run to continue. Returns {version,path,host_id,run,snapshot,records,next_cursor,has_more}; records retain nonblank positions and explicit event/malformed/oversized status. Pages are capped at 1 MiB including envelope/cursors, lines at 256 KiB; omitted payloads are explicit. At most 8 MiB of file bytes are scanned per call; 413 transcript_page_scan_limit if no complete record fits. Page positions must not become SSE resume cursors. Any file modification returns 409; reload without cursor. A finite page ends at recorded EOF without requiring run_complete. Reads launch no work.",
+        )
+        .query::<transcript::page::PageQuery>(),
         op(
             "transcripts.archive",
             Method::POST,

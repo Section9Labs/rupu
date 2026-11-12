@@ -1227,6 +1227,7 @@ async fn run_rerun_in(target_id: &str, run_id: &str) -> ExitCode {
 fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::Args {
     crate::cmd::run::Args {
         agent: invocation.agent_name.clone(),
+        exact_agent_definition: None,
         target: None,
         prompt: Some(invocation.user_prompt.clone()),
         prompt_flag: None,
@@ -1248,6 +1249,8 @@ fn rerun_args(invocation: &rupu_coverage::RerunInvocation) -> crate::cmd::run::A
         no_messaging: false,
         messaging_tools: Vec::new(),
         continue_from: None,
+        continue_options: None,
+        launch_lists: None,
         model: None,
         provider: None,
         message_space: None,

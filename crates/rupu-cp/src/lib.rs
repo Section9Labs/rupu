@@ -17,6 +17,9 @@ pub mod embed;
 pub mod error;
 pub mod fleet_inventory;
 pub mod host;
+pub mod issue_reader;
+pub mod forge_writer;
+pub mod forge_write_store;
 pub mod launcher;
 pub mod mcp;
 pub mod model_catalog;
@@ -59,7 +62,8 @@ pub struct ServeOpts {
     pub token: Option<String>,
     pub global_dir: PathBuf,
     /// Open the served URL in the default browser on startup (best-effort, and
-    /// only when stdout is a terminal). The URL is always printed regardless.
+    /// only when stdout is a terminal). Ordinary startup always prints the URL;
+    /// managed native startup suppresses both printing and browser opening.
     pub open_browser: bool,
     /// Optional run-launcher adapter. rupu-cli's `cp serve` provides the
     /// subprocess-spawning impl; `None` disables launching from the web UI.
@@ -168,6 +172,8 @@ fn load_pricing(global_dir: &Path) -> PricingConfig {
 pub const HEALTHZ_PID_HEADER: &str = "x-rupu-pid";
 /// Response header `/healthz` sets to the serving crate version.
 pub const HEALTHZ_VERSION_HEADER: &str = "x-rupu-version";
+/// Present only for a supervised native launch; binds live health to its receipt.
+pub const HEALTHZ_LAUNCH_ID_HEADER: &str = "x-rupu-launch-id";
 
 /// A live rupu control plane found answering on an address we failed to
 /// bind. Both fields come from the [`HEALTHZ_PID_HEADER`] /
@@ -375,10 +381,35 @@ pub(crate) fn open_mcp_warning(
 }
 
 pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> anyhow::Result<()> {
+    serve_on_with_presentation(listener, opts, None).await
+}
+
+/// A supervised native launch never prints access-bearing startup links and
+/// never opens a browser. The CLI publishes its private readiness receipt.
+pub async fn serve_on_managed(
+    listener: tokio::net::TcpListener,
+    mut opts: ServeOpts,
+    launch_id: &str,
+) -> anyhow::Result<()> {
+    opts.open_browser = false;
+    opts.bind = listener
+        .local_addr()
+        .context("read managed listener address")?;
+    let launch_id = axum::http::HeaderValue::from_str(launch_id)
+        .context("invalid managed launch identity header")?;
+    serve_on_with_presentation(listener, opts, Some(launch_id)).await
+}
+
+async fn serve_on_with_presentation(
+    listener: tokio::net::TcpListener,
+    opts: ServeOpts,
+    launch_id: Option<axum::http::HeaderValue>,
+) -> anyhow::Result<()> {
     if !opts.web && opts.mcp.is_none() {
         anyhow::bail!("nothing to serve: --no-web and --no-mcp together");
     }
     let open_browser = opts.open_browser;
+    let show_links = launch_id.is_none();
     let app_state = build_state(&opts);
     spawn_prewarm(&app_state);
 
@@ -390,6 +421,25 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
     let serves_mcp = mcp.is_some();
     let web = opts.web;
     let app = server::router_with(app_state, opts.token, server::RouterOpts { web, mcp });
+    let app = if let Some(launch_id) = launch_id {
+        app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let launch_id = launch_id.clone();
+                async move {
+                    let is_health = request.uri().path() == "/healthz";
+                    let mut response = next.run(request).await;
+                    if is_health {
+                        response
+                            .headers_mut()
+                            .insert(HEALTHZ_LAUNCH_ID_HEADER, launch_id);
+                    }
+                    response
+                }
+            },
+        ))
+    } else {
+        app
+    };
 
     let addr = listener.local_addr()?;
     // With a token, the printed (and opened) link carries it once: the first
@@ -400,15 +450,15 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
         None => click_url(addr),
     };
     // Always surface the URL prominently — independent of RUST_LOG / tracing.
-    if web {
+    if show_links && web {
         println!("\n  ➜  rupu Control Plane  →  {url}");
-    } else {
+    } else if show_links {
         println!(
             "\n  ➜  rupu Control Plane (API only, --no-web)  →  {}",
             click_url(addr)
         );
     }
-    if serves_mcp {
+    if show_links && serves_mcp {
         let mcp_url = format!("{}/mcp", click_url(addr));
         println!("  ➜  rupu MCP  →  {mcp_url}");
         match &token {
@@ -418,7 +468,9 @@ pub async fn serve_on(listener: tokio::net::TcpListener, opts: ServeOpts) -> any
             None => println!("     claude mcp add --transport http rupu {mcp_url}"),
         }
     }
-    println!();
+    if show_links {
+        println!();
+    }
     if let Some(warning) = open_mcp_warning(serves_mcp, addr, token.is_some()) {
         eprintln!("{warning}");
         tracing::warn!("{warning}");

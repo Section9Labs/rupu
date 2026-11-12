@@ -145,8 +145,8 @@ fn reasoning_block_from_output(
 /// decide `max_output_tokens`; the o-series is added on top. Deliberately NOT
 /// shared with that check — o-series models do accept `max_output_tokens`, so
 /// reusing this helper there would change its behavior.
-fn model_supports_reasoning(model: &str) -> bool {
-    if model.starts_with("gpt-5") {
+pub fn model_supports_reasoning(model: &str) -> bool {
+    if model.starts_with("gpt-5") || model.starts_with("gpt-6") {
         return true;
     }
     // o-series (o1, o3, o4-mini, …): an `o` followed by a digit.
@@ -2031,7 +2031,7 @@ mod tests {
             OpenAiCodexClient::new(creds, None, Arc::new(rupu_netflow::NullSink)).unwrap();
         client.api_url = "http://test".into();
 
-        let request = LlmRequest {
+        let mut request = LlmRequest {
             model: "o3".into(),
             system: None,
             messages: vec![Message::user("think")],
@@ -2054,6 +2054,11 @@ mod tests {
 
         let body = client.build_request_body(&request, false);
         assert_eq!(body["reasoning"]["effort"], "high");
+        request.model = "gpt-6.1-sol".into();
+        assert_eq!(
+            client.build_request_body(&request, false)["reasoning"]["effort"],
+            "high"
+        );
     }
 
     #[test]
@@ -3159,8 +3164,16 @@ mod reasoning_capture_tests {
     }
 
     #[test]
-    fn model_supports_reasoning_covers_gpt5_and_o_series() {
-        for m in ["gpt-5", "gpt-5.2", "gpt-5-mini", "o1", "o3", "o4-mini"] {
+    fn model_supports_reasoning_covers_gpt5_gpt6_and_o_series() {
+        for m in [
+            "gpt-5",
+            "gpt-5.2",
+            "gpt-5-mini",
+            "gpt-6.1-sol",
+            "o1",
+            "o3",
+            "o4-mini",
+        ] {
             assert!(
                 model_supports_reasoning(m),
                 "{m} should be a reasoning model"

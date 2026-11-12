@@ -1048,3 +1048,360 @@ async fn session_workflow_history_capabilities_match_read_and_write_availability
         .unwrap()
         .contains(&serde_json::json!("workflow.session_attach")));
 }
+
+async fn history_syntax_request(
+    state: AppState,
+    text: &str,
+    suffix: &str,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", text)
+        .finish();
+    session_workflow_request(
+        state,
+        "GET",
+        &format!("/api/projects/ws_a/workflow-history?query_mode=syntax&{encoded}{suffix}"),
+        serde_json::Value::Null,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn workflow_history_query_literal_default_is_unchanged() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_normal");
+    let mut literal = run_record("run_literal", "status:failed", "ws_a");
+    literal.codename = Some("Literal Quote".into());
+    state.run_store.create(literal, VALID_YAML).unwrap();
+    for mode in ["", "&query_mode=literal"] {
+        let (code, response) = session_workflow_request(
+            state.clone(),
+            "GET",
+            &format!("/api/projects/ws_a/workflow-history?q=STATUS%3AFAILED{mode}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(response["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(response["runs"][0]["run_id"], "run_literal");
+        assert!(response.get("query_mode").is_none());
+    }
+    let (_, syntax) = history_syntax_request(state, "status:failed", "").await;
+    assert!(syntax["runs"].as_array().unwrap().is_empty());
+    assert_eq!(syntax["q"], "status:failed");
+    assert_eq!(syntax["query_mode"], "syntax");
+}
+
+#[tokio::test]
+async fn workflow_history_query_filters_before_paging_and_keeps_archived_receipts() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    for id in ["run_a", "run_b", "run_c"] {
+        recorded_workflow(&state, project.path(), id);
+    }
+    state.run_store.archive("run_b").unwrap();
+    state.run_store.archive("run_c").unwrap();
+    let query = "status:completed workflow:demo host:local is:archived -id:run_a";
+    let (code, first) = history_syntax_request(state.clone(), query, "&limit=1").await;
+    assert_eq!(code, axum::http::StatusCode::OK, "{first}");
+    assert_eq!(first["workspace_id"], "ws_a");
+    assert_eq!(first["host_id"], "local");
+    assert_eq!(first["runs"][0]["archived"], true);
+    assert_eq!(first["next_offset"], 1);
+    let (_, second) = history_syntax_request(state, query, "&limit=1&offset=1").await;
+    assert_eq!(second["runs"][0]["archived"], true);
+    assert_ne!(first["runs"][0]["run_id"], second["runs"][0]["run_id"]);
+    assert!(second["next_offset"].is_null());
+}
+
+#[tokio::test]
+async fn workflow_history_query_resolves_active_identity_before_filter_and_scope() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_duplicate");
+    let mut archive = state.run_store.load("run_duplicate").unwrap();
+    archive.status = rupu_orchestrator::RunStatus::Failed;
+    archive.started_at += chrono::Duration::hours(1); // sorting must not prefer this archived copy
+    rupu_orchestrator::RunStore::new(state.run_store.archive_root())
+        .create(archive, VALID_YAML)
+        .unwrap();
+    for text in ["is:archived", "status:failed"] {
+        let (_, response) = history_syntax_request(state.clone(), text, "").await;
+        assert!(
+            response["runs"].as_array().unwrap().is_empty(),
+            "{response}"
+        );
+    }
+    let (_, response) = history_syntax_request(state, "id:run_duplicate", "").await;
+    assert_eq!(response["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(response["runs"][0]["archived"], false);
+    assert_eq!(response["runs"][0]["status"], "completed");
+}
+
+#[tokio::test]
+async fn workflow_history_query_excludes_worker_mirrors_and_foreign_projects_in_both_modes() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_local");
+    let mut mirror = run_record("run_mirror", "demo", "ws_a");
+    mirror.worker_id = Some("worker_remote".into());
+    state.run_store.create(mirror, VALID_YAML).unwrap();
+    state
+        .run_store
+        .create(run_record("run_foreign", "demo", "ws_other"), VALID_YAML)
+        .unwrap();
+    for suffix in ["", "?query_mode=syntax&q=host%3Alocal"] {
+        let (code, response) = session_workflow_request(
+            state.clone(),
+            "GET",
+            &format!("/api/projects/ws_a/workflow-history{suffix}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(response["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(response["runs"][0]["run_id"], "run_local");
+    }
+}
+
+#[tokio::test]
+async fn workflow_history_query_reports_shared_parser_errors_and_query_limits() {
+    let (_tmp, _project, state, _) = session_workflow_fixture(false);
+    let (code, response) = history_syntax_request(state.clone(), "é status:bogus", "").await;
+    assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
+    let expected =
+        crate::query::ListQuery::parse(Some("é status:bogus"), crate::query::workflow_runs::FIELDS)
+            .err()
+            .unwrap();
+    assert_eq!(response["code"], serde_json::json!(expected.code));
+    assert_eq!(response["token"], serde_json::json!(expected.token));
+    assert_eq!(response["start"], expected.start);
+    assert_eq!(response["end"], expected.end);
+    for text in ["x".repeat(4097), "demo ".repeat(129)] {
+        let (code, _) = history_syntax_request(state.clone(), &text, "").await;
+        assert_eq!(code, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    for suffix in ["?query_mode=unknown", "?query_mode=syntax&limit=101"] {
+        let (code, _) = session_workflow_request(
+            state.clone(),
+            "GET",
+            &format!("/api/projects/ws_a/workflow-history{suffix}"),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn workflow_history_query_uses_recorded_customer_and_time_trigger_fields() {
+    let (_tmp, _project, state, _) = session_workflow_fixture(false);
+    let mut record = run_record("run_customer", "demo", "ws_a");
+    record.customer = Some(Some("acme".into()));
+    record.started_at = "2026-01-15T12:00:00Z".parse().unwrap();
+    record.codename = Some("Cobalt Harbor".into());
+    state.run_store.create(record, VALID_YAML).unwrap();
+    let (_, response) = history_syntax_request(
+        state,
+        "customer:acme trigger:manual since:2026-01-01 until:2026-02-01 codename:\"cobalt harbor\"",
+        "",
+    )
+    .await;
+    assert_eq!(response["runs"][0]["run_id"], "run_customer", "{response}");
+}
+
+#[tokio::test]
+async fn workflow_history_query_keeps_empty_query_scope_and_readonly_capability() {
+    let (_tmp, _project, mut state, _) = session_workflow_fixture(false);
+    state.launcher = None;
+    let (code, response) = history_syntax_request(state.clone(), "", "").await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(response["q"], "");
+    assert_eq!(response["workspace_id"], "ws_a");
+    let (_, info) = session_workflow_request(
+        state.clone(),
+        "GET",
+        "/api/host/info",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert!(info["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workflow.session_history.query.v1")));
+    let (code, _) = session_workflow_request(
+        state,
+        "GET",
+        "/api/projects/missing/workflow-history?query_mode=syntax",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::NOT_FOUND);
+}
+
+fn local_worker_history_proof(state: &AppState, project: &std::path::Path, id: &str, kind: &str) {
+    recorded_workflow(state, project, id);
+    let mut record = state.run_store.load(id).unwrap();
+    record.worker_id = Some("worker_fixture".into());
+    record.backend_id = Some("local_worktree".into());
+    state.run_store.update(&record).unwrap();
+    let workers = state.global_dir.join("autoflows/workers");
+    std::fs::create_dir_all(&workers).unwrap();
+    let hostname = whoami::fallible::hostname().expect("fixture requires host identity");
+    let worker = rupu_runtime::WorkerRecord {
+        version: 1, worker_id: "worker_fixture".into(),
+        kind: if kind == "cli" { rupu_runtime::WorkerKind::Cli } else { rupu_runtime::WorkerKind::AutoflowServe },
+        name: "fixture".into(), host: hostname, capabilities: Default::default(),
+        registered_at: "2020-01-01T00:00:00Z".into(), last_seen_at: "2020-01-01T00:00:00Z".into(),
+    };
+    std::fs::write(workers.join("worker_fixture.toml"), toml::to_string(&worker).unwrap()).unwrap();
+    let envelope = serde_json::json!({"version":1,"run_id":id,"kind":"workflow_run",
+        "workflow":{"name":"demo","source_path":"/fixture/demo.yaml","fingerprint":"fixture"},
+        "repo":{"workspace_id":"ws_a","workspace_path":project},
+        "trigger":{"source":"workflow_cli"},"execution":{"backend":"local_worktree","permission_mode":"readonly"},
+        "worker":{"assigned_worker_id":"worker_fixture"}});
+    std::fs::write(state.run_store.root.join(id).join("run_envelope.json"), envelope.to_string()).unwrap();
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_cli_and_autoflow_have_explicit_provenance() {
+    for (kind, origin) in [("cli", "local_cli"), ("autoflow_serve", "local_autoflow")] {
+        let (_tmp, project, state, _) = session_workflow_fixture(false);
+        local_worker_history_proof(&state, project.path(), "run_worker", kind);
+        let (code, response) = history_syntax_request(state, "host:local id:run_worker", "").await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(response["runs"][0]["worker_id"], "worker_fixture");
+        assert_eq!(response["runs"][0]["execution_origin"], origin);
+        assert_eq!(response["ownership"]["complete"], true);
+    }
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_missing_corrupt_or_imported_proof_is_unavailable() {
+    for failure in ["missing_worker", "corrupt_worker", "foreign_host", "missing_envelope", "wrong_project", "wrong_worker", "wrong_backend"] {
+        let (_tmp, project, state, _) = session_workflow_fixture(false);
+        local_worker_history_proof(&state, project.path(), "run_worker", "cli");
+        let worker = state.global_dir.join("autoflows/workers/worker_fixture.toml");
+        let envelope = state.run_store.root.join("run_worker/run_envelope.json");
+        match failure {
+            "missing_worker" => std::fs::remove_file(&worker).unwrap(),
+            "corrupt_worker" => std::fs::write(&worker, "invalid\0").unwrap(),
+            "foreign_host" => {
+                let mut w: rupu_runtime::WorkerRecord = toml::from_str(&std::fs::read_to_string(&worker).unwrap()).unwrap();
+                w.host = "different-recorded-host.invalid".into();
+                std::fs::write(&worker, toml::to_string(&w).unwrap()).unwrap();
+            }
+            "missing_envelope" => std::fs::remove_file(&envelope).unwrap(),
+            other => {
+                let mut e: serde_json::Value = serde_json::from_slice(&std::fs::read(&envelope).unwrap()).unwrap();
+                match other {
+                    "wrong_project" => e["repo"]["workspace_id"] = "ws_foreign".into(),
+                    "wrong_worker" => e["worker"]["assigned_worker_id"] = "worker_foreign".into(),
+                    _ => e["execution"]["backend"] = "remote".into(),
+                }
+                std::fs::write(&envelope, e.to_string()).unwrap();
+            }
+        }
+        let (_, response) = history_syntax_request(state, "", "").await;
+        assert_eq!(response["runs"].as_array().unwrap().len(), 0, "{failure}: {response}");
+        assert_eq!(response["ownership"]["unavailable"], 1, "{failure}: {response}");
+        assert_eq!(response["ownership"]["complete"], false);
+    }
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_remote_identity_collision_is_excluded() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    local_worker_history_proof(&state, project.path(), "run_worker", "cli");
+    let hosts = state.global_dir.join("hosts");
+    std::fs::create_dir_all(&hosts).unwrap();
+    // Even malformed registered-host evidence prevents local reassignment.
+    std::fs::write(hosts.join("worker_fixture.toml"), "malformed").unwrap();
+    let (_, response) = history_syntax_request(state, "", "").await;
+    assert!(response["runs"].as_array().unwrap().is_empty());
+    assert_eq!(response["ownership"]["excluded"], 1);
+    assert_eq!(response["ownership"]["unavailable"], 0);
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_archive_and_active_precedence_preserved() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    local_worker_history_proof(&state, project.path(), "run_worker", "cli");
+    state.run_store.archive("run_worker").unwrap();
+    let (_, response) = history_syntax_request(state.clone(), "is:archived", "&limit=1").await;
+    assert_eq!(response["runs"][0]["run_id"], "run_worker");
+    assert_eq!(response["runs"][0]["archived"], true);
+    assert_eq!(response["runs"][0]["execution_origin"], "local_cli");
+    // An active record with unknown worker proof must not fall back to the
+    // otherwise valid archived record for the same ID.
+    let mut active = rupu_orchestrator::RunStore::new(state.run_store.archive_root()).load("run_worker").unwrap();
+    active.worker_id = Some("worker_unproven".into());
+    state.run_store.create(active, VALID_YAML).unwrap();
+    let (_, response) = history_syntax_request(state, "is:archived", "").await;
+    assert!(response["runs"].as_array().unwrap().is_empty());
+    assert_eq!(response["ownership"]["unavailable"], 1);
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_proof_bounds_and_special_files_fail_closed() {
+    for failure in ["large_worker", "large_envelope", "symlink_worker"] {
+        let (_tmp, project, state, _) = session_workflow_fixture(false);
+        local_worker_history_proof(&state, project.path(), "run_worker", "cli");
+        let worker = state.global_dir.join("autoflows/workers/worker_fixture.toml");
+        match failure {
+            "large_worker" => std::fs::write(&worker, vec![b'x'; 65537]).unwrap(),
+            "large_envelope" => std::fs::write(state.run_store.root.join("run_worker/run_envelope.json"), vec![b'x'; 262145]).unwrap(),
+            _ => {
+                #[cfg(unix)] {
+                    let target = worker.with_extension("saved");
+                    std::fs::rename(&worker, &target).unwrap();
+                    std::os::unix::fs::symlink(target, worker).unwrap();
+                }
+                #[cfg(not(unix))] { continue; }
+            }
+        }
+        let (_, response) = history_syntax_request(state, "", "").await;
+        assert!(response["runs"].as_array().unwrap().is_empty(), "{failure}");
+        assert_eq!(response["ownership"]["unavailable"], 1);
+    }
+}
+
+#[tokio::test]
+async fn workflow_history_local_worker_prefix_alone_is_not_proof_and_no_worker_is_unchanged() {
+    let (_tmp, project, state, _) = session_workflow_fixture(false);
+    recorded_workflow(&state, project.path(), "run_stored");
+    let mut fake = run_record("run_prefix", "demo", "ws_a");
+    fake.worker_id = Some("worker_local_fixture_cli".into());
+    state.run_store.create(fake, VALID_YAML).unwrap();
+    let (_, response) = history_syntax_request(state.clone(), "", "").await;
+    assert_eq!(response["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(response["runs"][0]["run_id"], "run_stored");
+    assert_eq!(response["runs"][0]["execution_origin"], "local_recorded");
+    assert!(response["runs"][0]["worker_id"].is_null());
+    assert_eq!(response["ownership"]["unavailable"], 1);
+    let (_, info) = session_workflow_request(state, "GET", "/api/host/info", serde_json::Value::Null).await;
+    assert!(info["features"].as_array().unwrap().contains(&serde_json::json!("workflow.session_history.local_worker.v1")));
+}
+
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workflow_history_local_worker_owner_root_alias_keeps_descendants_nofollow() {
+    use std::os::unix::fs::symlink;
+    let (_tmp, project, mut state, _) = session_workflow_fixture(false);
+    local_worker_history_proof(&state, project.path(), "run_worker", "cli");
+    let alias_parent = tempfile::tempdir().unwrap();
+    let alias = alias_parent.path().join("configured-home");
+    symlink(std::fs::canonicalize(&state.global_dir).unwrap(), &alias).unwrap();
+    state.global_dir = alias.clone();
+    state.run_store = std::sync::Arc::new(rupu_orchestrator::RunStore::new(alias.join("runs")));
+    let (_, response) = history_syntax_request(state.clone(), "", "").await;
+    assert_eq!(response["runs"][0]["execution_origin"], "local_cli", "{response}");
+    state.run_store.archive("run_worker").unwrap();
+    let (_, response) = history_syntax_request(state.clone(), "is:archived", "").await;
+    assert_eq!(response["runs"][0]["execution_origin"], "local_cli", "{response}");
+    let proof = state.run_store.archive_root().join("run_worker/run_envelope.json");
+    let saved = proof.with_extension("saved");
+    std::fs::rename(&proof, &saved).unwrap();
+    symlink(&saved, &proof).unwrap();
+    let (_, response) = history_syntax_request(state, "is:archived", "").await;
+    assert!(response["runs"].as_array().unwrap().is_empty());
+    assert_eq!(response["ownership"]["unavailable"], 1);
+}

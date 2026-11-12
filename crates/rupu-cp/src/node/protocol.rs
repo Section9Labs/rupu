@@ -430,7 +430,9 @@ pub const CAP_RUN_LIST: &str = "run.list";
 /// __message list|send` over SSH (spec F1b §3.6). A connector refuses to
 /// read or send messages through a peer that does not list it.
 pub const CAP_RUN_MESSAGES: &str = "run.messages";
-/// HTTP/local atomic recipient run precondition; SSH messaging does not implement it.
+/// Atomic recipient-run precondition for operator messages over HTTP and SSH.
+/// A guarded send is refused unless its explicit single recipient still has
+/// the expected live run in the owning message space at enqueue time.
 pub const CAP_RUN_MESSAGES_EXPECTED_RUN: &str = "run.messages.expected_run";
 
 /// Host feature: this build serves a run's board — `GET
@@ -460,6 +462,7 @@ pub fn host_features() -> Vec<String> {
         CAP_RUN_CODENAME_FLAG.to_string(),
         CAP_RUN_SUPPLIED_RUN_ID.to_string(),
         CAP_RUN_MESSAGES.to_string(),
+        CAP_RUN_MESSAGES_EXPECTED_RUN.to_string(),
         CAP_RUN_BOARD.to_string(),
     ]
 }
@@ -690,6 +693,14 @@ mod tests {
             "{features:?}"
         );
         assert!(features.iter().any(|f| f == CAP_RUN_BOARD), "{features:?}");
+        assert_eq!(
+            features
+                .iter()
+                .filter(|f| f.as_str() == CAP_RUN_MESSAGES_EXPECTED_RUN)
+                .count(),
+            1,
+            "guarded messaging must be advertised exactly once for HTTP and SSH"
+        );
     }
 
     #[test]

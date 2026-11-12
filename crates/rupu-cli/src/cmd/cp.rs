@@ -1,5 +1,7 @@
 //! `rupu cp` — control-plane HTTP server subcommand.
 
+mod bootstrap;
+
 use crate::paths;
 use clap::Subcommand;
 use rupu_cp::host::bucket::{poll_bucket_run, ObjectStoreBucket};
@@ -41,9 +43,22 @@ pub enum Action {
         /// the browser is signed in.
         #[arg(long)]
         token: Option<String>,
+        /// Read the access token from a private owner-only file for a managed
+        /// desktop launch. Requires --ready-file and --launch-id; never prints
+        /// a token-bearing URL. The native client removes its token file.
+        #[arg(long, conflicts_with = "token", requires_all = ["ready_file", "launch_id"])]
+        token_file: Option<std::path::PathBuf>,
+        /// Publish a new private rupu.cp.bootstrap.v1 JSON receipt after bind.
+        /// The parent directory must already exist, be owned by this user, and
+        /// have mode 0700. An existing receipt is never overwritten.
+        #[arg(long, requires_all = ["token_file", "launch_id"])]
+        ready_file: Option<std::path::PathBuf>,
+        /// Unique UUID supplied by the native app for this exact launch.
+        #[arg(long, requires_all = ["token_file", "ready_file"])]
+        launch_id: Option<String>,
         /// Do not open the served URL in a browser on startup. By default the
         /// URL is opened when running interactively (a terminal); the URL is
-        /// always printed regardless.
+        /// printed unless this is a managed desktop launch.
         #[arg(long)]
         no_open: bool,
         /// Serve no web UI or page shell: `/api/*`, `/healthz` and `/mcp`
@@ -53,6 +68,10 @@ pub enum Action {
         /// Do not serve the MCP endpoint (`/mcp` is a 404).
         #[arg(long)]
         no_mcp: bool,
+        /// Opt in to per-call Ask approvals for authenticated local session workers.
+        /// Does not change session modes or enable the operator MCP endpoint.
+        #[arg(long, default_value_t = false)]
+        enable_session_tool_approvals: bool,
         /// Narrow the MCP to these tools (exact names, `ns.*`, `*`;
         /// comma-separated). Default: every tool.
         #[arg(long, value_delimiter = ',')]
@@ -66,9 +85,13 @@ pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
     handle(Action::Serve {
         bind: DEFAULT_BIND.parse().expect("default bind"),
         token: None,
+        token_file: None,
+        ready_file: None,
+        launch_id: None,
         no_open: true,
         no_web: true,
         no_mcp: false,
+        enable_session_tool_approvals: false,
         tools,
     })
     .await
@@ -78,14 +101,16 @@ pub async fn serve_mcp_only(tools: Vec<String>) -> ExitCode {
 /// process, the run assembler's call-site context over the project a call
 /// names. A call naming a project is assembled from THAT project's layered
 /// config (global, its customer, the project: `[bash]`, `[findings]`, the
-/// SCM accounts and the customer slug), with an SCM registry of its own
-/// built once and kept; a call naming none uses the global layer.
+/// SCM accounts and the customer slug), with an SCM registry snapshot of its
+/// own. Enrollment changes apply to new calls; a call naming none uses the
+/// global layer. Existing calls keep their captured context.
 struct CliContextFactory {
     global: std::path::PathBuf,
     run_id: String,
     global_assembler: Arc<rupu_runtime::assembly::RunAssembler>,
+    current_scm: Option<Arc<crate::cp_scm::CurrentScm>>,
     /// Per project id.
-    projects: BuildCache<rupu_runtime::assembly::RunAssembler>,
+    projects: BuildCache<crate::cp_scm::CurrentScm>,
 }
 
 /// Values kept per key, each built OUTSIDE the lock: a slow build (a
@@ -93,7 +118,7 @@ struct CliContextFactory {
 /// or the build of another key. Two first callers of one key may both
 /// build; the first to finish is kept.
 struct BuildCache<V> {
-    map: std::sync::Mutex<HashMap<String, Arc<V>>>,
+    map: std::sync::Mutex<HashMap<String, (String, Arc<V>)>>,
 }
 
 impl<V> BuildCache<V> {
@@ -103,22 +128,39 @@ impl<V> BuildCache<V> {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<V>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (String, Arc<V>)>> {
         self.map.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(test)]
     fn get_or_build<E>(
         &self,
         key: &str,
         build: impl FnOnce() -> Result<V, E>,
     ) -> Result<Arc<V>, E> {
-        if let Some(v) = self.lock().get(key) {
-            return Ok(Arc::clone(v));
+        self.get_or_build_versioned(key, "", build)
+    }
+
+    fn get_or_build_versioned<E>(
+        &self,
+        key: &str,
+        generation: &str,
+        build: impl FnOnce() -> Result<V, E>,
+    ) -> Result<Arc<V>, E> {
+        if let Some((version, value)) = self.lock().get(key) {
+            if version == generation {
+                return Ok(Arc::clone(value));
+            }
         }
         let built = Arc::new(build()?);
-        Ok(Arc::clone(
-            self.lock().entry(key.to_string()).or_insert(built),
-        ))
+        let mut map = self.lock();
+        if let Some((version, value)) = map.get(key) {
+            if version == generation {
+                return Ok(Arc::clone(value));
+            }
+        }
+        map.insert(key.to_owned(), (generation.to_owned(), Arc::clone(&built)));
+        Ok(built)
     }
 
     #[cfg(test)]
@@ -150,8 +192,14 @@ impl CliContextFactory {
             global,
             run_id: format!("mcp_{}", ulid::Ulid::new()),
             global_assembler,
+            current_scm: None,
             projects: BuildCache::new(),
         }
+    }
+
+    fn with_current_scm(mut self, current: Arc<crate::cp_scm::CurrentScm>) -> Self {
+        self.current_scm = Some(current);
+        self
     }
 
     /// The registered project `ws` names: a project id, or (only when
@@ -181,67 +229,83 @@ impl CliContextFactory {
         }
     }
 
-    /// The registry discovery a `context` call needs, blocking on the
-    /// runtime: `context` runs on the blocking pool (`CatalogSource::call`).
-    fn discover(
-        resolver: &rupu_auth::KeychainResolver,
-        cfg: &rupu_config::Config,
-    ) -> rupu_scm::Registry {
-        tokio::runtime::Handle::current().block_on(rupu_scm::Registry::discover(
-            resolver,
-            cfg,
-            Arc::new(rupu_netflow::NullSink),
-        ))
-    }
-
     fn assembler_for(
         &self,
         w: &rupu_workspace::Workspace,
     ) -> Result<Arc<rupu_runtime::assembly::RunAssembler>, String> {
-        self.projects
-            .get_or_build(&w.id, || self.build_assembler(w))
-    }
-
-    fn build_assembler(
-        &self,
-        w: &rupu_workspace::Workspace,
-    ) -> Result<rupu_runtime::assembly::RunAssembler, String> {
-        let path = std::path::PathBuf::from(&w.path);
-        let project_root =
-            paths::project_root_for(&path).map_err(|e| format!("project `{}`: {e:#}", w.id))?;
-        // Strict: this config picks accounts and limits for a real call.
-        let cfg_paths = paths::config_paths(&self.global, project_root.as_deref(), &path)
-            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
-        let cfg = rupu_config::layer_files_locked(cfg_paths.layers())
-            .map_err(|e| format!("project `{}` config: {e:#}", w.id))?;
-        let resolver = Arc::new(crate::accounts::resolver_for(&cfg));
-        let registry = Arc::new(Self::discover(&resolver, &cfg));
+        let source = self.projects.get_or_build_versioned(&w.id, &w.path, || {
+            Ok::<_, String>(match &self.current_scm {
+                Some(source) => source.project_source(std::path::PathBuf::from(&w.path)),
+                None => crate::cp_scm::CurrentScm::new(
+                    self.global.clone(),
+                    rupu_auth::KeychainResolver::for_home(&self.global),
+                )
+                .with_project(std::path::PathBuf::from(&w.path)),
+            })
+        })?;
+        let snapshot = tokio::runtime::Handle::current()
+            .block_on(source.for_tools())
+            .map_err(|_| "current project SCM enrollment unavailable".to_string())?;
+        let cfg = snapshot.config.clone();
         let findings = crate::findings_opts::base_options(&self.global, &cfg.findings);
         let catalog = Arc::new(rupu_orchestrator::FsCatalog::for_project_root(
             &self.global,
-            project_root.as_deref(),
+            snapshot.project_root.as_deref(),
         ));
-        Ok(rupu_runtime::assembly::RunAssembler::new(
+        Ok(Arc::new(rupu_runtime::assembly::RunAssembler::new(
             rupu_runtime::assembly::AssemblyContext {
                 catalog: Some(catalog),
-                project_root,
-                customer: cfg_paths.customer_slug.clone(),
+                project_root: snapshot.project_root.clone(),
+                customer: snapshot.customer.clone(),
                 config: cfg,
-                resolver,
-                scm: Some(registry),
+                resolver: Arc::clone(&snapshot.resolver),
+                scm: snapshot.available.then(|| Arc::clone(&snapshot.registry)),
                 findings,
                 ..rupu_runtime::assembly::AssemblyContext::minimal(self.global.clone())
             },
-        ))
+        )))
     }
 }
 
 impl rupu_mcp::ContextFactory for CliContextFactory {
+    fn catalog_context(&self) -> Result<rupu_tools::ToolContext, String> {
+        Ok(self.global_assembler.call_site_context(
+            rupu_tools::RunIdentity {
+                run_id: self.run_id.clone(), surface: rupu_tools::Surface::Agent,
+                scope_name: Some("mcp".into()), ..Default::default()
+            },
+            &rupu_runtime::assembly::WorkspaceBinding { id: String::new(), path: self.global.clone() },
+            Arc::new(rupu_netflow::NullSink),
+        ))
+    }
     fn context(&self, workspace: Option<&str>) -> Result<rupu_tools::ToolContext, String> {
         use rupu_runtime::assembly::WorkspaceBinding;
+        // ContextFactory is invoked on the catalog's blocking pool. Refresh
+        // enrollment once per call; existing calls/runs keep their assembler.
+        let current = self
+            .current_scm
+            .as_ref()
+            .map(|source| {
+                tokio::runtime::Handle::current()
+                    .block_on(source.for_tools())
+                    .map_err(|_| "current SCM enrollment unavailable".to_string())
+            })
+            .transpose()?;
+        let global_assembler = current
+            .as_ref()
+            .map(|snapshot| {
+                Self::new(
+                    self.global.clone(),
+                    &snapshot.config,
+                    Arc::clone(&snapshot.resolver),
+                    Arc::clone(&snapshot.registry),
+                )
+                .global_assembler
+            })
+            .unwrap_or_else(|| Arc::clone(&self.global_assembler));
         let (assembler, binding) = match workspace {
             None => (
-                Arc::clone(&self.global_assembler),
+                global_assembler,
                 WorkspaceBinding {
                     id: String::new(),
                     path: self.global.clone(),
@@ -259,7 +323,7 @@ impl rupu_mcp::ContextFactory for CliContextFactory {
                 )
             }
         };
-        Ok(assembler.call_site_context(
+        let mut context = assembler.call_site_context(
             rupu_tools::RunIdentity {
                 run_id: self.run_id.clone(),
                 surface: rupu_tools::Surface::Agent,
@@ -270,7 +334,11 @@ impl rupu_mcp::ContextFactory for CliContextFactory {
             // A long-lived server is no run: a served `bash`'s flows have no
             // run ledger to land in.
             Arc::new(rupu_netflow::NullSink),
-        ))
+        );
+        if workspace.is_none() && current.as_ref().is_some_and(|snapshot| !snapshot.available) {
+            context.services.scm = None;
+        }
+        Ok(context)
     }
 }
 
@@ -279,9 +347,13 @@ pub async fn handle(action: Action) -> ExitCode {
         Action::Serve {
             bind,
             token,
+            token_file,
+            ready_file,
+            launch_id,
             no_open,
             no_web,
             no_mcp,
+            enable_session_tool_approvals,
             tools,
         } => {
             if no_mcp && !tools.is_empty() {
@@ -292,6 +364,14 @@ pub async fn handle(action: Action) -> ExitCode {
                 eprintln!("error: nothing to serve: --no-web and --no-mcp together");
                 return ExitCode::FAILURE;
             }
+            let mut managed = match bootstrap::prepare(bind, token_file, ready_file, launch_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("error: managed control-plane startup: {error:#}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let token = token.or_else(|| managed.as_ref().map(|value| value.token().to_owned()));
             let global_dir = match paths::global_dir() {
                 Ok(d) => d,
                 Err(e) => {
@@ -300,43 +380,49 @@ pub async fn handle(action: Action) -> ExitCode {
                 }
             };
 
-            // `cfg` is hoisted out of the registry block below purely so the
-            // resolver can be built from it: `resolver_for`, not a bare
-            // `KeychainResolver::new()`, so a declared `[scm.gh-work]`
-            // account becomes an `AccountSpec` and its SSO token can
-            // actually refresh (arc progress ledger, Ruling 7). This is the
-            // resolver backing BOTH `CpRepoLister` and the `cp_inventory`
-            // SCM sweep, so without it the Ruling 7 fix would be wired in
-            // `accounts.rs` yet inert everywhere `cp serve` runs.
-            let scm_cfg = {
-                let global_cfg = global_dir.join("config.toml");
-                rupu_config::layer_files_locked(rupu_config::LayerPaths::global_only(&global_cfg))
-                    .unwrap_or_default()
+            // One live source for operator routes, MCP and inventory. A new
+            // login/configuration is visible on the next request, without
+            // restarting the owned CP or replacing an in-flight run's tools.
+            let current_scm = Arc::new(crate::cp_scm::CurrentScm::new(
+                global_dir.clone(),
+                rupu_auth::KeychainResolver::for_home(&global_dir),
+            ));
+            let initial_scm = match current_scm.for_tools().await {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    eprintln!("error: current SCM configuration or credentials unavailable");
+                    return ExitCode::FAILURE;
+                }
             };
-            let scm_resolver = Arc::new(crate::accounts::resolver_for(&scm_cfg));
-            let scm_registry = Arc::new(
-                rupu_scm::Registry::discover(
-                    scm_resolver.as_ref(),
-                    &scm_cfg,
-                    Arc::new(rupu_netflow::NullSink),
-                )
-                .await,
-            );
+            let scm_cfg = initial_scm.config.clone();
+            let scm_resolver = Arc::clone(&initial_scm.resolver);
+            let scm_registry = Arc::clone(&initial_scm.registry);
             // The MCP's catalog tools: the same SCM registry, findings
             // options and global config the control plane serves with.
             let mcp = if no_mcp {
                 None
             } else {
-                let factory = Arc::new(CliContextFactory::new(
-                    global_dir.clone(),
-                    &scm_cfg,
-                    Arc::clone(&scm_resolver),
-                    Arc::clone(&scm_registry),
-                ));
-                let catalog = match rupu_mcp::CatalogSource::new(factory) {
-                    Ok(c) => c,
-                    Err(e) => {
+                let factory = Arc::new(
+                    CliContextFactory::new(
+                        global_dir.clone(),
+                        &scm_cfg,
+                        Arc::clone(&scm_resolver),
+                        Arc::clone(&scm_registry),
+                    )
+                    .with_current_scm(Arc::clone(&current_scm)),
+                );
+                let catalog = match tokio::task::spawn_blocking(move || {
+                    rupu_mcp::CatalogSource::new(factory)
+                })
+                .await
+                {
+                    Ok(Ok(c)) => c,
+                    Ok(Err(e)) => {
                         eprintln!("error: building the MCP catalog: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                    Err(_) => {
+                        eprintln!("error: building the MCP catalog failed");
                         return ExitCode::FAILURE;
                     }
                 };
@@ -347,7 +433,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 let served = rupu_cp::mcp::served_names(Some(&catalog));
                 let unserved: Vec<String> = unavailable
                     .iter()
-                    .filter(|u| !served.contains(u.tool))
+                    .filter(|u| !served.contains(u.tool.as_str()))
                     .map(|u| u.notice_message())
                     .collect();
                 if !unserved.is_empty() {
@@ -382,6 +468,17 @@ pub async fn handle(action: Action) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+
+            if let Some(bootstrap) = &mut managed {
+                if let Err(error) = listener
+                    .local_addr()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|address| bootstrap.publish(address))
+                {
+                    eprintln!("error: managed control-plane readiness: {error:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
 
             // `cp serve`'s own traffic (fleet HTTP to remote hosts, the ASN
             // refresh download, the SCM registry built below) is
@@ -420,6 +517,32 @@ pub async fn handle(action: Action) -> ExitCode {
             let store = Arc::new(RunStore::new(global_dir.join("runs")));
             let worker_id = format!("cp-serve-{}", std::process::id());
             let gate_sweep_worker_id = format!("{worker_id}-gate-sweep");
+            // This separate opt-in remains off for normal/tokenless startup.
+            // The private broker never receives the CP bearer token value.
+            #[cfg(unix)]
+            let approval_broker = if enable_session_tool_approvals {
+                if token.is_none() {
+                    eprintln!("error: session tool approvals require authenticated CP startup");
+                    return ExitCode::FAILURE;
+                }
+                match rupu_runtime::session_approvals::broker::Broker::open(global_dir.clone()) {
+                    Ok(broker) => Some(broker),
+                    Err(_) => {
+                        eprintln!(
+                            "error: unable to initialize the private session approval broker"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(not(unix))]
+            if enable_session_tool_approvals {
+                eprintln!("error: private session tool approvals are unavailable on this host");
+                return ExitCode::FAILURE;
+            }
+
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tracing::info!(
                 worker_id = %worker_id,
@@ -490,18 +613,23 @@ pub async fn handle(action: Action) -> ExitCode {
                             // `POST /api/cron/tick`, a crontab `rupu cron
                             // tick` or another `cp serve` holds makes this
                             // turn a skip.
-                            let _lock = match rupu_orchestrator::cron_triggers::TickLock::try_acquire(&global) {
-                                Ok(Some(lock)) => lock,
-                                Ok(None) => {
-                                    tracing::info!("cp serve: cron tick skipped: a tick is already running");
-                                    return;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
-                                    return;
-                                }
-                            };
-                            if let Err(e) = crate::cmd::cron::tick(false, false, false, &mut |_| {}).await {
+                            let _lock =
+                                match rupu_orchestrator::cron_triggers::TickLock::try_acquire(
+                                    &global,
+                                ) {
+                                    Ok(Some(lock)) => lock,
+                                    Ok(None) => {
+                                        tracing::info!("cp serve: cron tick skipped: a tick is already running");
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "cp serve: cron tick lock unavailable; tick skipped");
+                                        return;
+                                    }
+                                };
+                            if let Err(e) =
+                                crate::cmd::cron::tick(false, false, false, &mut |_| {}).await
+                            {
                                 tracing::warn!(error = %e, "cp serve: cron tick failed");
                             }
                         }
@@ -695,7 +823,11 @@ pub async fn handle(action: Action) -> ExitCode {
             // `rupu session send <id> "<prompt>" --detach` using this same
             // binary, reusing the launcher's resolved exe.
             let session_sender: Arc<dyn rupu_cp::session_sender::SessionSender> =
-                Arc::new(crate::cp_session_sender::SubprocessSessionSender { exe: exe.clone() });
+                Arc::new(crate::cp_session_sender::SubprocessSessionSender {
+                    exe: exe.clone(),
+                    #[cfg(unix)]
+                    approval_broker: approval_broker.clone(),
+                });
 
             // Adapter for rupu-cp's SessionMutator port: shells
             // `rupu session archive|restore|delete <id>` using this same binary.
@@ -723,7 +855,11 @@ pub async fn handle(action: Action) -> ExitCode {
             // Adapter for rupu-cp's SessionStarter port: shells
             // `rupu session start <agent> … --detach` using this same binary.
             let session_starter: Option<Arc<dyn rupu_cp::session_starter::SessionStarter>> = Some(
-                Arc::new(crate::cp_session_starter::SubprocessSessionStarter { exe }),
+                Arc::new(crate::cp_session_starter::SubprocessSessionStarter {
+                    exe,
+                    #[cfg(unix)]
+                    approval_broker,
+                }),
             );
 
             // Adapter for rupu-cp's SkillInstaller port: the git fetch behind
@@ -751,10 +887,7 @@ pub async fn handle(action: Action) -> ExitCode {
             // Repo lister for the web Run target picker. The same SCM registry
             // and repo lister feed the fleet strip's SCM half below — one
             // credential resolution, not two.
-            let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> =
-                Arc::new(crate::cp_repos::CpRepoLister {
-                    registry: Arc::clone(&scm_registry),
-                });
+            let repo_lister: Arc<dyn rupu_cp::repos::RepoLister> = current_scm.clone();
             let repos: Option<Arc<dyn rupu_cp::repos::RepoLister>> = Some(Arc::clone(&repo_lister));
 
             // Fleet inventory for the dashboard's fleet strip. Two halves on
@@ -766,9 +899,7 @@ pub async fn handle(action: Action) -> ExitCode {
                 Arc::clone(&scm_resolver),
                 Some(crate::cp_inventory::ScmDeps {
                     global_dir: global_dir.clone(),
-                    resolver: Arc::clone(&scm_resolver),
-                    repos: repo_lister,
-                    scm: scm_registry,
+                    current: Arc::clone(&current_scm),
                 }),
             ));
             // One immediate refresh per half so the strip is populated by the
@@ -804,31 +935,32 @@ pub async fn handle(action: Action) -> ExitCode {
                 })
             };
 
-            let serve_result = rupu_cp::serve_on(
-                listener,
-                rupu_cp::ServeOpts {
-                    bind,
-                    token,
-                    global_dir,
-                    open_browser: !no_open && !no_web,
-                    launcher: Some(launcher),
-                    session_sender: Some(session_sender),
-                    repos,
-                    model_catalog,
-                    agent_launcher,
-                    session_starter,
-                    generator,
-                    session_mutator,
-                    transcript_mutator,
-                    inventory: Some(inventory),
-                    web: !no_web,
-                    mcp,
-                    agentiflow_launcher,
-                    skill_installer,
-                    admin_ops: Some(admin_ops),
-                },
-            )
-            .await;
+            let options = rupu_cp::ServeOpts {
+                bind,
+                token,
+                global_dir,
+                open_browser: managed.is_none() && !no_open && !no_web,
+                launcher: Some(launcher),
+                session_sender: Some(session_sender),
+                repos,
+                model_catalog,
+                agent_launcher,
+                session_starter,
+                generator,
+                session_mutator,
+                transcript_mutator,
+                inventory: Some(inventory),
+                web: !no_web,
+                mcp,
+                agentiflow_launcher,
+                skill_installer,
+                admin_ops: Some(admin_ops),
+            };
+            let serve_result = if let Some(bootstrap) = &managed {
+                rupu_cp::serve_on_managed(listener, options, bootstrap.launch_id()).await
+            } else {
+                rupu_cp::serve_on(listener, options).await
+            };
 
             // Signal every background loop to stop and wait for them to drain.
             let _ = shutdown_tx.send(true);
@@ -5211,6 +5343,109 @@ mod catalog_context_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn catalog_calls_refresh_global_and_project_only_enrollment_without_restart() {
+        crate::test_support::ensure_crypto_provider();
+        let global = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let workspace = register(global.path(), project.path());
+        std::fs::write(
+            global.path().join("config.toml"),
+            "[scm.work]\nkind='github'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(project.path().join(".rupu")).unwrap();
+        std::fs::write(
+            project.path().join(".rupu/config.toml"),
+            "[scm.project-work]\nkind='gitlab'\n",
+        )
+        .unwrap();
+        let resolver =
+            rupu_auth::KeychainResolver::at(global.path().join("auth.json")).without_environment();
+        let source = Arc::new(crate::cp_scm::CurrentScm::new(
+            global.path().into(),
+            resolver.clone(),
+        ));
+        let factory = Arc::new(factory(global.path()).with_current_scm(source));
+        // Advertisement stays stable; each call still resolves current services.
+        let construct = Arc::clone(&factory);
+        let catalog = tokio::task::spawn_blocking(move || rupu_mcp::CatalogSource::new(construct))
+            .await
+            .unwrap()
+            .unwrap();
+        let old_global = on_pool(&factory, None).await.unwrap().services.scm.unwrap();
+        let old_project = on_pool(&factory, Some(&workspace.id))
+            .await
+            .unwrap()
+            .services
+            .scm
+            .unwrap();
+        assert!(old_global
+            .accounts_for(rupu_scm::Platform::Github)
+            .is_empty());
+        assert!(old_project
+            .accounts_for(rupu_scm::Platform::Gitlab)
+            .is_empty());
+        resolver
+            .store_named(
+                "work",
+                rupu_providers::AuthMode::ApiKey,
+                &rupu_auth::StoredCredential::api_key("global-enrollment-fixture"),
+            )
+            .await
+            .unwrap();
+        resolver
+            .store_named(
+                "project-work",
+                rupu_providers::AuthMode::ApiKey,
+                &rupu_auth::StoredCredential::api_key("project-enrollment-fixture"),
+            )
+            .await
+            .unwrap();
+        let global_next = on_pool(&factory, None).await.unwrap().services.scm.unwrap();
+        let project_next = on_pool(&factory, Some(&workspace.id))
+            .await
+            .unwrap()
+            .services
+            .scm
+            .unwrap();
+        assert_eq!(
+            global_next.accounts_for(rupu_scm::Platform::Github),
+            vec![rupu_scm::AccountId::new("work")]
+        );
+        assert!(global_next
+            .accounts_for(rupu_scm::Platform::Gitlab)
+            .is_empty());
+        assert_eq!(
+            project_next.accounts_for(rupu_scm::Platform::Gitlab),
+            vec![rupu_scm::AccountId::new("project-work")]
+        );
+        assert!(old_global
+            .accounts_for(rupu_scm::Platform::Github)
+            .is_empty());
+        assert!(old_project
+            .accounts_for(rupu_scm::Platform::Gitlab)
+            .is_empty());
+        resolver
+            .forget_named("project-work", rupu_providers::AuthMode::ApiKey)
+            .await
+            .unwrap();
+        assert!(on_pool(&factory, Some(&workspace.id))
+            .await
+            .unwrap()
+            .services
+            .scm
+            .unwrap()
+            .accounts_for(rupu_scm::Platform::Gitlab)
+            .is_empty());
+        std::fs::write(global.path().join("auth.json"), "invalid fixture auth").unwrap();
+        assert!(on_pool(&factory, None).await.unwrap().services.scm.is_none());
+        use rupu_mcp::ToolSource;
+        assert!(catalog.tools().iter().any(|tool| tool.name == "scm.repos.list"));
+        let result = catalog.call("scm.repos.list", serde_json::json!({}), &rupu_mcp::CallCx::default()).await;
+        assert!(matches!(result, Some(rupu_mcp::ToolResult::Error(message)) if message.contains("not available")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_project_call_is_layered_with_its_customers_config() {
         crate::test_support::ensure_crypto_provider();
         let global = tempfile::tempdir().unwrap();
@@ -5245,7 +5480,7 @@ mod catalog_context_tests {
         assert_eq!(by_path.services.customer.as_deref(), Some("acme"));
         let none = on_pool(&f, None).await.unwrap();
         assert_eq!(none.services.customer, None);
-        assert_eq!(f.projects.len(), 2, "one assembler per project");
+        assert_eq!(f.projects.len(), 2, "one enrollment source per project");
     }
 
     /// `context` as `CatalogSource::call` runs it: on the blocking pool.

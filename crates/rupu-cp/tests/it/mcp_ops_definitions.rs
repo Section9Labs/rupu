@@ -64,6 +64,24 @@ async fn definitions_tools_are_listed_with_their_required_arguments() {
         ("models.refresh", &[]),
     ];
     assert_required_args(addr, table).await;
+    #[cfg(unix)]
+    assert_required_args(
+        addr,
+        &[
+            ("agents.source", &["scope_kind", "path"]),
+            (
+                "agents.repair",
+                &[
+                    "scope_kind",
+                    "path",
+                    "raw",
+                    "expected_revision",
+                    "request_id",
+                ],
+            ),
+        ],
+    )
+    .await;
     let hints = |name: &str| -> Value {
         list.as_array()
             .unwrap()
@@ -74,6 +92,12 @@ async fn definitions_tools_are_listed_with_their_required_arguments() {
     };
     assert_eq!(hints("agents.delete")["destructiveHint"], json!(true));
     assert_eq!(hints("agents.generate")["openWorldHint"], json!(true));
+    #[cfg(unix)]
+    {
+        assert_eq!(hints("agents.source")["readOnlyHint"], json!(true));
+        assert_eq!(hints("agents.repair")["readOnlyHint"], json!(false));
+        assert_eq!(hints("agents.repair")["destructiveHint"], json!(true));
+    }
     // A read-only POST is also idempotent.
     assert_eq!(hints("workflows.validate")["readOnlyHint"], json!(true));
     assert_eq!(hints("workflows.validate")["idempotentHint"], json!(true));
@@ -259,4 +283,46 @@ async fn agents_get_is_the_operator_tool_not_the_catalogs() {
         assert!(got.get(key).is_some(), "{key} missing: {got}");
     }
     assert_eq!(got["name"], json!("seeded"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exact_agent_source_repair_matches_http_and_rejects_stale_revision() {
+    let (addr, tmp) = spawn_operator_with(
+        |dir| {
+            std::fs::create_dir_all(dir.join("agents")).unwrap();
+            std::fs::write(dir.join("agents/seeded.md"), "---\nname: [broken\n---\n").unwrap();
+        },
+        None,
+    )
+    .await;
+    let path = tmp.path().canonicalize().unwrap().join("agents/seeded.md");
+    let args = json!({"scope_kind":"global", "path":path});
+    let read = call_tool(addr, "agents.source", args.clone()).await;
+    assert!(!is_error(&read), "{read}");
+    let source = json_of(&read);
+    assert!(source["parse_error"].is_string());
+    assert_eq!(source["consistency"], "observed_with_revision_checks");
+    let mut url = reqwest::Url::parse(&format!("http://{addr}/api/agent-files/source")).unwrap();
+    url.query_pairs_mut()
+        .append_pair("scope_kind", "global")
+        .append_pair("path", path.to_str().unwrap());
+    let http: Value = reqwest::get(url).await.unwrap().json().await.unwrap();
+    assert_eq!(source, http);
+    let mut save = args;
+    save["raw"] = json!(AGENT_MD);
+    save["expected_revision"] = source["revision"].clone();
+    save["request_id"] = json!("repair-fixture-1");
+    let result = call_tool(addr, "agents.repair", save.clone()).await;
+    assert!(!is_error(&result), "{result}");
+    let saved = json_of(&result);
+    assert_eq!(saved["saved"], true);
+    assert_eq!(saved["raw"], AGENT_MD);
+    assert_eq!(saved["previous_revision"], source["revision"]);
+    assert_eq!(saved["path"], json!(path));
+    assert_eq!(saved["request_id"], "repair-fixture-1");
+    assert_ne!(saved["revision"], source["revision"]);
+    let stale = call_tool(addr, "agents.repair", save).await;
+    assert!(text_of(&stale).starts_with("HTTP 409"), "{stale}");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), AGENT_MD);
 }

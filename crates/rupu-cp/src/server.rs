@@ -36,12 +36,15 @@ async fn healthz() -> ([(HeaderName, String); 2], &'static str) {
 
 /// Every `/api/*` route, no auth layer: the in-process MCP caller's router.
 pub(crate) fn api_routes() -> Router<AppState> {
-    Router::new()
+    let router = Router::new()
+        .merge(crate::api::mcp_credentials::routes())
         .merge(crate::api::agentiflows::routes())
         .merge(crate::api::agentiflow_defs::routes())
         .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
         .merge(crate::api::board::routes())
+        .merge(crate::api::coordination_history::routes())
+        .merge(crate::api::operator_board::routes())
         .merge(crate::api::assets::routes())
         .merge(crate::api::autoflows::routes())
         .merge(crate::api::autoflow_claims::routes())
@@ -62,15 +65,22 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::workers::routes())
         .merge(crate::api::coverage::routes())
         .merge(crate::api::findings::routes())
+        .merge(crate::api::findings_import_review::routes())
         .merge(crate::api::query::routes())
         .merge(crate::api::dashboard::routes())
         .merge(crate::api::events::routes())
         .merge(crate::api::graph::routes())
+        .merge(crate::api::recorded_workflow::routes())
+        .merge(crate::api::workflow_observation::routes())
         .merge(crate::api::attempt_history::routes())
         .merge(crate::api::netflow::routes())
         .merge(crate::api::run_streams::routes())
         .merge(crate::api::autoflow_runs::routes())
         .merge(crate::api::repos::routes())
+        .merge(crate::api::issues_read::routes())
+        .merge(crate::api::issues_discovery::routes())
+        .merge(crate::api::forge_writes::routes())
+        .merge(crate::api::issues_discussion::routes())
         .merge(crate::api::models::routes())
         .merge(crate::api::fs::routes())
         .merge(crate::api::host_info::routes())
@@ -83,7 +93,10 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::scm::routes())
         .merge(crate::api::auth_status::routes())
         .merge(crate::api::cron::routes())
-        .merge(crate::api::maintenance::routes())
+        .merge(crate::api::maintenance::routes());
+    #[cfg(unix)]
+    let router = router.merge(crate::api::session_approvals::routes());
+    router
 }
 
 /// What `router_with` serves besides `/api/*` and `/healthz`.

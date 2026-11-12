@@ -378,7 +378,11 @@ async fn continue_refuses_a_running_run_an_unknown_one_a_bad_body_and_a_remote_h
         (AGENT_LIVE, json!({"prompt": "and then?"}), 409),
         (SUB_LIVE, json!({}), 409),
         ("run_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({}), 404),
-        ("sub_01J9ZQ3K4M5N6P7Q8R9NOSUCH", json!({"prompt": "and then?"}), 404),
+        (
+            "sub_01J9ZQ3K4M5N6P7Q8R9NOSUCH",
+            json!({"prompt": "and then?"}),
+            404,
+        ),
         (AGENT_DONE, json!({"prompt": "  "}), 400),
         (AGENT_DONE, json!({"prompt": ""}), 400),
         (AGENT_DONE, json!({"mode": "yolo"}), 400),
@@ -387,7 +391,11 @@ async fn continue_refuses_a_running_run_an_unknown_one_a_bad_body_and_a_remote_h
         (AGENT_DONE, json!({"findings_profile": "brief"}), 400),
         (AGENT_DONE, json!({"engagement_profiles": [" "]}), 400),
         (AGENT_DONE, json!({"skills": ["global:"]}), 400),
-        (AGENT_DONE, json!({"messaging": {"tools": ["read_file"]}}), 400),
+        (
+            AGENT_DONE,
+            json!({"messaging": {"tools": ["read_file"]}}),
+            400,
+        ),
         // Nothing names the directory it was launched from.
         (AGENT_LOST, json!({}), 409),
     ] {
@@ -406,6 +414,160 @@ async fn continue_refuses_a_running_run_an_unknown_one_a_bad_body_and_a_remote_h
         "{err}"
     );
     assert!(rec.agents.lock().unwrap().is_empty());
+}
+
+// The new strict route is opt-in on the actual installed launcher.
+struct OptionAgents(
+    Arc<Recorded>,
+    Arc<Mutex<Vec<rupu_runtime::continuation_options::ContinuationListOverrides>>>,
+);
+#[async_trait]
+impl AgentLauncher for OptionAgents {
+    async fn launch(&self, _: AgentLaunchRequest) -> Result<String, AgentLaunchError> {
+        panic!("new route must not fall back to the legacy launcher")
+    }
+    fn supports_continuation_options(&self) -> bool {
+        true
+    }
+    async fn launch_continuation_options(
+        &self,
+        req: AgentLaunchRequest,
+        lists: rupu_runtime::continuation_options::ContinuationListOverrides,
+    ) -> Result<String, AgentLaunchError> {
+        self.0.agents.lock().unwrap().push(req);
+        self.1.lock().unwrap().push(lists);
+        Ok("run_01CONTINUED".into())
+    }
+}
+async fn spawn_options() -> (
+    SocketAddr,
+    tempfile::TempDir,
+    Arc<Recorded>,
+    Arc<Mutex<Vec<rupu_runtime::continuation_options::ContinuationListOverrides>>>,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    seed(tmp.path());
+    let rec = Arc::new(Recorded::default());
+    let lists = Arc::new(Mutex::new(Vec::new()));
+    let state = rupu_cp::state::AppState::new(tmp.path().to_path_buf(), Default::default())
+        .with_agent_launcher(Some(Arc::new(OptionAgents(rec.clone(), lists.clone()))));
+    let app = rupu_cp::server::router(state, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, tmp, rec, lists)
+}
+
+#[tokio::test]
+async fn explicit_continuation_lists_dispatch_once_with_empty_and_omitted_distinct() {
+    let (addr, _tmp, rec, lists) = spawn_options().await;
+    let (_, host) = get(addr, "/api/host/info").await;
+    assert!(host["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("agent.continue_options.v1")));
+    let (status, receipt) = post(addr, &format!("/api/runs/agents/{AGENT_DONE}/continue-options?host=local"), json!({
+        "prompt":"continue", "mode":"readonly", "model":"model", "provider":"account", "messaging":"off",
+        "lists":{"skills":[],"engagement_profiles":["network"]}
+    })).await;
+    assert_eq!(status, 202, "{receipt}");
+    assert_eq!(
+        receipt,
+        json!({"run_id":"run_01CONTINUED","continues":AGENT_DONE,"host_id":"local"})
+    );
+    let requests = rec.agents.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].continue_from.as_deref(), Some(AGENT_DONE));
+    assert_eq!(requests[0].mode.as_deref(), Some("readonly"));
+    assert!(
+        requests[0].skills.is_empty()
+            && requests[0].preload_skills.is_empty()
+            && requests[0].engagement_profiles.is_empty()
+    );
+    let selections = lists.lock().unwrap();
+    assert_eq!(selections.len(), 1);
+    assert_eq!(selections[0].skills, Some(vec![]));
+    assert_eq!(selections[0].preload_skills, None);
+    assert_eq!(
+        selections[0].engagement_profiles,
+        Some(vec!["network".into()])
+    );
+}
+
+#[tokio::test]
+async fn explicit_continuation_rejects_unsupported_before_dispatch() {
+    let (addr, _tmp, rec) = spawn_launch().await;
+    let (_, host) = get(addr, "/api/host/info").await;
+    assert!(!host["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("agent.continue_options.v1")));
+    let (status, _) = post(
+        addr,
+        &format!("/api/runs/agents/{AGENT_DONE}/continue-options"),
+        json!({"lists":{"skills":[]}}),
+    )
+    .await;
+    assert_eq!(status, 501);
+    assert!(rec.agents.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn strict_continuation_shape_liveness_and_host_fail_before_dispatch() {
+    let (addr, _tmp, rec, lists) = spawn_options().await;
+    for body in [
+        json!({}),
+        json!({"lists":null}),
+        json!({"lists":{"skills":null}}),
+        json!({"lists":{"unknown":[]}}),
+        json!({"lists":{"skills":[]},"skills":[]}),
+        json!({"lists":{"skills":[]},"preload_skills":[]}),
+        json!({"lists":{"skills":[]},"engagement_profiles":[]}),
+    ] {
+        let (status, _) = post(
+            addr,
+            &format!("/api/runs/agents/{AGENT_DONE}/continue-options"),
+            body,
+        )
+        .await;
+        assert!(status == 400 || status == 422, "{status}");
+    }
+    for (id, suffix, body, expected) in [
+        (AGENT_DONE, "", json!({"lists":{}}), 400),
+        (AGENT_DONE, "", json!({"lists":{"skills":["global:"]}}), 400),
+        (
+            AGENT_DONE,
+            "",
+            json!({"mode":"invalid","lists":{"skills":[]}}),
+            400,
+        ),
+        (AGENT_LIVE, "", json!({"lists":{"skills":[]}}), 409),
+        (AGENT_LOST, "", json!({"lists":{"skills":[]}}), 409),
+        (
+            AGENT_DONE,
+            "?host=peer",
+            json!({"lists":{"skills":[]}}),
+            501,
+        ),
+        (
+            AGENT_DONE,
+            "?ignored=yes",
+            json!({"lists":{"skills":[]}}),
+            400,
+        ),
+    ] {
+        let (status, body) = post(
+            addr,
+            &format!("/api/runs/agents/{id}/continue-options{suffix}"),
+            body,
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+    assert!(rec.agents.lock().unwrap().is_empty());
+    assert!(lists.lock().unwrap().is_empty());
 }
 
 // ── retry ───────────────────────────────────────────────────────────────────

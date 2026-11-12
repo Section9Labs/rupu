@@ -209,6 +209,19 @@ fn agent_runs() -> Vec<RunArgv> {
         r.launch = Some(link);
         out.push(RunArgv::Agent(r));
     }
+    // Explicit clears and replacements travel as one typed JSON argument.
+    for raw in [
+        r#"{"skills":[]}"#,
+        r#"{"preload_skills":[],"engagement_profiles":[]}"#,
+        r#"{"skills":["project:inspect"],"preload_skills":[]}"#,
+    ] {
+        let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
+        r.continue_from = Some("run_01ROUNDTRIP".into());
+        r.continue_options = Some(
+            rupu_runtime::continuation_options::ContinuationListOverrides::decode(raw).unwrap(),
+        );
+        out.push(RunArgv::Agent(r));
+    }
     // A placed unit continued with its workflow's messaging still set.
     for messaging in messagings() {
         let mut r = AgentRun::new("recon", "run_01ROUNDTRIPNEXT");
@@ -328,7 +341,12 @@ fn sessions() -> Vec<RunArgv> {
         let on = |bit: u32| mask & (1 << bit) != 0;
         let target = on(0).then(|| "github:o/r".to_string());
         out.push(RunArgv::SessionStart(SessionStart {
+            tool_ceiling: None,
+            mcp_tools: None,
+            mcp_catalog_revision: None,
+            effort: None,
             skill_preset: None,
+            tools: None,
             agent: "triage".into(),
             provider: on(4).then(|| "named-account".into()),
             model: on(4).then(|| "deliberate-model".into()),
@@ -347,7 +365,12 @@ fn sessions() -> Vec<RunArgv> {
         }));
     }
     out.push(RunArgv::SessionStart(SessionStart {
+        tool_ceiling: None,
+        mcp_tools: None,
+        mcp_catalog_revision: None,
+        effort: Some("high".into()),
         skill_preset: Some("none".into()),
+        tools: None,
         agent: "rupu-session".into(),
         provider: Some("openai".into()),
         model: Some("selected-model".into()),
@@ -361,6 +384,51 @@ fn sessions() -> Vec<RunArgv> {
         skills: Vec::new(),
         preload_skills: Vec::new(),
     }));
+    // Exercise absent, explicit empty, and exact/wildcard tool grants against
+    // the real Clap parser, including combinations with idle and skill flags.
+    let tool_cases = [
+        Some(Vec::new()),
+        Some(vec!["read_file".into(), "scm.*".into()]),
+        Some(vec!["*".into()]),
+    ];
+    let starts = out.clone();
+    for start in starts {
+        if let RunArgv::SessionStart(start) = start {
+            for tools in &tool_cases {
+                let mut selected = start.clone();
+                selected.tools = tools.clone();
+                out.push(RunArgv::SessionStart(selected));
+            }
+        }
+    }
+    // MCP is separate from builtin grants: preserve empty and exact identities,
+    // including remote names that contain punctuation/spaces.
+    if let RunArgv::SessionStart(base) = out[0].clone() {
+        for tools in [
+            vec![],
+            vec![rupu_runtime::session_mcp::ToolRef {
+                server: "fixture".into(),
+                tool: "search.records / exact".into(),
+            }],
+        ] {
+            let mut selected = base.clone();
+            selected.provider = Some("openai".into());
+            selected.model = Some("gpt-6.1-sol".into());
+            selected.effort = Some("high".into());
+            selected.tools = Some(vec![]);
+            selected.skill_preset = Some("none".into());
+            selected.mcp_catalog_revision = (!tools.is_empty()).then(|| "opaque-revision".into());
+            selected.mcp_tools = Some(tools);
+            out.push(RunArgv::SessionStart(selected));
+        }
+    }
+    if let RunArgv::SessionStart(base) = out[0].clone() {
+        for ceiling in [vec![], vec!["skills.load".into()]] {
+            let mut selected = base.clone();
+            selected.tool_ceiling = Some(ceiling);
+            out.push(RunArgv::SessionStart(selected));
+        }
+    }
     let skill_sets = [skills(0), skills(1), skills(2)];
     for prompt in PROMPTS {
         for detach in [false, true] {
@@ -383,6 +451,7 @@ fn sessions() -> Vec<RunArgv> {
         }));
     }
     out.push(RunArgv::SessionWorker(SessionWorker {
+        approval_channel: false,
         session_id: "ses_01X".into(),
     }));
     for (session_id, window, compaction_id) in [
@@ -401,10 +470,13 @@ fn sessions() -> Vec<RunArgv> {
 fn agentiflows() -> Vec<RunArgv> {
     ["acme", "-x"]
         .into_iter()
-        .map(|def| {
-            RunArgv::Agentiflow(AgentiflowRun {
-                definition: def.into(),
-                run_id: "af_01X".into(),
+        .flat_map(|def| {
+            [false, true].map(|global_definition_only| {
+                RunArgv::Agentiflow(AgentiflowRun {
+                    definition: def.into(),
+                    run_id: "af_01X".into(),
+                    global_definition_only,
+                })
             })
         })
         .collect()
@@ -459,6 +531,7 @@ fn back(cli: Cli) -> RunArgv {
             let messaging = a.messaging();
             RunArgv::Agent(AgentRun {
                 agent: a.agent,
+                exact_agent_definition: a.exact_agent_definition,
                 target: a.target,
                 run_id: a.run_id.expect("every agent run carries its id"),
                 codename: a.codename.map(|c| c.to_string()),
@@ -478,6 +551,7 @@ fn back(cli: Cli) -> RunArgv {
                     participant: f.participant,
                 }),
                 continue_from: a.continue_from,
+                continue_options: a.continue_options,
                 model: a.model,
                 provider: a.provider,
                 launch: a.launch.link(),
@@ -557,6 +631,21 @@ fn back(cli: Cli) -> RunArgv {
             cmd::session::Action::Start(s) => {
                 assert_eq!(s.prompt, None, "the prompt is never positional");
                 RunArgv::SessionStart(SessionStart {
+                    tool_ceiling: s
+                        .tool_ceiling
+                        .as_deref()
+                        .map(|raw| serde_json::from_str(raw).unwrap()),
+                    mcp_tools: s
+                        .mcp_tools
+                        .as_deref()
+                        .map(|v| serde_json::from_str(v).unwrap()),
+                    mcp_catalog_revision: s.mcp_catalog_revision,
+                    tools: if s.no_tools || !s.tools.is_empty() {
+                        Some(s.tools)
+                    } else {
+                        None
+                    },
+                    effort: s.effort,
                     skill_preset: s.skill_preset,
                     agent: s.agent,
                     provider: s.provider,
@@ -579,6 +668,7 @@ fn back(cli: Cli) -> RunArgv {
                 skills: s.skills,
             }),
             cmd::session::Action::RunWorker(w) => RunArgv::SessionWorker(SessionWorker {
+                approval_channel: w.approval_channel,
                 session_id: w.session_id,
             }),
             cmd::session::Action::Compact {
@@ -598,12 +688,14 @@ fn back(cli: Cli) -> RunArgv {
                     def,
                     detach,
                     run_id,
+                    global_definition_only,
                 },
         } => {
             assert!(!detach, "the detached child must not detach again");
             RunArgv::Agentiflow(AgentiflowRun {
                 definition: def,
                 run_id: run_id.expect("the detached child carries its id"),
+                global_definition_only,
             })
         }
         Cmd::Autoflow {

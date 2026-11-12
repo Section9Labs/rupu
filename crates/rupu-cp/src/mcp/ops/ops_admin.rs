@@ -6,7 +6,7 @@ use crate::api::{cron, maintenance};
 use http::Method;
 
 pub(super) fn ops() -> Vec<OpSpec> {
-    vec![
+    let mut result = vec![
         op(
             "cron.list",
             Method::GET,
@@ -39,5 +39,21 @@ pub(super) fn ops() -> Vec<OpSpec> {
         .query::<HostQuery>()
         .body::<maintenance::PruneBody>()
         .destructive(),
-    ]
+    ];
+    #[cfg(unix)]
+    {
+        use crate::api::retention_policy;
+        result.extend([
+            op("maintenance.retention_preview",Method::POST,"/api/maintenance/retention/preview",
+                "Prepare an explicit archived-data retention policy without deleting resources.\n\nPersists a bounded preview and known operation ID. Exact roots and absolute cutoffs are echoed. Archive policy candidates are observations, not a frozen deletion promise. With maintenance.retention.netflow_exact.v1, kind netflow requires authorization_mode exact_preview_set and captures only proven inactive archived local standalone ledgers; all other ledger owners are retained. Requires writable local CP.")
+                .query::<HostQuery>().body::<retention_policy::PreviewBody>(),
+            op("maintenance.retention_execute",Method::POST,"/api/maintenance/retention/operations/:id/execute",
+                "Execute a previously reviewed retention policy once and retain durable effects.\n\nThe exact policy digest and matching authorization mode are required. Network-ledger exact_preview_set additionally requires the echoed preview_set_digest and never adds candidates at execution. Execution selects current eligible archived artifacts within approved roots and fixed cutoffs. Repeating the same operation never replays deletion; reconcile unknown outcomes with the operation read tool.")
+                .query::<HostQuery>().body::<retention_policy::ExecuteBody>().destructive(),
+            op("maintenance.retention_operation",Method::GET,"/api/maintenance/retention/operations/:id",
+                "Read a durable retention operation and bounded preview or effect pages.\n\nSections are summary, preview and effects. Opaque cursors bind the owning operation, section and finite published journal sequence. Unknown or partial outcomes are preserved; reading never retries deletion.")
+                .query::<retention_policy::ReadQuery>(),
+        ]);
+    }
+    result
 }

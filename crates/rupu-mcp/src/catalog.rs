@@ -24,6 +24,13 @@ pub trait ContextFactory: Send + Sync {
     /// the tool's error. Blocking: [`CatalogSource`] calls it on the
     /// blocking pool, where it may block on the runtime (`Handle::block_on`).
     fn context(&self, workspace: Option<&str>) -> Result<ToolContext, String>;
+
+    /// Services that may become available during this server's lifetime.
+    /// This builds schemas only; every call still obtains and validates its
+    /// own current context. Default retains existing factories' behavior.
+    fn catalog_context(&self) -> Result<ToolContext, String> {
+        self.context(None)
+    }
 }
 
 pub struct CatalogSource {
@@ -91,7 +98,7 @@ impl CatalogSource {
     /// its own tool by one of these names leaves the catalog's out.
     pub fn new(factory: Arc<dyn ContextFactory>) -> Result<Self, ServeError> {
         let base = factory
-            .context(None)
+            .catalog_context()
             .map_err(|e| ServeError::Filter(format!("catalog base context: {e}")))?;
         let grant = ToolCatalog::builtin().resolve_grant(GrantInputs {
             declared: Some(&["*".to_string()]),

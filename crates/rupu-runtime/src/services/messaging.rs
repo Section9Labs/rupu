@@ -167,10 +167,17 @@ impl MessageCollector {
         } else {
             (DIRECT_PRIORITY, m.body.clone())
         };
+        // Keep operator instruction semantics while retaining the recorded
+        // Board identity. Operator posts are not ordinary direct messages.
+        let message_kind = if m.post_kind.is_some() {
+            "post"
+        } else {
+            "operator"
+        };
         self.message(
             m,
             InjectionKind::Operator,
-            "operator",
+            message_kind,
             address::OPERATOR.to_string(),
             priority,
             content,
@@ -201,6 +208,7 @@ impl MessageCollector {
                     from_codename: m.from_codename.clone(),
                     to: m.to.clone(),
                     kind: message_kind.into(),
+                    post_kind: m.post_kind.map(|kind| kind.as_str().to_string()),
                     body: m.body.clone(),
                     urgent: m.urgent,
                 })
@@ -334,6 +342,7 @@ impl TurnCollector for DirectiveCollector {
                         from_codename: None,
                         to: d.addressed_to.clone(),
                         kind: "directive".into(),
+                        post_kind: None,
                         body: d.body.clone(),
                         urgent: false,
                     })
@@ -471,6 +480,7 @@ mod tests {
         );
         assert_eq!(p.messages[0].id, post.id());
         assert_eq!(p.messages[0].kind, "post");
+        assert_eq!(p.messages[0].post_kind.as_deref(), Some("question"));
         // Delivered once.
         assert!(c.collect(&ctx()).is_empty());
     }
@@ -539,6 +549,44 @@ mod tests {
             ops,
             vec![(now.id(), "operator", true), (calm.id(), "operator", false)]
         );
+        assert!(got
+            .iter()
+            .all(|i| i.messages.iter().all(|m| m.post_kind.is_none())));
+    }
+
+    #[test]
+    fn operator_board_posts_keep_subtype_and_operator_instruction_framing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reader = joined(tmp.path(), "otter", "triage", None);
+        let operator = Bus::open(tmp.path(), "operator");
+        let sent = operator
+            .operator_board(
+                rupu_fleet::OperatorBoardWrite::Post {
+                    kind: rupu_fleet::PostKind::Question,
+                    to: Some(Address::parse("otter").unwrap()),
+                    body: "Review the evidence".into(),
+                    expected_run_id: Some("run_triage".into()),
+                },
+                rupu_fleet::OperatorVia::Cp,
+                None,
+                || Ok(()),
+            )
+            .unwrap();
+        let collector = MessageCollector {
+            bus: Arc::clone(&reader),
+        };
+        let received = collector.collect(&ctx());
+        assert_eq!(received.len(), 1);
+        let injection = &received[0];
+        assert_eq!(injection.kind, InjectionKind::Operator);
+        assert_eq!(injection.source, "operator");
+        assert_eq!(injection.priority, DIRECT_PRIORITY);
+        assert_eq!(injection.content, "Review the evidence");
+        assert_eq!(injection.messages[0].id, sent.id());
+        assert_eq!(injection.messages[0].from, "operator");
+        assert_eq!(injection.messages[0].kind, "post");
+        assert_eq!(injection.messages[0].post_kind.as_deref(), Some("question"));
+        assert!(collector.collect(&ctx()).is_empty());
     }
 
     /// The same words from the operator and from a peer's `msg.send`

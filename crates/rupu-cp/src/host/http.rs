@@ -651,13 +651,18 @@ impl HostConnector for HttpHostConnector {
 
     async fn start_session(&self, req: SessionStartRequest) -> Result<String, HostConnectorError> {
         if req.idle
+            || req.tool_ceiling.is_some()
+            || req.effort.is_some()
             || req.provider.is_some()
             || req.model.is_some()
             || req.workspace_id.is_some()
             || req.skill_preset.is_some()
+            || req.tools.is_some()
+            || req.mcp_tools.is_some()
+            || req.mcp_catalog_revision.is_some()
         {
             return Err(HostConnectorError::Unsupported(
-                "skill presets, idle creation, first-turn model selection and project-owned sessions require a direct connection to the owning host".into(),
+                "skill presets, idle creation, first-turn model/tool selection and project-owned sessions require a direct connection to the owning host".into(),
             ));
         }
         if !req.skills.is_empty() || !req.preload_skills.is_empty() {
@@ -1047,14 +1052,18 @@ impl HostConnector for HttpHostConnector {
         msg: OperatorMessageRequest,
     ) -> Result<OperatorSendReply, HostConnectorError> {
         if msg.expected_run_id.is_some() {
-            self.require_known_feature(
+            // This field is a precondition, not a display capability. Recheck
+            // after a peer restart/downgrade rather than trusting a cached flag.
+            self.require_feature(
                 crate::node::protocol::CAP_RUN_MESSAGES_EXPECTED_RUN,
                 "run-bound messages are unsupported by this host",
             )
             .await?;
         }
-        let body = serde_json::json!({ "to": msg.to, "body": msg.body, "urgent": msg.urgent,
-            "expected_run_id": msg.expected_run_id });
+        let mut body = serde_json::json!({ "to": msg.to, "body": msg.body, "urgent": msg.urgent });
+        if let Some(expected_run_id) = msg.expected_run_id {
+            body["expected_run_id"] = expected_run_id.into();
+        }
         let resp = self
             .messages_request(id, "this run cannot be messaged", |url| {
                 self.client.post(url).json(&body)

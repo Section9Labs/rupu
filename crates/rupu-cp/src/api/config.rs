@@ -21,6 +21,8 @@
 //! with, and the bearer token `cp serve` was started with is never threaded
 //! onto `AppState` at all — only a `token_set: bool` is.
 
+mod scoped;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +44,7 @@ use crate::{
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(scoped::routes())
         .route("/api/config", get(get_config))
         .route("/api/config/global", put(put_global))
         .route("/api/config/customer/:slug", put(put_customer))
@@ -317,14 +320,7 @@ async fn put_customer(
     Json(body): Json<ConfigWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_writable(&s)?;
-    let store = CustomerStore::new(s.global_dir.clone());
-    store.get(&slug).map_err(customer_api_err)?;
-    let path = store.config_path(&slug);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let cand = candidate_toml(&body, &existing)?;
-    reject_globally_locked_keys(&s, &cand)?;
-    validate_customer_layer(&s.global_dir.join("config.toml"), &path, &cand)?;
-    write_atomic_blocking(path, cand).await?;
+    scoped::legacy_write(s, scoped::Kind::Customer, slug, body).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -368,24 +364,7 @@ async fn put_project(
     Json(body): Json<ConfigWriteBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_writable(&s)?;
-    let path = project_config_path(&s, &id)?;
-    // The shared rule (`rupu_workspace::ConfigPaths`): a project whose
-    // `.rupu/` is the global dir has no project layer of its own.
-    let ws = load_ws(&s, &id)?;
-    let root = ws_root(&ws)?;
-    if rupu_workspace::ConfigPaths::without_customer(&s.global_dir, Some(&root))
-        .project
-        .is_none()
-    {
-        return Err(ApiError::bad_request(format!(
-            "this project's config is the global config ({}); edit it as the global config",
-            path.display()
-        )));
-    }
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let cand = candidate_toml(&body, &existing)?;
-    reject_locked_project_keys(&s, &ws, &cand)?;
-    write_atomic_blocking(path, cand).await?;
+    scoped::legacy_write(s, scoped::Kind::Project, id, body).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

@@ -4,6 +4,9 @@
 use crate::AgentSpec;
 
 pub const SESSION_AGENT_NAME: &str = "rupu-session";
+/// Frozen declaration version for newly created builtin sessions without overrides.
+pub const SESSION_TOOLS_PRESET: &str = "rupu-session-tools-v2";
+pub const SESSION_READS_FEATURE: &str = "session.scoped_reads.v1";
 const SESSION_AGENT: &str = include_str!("builtin/rupu-session.md");
 
 /// One provider-independent root definition, shipped in every runtime binary.

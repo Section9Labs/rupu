@@ -62,6 +62,7 @@ impl Interner {
 enum COrigin {
     Provider(Sym),
     Scm(Sym),
+    Mcp(Sym),
     Subprocess(Sym),
     Update,
     Cp,
@@ -146,6 +147,7 @@ impl CompactRows {
                 origin: match r.origin {
                     COrigin::Provider(x) => Origin::Provider(s.get(x)),
                     COrigin::Scm(x) => Origin::Scm(s.get(x)),
+                    COrigin::Mcp(x) => Origin::Mcp(s.get(x)),
                     COrigin::Subprocess(x) => Origin::Subprocess(s.get(x)),
                     COrigin::Update => Origin::Update,
                     COrigin::Cp => Origin::Cp,
@@ -234,6 +236,7 @@ impl CompactRows {
         let origin = match origin {
             Origin::Provider(x) => COrigin::Provider(st.intern(&x)),
             Origin::Scm(x) => COrigin::Scm(st.intern(&x)),
+            Origin::Mcp(x) => COrigin::Mcp(st.intern(&x)),
             Origin::Subprocess(x) => COrigin::Subprocess(st.intern(&x)),
             Origin::Update => COrigin::Update,
             Origin::Cp => COrigin::Cp,
@@ -321,6 +324,7 @@ mod tests {
         vec![
             Origin::Provider("anthropic".into()),
             Origin::Scm("github".into()),
+            Origin::Mcp("fixture".into()),
             Origin::Subprocess("bash".into()),
             Origin::Update,
             Origin::Cp,

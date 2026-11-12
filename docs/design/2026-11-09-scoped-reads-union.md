@@ -1,0 +1,13 @@
+# Scoped session reads: additive integration
+
+This source-only delta applies frozen scoped-read input `93f573afaa4a7dc0e7e16090528b2a89e965d728efe58c7f1862f99f446c1ff6` (base `a42e3beaa5736998fabcf9513976545044e326de`) atop the reviewed backend union `560780eb9f8c2b43982018fc6db1f862c6cc31ac`. The earlier union export remains unchanged at SHA256 `f6bfaceaf0608dcd241980afbcdfab4c0e6a31cf27a45b99497eaed393fce3b2`.
+
+All input hunks apply directly except `rustix.workspace = true` in the runtime manifest, which the current retention implementation already provides. The existing dependency placement and removed duplicate dev dependency remain intact. The current Cargo.lock already records rustix for rupu-runtime, so this delta needs no lockfile mutation.
+
+Twenty of the 25 frozen input files are byte-identical. Five retain additive baseline behavior: session pruning and CLI archive/restore/delete keep retention leases; the runtime retains its retention_lease module export and current manifest; host information retains all prior capability gates while adding the scoped-reader gate. G8 agent source-repair source and fixtures, other backend union modules, existing operator catalog/exclusions, and current session fields remain unchanged.
+
+The reviewed reader change intentionally adds optional creation-time provenance and reader-version markers and raises the record write floor to6 when either exists. Existing records keep their frozen declarations and absent markers. A legacy inherited wildcard does not enable these readers; persisted exact opt-in remains necessary. Explicit empty/custom selections remain authoritative. Service construction is bound to the root session turn and does not grant generic MCP or child sessions access. These are inherited input semantics, not additional integration policy.
+
+The frozen `session-scoped-tool-mapping-v1.json` is an inventory of its stated a42 source input, not a regenerated complete inventory of the newer combined operator catalog. The four scoped readers do not implicitly expose any newer G4/G8/discussion operations. Ask remains excluded and unchanged.
+
+Validation is reserved for the owning warm lane. The input authors22 unexecuted test declarations. Focused filters: `rupu-runtime --lib session_reads`, `rupu-runtime --lib sessions`, `rupu-tools --lib session_reads`, `rupu-cli --lib session_harness_tests`, and `rupu-cp --lib session_capabilities`. The CLI actual-worker fixture uses a mock provider; it does not establish live OpenAI/Anthropic acceptance. No build, test execution, provider API call, service mutation, or warm-checkout edit occurred in this integration lane.

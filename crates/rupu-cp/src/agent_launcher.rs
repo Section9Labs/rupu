@@ -160,6 +160,39 @@ pub enum AgentLaunchError {
 pub trait AgentLauncher: Send + Sync {
     async fn launch(&self, req: AgentLaunchRequest) -> Result<String, AgentLaunchError>;
 
+    /// Explicit continuation-list clearing is opt-in. Legacy launch adapters
+    /// cannot emulate it by dropping an empty vector.
+    fn supports_continuation_options(&self) -> bool {
+        false
+    }
+
+    async fn launch_continuation_options(
+        &self,
+        _req: AgentLaunchRequest,
+        _lists: rupu_runtime::continuation_options::ContinuationListOverrides,
+    ) -> Result<String, AgentLaunchError> {
+        Err(AgentLaunchError::Invalid(
+            "explicit continuation lists unsupported".into(),
+        ))
+    }
+
+    /// Exact file/project pinning is opt-in; legacy adapters cannot emulate it by cwd.
+    #[cfg(unix)]
+    fn supports_exact_global_agent(&self) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    async fn launch_exact_global(
+        &self,
+        _req: AgentLaunchRequest,
+        _binding: rupu_runtime::exact_agent::Binding,
+    ) -> Result<String, AgentLaunchError> {
+        Err(AgentLaunchError::Invalid(
+            "exact global agent launch unsupported".into(),
+        ))
+    }
+
     /// Whether [`Self::launch`] runs under a supplied
     /// [`AgentLaunchRequest::run_id`] rather than minting its own — the
     /// local connector's answer to `HostConnector::honours_supplied_run_id`.

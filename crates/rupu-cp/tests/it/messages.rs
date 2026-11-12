@@ -627,6 +627,8 @@ async fn expected_run_guard_survives_http_proxy_and_refuses_before_recording() {
     .unwrap();
     let peer = spawn(peer_dir.path(), true).await;
     let tmp = tempfile::tempdir().unwrap();
+    // Same root/address on the coordinator must never become a fallback.
+    let local_bus = workflow_run(tmp.path(), RUN, RunStatus::Running);
     let coordinator = state(tmp.path(), true);
     let host = coordinator
         .hosts
@@ -654,6 +656,108 @@ async fn expected_run_guard_survives_http_proxy_and_refuses_before_recording() {
     assert_eq!(status, 202, "{body}");
     assert_eq!(body["delivery"]["resolved"], json!(["lynx#1"]));
     assert_eq!(bus.mailbox.drain("lynx#1").unwrap().len(), 1);
+    assert!(log_lines(&tmp.path().join("runs").join(RUN).join("messages")).is_empty());
+    assert!(local_bus.mailbox.drain("lynx#1").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn guarded_messages_pin_exact_live_occupants_in_each_root_family() {
+    let tmp = tempfile::tempdir().unwrap();
+    let g = tmp.path();
+    workflow_run(g, RUN, RunStatus::Running);
+    let session = g.join("sessions").join(SESSION);
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("session.json"), r#"{"status":"active"}"#).unwrap();
+    live_flow(g, FLOW);
+    let addr = spawn(g, true).await;
+    let (_, info) = get(addr, "/api/host/info").await;
+    assert_eq!(
+        info["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| *f == "run.messages.expected_run")
+            .count(),
+        1
+    );
+    for (family, id, target) in [
+        ("runs", RUN, "lynx#1"),
+        ("sessions", SESSION, "session-main"),
+        ("agentiflows", FLOW, "lead"),
+    ] {
+        let root = MessageRoot::resolve(g, id).unwrap();
+        let bus = Bus::open(&root.space, target);
+        let join = |run: &str| {
+            bus.join(Member {
+                agent: "review".into(),
+                run_id: run.into(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        join("sub_current");
+        let path = format!("/api/{family}/{id}/messages");
+        let message = |run: &str| {
+            json!({
+                "to":target,"body":"Inspect this participant's current work.",
+                "expected_run_id":run,"urgent":true
+            })
+        };
+        let (status, reply) = post(addr, &path, message("sub_current")).await;
+        assert_eq!(status, 202, "{family}: {reply}");
+        assert_eq!(reply["delivery"]["resolved"], json!([target]));
+        assert_eq!(bus.mailbox.drain(target).unwrap().len(), 1);
+        bus.leave("completed").unwrap();
+        let before = log_lines(&root.space);
+        let (status, reply) = post(addr, &path, message("sub_current")).await;
+        assert_eq!(status, 409, "{family}: {reply}");
+        join("sub_replacement");
+        let (status, reply) = post(addr, &path, message("sub_current")).await;
+        assert_eq!(status, 409, "{family}: {reply}");
+        assert_eq!(log_lines(&root.space), before);
+        assert!(bus.mailbox.drain(target).unwrap().is_empty());
+        let (status, reply) = post(addr, &path, message("sub_replacement")).await;
+        assert_eq!(status, 202, "{family}: {reply}");
+        assert_eq!(bus.mailbox.drain(target).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn guarded_messages_require_explicit_unambiguous_targets_and_valid_run_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let g = tmp.path();
+    workflow_run(g, RUN, RunStatus::Running);
+    let session = g.join("sessions").join(SESSION);
+    std::fs::create_dir_all(&session).unwrap();
+    std::fs::write(session.join("session.json"), r#"{"status":"active"}"#).unwrap();
+    live_flow(g, FLOW);
+    let addr = spawn(g, true).await;
+    for (family, id) in [("runs", RUN), ("sessions", SESSION), ("agentiflows", FLOW)] {
+        let root = MessageRoot::resolve(g, id).unwrap();
+        let path = format!("/api/{family}/{id}/messages");
+        let before = log_lines(&root.space);
+        let mut invalid = vec![
+            json!({"body":"No implicit recipient", "expected_run_id":"sub_one"}),
+            json!({"to":null,"body":"No implicit recipient", "expected_run_id":"sub_one"}),
+        ];
+        for to in [
+            "broadcast",
+            "role:review",
+            "step:scan",
+            "parent",
+            "operator",
+        ] {
+            invalid.push(json!({"to":to,"body":"No group fallback","expected_run_id":"sub_one"}));
+        }
+        for run in ["", "run with spaces", "../run", "\n", &"x".repeat(129)] {
+            invalid.push(json!({"to":"lead","body":"Bad guard", "expected_run_id":run}));
+        }
+        for body in invalid {
+            let (status, response) = post(addr, &path, body.clone()).await;
+            assert_eq!(status, 400, "{family}: {body}: {response}");
+        }
+        assert_eq!(log_lines(&root.space), before);
+    }
 }
 
 #[tokio::test]

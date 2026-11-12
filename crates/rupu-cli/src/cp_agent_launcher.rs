@@ -25,10 +25,97 @@ fn spawn_spec(
     Ok((spec, run_id))
 }
 
+fn continuation_options_spawn_spec(
+    exe: &std::path::Path,
+    req: &AgentLaunchRequest,
+    lists: rupu_runtime::continuation_options::ContinuationListOverrides,
+) -> Result<(SpawnSpec, String), AgentLaunchError> {
+    lists.validate().map_err(AgentLaunchError::Invalid)?;
+    if req.continue_from.is_none()
+        || !req.skills.is_empty()
+        || !req.preload_skills.is_empty()
+        || !req.engagement_profiles.is_empty()
+    {
+        return Err(AgentLaunchError::Invalid(
+            "explicit continuation lists require a continuation with no legacy list fields".into(),
+        ));
+    }
+    let (mut spec, run_id) = spawn_spec(exe, req)?;
+    let RunArgv::Agent(run) = &mut spec.argv else {
+        unreachable!("agent spawn")
+    };
+    run.continue_options = Some(lists);
+    Ok((spec, run_id))
+}
+
+#[cfg(unix)]
+fn exact_spawn_spec(
+    exe: &std::path::Path,
+    req: &AgentLaunchRequest,
+    binding: &rupu_runtime::exact_agent::Binding,
+) -> Result<(SpawnSpec, String), AgentLaunchError> {
+    binding
+        .validate()
+        .map_err(|e| AgentLaunchError::Invalid(e.to_string()))?;
+    if req.agent != binding.effective_name
+        || req.working_dir.as_deref() != Some(&binding.project_path)
+        || req.target.is_some()
+        || req.continue_from.is_some()
+    {
+        return Err(AgentLaunchError::Invalid(
+            "exact launch differs from reviewed definition/project".into(),
+        ));
+    }
+    let (mut spec, run_id) = spawn_spec(exe, req)?;
+    let RunArgv::Agent(run) = &mut spec.argv else {
+        unreachable!("agent spawn")
+    };
+    run.exact_agent_definition =
+        Some(serde_json::to_string(binding).map_err(|e| AgentLaunchError::Invalid(e.to_string()))?);
+    Ok((spec, run_id))
+}
+
 #[async_trait::async_trait]
 impl AgentLauncher for SubprocessAgentLauncher {
     async fn launch(&self, req: AgentLaunchRequest) -> Result<String, AgentLaunchError> {
         let (spec, run_id) = spawn_spec(&self.exe, &req)?;
+        spawn_detached(spec).map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
+        Ok(run_id)
+    }
+
+    fn supports_continuation_options(&self) -> bool {
+        true
+    }
+
+    async fn launch_continuation_options(
+        &self,
+        req: AgentLaunchRequest,
+        lists: rupu_runtime::continuation_options::ContinuationListOverrides,
+    ) -> Result<String, AgentLaunchError> {
+        let (spec, run_id) = continuation_options_spawn_spec(&self.exe, &req, lists)?;
+        spawn_detached(spec).map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
+        Ok(run_id)
+    }
+
+    #[cfg(unix)]
+    fn supports_exact_global_agent(&self) -> bool {
+        true
+    }
+
+    #[cfg(unix)]
+    async fn launch_exact_global(
+        &self,
+        req: AgentLaunchRequest,
+        binding: rupu_runtime::exact_agent::Binding,
+    ) -> Result<String, AgentLaunchError> {
+        let global =
+            crate::paths::global_dir().map_err(|e| AgentLaunchError::Invalid(e.to_string()))?;
+        let cwd = req.working_dir.as_deref().ok_or_else(|| {
+            AgentLaunchError::Invalid("exact execution project is required".into())
+        })?;
+        rupu_runtime::exact_agent::load(&global, &binding, cwd.as_ref())
+            .map_err(|e| AgentLaunchError::Invalid(e.to_string()))?;
+        let (spec, run_id) = exact_spawn_spec(&self.exe, &req, &binding)?;
         spawn_detached(spec).map_err(|e| AgentLaunchError::Spawn(e.to_string()))?;
         Ok(run_id)
     }
@@ -93,6 +180,79 @@ mod tests {
         );
         assert_eq!(spec.cwd.as_deref(), Some("/tmp/p".as_ref()));
         assert!(!spec.keep_child);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_global_spec_preserves_file_proof_and_separate_cwd() {
+        let binding = rupu_runtime::exact_agent::Binding {
+            file_key: "installed.md".into(),
+            definition_revision: "a".repeat(64),
+            effective_name: "triage".into(),
+            workspace_id: "ws_selected".into(),
+            project_path: "/tmp/p".into(),
+            project_revision: "b".repeat(64),
+        };
+        let mut r = req();
+        r.target = None;
+        let (spec, _) = super::exact_spawn_spec("/bin/rupu".as_ref(), &r, &binding).unwrap();
+        assert_eq!(spec.cwd.as_deref(), Some(std::path::Path::new("/tmp/p")));
+        let RunArgv::Agent(run) = &spec.argv else {
+            panic!()
+        };
+        assert_eq!(
+            rupu_runtime::exact_agent::Binding::decode(
+                run.exact_agent_definition.as_deref().unwrap()
+            )
+            .unwrap(),
+            binding
+        );
+        assert!(!args(&spec).iter().any(|v| v == "--tmp"));
+        r.agent = "shadow".into();
+        assert!(super::exact_spawn_spec("/bin/rupu".as_ref(), &r, &binding).is_err());
+        r.agent = "triage".into();
+        r.working_dir = Some("/other".into());
+        assert!(super::exact_spawn_spec("/bin/rupu".as_ref(), &r, &binding).is_err());
+    }
+
+    #[test]
+    fn explicit_continuation_spec_keeps_empty_json_and_has_no_legacy_lists() {
+        use rupu_runtime::continuation_options::ContinuationListOverrides;
+        let mut request = req();
+        request.target = None;
+        request.continue_from = Some("run_original".into());
+        request.mode = Some("readonly".into());
+        let lists =
+            ContinuationListOverrides::decode(r#"{"skills":[],"engagement_profiles":["network"]}"#)
+                .unwrap();
+        let (spec, _) =
+            super::continuation_options_spawn_spec("/bin/rupu".as_ref(), &request, lists.clone())
+                .unwrap();
+        let RunArgv::Agent(run) = &spec.argv else {
+            panic!()
+        };
+        assert_eq!(run.continue_options, Some(lists));
+        assert_eq!(run.mode, Some(rupu_tools::PermissionMode::Readonly));
+        let argv = args(&spec);
+        assert!(argv.iter().any(|v| v.starts_with("--continue-options=")));
+        assert!(!argv
+            .iter()
+            .any(|v| v == "--skill" || v == "--engagement-profile"));
+        request.skills = vec!["inspect".into()];
+        assert!(super::continuation_options_spawn_spec(
+            "/bin/rupu".as_ref(),
+            &request,
+            ContinuationListOverrides::decode(r#"{"skills":[]}"#).unwrap()
+        )
+        .is_err());
+        request.skills.clear();
+        request.continue_from = None;
+        assert!(super::continuation_options_spawn_spec(
+            "/bin/rupu".as_ref(),
+            &request,
+            ContinuationListOverrides::decode(r#"{"skills":[]}"#).unwrap()
+        )
+        .is_err());
     }
 
     /// L8: the local CP launcher used to mint its own id and drop the

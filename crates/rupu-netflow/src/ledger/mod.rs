@@ -1,6 +1,7 @@
 pub mod compact;
 pub mod explorer;
 pub mod fold;
+pub mod lease;
 pub mod paths;
 pub mod views;
 pub mod writer;

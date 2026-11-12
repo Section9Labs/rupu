@@ -56,6 +56,10 @@ async fn agentiflows_tools_are_listed_with_their_required_arguments() {
     let table: &[(&str, &[&str])] = &[
         ("agentiflows.list", &[]),
         ("agentiflows.get", &["id"]),
+        ("agentiflows.snapshot", &["id"]),
+        ("agentiflows.snapshot_pages", &["id", "snapshot", "section"]),
+        #[cfg(unix)]
+        ("agentiflows.usage_timeline_page", &["id", "project"]),
         ("agentiflows.events", &["id"]),
         ("agentiflows.children", &["id"]),
         ("agentiflows.unit_output", &["id", "unit_id"]),
@@ -320,4 +324,80 @@ async fn agentiflow_tool_hints() {
     );
     assert_eq!(hint("agentiflow_defs.list", "readOnlyHint"), json!(true));
     assert_ne!(hint("agentiflow_defs.save", "destructiveHint"), json!(true));
+}
+
+#[tokio::test]
+async fn captured_observation_pages_match_http_without_reloading_sources() {
+    let (addr, tmp) = spawn_operator_with(seed_live_flow, None).await;
+    let r = call_tool(addr, "agentiflows.snapshot", json!({"id": FLOW})).await;
+    assert_ne!(r["isError"], json!(true), "{r}");
+    let snapshot = json_of(&r);
+    assert_eq!(snapshot["flow_id"], FLOW);
+    assert_eq!(snapshot["host_id"], "local");
+    assert!(snapshot.get("events").is_none());
+    let token = snapshot["snapshot"].as_str().unwrap();
+    // The capture remains readable after its source has disappeared.
+    std::fs::remove_dir_all(agentiflow_dir(tmp.path()).join(FLOW)).unwrap();
+    let args = json!({"id":FLOW,"snapshot":token,"section":"events","limit":1});
+    let page = call_tool(addr, "agentiflows.snapshot_pages", args).await;
+    assert_ne!(page["isError"], json!(true), "{page}");
+    let (status, body) = http_get(
+        addr,
+        &format!("/api/agentiflows/{FLOW}/snapshot/pages?snapshot={token}&section=events&limit=1"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json_of(&page), body);
+    let bad = call_tool(
+        addr,
+        "agentiflows.snapshot_pages",
+        json!({"id":FLOW,"snapshot":token,"section":"events","host":"remote"}),
+    )
+    .await;
+    assert_eq!(bad["isError"], json!(true));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agentiflow_usage_page_http_mcp_share_captured_scope_and_no_navigation_authority() {
+    let (addr,_tmp)=spawn_operator_with(|global| {
+        seed_live_flow(global);
+        let root=agentiflow_dir(global).join(FLOW);
+        std::fs::create_dir_all(root.join("lead")).unwrap();
+        std::fs::write(root.join("lead/transcript.r0.jsonl"),format!("{}\n",json!({"type":"run_start","data":{"run_id":FLOW,"workspace_id":"ws_usage","agent":"lead","provider":"test","model":"test","started_at":"2026-11-09T00:00:00Z","mode":"readonly"}}))).unwrap();
+        std::fs::write(root.join("usage.jsonl"),format!("{}\n",json!({"v":1,"id":"call_one","at":"2026-11-09T00:00:00Z","kind":"turn","agent_run_id":FLOW,"transcript":"/recorded/not/read.jsonl","agent":"lead","provider":"test","model":"test","input_tokens":12,"output_tokens":4}))).unwrap();
+    },None).await;
+    let first = call_tool(
+        addr,
+        "agentiflows.usage_timeline_page",
+        json!({"id":FLOW,"project":"ws_usage","limit":1}),
+    )
+    .await;
+    assert!(!is_error(&first), "{first}");
+    let captured = json_of(&first);
+    let token = captured["snapshot"].as_str().unwrap();
+    let (status, http) = http_get(
+        addr,
+        &format!(
+            "/api/agentiflows/{FLOW}/usage-timeline/page?project=ws_usage&snapshot={token}&limit=1"
+        ),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(captured, http);
+    assert_eq!(http["records"][0]["round_source"], "unknown");
+    assert!(http["records"][0]["cost_usd"].is_null());
+    let foreign = call_tool(
+        addr,
+        "agentiflows.usage_timeline_page",
+        json!({"id":FLOW,"project":"ws_other","snapshot":token}),
+    )
+    .await;
+    assert!(is_error(&foreign));
+    let (status, info) = http_get(addr, "/api/host/info").await;
+    assert_eq!(status, 200);
+    assert!(info["features"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("agentiflow.usage.pages.v1")));
 }

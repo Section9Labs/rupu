@@ -38,6 +38,151 @@ impl IssueConnector for GithubIssueConnector {
         IssueTracker::Github
     }
 
+    fn forge_actions(&self) -> Vec<crate::forge_write::ForgeAction> {
+        use crate::forge_write::ForgeAction::*;
+        vec![
+            ReviewComment,
+            ReviewCreate,
+            BranchCreate,
+            WorkflowDispatch,
+            IssueComment,
+            IssueCreate,
+            IssueSetState,
+        ]
+    }
+    async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        self.client.forge_session()
+    }
+
+    fn discussion_supported(&self) -> bool {
+        self.operator_read_capabilities().origin.is_some()
+    }
+    fn discussion_epoch(&self) -> Option<String> {
+        self.discussion_supported()
+            .then(|| self.client.review_identity_epoch())
+    }
+    async fn discussion_page(
+        &self,
+        issue: &IssueRef,
+        after: Option<&str>,
+    ) -> Result<crate::issue_discussion::DiscussionPage, ScmError> {
+        self.operator_expected_issue(issue)?;
+        self.client.discussion_session()?.page(issue, after).await
+    }
+
+    fn discovery_supported(&self) -> bool {
+        self.discussion_supported()
+    }
+    fn discovery_search_supported(&self) -> bool {
+        false
+    }
+    fn discovery_epoch(&self) -> Option<String> {
+        self.discussion_epoch()
+    }
+    async fn discovery_page(
+        &self,
+        request: &crate::issue_discovery::DiscoveryRequest,
+    ) -> Result<crate::issue_discovery::DiscoveryPage, ScmError> {
+        crate::issue_discovery::validate(request, self.tracker())?;
+        // Synthetic number validates project/account issuer only; no issue 1 read.
+        let expected = self.operator_expected_issue(&IssueRef {
+            tracker: self.tracker(),
+            project: request.project.clone(),
+            number: 1,
+        })?;
+        let mut request = request.clone();
+        request.project = expected.project;
+        self.client.discussion_session()?.discover(&request).await
+    }
+
+    fn operator_read_capabilities(&self) -> crate::operator_issues::IssueReadCapabilities {
+        crate::operator_issues::IssueReadCapabilities::configured(
+            self.client.operator_read_origin(),
+            true,
+        )
+    }
+
+    async fn operator_get_issue(&self, issue: &IssueRef) -> Result<Issue, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let _permit = self.client.permit().await;
+        let path = format!("/repos/{}/issues/{}", issue.project, issue.number);
+        let value = self.client.operator_json(&path).await?;
+        let origin = self
+            .client
+            .operator_read_origin()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        if value["url"].as_str() != Some(format!("{origin}{path}").as_str())
+            || value["repository_url"].as_str()
+                != Some(format!("{origin}/repos/{}", issue.project).as_str())
+            || value["number"].as_u64() != Some(issue.number)
+        {
+            return Err(crate::operator_issues::rejected());
+        }
+        let model =
+            serde_json::from_value(value).map_err(|_| crate::operator_issues::rejected())?;
+        Ok(issue_from_octocrab(issue.project.clone(), model))
+    }
+
+    async fn operator_comments_page(
+        &self,
+        issue: &IssueRef,
+        page: u32,
+    ) -> Result<crate::operator_issues::IssueCommentPage, ScmError> {
+        self.operator_expected_issue(issue)?;
+        if page == 0 || page > 10000 {
+            return Err(crate::operator_issues::rejected());
+        }
+        let _permit = self.client.permit().await;
+        let value = self
+            .client
+            .operator_json(&format!(
+                "/repos/{}/issues/{}/comments?per_page=50&page={page}",
+                issue.project, issue.number
+            ))
+            .await?;
+        let rows = value
+            .as_array()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        if rows.len() > 50 {
+            return Err(crate::operator_issues::rejected());
+        }
+        let origin = self
+            .client
+            .operator_read_origin()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let expected_issue = format!("{origin}/repos/{}/issues/{}", issue.project, issue.number);
+        let mut items = Vec::new();
+        for row in rows {
+            if row["issue_url"].as_str() != Some(expected_issue.as_str()) {
+                return Err(crate::operator_issues::rejected());
+            }
+            let id = row["id"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(crate::operator_issues::rejected)?
+                .to_string();
+            items.push(Comment {
+                id,
+                author: row["user"]["login"]
+                    .as_str()
+                    .ok_or_else(crate::operator_issues::rejected)?
+                    .into(),
+                body: row["body"].as_str().unwrap_or_default().into(),
+                created_at: serde_json::from_value(row["created_at"].clone())
+                    .map_err(|_| crate::operator_issues::rejected())?,
+                author_association: row["author_association"].as_str().map(str::to_string),
+            });
+        }
+        let full = items.len() == 50;
+        Ok(crate::operator_issues::IssueCommentPage {
+            items,
+            next_page: (full && page < 10000).then_some(page + 1),
+            end_observed: !full,
+        })
+    }
+
     async fn list_issues(
         &self,
         project: &str,

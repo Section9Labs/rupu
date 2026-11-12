@@ -8,12 +8,14 @@ use std::collections::BTreeMap;
 
 use rupu_agent::AgentRunOpts;
 use rupu_scm::Platform;
-use rupu_tools::{Effect, PermissionMode, ToolCatalog};
+use rupu_tools::{Effect, PermissionMode};
 use serde::{Deserialize, Serialize};
 
 /// Owned wire representation suitable for storing beside a session record.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunReadiness {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ceiling: Option<Vec<String>>,
     pub schema_version: u32,
     pub run_id: String,
     pub agent: String,
@@ -33,6 +35,10 @@ pub struct RunReadiness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolReadiness {
     pub name: String,
+    /// Exact identity from this assembled catalog, never current discovery.
+    /// Absent for builtins and readiness records written before MCP support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<rupu_transcript::RemoteToolIdentity>,
     pub effect: String,
     /// Present in an offered, narrowed, unavailable, or skipped grant entry.
     /// This includes ambient grants; it does not mean explicitly declared.
@@ -85,30 +91,32 @@ pub struct SkillReadiness {
 /// Inspect the actual grant, services, and permission policy of an assembled
 /// run. No speculative service handles are substituted for absent services.
 pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
-    let catalog = ToolCatalog::builtin();
+    let catalog = &opts.grant.catalog;
     let services = opts.tool_context.services.provided(opts.concerns.is_some());
     // Include unselected builtins so the distinction between selection and
     // model exposure remains visible. An offered descriptor is authoritative
     // even when a caller supplied a smaller or extended test catalog.
     let mut descriptors: BTreeMap<_, _> = catalog
-        .descriptors()
-        .map(|descriptor| (descriptor.name, descriptor))
+        .definitions()
+        .map(|descriptor| (descriptor.name.clone(), descriptor))
         .collect();
     for entry in opts.grant.entries.values() {
-        descriptors.insert(entry.canonical, entry.descriptor);
+        descriptors.insert(entry.canonical.clone(), entry.descriptor.clone());
     }
     let mode = opts.permission.mode();
-    let approval_channel_available = opts.permission.prompter().is_some();
+    let approval_channel_available = opts.permission.has_approval_channel();
     let tools = descriptors
         .into_iter()
         .map(|(name, descriptor)| {
-            let entry = opts.grant.entries.get(name);
+            let entry = opts.grant.entries.get(&name);
             let narrowed = opts.grant.narrowed.contains(&name);
             let unavailable = opts.grant.unavailable.iter().any(|u| u.tool == name);
             let skipped = opts.grant.skipped.iter().any(|u| u.tool == name);
-            let missing_services: Vec<_> = services
-                .missing_for(descriptor)
-                .into_iter()
+            let missing_services: Vec<_> = descriptor
+                .needs
+                .iter()
+                .copied()
+                .filter(|service| !services.contains(*service))
                 .map(|service| service.as_str().to_owned())
                 .collect();
             // Do not use PermissionPolicy::decide: Ask may invoke a prompter.
@@ -126,6 +134,12 @@ pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
             };
             ToolReadiness {
                 name: name.to_owned(),
+                remote: descriptor.remote_identity().map(|identity| {
+                    rupu_transcript::RemoteToolIdentity {
+                        server: identity.server.clone(),
+                        tool: identity.tool.clone(),
+                    }
+                }),
                 effect: descriptor.effect.as_str().to_owned(),
                 selected: entry.is_some() || narrowed || unavailable || skipped,
                 offered: entry.is_some(),
@@ -162,7 +176,8 @@ pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
             reason: granted.reason.as_str().to_owned(),
             indexed: granted.indexed,
             preload: granted.preload,
-            model_loadable: granted.model_loadable(),
+            model_loadable: granted.model_loadable()
+                && (opts.grant.tool_ceiling.is_none() || opts.grant.offers("skills.load")),
             baseline_stamp: granted.baseline_stamp.hex(),
         })
         .collect();
@@ -208,6 +223,7 @@ pub fn inspect(opts: &AgentRunOpts) -> RunReadiness {
     }
     let identity = opts.identity();
     RunReadiness {
+        tool_ceiling: opts.grant.tool_ceiling.clone(),
         schema_version: 1,
         run_id: identity.run_id.clone(),
         agent: identity.agent.clone(),

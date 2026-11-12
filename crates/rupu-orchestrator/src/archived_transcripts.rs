@@ -180,6 +180,12 @@ pub fn prune_archived_transcripts(
     older_than: Option<&str>,
     dry_run: bool,
 ) -> Result<TranscriptPruneReport, PruneError> {
+    // The global lifecycle lease is outermost and non-reentrant. Cleanup
+    // invokes the session and transcript stages sequentially, not under a
+    // second lease; its pre-existing partial-stage semantics remain intact.
+    let _retention_lease = if dry_run { None } else {
+        rupu_runtime::retention_lease::RetentionLease::for_legacy(global)?
+    };
     let cutoff = transcript_prune_cutoff(global, older_than)?;
     let mut rows = Vec::new();
     for t in scan_archived_transcripts(global, project_root)? {
@@ -257,6 +263,22 @@ mod tests {
             &meta,
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_lifecycle_blocks_legacy_deletion_but_not_preview() {
+        let tmp = tempfile::tempdir().unwrap();
+        archive(tmp.path(), "run_guarded", Some("2020-01-01T00:00:00Z"), None);
+        let path = archived_transcripts_dir(&tmp.path().join("transcripts")).join("run_guarded.jsonl");
+        let held = rupu_runtime::retention_lease::RetentionLease::try_acquire(tmp.path()).unwrap();
+        let preview = prune_archived_transcripts(tmp.path(), None, Some("30d"), true).unwrap();
+        assert_eq!(preview.rows.len(), 1);
+        assert!(prune_archived_transcripts(tmp.path(), None, Some("30d"), false).is_err());
+        assert!(path.is_file());
+        drop(held);
+        assert_eq!(prune_archived_transcripts(tmp.path(), None, Some("30d"), false).unwrap().rows.len(), 1);
+        assert!(!path.exists());
     }
 
     #[test]

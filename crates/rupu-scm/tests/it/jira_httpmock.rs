@@ -258,3 +258,52 @@ async fn update_issue_state_uses_done_transition() {
     transitions.assert();
     post_transition.assert();
 }
+
+#[tokio::test]
+async fn operator_read_rejects_moved_full_key_before_projection() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start_async().await;
+    let response = server.mock(|when, then| {
+        when.method(GET).path("/rest/api/3/issue/OLD-42");
+        then.status(200)
+            .json_body(issue_response("NEW-42", "indeterminate", &[]));
+    });
+    let result = connector_against(&server)
+        .operator_get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Jira,
+            project: "OLD".into(),
+            number: 42,
+        })
+        .await;
+    assert!(result.is_err());
+    response.assert();
+}
+
+#[tokio::test]
+async fn operator_read_does_not_follow_authenticated_redirect() {
+    rupu_scm::install_default_crypto_provider();
+    let server = MockServer::start_async().await;
+    let other = MockServer::start_async().await;
+    let redirected = other.mock(|when, then| {
+        when.method(GET);
+        then.status(200)
+            .json_body(issue_response("ENG-42", "indeterminate", &[]));
+    });
+    let redirect = server.mock(|when, then| {
+        when.method(GET).path("/rest/api/3/issue/ENG-42");
+        then.status(302).header(
+            "Location",
+            format!("{}/rest/api/3/issue/ENG-42", other.base_url()),
+        );
+    });
+    assert!(connector_against(&server)
+        .operator_get_issue(&rupu_scm::IssueRef {
+            tracker: rupu_scm::IssueTracker::Jira,
+            project: "ENG".into(),
+            number: 42
+        })
+        .await
+        .is_err());
+    redirect.assert();
+    redirected.assert_hits(0);
+}

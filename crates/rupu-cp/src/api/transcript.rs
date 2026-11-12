@@ -27,6 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[path = "transcript_page.rs"]
+pub(crate) mod page;
+
 /// Validate a requested transcript `?path=`: require a `.jsonl` file, reject
 /// `..` traversal, and require the path to resolve inside one of `allowed_roots`
 /// (themselves canonicalized). Symlink-escape is defeated by canonicalizing the
@@ -298,6 +301,7 @@ where
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/api/transcript/page", get(page::get_page))
         .route("/api/transcript", get(get_transcript))
         .route("/api/transcript/stream", get(stream_transcript))
 }

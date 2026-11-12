@@ -101,7 +101,7 @@ pub(crate) struct HostQuery {
 pub(crate) struct PostBody {
     /// Optional atomic enqueue precondition: `to` must be one exact live address
     /// currently owned by this run. A mismatch is 409 without recording a message.
-    /// Requires the destination HTTP host feature `run.messages.expected_run`.
+    /// Requires an explicit `to` and the destination feature `run.messages.expected_run`.
     #[serde(default)]
     pub expected_run_id: Option<String>,
     /// The recipient; the root's default (an agentiflow's lead, everyone
@@ -194,6 +194,11 @@ pub(crate) async fn post(
 ) -> ApiResult<Response> {
     check_route(route, id)?;
     crate::api::config::require_writable_to(s, "messaging a run")?;
+    if body.expected_run_id.is_some() && body.to.is_none() {
+        return Err(ApiError::bad_request(
+            "expected_run_id requires an explicit participant address in to",
+        ));
+    }
     // The CP authenticates a shared token, not a person: there is no viewer
     // to record. A call through `/mcp` (the operator source's request
     // extension, never a header) records `client: mcp`, on a local write

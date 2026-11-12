@@ -583,3 +583,118 @@ async fn duplicate_active_and_archived_identity_is_ambiguous() {
     );
     assert_eq!(tree(tmp.path()), before);
 }
+
+#[tokio::test]
+async fn full_preset_inventory_is_exact_and_read_only_without_a_launcher() {
+    let (tmp, state, workspace) = fixture();
+    install(&state.global_dir, "code-review");
+    install(&state.global_dir, "rupu-session-operations");
+    install(&state.global_dir, "unrelated");
+    let before = tree(tmp.path());
+    let (status, body) = get(
+        state.clone(),
+        &format!(
+            "/api/projects/{workspace}/session-capabilities?skill_preset=rupu-session-full-v1"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["preset"]["id"], "rupu-session-full-v1");
+    assert_eq!(
+        body["skills"]["inventory"]["expected_entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        110
+    );
+    assert_eq!(body["skills"]["selected"].as_array().unwrap().len(), 2);
+    assert_eq!(body["skills"]["diagnostics"].as_array().unwrap().len(), 108);
+    assert!(body["effective"].is_null());
+    {
+        use rupu_mcp::{CallCx, ToolResult, ToolSource};
+        let source = crate::mcp::operator_source::OperatorSource::new(crate::mcp::guarded(
+            routes().with_state(state.clone()),
+        ));
+        let response = source
+            .call(
+                "projects.session_capabilities",
+                json!({"id": workspace, "skill_preset": "rupu-session-full-v1"}),
+                &CallCx::default(),
+            )
+            .await
+            .unwrap();
+        let ToolResult::Json(value) = response else {
+            panic!("unexpected MCP response");
+        };
+        assert_eq!(value, body);
+    }
+    let (_, legacy) = get(
+        state,
+        &format!("/api/projects/{workspace}/session-capabilities"),
+    )
+    .await;
+    assert_eq!(legacy["preset"]["id"], "rupu-session-v1");
+    assert_eq!(legacy["declared_tools"], body["declared_tools"]);
+    assert_eq!(tree(tmp.path()), before);
+}
+
+#[tokio::test]
+async fn tool_preset_provenance_is_gated_and_never_replaces_frozen_or_empty_declarations() {
+    struct ScopedStarter;
+    #[async_trait::async_trait]
+    impl crate::session_starter::SessionStarter for ScopedStarter {
+        fn supports_session_scoped_reads(&self) -> bool {
+            true
+        }
+        async fn start(
+            &self,
+            _: crate::session_starter::SessionStartRequest,
+        ) -> Result<String, crate::session_starter::SessionStartError> {
+            panic!("capability projection must not launch")
+        }
+    }
+    let (tmp, state, workspace) = fixture();
+    let project_path = format!("/api/projects/{workspace}/session-capabilities?host=local");
+    let (_, unsupported) = get(state.clone(), &project_path).await;
+    assert!(unsupported["builtin_tools_preset"].is_null());
+    assert!(unsupported["scoped_reads_version"].is_null());
+    let supported = state
+        .clone()
+        .with_session_starter(Some(Arc::new(ScopedStarter)));
+    let (_, planned) = get(supported, &project_path).await;
+    assert_eq!(planned["scoped_reads_version"], json!(1));
+    assert_eq!(
+        planned["builtin_tools_preset"],
+        rupu_agent::builtin::SESSION_TOOLS_PRESET
+    );
+    assert_eq!(
+        planned["declared_tools"],
+        serde_json::to_value(rupu_agent::builtin::session_agent().tools).unwrap()
+    );
+    let session_path = format!("/api/sessions/{SESSION}/capabilities?host=local");
+    let (_, legacy) = get(state.clone(), &session_path).await;
+    assert!(legacy["builtin_tools_preset"].is_null());
+    assert!(legacy["scoped_reads_version"].is_null());
+    assert_eq!(legacy["declared_tools"], json!(["read_file"]));
+    edit_record(&state, |record| {
+        record["version"] = json!(6);
+        record["builtin_tools_preset"] = json!(rupu_agent::builtin::SESSION_TOOLS_PRESET);
+        record["scoped_reads_version"] = json!(1);
+    });
+    SessionSettings {
+        tools: Some(Vec::new()),
+        ..Default::default()
+    }
+    .save(&session_dir(&state))
+    .unwrap();
+    let before = tree(tmp.path());
+    let (_, current) = get(state.clone(), &session_path).await;
+    assert_eq!(current["scoped_reads_version"], json!(1));
+    assert_eq!(
+        current["builtin_tools_preset"],
+        rupu_agent::builtin::SESSION_TOOLS_PRESET
+    );
+    assert_eq!(current["declared_tools"], json!([]));
+    assert!(current["effective"].is_null());
+    assert_eq!(tree(tmp.path()), before);
+}

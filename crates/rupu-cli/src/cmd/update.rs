@@ -82,7 +82,7 @@ pub(crate) fn load_cli_config() -> rupu_config::Config {
 ///
 /// Pure so the whole matrix is testable; the real owner is fixed at compile
 /// time / by the exe path and cannot be varied from a test.
-fn packaged_refusal(
+pub(super) fn packaged_refusal(
     owner: Option<crate::build_info::InstallOwner>,
     pm: &str,
     check: bool,
@@ -94,6 +94,13 @@ fn packaged_refusal(
     }
     let action = if rollback { "roll back" } else { "update" };
     let manager = match owner {
+        crate::build_info::InstallOwner::DesktopApp => {
+            return Some(format!(
+                "This runtime is bundled with rupu.app and cannot {action} itself. \
+                 Update rupu.app instead to preserve its signature.\n  \
+                 `rupu update --check` remains available."
+            ));
+        }
         crate::build_info::InstallOwner::Brew => "Homebrew",
         crate::build_info::InstallOwner::Nix => "Nix",
         crate::build_info::InstallOwner::Distro => "a system package",
@@ -179,8 +186,13 @@ async fn run(args: UpdateArgs) -> anyhow::Result<ExitCode> {
                 return Ok(ExitCode::SUCCESS);
             }
             Decision::Update { to, .. } => {
+                let hint = crate::update_notice::packaged_call_to_action_for(
+                    crate::build_info::installed_owner(),
+                    crate::build_info::package_manager_hint(),
+                )
+                .unwrap_or_else(|| "Run 'rupu update'.".to_string());
                 println!(
-                    "Update available: {} → {to} ({channel}). Run 'rupu update'.",
+                    "Update available: {} → {to} ({channel}). {hint}",
                     ctx.current_version
                 );
                 return Ok(ExitCode::from(10));
@@ -419,6 +431,18 @@ mod packaged_tests {
 
     /// The common case under test: a distro-package install (.deb/.rpm/AUR).
     const DISTRO: Option<InstallOwner> = Some(InstallOwner::Distro);
+
+    #[test]
+    fn desktop_runtime_refuses_update_and_rollback_but_allows_read_only_check() {
+        let owner = Some(InstallOwner::DesktopApp);
+        for (check, rollback) in [(false, false), (false, true), (true, true)] {
+            let message =
+                packaged_refusal(owner, "apt", check, rollback).expect("app owns runtime");
+            assert!(message.contains("Update rupu.app instead"), "{message}");
+            assert!(!message.contains("apt"), "{message}");
+        }
+        assert!(packaged_refusal(owner, "apt", true, false).is_none());
+    }
 
     #[test]
     fn homebrew_is_refused_without_ever_saying_sudo_brew() {

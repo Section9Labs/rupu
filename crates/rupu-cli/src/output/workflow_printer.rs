@@ -2121,7 +2121,7 @@ fn workflow_transcript_event_lines(
                 kind: WorkflowViewLineKind::Event,
             }]
         }
-        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::AssistantBlock { .. } | TxEvent::Unknown { .. } => {
+        TxEvent::Outcome { .. } | TxEvent::Recovery { .. } | TxEvent::AssistantBlock { .. } | TxEvent::ToolApproval { .. } | TxEvent::Unknown { .. } => {
             super::outcome_row::outcome_event_row(event)
                 .into_iter()
                 .map(|(status, label, text)| WorkflowViewLine {
@@ -3608,6 +3608,7 @@ fn process_event(
         ev @ (TxEvent::Outcome { .. }
         | TxEvent::Recovery { .. }
         | TxEvent::AssistantBlock { .. }
+        | TxEvent::ToolApproval { .. }
         | TxEvent::Unknown { .. }) => {
             super::outcome_row::print_outcome_event(printer, &ev);
         }

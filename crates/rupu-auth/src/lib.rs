@@ -15,6 +15,7 @@
 //! lives in `rupu-providers` (`auth::discovery`).
 
 pub mod backend;
+pub mod mcp_credentials;
 pub mod json_file;
 
 pub mod account;

@@ -15,6 +15,12 @@ use rupu_orchestrator::Workflow;
 use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DRAFT_FEATURE: &str = "workflow.draft_session_launch.v1";
+#[path = "workflow_draft.rs"]
+mod draft;
+#[path = "workflow_validation_projection.rs"]
+pub(crate) mod validation_projection;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workflows", get(list_workflows).post(create_workflow))
@@ -26,9 +32,16 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/workflows/:name/run", post(launch_run))
         .route("/api/workflows/run", post(launch_yaml_run))
+        .route("/api/workflows/draft/preview", post(draft::preview))
         // axum matches static literal segments before dynamic `:name` captures,
         // so this route is reachable and is NOT shadowed by `/api/workflows/:name`.
         .route("/api/workflows/validate", post(validate_workflow))
+        .route(
+            "/api/workflows/validate/projection",
+            post(validation_projection::validate).layer(axum::extract::DefaultBodyLimit::max(
+                validation_projection::MAX_REQUEST,
+            )),
+        )
         .route("/api/workflows/generate", post(generate_workflow))
         .route("/api/generate/models", get(generate_models))
 }
@@ -795,6 +808,10 @@ pub(crate) struct LaunchBody {
 /// rather than saved under a name.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub(crate) struct LaunchYamlBody {
+    /// HTTP-only reviewed draft binding. Older unbound YAML launches stay unchanged.
+    #[serde(default)]
+    #[schemars(skip)]
+    draft: Option<draft::Binding>,
     /// The workflow's YAML, as a saved workflow file holds it. Validated
     /// before anything is written or spawned.
     yaml: String,
@@ -830,6 +847,9 @@ async fn launch_yaml_run(
     State(s): State<AppState>,
     Json(b): Json<LaunchYamlBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if b.draft.is_some() {
+        return draft::launch(s, b).await;
+    }
     if let Some(host) = b.host.as_deref().filter(|h| *h != "local") {
         return Err(ApiError::not_available(format!(
             "a YAML launch is local-only: host `{host}` has no transport for it"
@@ -1120,6 +1140,7 @@ async fn launch_run(
                     scope_kind: b.scope_kind.clone().unwrap(),
                     scope_id: b.scope_id.clone(),
                     revision: b.expected_revision.clone().unwrap(),
+                    draft_revision: None,
                 },
                 req.clone(),
             )
@@ -3203,4 +3224,5 @@ mod tests {
         assert!(!yaml_launch_dir(&s).exists());
     }
     include!("workflow_session_link_tests.rs");
+    include!("workflow_draft_tests.rs");
 }

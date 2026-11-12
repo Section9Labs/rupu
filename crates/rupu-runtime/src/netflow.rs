@@ -25,6 +25,7 @@ pub struct RunNetflow {
     writer: Option<rupu_netflow::NetflowWriterHandle>,
     paths: rupu_netflow::NetflowPaths,
     transcript: PathBuf,
+    lease: Option<Arc<rupu_netflow::ledger::lease::LedgerLease>>,
 }
 
 impl RunNetflow {
@@ -38,11 +39,13 @@ impl RunNetflow {
             writer.shutdown().await;
         }
         let RunNetflow {
-            paths, transcript, ..
+            paths,
+            transcript,
+            lease,
+            ..
         } = self;
         let ledger = paths.flows.clone();
-        let backfilled =
-            tokio::task::spawn_blocking(move || backfill_ledger(&paths, &transcript)).await;
+        let backfilled = start_backfill(paths, transcript, lease).await;
         match backfilled {
             Ok(Ok(0)) => {}
             Ok(Ok(n)) => {
@@ -54,6 +57,15 @@ impl RunNetflow {
             Err(e) => tracing::debug!(error = %e, "netflow ledger backfill task failed"),
         }
     }
+}
+
+// The owned queued closure, not its awaiting task, retains the handoff lease.
+fn start_backfill(
+    paths: rupu_netflow::NetflowPaths,
+    transcript: PathBuf,
+    lease: Option<Arc<rupu_netflow::ledger::lease::LedgerLease>>,
+) -> tokio::task::JoinHandle<std::io::Result<usize>> {
+    tokio::task::spawn_blocking(move || backfill_with_lease(&paths, &transcript, lease.as_deref()))
 }
 
 /// Build the netflow sink for one run: a ledger writer rooted at
@@ -93,7 +105,14 @@ pub fn for_run(
             None
         }
     };
+    let lease = writer.as_ref().map(|v| v.ledger_lease());
+    let mut paths = paths;
+    if let Some(lease) = &lease {
+        paths.root = lease.root().to_owned();
+        paths.flows = lease.path().to_owned();
+    }
     RunNetflow {
+        lease,
         sink: Arc::new(rupu_netflow::FanoutSink::new(sinks)),
         writer,
         paths,
@@ -127,6 +146,14 @@ pub fn backfill_ledger(
     paths: &rupu_netflow::NetflowPaths,
     transcript: &Path,
 ) -> std::io::Result<usize> {
+    backfill_with_lease(paths, transcript, None)
+}
+
+fn backfill_with_lease(
+    paths: &rupu_netflow::NetflowPaths,
+    transcript: &Path,
+    held: Option<&rupu_netflow::ledger::lease::LedgerLease>,
+) -> std::io::Result<usize> {
     let mut wanted: HashSet<rupu_netflow::FlowId> = HashSet::new();
     for_each_line(transcript, |line| {
         if let Some(id) = transcript_flow_id(line) {
@@ -136,10 +163,18 @@ pub fn backfill_ledger(
     if wanted.is_empty() {
         return Ok(0);
     }
+    let acquired;
+    let lease = if let Some(held) = held {
+        held
+    } else {
+        paths.ensure_dir()?;
+        acquired = rupu_netflow::ledger::lease::LedgerLease::shared(&paths.flows)?;
+        &acquired
+    };
     let mut torn = false;
     let mut unrecovered = 0u64;
     let mut patches: HashMap<rupu_netflow::FlowId, Vec<Vec<u8>>> = HashMap::new();
-    for_each_line(&paths.flows, |line| {
+    for_each_opened_line(lease.read(), |line| {
         torn = line.last() != Some(&b'\n');
         let Ok(LedgerIdLine { kind, id, count }) = serde_json::from_slice(line) else {
             return;
@@ -172,6 +207,7 @@ pub fn backfill_ledger(
     }
     let mut ledger = Appender {
         paths,
+        lease,
         torn,
         file: None,
         buf: Vec::new(),
@@ -207,6 +243,7 @@ pub fn backfill_ledger(
 /// agentiflow's launch sink beside its rounds') can't land inside one.
 struct Appender<'a> {
     paths: &'a rupu_netflow::NetflowPaths,
+    lease: &'a rupu_netflow::ledger::lease::LedgerLease,
     torn: bool,
     file: Option<std::fs::File>,
     buf: Vec<u8>,
@@ -256,11 +293,7 @@ impl Appender<'_> {
         let file = match &mut self.file {
             Some(file) => file,
             None => {
-                self.paths.ensure_dir()?;
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.paths.flows)?;
+                let mut file = self.lease.append()?;
                 if self.torn {
                     file.write_all(b"\n")?;
                 }
@@ -337,8 +370,14 @@ fn transcript_flow_id(line: &[u8]) -> Option<rupu_netflow::FlowId> {
 
 /// Call `f` with each line of `path`, its newline included. A missing file
 /// has no lines.
-fn for_each_line(path: &Path, mut f: impl FnMut(&[u8])) -> std::io::Result<()> {
-    let file = match std::fs::File::open(path) {
+fn for_each_line(path: &Path, f: impl FnMut(&[u8])) -> std::io::Result<()> {
+    for_each_opened_line(std::fs::File::open(path), f)
+}
+fn for_each_opened_line(
+    opened: std::io::Result<std::fs::File>,
+    mut f: impl FnMut(&[u8]),
+) -> std::io::Result<()> {
+    let file = match opened {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
@@ -429,5 +468,52 @@ mod tests {
             None,
             "no usage root, no stream"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn queued_backfill_retains_shutdown_handoff_after_waiter_cancellation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = rupu_netflow::NetflowPaths::for_run(temp.path(), "run_handoff");
+            let handle = rupu_netflow::NetflowWriterHandle::spawn(paths.clone()).unwrap();
+            let lease = handle.ledger_lease();
+            handle.shutdown().await;
+            assert!(rupu_netflow::ledger::lease::LedgerLease::exclusive(&paths.flows).is_err());
+            let transcript = temp.path().join("transcript.jsonl");
+            std::fs::write(&transcript, "").unwrap();
+            let (release, gate) = std::sync::mpsc::sync_channel(1);
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = entered.send(());
+                gate.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            });
+            ready.await.unwrap();
+            let queued = start_backfill(paths.clone(), transcript, Some(lease));
+            let waiter = tokio::spawn(queued);
+            waiter.abort();
+            let _ = waiter.await;
+            assert!(rupu_netflow::ledger::lease::LedgerLease::exclusive(&paths.flows).is_err());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    match rupu_netflow::ledger::lease::LedgerLease::exclusive(&paths.flows) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            tokio::task::yield_now().await
+                        }
+                        Err(e) => panic!("unexpected lease failure: {e}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
     }
 }

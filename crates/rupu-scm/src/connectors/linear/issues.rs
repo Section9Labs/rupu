@@ -13,8 +13,13 @@ const DEFAULT_BASE_URL: &str = "https://api.linear.app/graphql";
 
 pub struct LinearIssueConnector {
     http: reqwest_middleware::ClientWithMiddleware,
+    operator_http: reqwest_middleware::ClientWithMiddleware,
+    forge_http: reqwest_middleware::ClientWithMiddleware,
+    discussion_http: reqwest_middleware::ClientWithMiddleware,
+    discussion_epoch: String,
     token: String,
     base_url: String,
+    forge_generation: String,
 }
 
 impl LinearIssueConnector {
@@ -24,6 +29,14 @@ impl LinearIssueConnector {
         sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
     ) -> Self {
         Self {
+            forge_generation: format!("{:032x}", rand::random::<u128>()),
+            forge_http: crate::forge_write::http("linear", sink.clone())
+                .expect("linear operator write client build"),
+            discussion_epoch: format!("{:032x}", rand::random::<u128>()),
+            discussion_http: crate::issue_discussion::http("linear", sink.clone())
+                .expect("linear discussion client build"),
+            operator_http: crate::operator_issues::http("linear", sink.clone())
+                .expect("linear operator client build"),
             // Infallible constructor (`-> Self`); `.expect()` preserves the
             // deleted `http::client()` fallback's panic-on-failure behaviour.
             // No fallback to an uninstrumented client.
@@ -36,6 +49,31 @@ impl LinearIssueConnector {
             token,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
         }
+    }
+
+    async fn operator_graphql(&self, query: &str, variables: Value) -> Result<Value, ScmError> {
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let response = self
+            .operator_http
+            .post(origin)
+            .header(AUTHORIZATION, &self.token)
+            .json(&json!({"query":query,"variables":variables}))
+            .send()
+            .await
+            .map_err(|_| crate::operator_issues::rejected())?;
+        let value = crate::operator_issues::json(response).await?;
+        if let Some(errors) = value.get("errors").filter(|v| !v.is_null()) {
+            let errors: Vec<LinearGraphqlError> = serde_json::from_value(errors.clone())
+                .map_err(|_| crate::operator_issues::rejected())?;
+            if let Some(error) = classify_linear_graphql_error(&errors) {
+                return Err(error);
+            }
+        }
+        value
+            .get("data")
+            .cloned()
+            .ok_or_else(crate::operator_issues::rejected)
     }
 
     async fn graphql<T>(&self, query: &str, variables: Value) -> Result<T, ScmError>
@@ -256,6 +294,163 @@ impl LinearIssueConnector {
 impl IssueConnector for LinearIssueConnector {
     fn tracker(&self) -> IssueTracker {
         IssueTracker::Linear
+    }
+
+    fn forge_actions(&self) -> Vec<crate::forge_write::ForgeAction> {
+        use crate::forge_write::ForgeAction::*;
+        vec![IssueComment, IssueCreate, IssueSetState]
+    }
+    async fn forge_session(
+        &self,
+    ) -> Result<crate::forge_write::ForgeSession, crate::forge_write::ForgeError> {
+        use crate::forge_write::ForgeError;
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(ForgeError::unsupported)?;
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.token).map_err(|_| ForgeError::unsupported())?,
+        );
+        let generation = self.forge_generation.clone();
+        let current = generation.clone();
+        crate::forge_write::ForgeSession::new(
+            IssueTracker::Linear,
+            origin,
+            generation,
+            self.forge_http.clone(),
+            auth,
+            std::sync::Arc::new(move || current.clone()),
+        )
+    }
+
+    fn discussion_supported(&self) -> bool {
+        self.operator_read_capabilities().origin.is_some()
+    }
+    fn discussion_epoch(&self) -> Option<String> {
+        self.discussion_supported()
+            .then(|| self.discussion_epoch.clone())
+    }
+    async fn discussion_page(
+        &self,
+        issue: &IssueRef,
+        after: Option<&str>,
+    ) -> Result<crate::issue_discussion::DiscussionPage, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.token)
+                .map_err(|_| crate::issue_discussion::unsupported())?,
+        );
+        let epoch = self.discussion_epoch.clone();
+        let current = epoch.clone();
+        crate::issue_discussion::Session::new(
+            IssueTracker::Linear,
+            origin.clone(),
+            origin.clone(),
+            epoch,
+            self.discussion_http.clone(),
+            auth,
+            std::sync::Arc::new(move || current.clone()),
+        )?
+        .page(issue, after)
+        .await
+    }
+
+    fn discovery_supported(&self) -> bool {
+        self.discussion_supported()
+    }
+    fn discovery_search_supported(&self) -> bool {
+        self.discovery_supported()
+    }
+    fn discovery_epoch(&self) -> Option<String> {
+        self.discussion_epoch()
+    }
+    async fn discovery_page(
+        &self,
+        request: &crate::issue_discovery::DiscoveryRequest,
+    ) -> Result<crate::issue_discovery::DiscoveryPage, ScmError> {
+        crate::issue_discovery::validate(request, self.tracker())?;
+        // Synthetic number validates project/account issuer only; no issue 1 read.
+        let expected = self.operator_expected_issue(&IssueRef {
+            tracker: self.tracker(),
+            project: request.project.clone(),
+            number: 1,
+        })?;
+        let mut request = request.clone();
+        request.project = expected.project;
+        let origin = crate::operator_issues::safe_origin(&self.base_url)
+            .ok_or_else(crate::issue_discussion::unsupported)?;
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.token)
+                .map_err(|_| crate::issue_discussion::unsupported())?,
+        );
+        let epoch = self.discussion_epoch.clone();
+        let current = epoch.clone();
+        crate::issue_discussion::Session::new(
+            IssueTracker::Linear,
+            origin.clone(),
+            origin.clone(),
+            epoch,
+            self.discussion_http.clone(),
+            auth,
+            std::sync::Arc::new(move || current.clone()),
+        )?
+        .discover(&request)
+        .await
+    }
+
+    fn operator_read_capabilities(&self) -> crate::operator_issues::IssueReadCapabilities {
+        crate::operator_issues::IssueReadCapabilities::configured(
+            crate::operator_issues::safe_origin(&self.base_url),
+            false,
+        )
+    }
+
+    async fn operator_get_issue(&self, issue: &IssueRef) -> Result<Issue, ScmError> {
+        self.operator_expected_issue(issue)?;
+        let team = self
+            .operator_graphql(
+                "query($id:String!){team(id:$id){id key}}",
+                json!({"id":issue.project}),
+            )
+            .await?;
+        let team = &team["team"];
+        if team.is_null() {
+            return Err(ScmError::NotFound {
+                what: "issue team".into(),
+            });
+        }
+        let id = team["id"]
+            .as_str()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        let key = team["key"]
+            .as_str()
+            .ok_or_else(crate::operator_issues::rejected)?;
+        if issue.project != id && issue.project != key {
+            return Err(crate::operator_issues::rejected());
+        }
+        let identifier = format!("{key}-{}", issue.number);
+        let data = self.operator_graphql("query($id:String!){issue(id:$id){id identifier title description createdAt updatedAt creator{name} team{id key} state{id type} labels(first:65){nodes{id name color}}}}",json!({"id":identifier})).await?;
+        let value = &data["issue"];
+        if value.is_null() {
+            return Err(ScmError::NotFound {
+                what: "issue".into(),
+            });
+        }
+        if value["identifier"].as_str() != Some(identifier.as_str())
+            || value["team"]["id"].as_str() != Some(id)
+            || value["team"]["key"].as_str() != Some(key)
+        {
+            return Err(crate::operator_issues::rejected());
+        }
+        let node = serde_json::from_value(value.clone())
+            .map_err(|_| crate::operator_issues::rejected())?;
+        Ok(linear_issue_from_node(issue.project.clone(), node))
     }
 
     async fn list_issues(

@@ -32,6 +32,7 @@ pub struct TokenSource {
     /// for the one refresh instead of each starting their own.
     state: tokio::sync::Mutex<State>,
     refresher: Option<Arc<dyn OAuthRefresher>>,
+    credential_epoch: std::sync::atomic::AtomicU64,
 }
 
 struct State {
@@ -70,7 +71,14 @@ impl TokenSource {
                 retry_after: None,
             }),
             refresher,
+            credential_epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Nonsecret accepted-credential generation; never derived from a token.
+    pub fn credential_epoch(&self) -> u64 {
+        self.credential_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The source for `credentials` as `resolver` resolved them for
@@ -105,6 +113,13 @@ impl TokenSource {
     /// dropped mid-refresh leaves the rotation persisted, and the next call
     /// adopts it from the store.
     pub async fn token(&self) -> Result<String, ScmError> {
+        Ok(self.token_snapshot().await?.0)
+    }
+
+    /// Capture the credential and its nonsecret accepted generation while
+    /// holding the same state lock as refresh/replacement. Operator writes
+    /// must never label an older credential with a later sampled generation.
+    pub(crate) async fn token_snapshot(&self) -> Result<(String, u64), ScmError> {
         let mut state = self.state.lock().await;
         for _ in 0..2 {
             let AuthCredentials::OAuth {
@@ -127,6 +142,8 @@ impl TokenSource {
             match refresher.refresh(state.credentials.clone()).await {
                 Ok(fresh) => {
                     state.credentials = fresh;
+                    self.credential_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     state.retry_after = None;
                 }
                 Err(e) if !has_expired(expires) => {
@@ -136,12 +153,12 @@ impl TokenSource {
                         "OAuth token refresh failed; using the current token until it expires"
                     );
                     state.retry_after = Some(Instant::now() + RETRY_AFTER_FAILED_REFRESH);
-                    return Ok(access);
+                    return Ok((access, self.credential_epoch()));
                 }
                 Err(e) => return Err(self.refresh_failed("expired", e)),
             }
         }
-        Ok(access_of(&state.credentials))
+        Ok((access_of(&state.credentials), self.credential_epoch()))
     }
 
     /// The server rejected `rejected` (a 401). For an OAuth token, the
@@ -165,6 +182,8 @@ impl TokenSource {
             .refresh(state.credentials.clone())
             .await
             .map_err(|e| self.refresh_failed("was rejected", e))?;
+        self.credential_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         state.retry_after = None;
         let fresh = access_of(&state.credentials);
         Ok((fresh != rejected).then_some(fresh))
@@ -513,5 +532,42 @@ mod tests {
             src.replacement_for("a1").await,
             Err(ScmError::Unauthorized { .. })
         ));
+    }
+    #[tokio::test]
+    async fn credential_epoch_changes_only_when_a_replacement_is_accepted() {
+        let refresher = FakeRefresher::answering(oauth("fresh", "refresh", now_ms() + 7_200_000));
+        let src = source(oauth("old", "refresh", now_ms() + 3_600_000), &refresher);
+        assert_eq!(src.credential_epoch(), 0);
+        src.token().await.unwrap();
+        assert_eq!(src.credential_epoch(), 0);
+        src.replacement_for("old").await.unwrap();
+        assert_eq!(src.credential_epoch(), 1);
+        src.replacement_for("old").await.unwrap();
+        assert_eq!(src.credential_epoch(), 1);
+        let failure = FakeRefresher::failing("fixture failed");
+        let unchanged = source(oauth("old", "refresh", now_ms() - 1), &failure);
+        assert!(unchanged.token().await.is_err());
+        assert_eq!(unchanged.credential_epoch(), 0);
+        let proactive = source(oauth("old", "refresh", now_ms() - 1), &refresher);
+        proactive.token().await.unwrap();
+        assert_eq!(proactive.credential_epoch(), 1);
+    }
+    #[tokio::test]
+    async fn operator_snapshot_never_labels_old_auth_with_new_epoch() {
+        let source = Arc::new(TokenSource::fixed(Platform::Gitlab, "old"));
+        let first = source.token_snapshot().await.unwrap();
+        let mut held = source.state.lock().await;
+        let pending = {
+            let source = source.clone();
+            tokio::spawn(async move { source.token_snapshot().await.unwrap() })
+        };
+        held.credentials = AuthCredentials::ApiKey { key: "new".into() };
+        source
+            .credential_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(held);
+        assert_eq!(first, ("old".to_string(), 0));
+        assert_eq!(pending.await.unwrap(), ("new".to_string(), 1));
+        assert_ne!(first.1, source.credential_epoch());
     }
 }

@@ -11,7 +11,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "projects.session_capabilities",
             Method::GET,
             "/api/projects/:id/session-capabilities",
-            "Inspect a project's installed skill preset and declared session tools without starting work.\n\n`id` is the registered project ID; `host` is local only. `skill_preset` is rupu-session-v1 (default) or none. Returns frozen skill selections, preload defaults and diagnostics. `effective` is null because no turn is assembled. This read does not resolve credentials or verify provider or connector access.",
+            "Inspect a project's installed skill preset and declared session tools without starting work.\n\n`id` is the registered project ID; `host` is local only. `skill_preset` is rupu-session-v1 (default), rupu-session-full-v1 (the pinned installed suite), or none. The full preset adds an exact expected inventory; missing instructions are diagnostics, not installed or granted tools. Returns frozen skill selections, preload defaults and diagnostics. `effective` is null because no turn is assembled. This read does not resolve credentials or verify provider or connector access.",
         ).query::<session_capabilities::ProjectQuery>(),
         op(
             "sessions.capabilities",
@@ -35,7 +35,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "projects.workflow_history",
             Method::GET,
             "/api/projects/:id/workflow-history",
-            "List a project's recorded workflow executions, including archived runs.\n\n`id` is the registered project ID, on the directly connected local host. `offset` and `limit` (1–100, default 50) page newest-first. `q` is plain case-insensitive text over workflow name, run ID and codename. Returns {workspace_id,host_id,runs,next_offset}; rows include canonical run IDs, recorded names, states, dates and archived flags. Unknown project is HTTP 404.",
+            "List a project's recorded workflow executions, including archived runs.\n\n`id` is the registered project ID, on the directly connected local host. `offset` and `limit` (1–100, default 50) page newest-first. `q` defaults to plain case-insensitive text over workflow name, run ID and codename. Explicit `query_mode=syntax` uses the workflow_runs grammar (status, workflow, id, codename, trigger, host, customer, since, until, is); syntax is limited to 4096 UTF-8 bytes and 128 terms. Syntax replies echo query_mode and q; invalid grammar is a structured HTTP 400. Active IDs win over archived copies before filtering, and worker mirrors are excluded. Returns {workspace_id,host_id,runs,next_offset}; rows include canonical run IDs, recorded names, states, dates and archived flags. Unknown project is HTTP 404.",
         ).query::<session_workflows::HistoryQuery>(),
         op(
             "sessions.list",
@@ -114,7 +114,7 @@ pub(super) fn ops() -> Vec<OpSpec> {
             "messages.send",
             Method::POST,
             "/api/{root}/:id/messages",
-            "Send an operator message to a live run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `body` is the text, `to` the recipient (default: the root's default), `urgent` interrupts a running turn. Returns the message id and its delivery.",
+            "Send an operator message to a live run, session or agentiflow.\n\n`id` is the root's id (its prefix picks run, session or agentiflow); `body` is the text, `to` the recipient (default: the root's default), `urgent` interrupts a running turn. Optional `expected_run_id` requires an explicit exact participant address or lead; the owning host atomically refuses a changed or departed occupant with HTTP 409 and no enqueue. Guarded sends require run.messages.expected_run on remote peers. Returns the message id and its delivery; acceptance does not prove the agent read it.",
         )
         .query::<messages::HostQuery>()
         .body::<messages::PostBody>(),

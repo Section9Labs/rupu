@@ -13,6 +13,7 @@ pub const RELEASE_VERSION: &str = match option_env!("RUPU_RELEASE_VERSION") {
 };
 
 /// `"pkg"` when this binary came from a native package (.deb or .rpm);
+/// `"desktop"` for the runtime bundled inside the signed desktop app;
 /// `None` for tarball, `install.sh`, `cargo install`, and dev builds.
 ///
 /// Stamped by the packaging build exactly the way `RUPU_RELEASE_CHANNEL` is
@@ -72,19 +73,30 @@ pub fn package_manager_hint() -> &'static str {
 
 /// Who owns this binary, when it was not placed by hand.
 ///
-/// [`INSTALL_METHOD`] only covers the formats rupu itself builds (.deb/.rpm).
+/// [`INSTALL_METHOD`] covers native packages and the desktop app bundle.
 /// Homebrew, the AUR and Nix all install the *plain* published binary, so they
 /// carry no marker — yet they own the file just as much, and self-updating one
 /// fights the manager that owns it (brew/pacman revert it on the next upgrade;
 /// the Nix store is read-only). Hence the second, path-based signal below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOwner {
+    /// The signed desktop application owns its embedded runtime.
+    DesktopApp,
     /// Homebrew, on macOS or Linux. Never takes `sudo`.
     Brew,
     /// The Nix store — immutable by construction.
     Nix,
     /// A distro package manager: apt / dnf / pacman (.deb, .rpm, AUR).
     Distro,
+}
+
+/// Compile-time ownership is authoritative even if the binary was copied.
+pub fn owner_for_method(method: Option<&str>) -> Option<InstallOwner> {
+    match method {
+        Some("desktop") => Some(InstallOwner::DesktopApp),
+        Some("pkg") => Some(InstallOwner::Distro),
+        _ => None,
+    }
 }
 
 /// Which package manager owns a binary living at `path`, if any.
@@ -118,8 +130,8 @@ pub fn owner_for_path(path: &str) -> Option<InstallOwner> {
 /// path it is running from. `None` means a hand-placed or `cargo install`
 /// binary that is free to replace itself.
 pub fn installed_owner() -> Option<InstallOwner> {
-    if is_packaged_for(INSTALL_METHOD) {
-        return Some(InstallOwner::Distro);
+    if let Some(owner) = owner_for_method(INSTALL_METHOD) {
+        return Some(owner);
     }
     let exe = std::env::current_exe().ok()?;
     let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -136,6 +148,7 @@ pub fn installed_owner() -> Option<InstallOwner> {
 /// returns `None` on purpose.
 pub fn upgrade_command(owner: InstallOwner, distro_pm: &str) -> Option<String> {
     match owner {
+        InstallOwner::DesktopApp => None,
         InstallOwner::Brew => Some("brew upgrade rupu".to_string()),
         InstallOwner::Nix => None,
         InstallOwner::Distro if distro_pm != UNKNOWN_PACKAGE_MANAGER_HINT => {
@@ -169,6 +182,19 @@ pub fn version_line_static() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_marker_belongs_to_the_app_not_a_system_package_manager() {
+        assert_eq!(
+            owner_for_method(Some("desktop")),
+            Some(InstallOwner::DesktopApp)
+        );
+        assert_eq!(owner_for_method(Some("pkg")), Some(InstallOwner::Distro));
+        assert_eq!(owner_for_method(None), None);
+        assert_eq!(owner_for_method(Some("unknown")), None);
+        assert!(!is_packaged_for(Some("desktop")));
+        assert_eq!(upgrade_command(InstallOwner::DesktopApp, "apt"), None);
+    }
 
     #[test]
     fn package_manager_owned_paths_are_recognized() {

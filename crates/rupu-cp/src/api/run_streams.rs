@@ -27,6 +27,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/runs/autoflows/events", get(list_autoflow_events))
         .route("/api/runs/agents", get(list_agent_runs))
         .route("/api/runs/agents/:id/continue", post(continue_agent_run))
+        .route(
+            "/api/runs/agents/:id/continue-options",
+            post(continue_agent_run_options),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +91,60 @@ pub(crate) struct ContinueAgentRunBody {
     messaging: rupu_runtime::argv::LaunchMessaging,
 }
 
+/// A new strict route keeps old servers from ignoring explicit clear semantics.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueAgentRunOptionsBody {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    findings_profile: Option<String>,
+    #[serde(default)]
+    messaging: rupu_runtime::argv::LaunchMessaging,
+    lists: rupu_runtime::continuation_options::ContinuationListOverrides,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueAgentRunOptionsQuery {
+    host: Option<String>,
+}
+
+async fn continue_agent_run_options(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ContinueAgentRunOptionsQuery>,
+    Json(b): Json<ContinueAgentRunOptionsBody>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    let mut lists = b.lists;
+    lists.validate().map_err(ApiError::bad_request)?;
+    if let Some(values) = lists.engagement_profiles.take() {
+        lists.engagement_profiles = Some(crate::api::agents::parse_engagement_profiles(values)?);
+    }
+    let legacy = ContinueAgentRunBody {
+        prompt: b.prompt,
+        model: b.model,
+        provider: b.provider,
+        mode: b.mode,
+        findings_profile: b.findings_profile,
+        messaging: b.messaging,
+        ..Default::default()
+    };
+    continue_agent_run_with(
+        s,
+        id,
+        q.host.as_deref().filter(|h| *h != "local"),
+        legacy,
+        Some(lists),
+    )
+    .await
+}
+
 /// What continuing an agent run needs from the run it continues.
 #[derive(Debug)]
 struct ContinuedRun {
@@ -131,14 +189,21 @@ fn sub_run_running(runs: &std::path::Path, parent: &str, id: &str) -> Option<boo
     Some(
         entry.finished.is_none()
             && entry.continued_by.is_none()
-            && rupu_launch::proc::process_alive(entry.started.parent_pid, entry.started.parent_start),
+            && rupu_launch::proc::process_alive(
+                entry.started.parent_pid,
+                entry.started.parent_start,
+            ),
     )
 }
 
 /// Whether a pre-ledger sub-run under `parent` (or a standalone run, when
 /// `parent` is the run itself) is still running: the workflow run's runner,
 /// or the standalone run's own process, is alive.
-fn run_process_running(global: &std::path::Path, runs: &rupu_orchestrator::RunStore, parent: &str) -> bool {
+fn run_process_running(
+    global: &std::path::Path,
+    runs: &rupu_orchestrator::RunStore,
+    parent: &str,
+) -> bool {
     let live = |pid: Option<u32>| pid.is_some_and(rupu_orchestrator::runs::pid_is_running);
     match runs.load(parent) {
         Ok(rec) if !rec.workflow_name.starts_with(rupu_orchestrator::AGENT_RUN_PREFIX) => {
@@ -244,12 +309,28 @@ async fn continue_agent_run(
     Query(q): Query<crate::api::runs::RunControlQuery>,
     body: Option<Json<ContinueAgentRunBody>>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    if let Some(host) = q.remote_host() {
+    continue_agent_run_with(
+        s,
+        id,
+        q.remote_host(),
+        body.map(|b| b.0).unwrap_or_default(),
+        None,
+    )
+    .await
+}
+
+async fn continue_agent_run_with(
+    s: AppState,
+    id: String,
+    remote: Option<&str>,
+    b: ContinueAgentRunBody,
+    lists: Option<rupu_runtime::continuation_options::ContinuationListOverrides>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if let Some(host) = remote {
         return Err(ApiError::not_available(format!(
             "continuing an agent run is local-only: host `{host}` has no transport for it"
         )));
     }
-    let b = body.map(|b| b.0).unwrap_or_default();
     crate::agent_launcher::parse_mode(b.mode.as_deref()).map_err(ApiError::bad_request)?;
     for (field, value) in [
         ("prompt", &b.prompt),
@@ -272,6 +353,11 @@ async fn continue_agent_run(
         .agent_launcher
         .clone()
         .ok_or_else(|| ApiError::not_available("continuing a run requires `rupu cp serve`"))?;
+    if lists.is_some() && !launcher.supports_continuation_options() {
+        return Err(ApiError::not_available(
+            "explicit continuation lists are unsupported by this launcher",
+        ));
+    }
     let (global, rid) = (s.global_dir.clone(), id.clone());
     let run = tokio::task::spawn_blocking(move || continued_run(&global, &rid))
         .await
@@ -299,7 +385,11 @@ async fn continue_agent_run(
         messaging,
         codename: None,
     };
-    let run_id = launcher.launch(req).await.map_err(|e| match e {
+    let launched = match lists {
+        Some(lists) => launcher.launch_continuation_options(req, lists).await,
+        None => launcher.launch(req).await,
+    };
+    let run_id = launched.map_err(|e| match e {
         crate::agent_launcher::AgentLaunchError::Invalid(m) => ApiError::bad_request(m),
         crate::agent_launcher::AgentLaunchError::Spawn(m) => ApiError::internal(m),
     })?;

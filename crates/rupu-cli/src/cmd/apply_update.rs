@@ -46,6 +46,17 @@ pub struct ApplyUpdateArgs {
 /// Privileged apply step (invoked via sudo). Re-verifies the staged
 /// file's checksum before swapping.
 fn run_inner(args: ApplyUpdateArgs) -> Result<()> {
+    run_inner_owned(args, crate::build_info::installed_owner())
+}
+
+fn run_inner_owned(
+    args: ApplyUpdateArgs,
+    owner: Option<crate::build_info::InstallOwner>,
+) -> Result<()> {
+    if owner == Some(crate::build_info::InstallOwner::DesktopApp) {
+        anyhow::bail!(super::update::packaged_refusal(owner, "", false, false)
+            .expect("desktop runtime refuses mutation"));
+    }
     let bytes = std::fs::read(&args.from).context("read staged binary")?;
     let side = format!("{}  staged", args.sha256);
     rupu_update::verify::verify_checksum(&bytes, &side).context("staged checksum re-verify")?;
@@ -65,6 +76,27 @@ pub fn handle(args: ApplyUpdateArgs) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_apply_refuses_before_reading_or_replacing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("runtime");
+        let backup = directory.path().join("backup");
+        std::fs::write(&target, "signed runtime").unwrap();
+        let error = run_inner_owned(
+            ApplyUpdateArgs {
+                from: directory.path().join("does-not-exist"),
+                to: target.clone(),
+                sha256: "unused".into(),
+                backup: backup.clone(),
+            },
+            Some(crate::build_info::InstallOwner::DesktopApp),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Update rupu.app instead"));
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "signed runtime");
+        assert!(!backup.exists());
+    }
 
     #[test]
     fn tempdir_is_writable() {

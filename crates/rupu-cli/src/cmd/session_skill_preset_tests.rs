@@ -225,3 +225,40 @@ async fn persisted_session_does_not_expand_when_more_preset_skills_are_installed
     assert_eq!(selections(&stored), vec!["global:rupu-session-operations"]);
     assert_unstarted(&global, &stored);
 }
+
+#[tokio::test]
+async fn explicit_full_preset_freezes_more_instructions_without_changing_grants() {
+    let (_temp, global, project) = fixture();
+    install_preset(&global);
+    install(&global, "code-review");
+    install(&global, "unrelated");
+    let (legacy, _) = prepare_start(&args(&[]), global.clone(), project.clone())
+        .await
+        .unwrap();
+    let (full, _) = prepare_start(
+        &args(&["--skill-preset", "rupu-session-full-v1"]),
+        global.clone(),
+        project.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.skill_index.len(), 5);
+    assert_eq!(
+        full.skill_preset.as_ref().unwrap().id,
+        "rupu-session-full-v1"
+    );
+    assert_eq!(full.skill_preset_diagnostics.len(), 105);
+    assert_eq!(full.agent_tools, legacy.agent_tools);
+    assert_eq!(full.mcp_tools, legacy.mcp_tools);
+    assert_eq!(full.permission_mode, legacy.permission_mode);
+    assert_unstarted(&global, &full);
+    install(&global, "recon");
+    let (resolved, missing) = rupu_runtime::assembly::resolve_frozen_skills(
+        &skill_dirs(&global, Some(&project)),
+        &full.skill_index,
+    )
+    .await
+    .unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(resolved.unwrap().freeze(), full.skill_index);
+}

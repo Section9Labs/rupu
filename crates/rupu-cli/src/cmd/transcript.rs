@@ -12,6 +12,10 @@
 //! and renders it as a timeline (`pretty`, the default), a structured
 //! `json` envelope, or raw `jsonl`.
 
+#[cfg(unix)]
+#[path = "transcript_exact_delete.rs"]
+mod exact_delete;
+
 use crate::cmd::completers::{standalone_transcript_run_ids, transcript_run_ids};
 use crate::cmd::ui::LiveViewMode;
 use crate::output::formats::OutputFormat;
@@ -86,8 +90,19 @@ pub enum Action {
     },
     /// Permanently delete a standalone transcript and its metadata.
     Delete(DeleteArgs),
+    #[command(hide = true)]
+    DeleteContext(DeleteContextArgs),
     /// Delete archived standalone transcripts older than a cutoff.
     Prune(PruneArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct DeleteContextArgs {
+    pub run_id: String,
+    #[arg(long)]
+    pub workspace_id: String,
+    #[arg(long)]
+    pub path: String,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -104,6 +119,12 @@ pub struct DeleteArgs {
     /// transcript that still looks live.
     #[arg(long)]
     pub ignore_liveness: bool,
+    #[arg(long, hide = true)]
+    pub expected_workspace_id: Option<String>,
+    #[arg(long, hide = true)]
+    pub expected_path: Option<String>,
+    #[arg(long, hide = true)]
+    pub expected_revision: Option<String>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -161,6 +182,7 @@ pub async fn handle(
             ignore_liveness,
         } => archive(&run_id, ignore_liveness).await,
         Action::Delete(args) => delete(args).await,
+        Action::DeleteContext(args) => exact_context(args),
         Action::Prune(args) => prune(args, global_format, absolute, all_columns).await,
     };
     match result {
@@ -175,6 +197,7 @@ pub fn ensure_output_format(action: &Action, format: OutputFormat) -> anyhow::Re
         Action::Show { .. } => ("transcript show", report::PRETTY_TABLE_JSON_JSONL),
         Action::Archive { .. } => ("transcript archive", report::TABLE_ONLY),
         Action::Delete(_) => ("transcript delete", report::TABLE_ONLY),
+        Action::DeleteContext(_) => ("transcript delete-context", report::TABLE_JSON_CSV),
         Action::Prune(_) => ("transcript prune", report::TABLE_JSON_CSV),
     };
     crate::output::formats::ensure_supported(command_name, format, supported)
@@ -1261,7 +1284,7 @@ fn transcript_event_lines(
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
         | TranscriptEvent::AssistantBlock { .. }
-        | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
+        | TranscriptEvent::ToolApproval { .. } | TranscriptEvent::Unknown { .. } => crate::output::outcome_row::outcome_event_row(event)
             .into_iter()
             .map(|(status, label, text)| {
                 transcript_event_line(status, 0, false, transcript_event_text(status, label, &text))
@@ -1819,6 +1842,7 @@ pub(crate) fn render_pretty_transcript_event(
         TranscriptEvent::Outcome { .. }
         | TranscriptEvent::Recovery { .. }
         | TranscriptEvent::AssistantBlock { .. }
+        | TranscriptEvent::ToolApproval { .. }
         | TranscriptEvent::Unknown { .. } => {
             crate::output::outcome_row::print_outcome_event(printer, event);
         }
@@ -2197,6 +2221,8 @@ struct TranscriptLocation {
 }
 
 async fn archive(run_id: &str, ignore_liveness: bool) -> anyhow::Result<()> {
+    let global = paths::global_dir()?;
+    let _retention_lease = rupu_runtime::retention_lease::RetentionLease::for_legacy(&global)?;
     let location = locate_transcript(run_id)?;
     // Resolved full id from here on — `run_id` may have been a
     // fragment, and paths built below must use the real id.
@@ -2231,10 +2257,50 @@ async fn archive(run_id: &str, ignore_liveness: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn exact_context(args: DeleteContextArgs) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        let scope = rupu_cp::transcript_mutator::ExactTranscriptScope {
+            workspace_id: args.workspace_id,
+            path: args.path,
+        };
+        let context = exact_delete::prepare(&paths::global_dir()?, &args.run_id, &scope)?;
+        println!("{}", serde_json::to_string(&context)?);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("exact_transcript_unsupported: exact deletion requires Unix")
+}
 async fn delete(args: DeleteArgs) -> anyhow::Result<()> {
+    if args.expected_workspace_id.is_some()
+        || args.expected_path.is_some()
+        || args.expected_revision.is_some()
+    {
+        if !args.force || args.ignore_liveness {
+            anyhow::bail!("exact_transcript_conflict: guarded deletion requires force and forbids ignore-liveness");
+        }
+        let (Some(workspace_id), Some(path), Some(revision)) = (
+            args.expected_workspace_id,
+            args.expected_path,
+            args.expected_revision,
+        ) else {
+            anyhow::bail!("exact_transcript_conflict: complete expected source required");
+        };
+        #[cfg(unix)]
+        {
+            let scope = rupu_cp::transcript_mutator::ExactTranscriptScope { workspace_id, path };
+            exact_delete::delete(&paths::global_dir()?, &args.run_id, &scope, &revision)?;
+            println!("deleted exact transcript {}", args.run_id);
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        anyhow::bail!("exact_transcript_unsupported: exact deletion requires Unix");
+    }
     if !args.force {
         anyhow::bail!("transcript delete requires --force");
     }
+    let global = paths::global_dir()?;
+    let _retention_lease = rupu_runtime::retention_lease::RetentionLease::for_legacy(&global)?;
     let location = locate_transcript(&args.run_id)?;
     // Resolved full id — see the comment in `archive`.
     let run_id = location.run_id.as_str();

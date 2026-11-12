@@ -22,7 +22,16 @@ fn tool_names_fixture() -> std::path::PathBuf {
 pub(super) fn pinned_tool_names() -> Vec<String> {
     let text =
         std::fs::read_to_string(tool_names_fixture()).expect("fixture missing: run with BLESS=1");
-    serde_json::from_str(&text).unwrap()
+    let names: Vec<String> = serde_json::from_str(&text).unwrap();
+    names
+        .into_iter()
+        .filter(|name| {
+            cfg!(unix)
+                || (!name.starts_with("maintenance.retention_")
+                    && name != "agentiflows.usage_timeline_page"
+                    && !matches!(name.as_str(), "agents.source" | "agents.repair"))
+        })
+        .collect()
 }
 
 #[test]
@@ -231,6 +240,10 @@ fn every_route_is_a_tool_or_listed() {
         found.insert(("GET".into(), base.clone()));
         found.insert(("POST".into(), base.clone()));
         found.insert(("GET".into(), format!("{base}/stream")));
+        // Operator Board routes use the same dynamic owner-family registration.
+        let board = format!("/api/{}/:id/board/operator", r.segment());
+        found.insert(("GET".into(), board.clone()));
+        found.insert(("POST".into(), board));
     }
     println!("scanned {} method+path pairs", found.len());
     assert!(found.len() >= 155, "scanner found only {}", found.len());
@@ -261,14 +274,70 @@ fn every_route_is_a_tool_or_listed() {
 #[test]
 fn excluded_is_exactly_the_spec_list() {
     let spec: BTreeSet<(&str, &str)> = [
+        ("GET", "/api/runs/:id/board/operator"),
+        ("POST", "/api/runs/:id/board/operator"),
+        ("GET", "/api/sessions/:id/board/operator"),
+        ("POST", "/api/sessions/:id/board/operator"),
+        ("GET", "/api/agentiflows/:id/board/operator"),
+        ("POST", "/api/agentiflows/:id/board/operator"),
+        ("GET", "/api/mcp/servers/:id/credential"),
+        ("PUT", "/api/mcp/servers/:id/credential"),
+        ("DELETE", "/api/mcp/servers/:id/credential"),
+        ("GET", "/api/mcp/credential-operations/:id"),
+        ("GET", "/api/mcp/credential-orphans"),
+        ("DELETE", "/api/mcp/credential-orphans/:generation"),
+        ("GET", "/api/projects/:ws_id/scm/reviews/:number"),
+        ("GET", "/api/projects/:ws_id/scm/reviews/:number/pages"),
+        ("GET", "/api/forge/write-capabilities"),
+        ("POST", "/api/forge/intents"),
+        ("GET", "/api/forge/intents/:id"),
+        ("POST", "/api/forge/intents/:id/execute"),
+        ("GET", "/api/forge/operations/:id"),
+        ("GET", "/api/issues/accounts"),
+        ("GET", "/api/issues/:tracker/discovery"),
+        ("GET", "/api/issues/:tracker/:number"),
+        ("GET", "/api/issues/:tracker/:number/body"),
+        ("GET", "/api/issues/:tracker/:number/comments"),
+        ("GET", "/api/config/scoped/project/:id"),
+        ("PUT", "/api/config/scoped/project/:id"),
+        ("GET", "/api/config/scoped/customer/:slug"),
+        ("PUT", "/api/config/scoped/customer/:slug"),
+        ("GET", "/api/mcp/servers"),
+        ("PUT", "/api/mcp/servers/:id"),
+        ("DELETE", "/api/mcp/servers/:id"),
+        ("GET", "/api/mcp/tools"),
+        ("GET", "/api/sessions/:id/mcp"),
+        ("PUT", "/api/sessions/:id/mcp"),
         ("GET", "/api/sessions/:id/controls"),
         ("POST", "/api/sessions/:id/commands"),
+        ("GET", "/api/sessions/:id/approvals"),
+        ("GET", "/api/sessions/:id/approvals/:approval"),
+        ("PUT", "/api/sessions/:id/approvals/:approval/decision"),
+        ("POST", "/api/sessions/:id/approvals/:approval/revoke"),
         ("GET", "/api/sessions/:id/settings"),
         ("PUT", "/api/sessions/:id/settings"),
         ("GET", "/api/sessions/:id/orchestration"),
         ("PUT", "/api/sessions/:id/orchestration"),
         ("GET", "/api/runs/:id/log"),
+        ("POST", "/api/workflows/draft/preview"),
+        ("POST", "/api/workflows/validate/projection"),
+        ("GET", "/api/runs/:id/workflow-source"),
+        ("GET", "/api/runs/:id/observation"),
+        ("GET", "/api/agent-files/conversation-review"),
+        ("POST", "/api/agent-files/conversation"),
+        ("GET", "/api/agent-files/run-review"),
+        ("POST", "/api/agent-files/run"),
+        ("POST", "/api/runs/agents/:id/continue-options"),
+        ("GET", "/api/runs/:id/process-log"),
+        ("GET", "/api/runs/:id/observation/page"),
+        ("GET", "/api/runs/:id/observation/frontier"),
+        ("GET", "/api/transcripts/:id/delete-context"),
+        ("DELETE", "/api/transcripts/:id/exact-source"),
+        ("GET", "/api/runs/:id/observation/transcript"),
+        ("GET", "/api/runs/:id/observation/transcript/children"),
+        ("GET", "/api/runs/:id/observation/transcript/descendant"),
         ("GET", "/api/events/stream"),
+        ("POST", "/api/events/scan"),
         ("GET", "/api/transcript/stream"),
         ("GET", "/api/runs/:id/messages/stream"),
         ("GET", "/api/sessions/:id/messages/stream"),
@@ -276,6 +345,9 @@ fn excluded_is_exactly_the_spec_list() {
         ("GET", "/api/runs/:id/coverage"),
         ("GET", "/api/runs/:id/netflow/stream"),
         ("GET", "/api/findings/artifacts/:sha256"),
+        ("POST", "/api/findings/import/preview"),
+        ("POST", "/api/findings/import/commit"),
+        ("GET", "/api/findings/import/operations/:id"),
         ("POST", "/api/workspace/stage"),
         ("GET", "/api/workspace/delta"),
         ("DELETE", "/api/workspace/discard"),
@@ -295,6 +367,9 @@ fn excluded_is_exactly_the_spec_list() {
 
 #[test]
 fn the_operator_tool_count_is_pinned() {
-    assert_eq!(ops().len(), 198);
-    assert_eq!(pinned_tool_names().len(), 198);
+    assert_eq!(ops().len(), 205 + if cfg!(unix) { 6 } else { 0 });
+    assert_eq!(
+        pinned_tool_names().len(),
+        205 + if cfg!(unix) { 6 } else { 0 }
+    );
 }

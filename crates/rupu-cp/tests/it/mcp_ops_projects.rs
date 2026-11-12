@@ -217,3 +217,35 @@ async fn an_unknown_project_is_an_error() {
     let r = call_tool(addr, "projects.get", json!({"ws_id": "ws_nope"})).await;
     assert!(is_error(&r), "{r}");
 }
+
+#[tokio::test]
+async fn workflow_history_syntax_tool_matches_http_and_exposes_explicit_mode() {
+    let (addr, _tmp) = spawn_operator_with(seed_project, None).await;
+    let listed = rpc(addr, "tools/list", json!({})).await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "projects.workflow_history")
+        .unwrap();
+    assert!(tool["inputSchema"]["properties"]
+        .get("query_mode")
+        .is_some());
+    assert_eq!(tool["annotations"]["readOnlyHint"], true);
+    let result = call_tool(
+        addr,
+        "projects.workflow_history",
+        json!({"id":WS,"query_mode":"syntax","q":"status:completed"}),
+    )
+    .await;
+    assert!(!is_error(&result), "{result}");
+    let (status, expected) = http_get(
+        addr,
+        &format!("/api/projects/{WS}/workflow-history?query_mode=syntax&q=status%3Acompleted"),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(json_of(&result), expected);
+    assert_eq!(expected["query_mode"], "syntax");
+    assert_eq!(expected["q"], "status:completed");
+}

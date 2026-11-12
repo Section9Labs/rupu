@@ -11,6 +11,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use axum::{
     extract::{Query, State},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -18,6 +19,10 @@ use rupu_templates::fleet::{self, Installed};
 use rupu_templates::WriteReport;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+mod project_layer;
+#[cfg(test)]
+mod project_layer_tests;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -81,16 +86,15 @@ struct FleetRow {
 /// with each one's installed status — `missing`, `current` (the shipped
 /// file), `modified` or `unreadable` — in the global root and, with
 /// `ws_id`, that project's `.rupu/`.
-async fn get_fleet(
-    State(s): State<AppState>,
-    Query(q): Query<FleetQuery>,
-) -> ApiResult<Json<serde_json::Value>> {
+async fn get_fleet(State(s): State<AppState>, Query(q): Query<FleetQuery>) -> ApiResult<Response> {
     require_local(q.host.as_deref(), "the stock fleet")?;
-    let project = q
-        .ws_id
-        .as_deref()
-        .map(|id| project_rupu_dir(&s, id))
-        .transpose()?;
+    let project = match q.ws_id.as_deref() {
+        Some(id) => match project_layer::inspect(&s, id)? {
+            Ok(path) => Some(path),
+            Err(refusal) => return Ok(refusal.into_response()),
+        },
+        None => None,
+    };
     let global = s.global_dir.clone();
     let (rows, project) = blocking(move || {
         let in_global = fleet::status(&global);
@@ -113,7 +117,8 @@ async fn get_fleet(
         "entries": rows,
         "global_root": s.global_dir,
         "project_root": project,
-    })))
+    }))
+    .into_response())
 }
 
 #[derive(Deserialize, Default, schemars::JsonSchema)]

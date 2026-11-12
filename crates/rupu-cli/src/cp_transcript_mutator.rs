@@ -79,6 +79,50 @@ pub(crate) fn classify_failure(action: TranscriptAction, stderr: &str) -> Transc
 
 #[async_trait::async_trait]
 impl TranscriptMutator for SubprocessTranscriptMutator {
+    fn supports_exact_delete(&self) -> bool {
+        cfg!(unix)
+    }
+    async fn exact_delete_context(
+        &self,
+        id: &str,
+        scope: &rupu_cp::transcript_mutator::ExactTranscriptScope,
+    ) -> Result<rupu_cp::transcript_mutator::ExactTranscriptContext, TranscriptMutateError> {
+        let args = vec![
+            "transcript".into(),
+            "delete-context".into(),
+            id.into(),
+            "--workspace-id".into(),
+            scope.workspace_id.clone(),
+            "--path".into(),
+            scope.path.clone(),
+        ];
+        let output = self.exact_process(args).await?;
+        serde_json::from_slice(&output).map_err(|_| TranscriptMutateError::Failed {
+            action: "inspect",
+            message: "invalid bounded exact transcript context".into(),
+        })
+    }
+    async fn delete_exact(
+        &self,
+        id: &str,
+        scope: &rupu_cp::transcript_mutator::ExactTranscriptScope,
+        revision: &str,
+    ) -> Result<(), TranscriptMutateError> {
+        let args = vec![
+            "transcript".into(),
+            "delete".into(),
+            id.into(),
+            "--force".into(),
+            "--expected-workspace-id".into(),
+            scope.workspace_id.clone(),
+            "--expected-path".into(),
+            scope.path.clone(),
+            "--expected-revision".into(),
+            revision.into(),
+        ];
+        self.exact_process(args).await.map(|_| ())
+    }
+
     async fn mutate(
         &self,
         id: &str,
@@ -164,7 +208,10 @@ mod tests {
         // Invalid: delete without --force (defensive; the adapter always
         // passes it, but classification should still be correct).
         assert!(matches!(
-            classify_failure(TranscriptAction::Delete, "transcript delete requires --force"),
+            classify_failure(
+                TranscriptAction::Delete,
+                "transcript delete requires --force"
+            ),
             TranscriptMutateError::Invalid(_)
         ));
         // Failed: unrecognised stderr falls through.
@@ -180,5 +227,145 @@ mod tests {
             ),
             TranscriptMutateError::Invalid(_)
         ));
+    }
+}
+
+impl SubprocessTranscriptMutator {
+    /// The owned task finishes even if the HTTP waiter is dropped. A timeout or
+    /// process failure is unconfirmed, never a signal to retry deletion.
+    async fn exact_process(&self, args: Vec<String>) -> Result<Vec<u8>, TranscriptMutateError> {
+        use tokio::io::AsyncReadExt;
+        static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = GATE
+            .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                TranscriptMutateError::Invalid("exact transcript operations busy".into())
+            })?;
+        let exe = self.exe.clone();
+        let worker = tokio::spawn(async move {
+            let _permit = permit;
+            let mut child = tokio::process::Command::new(exe)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|_| exact_failure("could not start owning transcript command"))?;
+            let collect = async {
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| exact_failure("transcript stdout unavailable"))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| exact_failure("transcript stderr unavailable"))?;
+                let mut output = Vec::new();
+                let mut error = Vec::new();
+                let mut stdout = stdout.take(65_537);
+                let mut stderr = stderr.take(16_385);
+                tokio::try_join!(
+                    stdout.read_to_end(&mut output),
+                    stderr.read_to_end(&mut error)
+                )
+                .map_err(|_| exact_failure("transcript response read failed"))?;
+                if output.len() > 65_536 || error.len() > 16_384 {
+                    return Err(exact_failure(
+                        "transcript response exceeded its limit; result unconfirmed",
+                    ));
+                }
+                let status = child
+                    .wait()
+                    .await
+                    .map_err(|_| exact_failure("transcript command status unavailable"))?;
+                Ok((status, output, error))
+            };
+            let collected = match tokio::time::timeout(std::time::Duration::from_secs(10), collect).await {
+                Ok(result) => result,
+                Err(_) => Err(exact_failure("exact transcript operation timed out; result unconfirmed; do not retry automatically")),
+            };
+            let (status, output, error) = match collected {
+                Ok(value) => value,
+                Err(error) => {
+                    // Retain admission until the actual child has exited, including
+                    // after the HTTP waiter times out or is cancelled.
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(error);
+                }
+            };
+            if !status.success() {
+                let message = String::from_utf8_lossy(&error);
+                return Err(if message.contains("exact_transcript_not_found") {
+                    TranscriptMutateError::NotFound(message.trim().into())
+                } else if message.contains("exact_transcript_unsupported") {
+                    TranscriptMutateError::Unsupported(message.trim().into())
+                } else if message.contains("exact_transcript_conflict")
+                    || message.contains("exact_transcript_unavailable")
+                {
+                    TranscriptMutateError::Invalid(message.trim().into())
+                } else {
+                    exact_failure("exact transcript operation failed; result unconfirmed; refresh before any further action")
+                });
+            }
+            Ok(output)
+        });
+        // Dropping this JoinHandle detaches, rather than cancels, the owner.
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .map_err(|_| exact_failure("exact transcript operation timed out; result unconfirmed; do not retry automatically"))?
+            .map_err(|_| exact_failure("exact transcript task unavailable; result unconfirmed"))?
+    }
+}
+fn exact_failure(message: &str) -> TranscriptMutateError {
+    TranscriptMutateError::Failed {
+        action: "delete",
+        message: message.into(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exact_process_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    fn executable(script: &str) -> (tempfile::TempDir, SubprocessTranscriptMutator) {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("fixture-command");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        (t, SubprocessTranscriptMutator { exe: path })
+    }
+    #[tokio::test]
+    async fn exact_owned_command_finishes_after_waiter_cancellation() {
+        let (_t,adapter)=executable("printf started > \"$0.started\"\nsleep 0.1\nprintf finished > \"$0.finished\"\nprintf '{}'");
+        let started = adapter.exe.with_extension("started");
+        let finished = adapter.exe.with_extension("finished");
+        let waiter = tokio::spawn(async move { adapter.exact_process(Vec::new()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !finished.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(finished).unwrap(), "finished");
+    }
+    #[tokio::test]
+    async fn exact_command_output_is_bounded() {
+        let (_t, adapter) = executable("head -c 70000 /dev/zero");
+        let error = adapter.exact_process(Vec::new()).await.unwrap_err();
+        assert!(error.to_string().contains("exceeded its limit"));
     }
 }

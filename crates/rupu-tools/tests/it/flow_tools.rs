@@ -63,12 +63,21 @@ fn json_of(out: &ToolOutput) -> Value {
 async fn board_post_then_read_roundtrips() {
     let dir = tempfile::tempdir().unwrap();
     let lead = on(dir.path(), "lead");
-    call(
+    let posted = call(
         &lead,
         "board.post",
         json!({"kind":"observation","body":"found an open port"}),
     )
     .await;
+    match posted.derived {
+        Some(rupu_tools::DerivedEvent::MessageSent {
+            kind, post_kind, ..
+        }) => {
+            assert_eq!(kind, "post");
+            assert_eq!(post_kind.as_deref(), Some("observation"));
+        }
+        other => panic!("missing canonical post evidence: {other:?}"),
+    }
     let out = call(&lead, "board.read", json!({})).await;
     assert!(out.error.is_none(), "{out:?}");
     assert!(out.stdout.contains("found an open port"), "{}", out.stdout);

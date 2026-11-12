@@ -9,6 +9,8 @@ use std::path::PathBuf;
 /// `rupu` binary (resolved via `std::env::current_exe()` in `cp serve`).
 pub struct SubprocessSessionStarter {
     pub exe: PathBuf,
+    #[cfg(unix)]
+    pub approval_broker: Option<std::sync::Arc<rupu_runtime::session_approvals::broker::Broker>>,
 }
 
 /// The `rupu session start --detach` for `req`. `--into` is added only when
@@ -18,14 +20,31 @@ pub(crate) fn session_start_argv(
     req: &SessionStartRequest,
     clone_dir: Option<&str>,
 ) -> Result<RunArgv, String> {
+    rupu_runtime::session_settings::SessionSettings {
+        tools: req.tools.clone(),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| e.to_string())?;
+    if let Some(ceiling) = &req.tool_ceiling {
+        rupu_tools::tool_ceiling::validate_names(
+            ceiling,
+            &rupu_tools::ToolCatalog::builtin(),
+            req.mcp_tools.iter().flatten().map(|tool| tool.local_name()),
+        )
+        .map_err(|e| e.to_string())?;
+    }
     if req.idle && (req.prompt.is_some() || req.target.is_some()) {
         return Err("idle session creation cannot include a prompt or target".into());
     }
     if let Some(preset) = req.skill_preset.as_deref() {
         if req.agent != rupu_agent::builtin::SESSION_AGENT_NAME
-            || !matches!(preset, "rupu-session-v1" | "none")
+            || !rupu_runtime::session_skill_preset::valid_preset(preset)
         {
-            return Err("skill presets require rupu-session and rupu-session-v1 or none".into());
+            return Err(
+                "skill presets require rupu-session and a supported versioned preset or none"
+                    .into(),
+            );
         }
     }
     let mode = req
@@ -35,7 +54,12 @@ pub(crate) fn session_start_argv(
         .transpose()
         .map_err(|e| e.to_string())?;
     Ok(RunArgv::SessionStart(SessionStart {
+        tool_ceiling: req.tool_ceiling.clone(),
+        mcp_tools: req.mcp_tools.clone(),
+        mcp_catalog_revision: req.mcp_catalog_revision.clone(),
+        effort: req.effort.clone(),
         skill_preset: req.skill_preset.clone(),
+        tools: req.tools.clone(),
         agent: req.agent.clone(),
         provider: req.provider.clone(),
         model: req.model.clone(),
@@ -71,7 +95,43 @@ pub(crate) fn parse_session_id(stdout: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl SessionStarter for SubprocessSessionStarter {
+    #[cfg(unix)]
+    fn approval_broker(
+        &self,
+    ) -> Option<std::sync::Arc<rupu_runtime::session_approvals::broker::Broker>> {
+        self.approval_broker.clone()
+    }
+    fn supports_session_approvals(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.approval_broker.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn supports_session_mcp(&self) -> bool {
+        true
+    }
+    fn supports_session_scoped_reads(&self) -> bool {
+        true
+    }
+    fn supports_session_tool_ceiling(&self) -> bool {
+        true
+    }
+    fn supports_session_tool_selection(&self) -> bool {
+        true
+    }
+    /// Exact pinned full-suite skill preset, independently gated from legacy v1.
+    fn supports_full_skill_preset(&self) -> bool {
+        true
+    }
     fn supports_session_capabilities(&self) -> bool {
+        true
+    }
+    fn supports_reasoning_effort(&self) -> bool {
         true
     }
     fn supports_builtin_harness(&self) -> bool {
@@ -82,7 +142,63 @@ impl SessionStarter for SubprocessSessionStarter {
         true
     }
 
+    fn supports_exact_global_conversation(&self) -> bool {
+        cfg!(unix)
+    }
+    #[cfg(unix)]
+    async fn start_exact_global(
+        &self,
+        req: SessionStartRequest,
+        binding: rupu_runtime::exact_agent::Binding,
+    ) -> Result<String, SessionStartError> {
+        let proof = exact_session_proof(&req, &binding)?;
+        let global =
+            crate::paths::global_dir().map_err(|e| SessionStartError::Invalid(e.to_string()))?;
+        rupu_runtime::exact_agent::load(
+            &global,
+            &binding,
+            std::path::Path::new(&binding.project_path),
+        )
+        .map_err(|e| SessionStartError::Conflict(e.to_string()))?;
+        self.start_inner(req, Some(proof)).await
+    }
     async fn start(&self, req: SessionStartRequest) -> Result<String, SessionStartError> {
+        self.start_inner(req, None).await
+    }
+}
+
+#[cfg(unix)]
+fn exact_session_proof(
+    req: &SessionStartRequest,
+    binding: &rupu_runtime::exact_agent::Binding,
+) -> Result<String, SessionStartError> {
+    binding
+        .validate()
+        .map_err(|e| SessionStartError::Invalid(e.to_string()))?;
+    if req.agent != binding.effective_name
+        || req.workspace_id.as_deref() != Some(&binding.workspace_id)
+        || req.working_dir.as_deref() != Some(&binding.project_path)
+        || req.target.is_some()
+        || req.idle
+        || !matches!(req.mode.as_deref(), Some("readonly" | "bypass"))
+        || !req
+            .prompt
+            .as_ref()
+            .is_some_and(|p| !p.trim().is_empty() && p.len() <= 32768)
+    {
+        return Err(SessionStartError::Invalid(
+            "exact conversation differs from reviewed definition/project/first turn".into(),
+        ));
+    }
+    serde_json::to_string(binding).map_err(|e| SessionStartError::Invalid(e.to_string()))
+}
+
+impl SubprocessSessionStarter {
+    async fn start_inner(
+        &self,
+        req: SessionStartRequest,
+        exact: Option<String>,
+    ) -> Result<String, SessionStartError> {
         // A repo target with no explicit working_dir needs a persistent clone
         // dir (the session lives on after start). Create it under the global
         // rupu dir so it survives across cp-serve restarts.
@@ -100,10 +216,42 @@ impl SessionStarter for SubprocessSessionStarter {
         let argv =
             session_start_argv(&req, clone_dir.as_deref()).map_err(SessionStartError::Invalid)?;
 
+        let exact_start = exact.is_some();
         let mut cmd = tokio::process::Command::new(&self.exe);
         cmd.args(argv.to_args());
+        if let Some(proof) = exact {
+            cmd.arg("--exact-agent-definition").arg(proof);
+        }
         if let Some(dir) = req.working_dir.as_deref() {
             cmd.current_dir(dir);
+        }
+        if req.mode.as_deref() == Some("ask") {
+            #[cfg(not(unix))]
+            return Err(SessionStartError::Invalid(
+                "native Ask approvals require a local authenticated broker".into(),
+            ));
+            #[cfg(unix)]
+            {
+                if req.agent != rupu_agent::builtin::SESSION_AGENT_NAME {
+                    return Err(SessionStartError::Invalid(
+                        "native Ask requires the builtin session harness".into(),
+                    ));
+                }
+                let broker = self.approval_broker.as_ref().ok_or_else(|| {
+                    SessionStartError::Invalid("Ask approval broker unavailable".into())
+                })?;
+                let workspace = req.workspace_id.clone().ok_or_else(|| {
+                    SessionStartError::Invalid("Ask requires exact workspace identity".into())
+                })?;
+                let path = req.working_dir.as_ref().map(PathBuf::from).ok_or_else(|| {
+                    SessionStartError::Invalid("Ask requires exact workspace path".into())
+                })?;
+                let channel = broker
+                    .spawn_channel(None, workspace, path)
+                    .map_err(|_| SessionStartError::Spawn("approval channel unavailable".into()))?;
+                cmd.arg("--approval-channel")
+                    .stdin(crate::session_approval_channel::stdin_for_child(channel));
+            }
         }
 
         let out = cmd
@@ -115,7 +263,13 @@ impl SessionStarter for SubprocessSessionStarter {
             let msg = crate::cp_session_sender::cli_failure(&out.stderr, "session start failed");
             // Exit 1 is the command refusing the request (a skill that
             // doesn't resolve, an unknown agent): the caller's to fix.
-            return Err(if out.status.code() == Some(1) {
+            return Err(if exact_start {
+                // The child may have persisted a session before failing. No safe
+                // rejection/automatic retry claim follows a started process.
+                SessionStartError::Spawn(msg)
+            } else if out.status.code() == Some(75) {
+                SessionStartError::Conflict(msg)
+            } else if out.status.code() == Some(1) {
                 SessionStartError::Invalid(msg)
             } else {
                 SessionStartError::Spawn(msg)
@@ -140,7 +294,12 @@ mod tests {
         wd: Option<&str>,
     ) -> SessionStartRequest {
         SessionStartRequest {
+            tool_ceiling: None,
+            mcp_tools: None,
+            mcp_catalog_revision: None,
+            effort: None,
             skill_preset: None,
+            tools: None,
             agent: "triage".into(),
             provider: None,
             model: None,
@@ -162,6 +321,29 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn stale_mcp_child_preflight_is_a_conflict_without_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = crate::test_support::exec_ready_script(
+            &tmp.path().join("rupu"),
+            "echo '[error] MCP catalog changed' >&2\nexit 75\n",
+        );
+        let starter = SubprocessSessionStarter {
+            exe,
+            #[cfg(unix)]
+            approval_broker: None,
+        };
+        let request = req(
+            None,
+            Some("fixture"),
+            None,
+            Some(tmp.path().to_str().unwrap()),
+        );
+        assert!(
+            matches!(starter.start(request).await, Err(SessionStartError::Conflict(message)) if message.contains("MCP catalog changed"))
+        );
     }
 
     #[test]
@@ -214,6 +396,24 @@ mod tests {
         assert!(session_start_argv(&r, None).is_err());
         r.prompt = None;
         r.target = Some("github:o/r".into());
+        assert!(session_start_argv(&r, None).is_err());
+    }
+
+    #[test]
+    fn argv_carries_first_turn_tools_without_collapsing_an_empty_selection() {
+        let mut r = req(None, Some("inspect"), Some("readonly"), None);
+        assert!(!argv(&r, None)
+            .iter()
+            .any(|v| v == "--tool" || v == "--no-tools"));
+        r.tools = Some(vec![]);
+        assert!(argv(&r, None).iter().any(|v| v == "--no-tools"));
+        r.tools = Some(vec!["read_file".into(), "scm.*".into()]);
+        let a = argv(&r, None);
+        assert!(a
+            .windows(4)
+            .any(|v| v == ["--tool", "read_file", "--tool", "scm.*"]));
+        assert!(!a.iter().any(|v| v == "--no-tools"));
+        r.tools = Some(vec!["--mode".into()]);
         assert!(session_start_argv(&r, None).is_err());
     }
 
@@ -281,6 +481,8 @@ mod tests {
         );
 
         let starter = SubprocessSessionStarter {
+            #[cfg(unix)]
+            approval_broker: None,
             exe: crate::cp_session_sender::tests::failing_rupu(tmp.path(), &format!("{message}\n")),
         };
         let mut r = req(None, None, None, Some(tmp.path().to_str().unwrap()));
@@ -345,7 +547,75 @@ mod tests {
         assert!(argv(&request, None)
             .windows(2)
             .any(|pair| pair == ["--skill-preset", "none"]));
+        request.skill_preset = Some("rupu-session-full-v1".into());
+        assert!(session_start_argv(&request, None).is_ok());
         request.skill_preset = Some("future-preset".into());
         assert!(session_start_argv(&request, None).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod exact_conversation_tests {
+    use super::*;
+    fn fixture() -> (SessionStartRequest, rupu_runtime::exact_agent::Binding) {
+        let binding = rupu_runtime::exact_agent::Binding {
+            file_key: "chosen.md".into(),
+            definition_revision: "a".repeat(64),
+            effective_name: "analyst".into(),
+            workspace_id: "ws_selected".into(),
+            project_path: "/chosen/project".into(),
+            project_revision: "b".repeat(64),
+        };
+        let req = SessionStartRequest {
+            effort: None,
+            agent: "analyst".into(),
+            provider: None,
+            model: None,
+            tools: None,
+            tool_ceiling: None,
+            mcp_tools: Some(vec![]),
+            mcp_catalog_revision: None,
+            workspace_id: Some(binding.workspace_id.clone()),
+            idle: false,
+            prompt: Some("Inspect".into()),
+            mode: Some("readonly".into()),
+            target: None,
+            working_dir: Some(binding.project_path.clone()),
+            skills: vec![],
+            preload_skills: vec![],
+            skill_preset: None,
+        };
+        (req, binding)
+    }
+    #[test]
+    fn exact_conversation_adapter_proof_retains_filename_and_project() {
+        let (req, binding) = fixture();
+        let proof = exact_session_proof(&req, &binding).unwrap();
+        assert_eq!(
+            rupu_runtime::exact_agent::Binding::decode(&proof).unwrap(),
+            binding
+        );
+        let args = session_start_argv(&req, None).unwrap().to_args();
+        assert!(args.iter().any(|v| v == "--workspace-id"));
+        assert!(args.iter().any(|v| v == "--detach"));
+    }
+    #[test]
+    fn exact_conversation_adapter_rejects_request_rebinding() {
+        let (req, binding) = fixture();
+        let mut v = req.clone();
+        v.agent = "shadow".into();
+        assert!(exact_session_proof(&v, &binding).is_err());
+        let mut v = req.clone();
+        v.workspace_id = None;
+        assert!(exact_session_proof(&v, &binding).is_err());
+        let mut v = req.clone();
+        v.working_dir = Some("/other".into());
+        assert!(exact_session_proof(&v, &binding).is_err());
+        let mut v = req.clone();
+        v.target = Some("github:o/r".into());
+        assert!(exact_session_proof(&v, &binding).is_err());
+        let mut v = req;
+        v.idle = true;
+        assert!(exact_session_proof(&v, &binding).is_err());
     }
 }

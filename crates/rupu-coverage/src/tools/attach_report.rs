@@ -458,7 +458,7 @@ fn dry_run_check(
 
 /// A ledger line as JSON text: `None` when it is not UTF-8, otherwise the
 /// text without its `\n` / `\r\n` terminator.
-fn line_text(segment: &[u8]) -> Option<&str> {
+pub(crate) fn line_text(segment: &[u8]) -> Option<&str> {
     std::str::from_utf8(segment)
         .ok()
         .map(|t| t.trim_end_matches(['\n', '\r']))
@@ -466,7 +466,7 @@ fn line_text(segment: &[u8]) -> Option<&str> {
 
 /// The line terminator `segment` ends with: `"\r\n"`, `"\n"`, or `""` for
 /// an unterminated final line.
-fn terminator(segment: &[u8]) -> &'static str {
+pub(crate) fn terminator(segment: &[u8]) -> &'static str {
     if segment.ends_with(b"\r\n") {
         "\r\n"
     } else if segment.ends_with(b"\n") {
@@ -478,7 +478,7 @@ fn terminator(segment: &[u8]) -> &'static str {
 
 /// Whether the raw line carries a non-null `report` key, whether or not this
 /// build can parse what is in it.
-fn has_raw_report(line: &str) -> bool {
+pub(crate) fn has_raw_report(line: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
         .and_then(|v| v.get("report").map(|r| !r.is_null()))
@@ -488,7 +488,10 @@ fn has_raw_report(line: &str) -> bool {
 /// `line` with the report attached and the fields a full finding derives
 /// from it. Edited as JSON, not re-serialized from `FindingRecord`, so keys
 /// this version does not know survive.
-fn upgraded_line(line: &str, report: &FindingReport) -> Result<String, serde_json::Error> {
+pub(crate) fn upgraded_line(
+    line: &str,
+    report: &FindingReport,
+) -> Result<String, serde_json::Error> {
     let mut v: serde_json::Value = serde_json::from_str(line)?;
     let (summary, severity, evidence) = derived_fields(report);
     let Some(obj) = v.as_object_mut() else {
@@ -586,7 +589,7 @@ pub(crate) fn replace_ledger(
 /// container wrote it) changes to the importer's, with no group access and a
 /// warning: its owner can still append.
 #[cfg(unix)]
-fn keep_owner(
+pub(crate) fn keep_owner(
     f: &std::fs::File,
     ledger: &std::fs::Metadata,
     kind: RewriteKind,
@@ -621,7 +624,11 @@ fn keep_owner(
 }
 
 #[cfg(not(unix))]
-fn keep_owner(_: &std::fs::File, _: &std::fs::Metadata, _: RewriteKind) -> std::io::Result<()> {
+pub(crate) fn keep_owner(
+    _: &std::fs::File,
+    _: &std::fs::Metadata,
+    _: RewriteKind,
+) -> std::io::Result<()> {
     Ok(())
 }
 

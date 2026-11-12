@@ -35,6 +35,9 @@ use rupu_workspace::{RepoRegistryStore, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::path::{Path as FsPath, PathBuf};
 
+mod validation_echo;
+pub(crate) use validation_echo::FEATURE as VALIDATION_DEFINITION_FEATURE;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/agentiflow-defs", get(list_defs).post(create_def))
@@ -208,9 +211,10 @@ fn resolve_for(s: &AppState, name: &str, q: &DefQuery) -> ApiResult<Resolved> {
     }
 }
 
-/// The launch directory a scope-pinned agentiflow launch starts in, so the
-/// child's own lookup finds the definition `scope_kind`/`scope_id` picked
-/// (`repo_scope::launch_dir_for`). 404 when `name` is not in that scope.
+/// The scope-pinned working directory. Global keeps the existing global-parent
+/// rule, even for a configured directory not named `.rupu`: the launcher now
+/// pins definition lookup explicitly instead of relying on cwd shadowing.
+/// Project keeps `repo_scope::launch_dir_for`. Missing selected files are 404.
 pub(crate) fn launch_dir(
     s: &AppState,
     name: &str,
@@ -222,8 +226,11 @@ pub(crate) fn launch_dir(
             "agentiflow definition {name} not found in the requested scope"
         ))
     })?;
-    crate::api::repo_scope::launch_dir_for(&r.dir, r.scope_kind)?
-        .ok_or_else(|| ApiError::internal("the definition's directory has no workspace root"))
+    match r.scope_kind {
+        ScopeKind::Global => s.global_dir.parent().map(FsPath::to_path_buf),
+        ScopeKind::Project => crate::api::repo_scope::launch_dir_for(&r.dir, r.scope_kind)?,
+    }
+    .ok_or_else(|| ApiError::internal("the definition's directory has no workspace root"))
 }
 
 /// One row of `GET /api/agentiflow-defs`.
@@ -462,6 +469,10 @@ pub(crate) struct ValidateBody {
     /// there. Without it, the built-in and global profiles only.
     #[serde(default)]
     scope_id: Option<String>,
+    /// Return a bounded, exact JSON projection of the parsed definition for
+    /// structured authoring. Omit to retain the legacy validation response.
+    #[serde(default)]
+    include_definition: bool,
 }
 
 /// `POST /api/agentiflow-defs/validate` — what `rupu agentiflow run` checks
@@ -473,8 +484,11 @@ async fn validate_def(
     State(s): State<AppState>,
     Query(q): Query<LocalHostQuery>,
     Json(body): Json<ValidateBody>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> Result<Json<serde_json::Value>, validation_echo::ValidationError> {
     q.require_local("validating an agentiflow definition")?;
+    if body.include_definition {
+        validation_echo::check_source(&body.raw)?;
+    }
     let def = parse(&body.raw)?;
     let workspace = match body.scope_id.as_deref() {
         Some(id) => {
@@ -490,6 +504,9 @@ async fn validate_def(
     };
     def.check(&s.global_dir, workspace.as_deref())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if body.include_definition {
+        return validation_echo::response(&def, &body.raw, body.scope_id.as_deref()).map(Json);
+    }
     Ok(Json(serde_json::json!({
         "ok": true,
         "name": def.name,

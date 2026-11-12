@@ -23,6 +23,12 @@ pub struct Board {
     pub root: PathBuf,
 }
 
+/// Store acquisition, independent of a worker RAII lifetime.
+enum LeaseAcquisition {
+    Granted(ClaimRecord),
+    Denied { holder: String },
+}
+
 impl Board {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -47,7 +53,10 @@ impl Board {
     /// turn/restart. Tokens stay unchanged; a stale guard can never release
     /// another participant's replacement claim. The session owns a worker
     /// lease while these guards are in use.
-    pub(crate) fn restore_claims(&self, owner: &str) -> Result<Vec<(String, ClaimGuard)>, FleetError> {
+    pub(crate) fn restore_claims(
+        &self,
+        owner: &str,
+    ) -> Result<Vec<(String, ClaimGuard)>, FleetError> {
         let entries = match std::fs::read_dir(self.claims_dir()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -110,6 +119,26 @@ impl Board {
     /// expired lease is serialized per key by a `flock` reap lock so a claimant
     /// holding a stale read can never delete another claimant's live lease.
     pub fn claim(&self, key: &str, owner: &str, ttl: Duration) -> Result<ClaimOutcome, FleetError> {
+        match self.acquire_lease(key, owner, ttl)? {
+            LeaseAcquisition::Denied { holder } => Ok(ClaimOutcome::Denied { holder }),
+            LeaseAcquisition::Granted(record) => Ok(ClaimOutcome::Granted(ClaimGuard {
+                keep_on_drop: false,
+                path: self.claim_path(key),
+                board_root: self.root.clone(),
+                key: key.to_string(),
+                owner: owner.to_string(),
+                lock_path: self.reap_lock_path(key),
+                token: record.token,
+            })),
+        }
+    }
+
+    fn acquire_lease(
+        &self,
+        key: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseAcquisition, FleetError> {
         let path = self.claim_path(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
@@ -124,18 +153,10 @@ impl Board {
                     key: key.to_string(),
                     owner: owner.to_string(),
                     token: Some(rec.token.clone()),
-                    at: rec.acquired_at,
-                    lease_expires_at: rec.lease_expires_at,
+                    at: rec.acquired_at.clone(),
+                    lease_expires_at: rec.lease_expires_at.clone(),
                 });
-                return Ok(ClaimOutcome::Granted(ClaimGuard {
-                    keep_on_drop: false,
-                    path,
-                    board_root: self.root.clone(),
-                    key: key.to_string(),
-                    owner: owner.to_string(),
-                    lock_path: self.reap_lock_path(key),
-                    token: rec.token,
-                }));
+                return Ok(LeaseAcquisition::Granted(rec));
             }
             // A lease exists. Inspect it.
             let Some(rec) = read_claim(&path)? else {
@@ -143,7 +164,7 @@ impl Board {
                 continue;
             };
             if !is_expired(&rec) {
-                return Ok(ClaimOutcome::Denied { holder: rec.owner });
+                return Ok(LeaseAcquisition::Denied { holder: rec.owner });
             }
             last_holder = rec.owner;
             // Expired: one claimant at a time may reap. Whether we reaped, found
@@ -152,9 +173,144 @@ impl Board {
                 std::thread::sleep(RETRY_INTERVAL);
             }
         }
-        Ok(ClaimOutcome::Denied {
+        Ok(LeaseAcquisition::Denied {
             holder: last_holder,
         })
+    }
+
+    /// An operator lease belongs to the shared operator, never a worker. Its
+    /// explicit bounded TTL survives a stateless HTTP request; no worker guard
+    /// table, worker lease, or leaked RAII guard participates.
+    pub fn operator_claim(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<OperatorClaimOutcome, FleetError> {
+        validate_operator_key(key)?;
+        if !(30..=3600).contains(&ttl.as_secs()) {
+            return Err(FleetError::Refused(
+                "operator claim TTL must be 30..3600 seconds".into(),
+            ));
+        }
+        std::fs::create_dir_all(self.root.join("board")).map_err(|source| FleetError::Io {
+            action: "create operator board".into(),
+            source,
+        })?;
+        // Serialize operator acquisition limits across independent HTTP callers.
+        let _operator_lock =
+            crate::bus::lock_exclusive(&self.root.join("board/operator-claims.lock"))?;
+        if self.operator_leases()?.len() >= 128 {
+            return Err(FleetError::Refused(
+                "operator claim limit reached (128 live leases)".into(),
+            ));
+        }
+        match self.acquire_lease(key, crate::address::OPERATOR, ttl)? {
+            LeaseAcquisition::Denied { holder } => Ok(OperatorClaimOutcome::Denied { holder }),
+            LeaseAcquisition::Granted(record) => Ok(OperatorClaimOutcome::Granted {
+                lease: OperatorClaimLease {
+                    work_unit: key.into(),
+                    owner: crate::address::OPERATOR.into(),
+                    token: record.token,
+                    acquired_at: record.acquired_at,
+                    lease_expires_at: record.lease_expires_at,
+                },
+            }),
+        }
+    }
+
+    /// Recover operator receipts after UI reconnect; never reveal worker tokens.
+    /// Scan is finite even if a board has accumulated many historical lock files.
+    pub fn operator_leases(&self) -> Result<Vec<OperatorClaimLease>, FleetError> {
+        let entries = match std::fs::read_dir(self.claims_dir()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(FleetError::Io {
+                    action: "read operator claims".into(),
+                    source,
+                })
+            }
+        };
+        let mut leases = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= 10_000 {
+                return Err(FleetError::Refused(
+                    "operator claim inspection exceeds its 10000-entry bound".into(),
+                ));
+            }
+            let path = entry
+                .map_err(|source| FleetError::Io {
+                    action: "read operator claim entry".into(),
+                    source,
+                })?
+                .path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(record) = read_claim_limited(&path, Some(65_536))? else {
+                continue;
+            };
+            if record.owner != crate::address::OPERATOR
+                || record.token.is_empty()
+                || is_expired(&record)
+            {
+                continue;
+            }
+            let Some(key) = record.key else { continue };
+            if self.claim_path(&key) != path {
+                continue;
+            }
+            if leases.len() >= 128 {
+                return Err(FleetError::Refused(
+                    "operator claim inspection exceeds 128 live leases".into(),
+                ));
+            }
+            leases.push(OperatorClaimLease {
+                work_unit: key,
+                owner: record.owner,
+                token: record.token,
+                acquired_at: record.acquired_at,
+                lease_expires_at: record.lease_expires_at,
+            });
+        }
+        leases.sort_by(|a, b| a.work_unit.cmp(&b.work_unit));
+        Ok(leases)
+    }
+
+    /// Release only this exact operator acquisition. A stale receipt, expired
+    /// lease, or worker's claim changes nothing. Compare and delete share the
+    /// same per-key lock as expiry/regrant and worker guard release.
+    pub fn operator_release(&self, key: &str, token: &str) -> Result<bool, FleetError> {
+        validate_operator_key(key)?;
+        if token.is_empty()
+            || token.len() > 128
+            || !token.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err(FleetError::Refused("invalid operator claim token".into()));
+        }
+        if !self.claims_dir().is_dir() {
+            return Ok(false);
+        }
+        let _lock = crate::bus::lock_exclusive(&self.reap_lock_path(key))?;
+        let path = self.claim_path(key);
+        let Some(record) = read_claim_limited(&path, Some(65_536))? else {
+            return Ok(false);
+        };
+        if record.owner != crate::address::OPERATOR || record.token != token || is_expired(&record)
+        {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path).map_err(|source| FleetError::Io {
+            action: "release operator claim".into(),
+            source,
+        })?;
+        self.journal_claim(&JournalLine::Released {
+            key: key.into(),
+            owner: crate::address::OPERATOR.into(),
+            token: Some(record.token),
+            at: Utc::now().to_rfc3339(),
+        });
+        Ok(true)
     }
 
     /// `Ok(Some(record))` if the create succeeded (the record's token is unique
@@ -475,8 +631,12 @@ impl Board {
     pub fn directive_events(&self) -> Result<Vec<DirectiveEvent>, FleetError> {
         let path = self.directives_path();
         let text = read_log_text(&path)?;
-        Ok(text
-            .lines()
+        Ok(self.parse_directive_events(&text))
+    }
+
+    fn parse_directive_events(&self, text: &str) -> Vec<DirectiveEvent> {
+        let path = self.directives_path();
+        text.lines()
             .enumerate()
             .filter(|(_, line)| !line.trim().is_empty())
             .filter_map(
@@ -493,7 +653,40 @@ impl Board {
                     }
                 },
             )
-            .collect())
+            .collect()
+    }
+
+    /// Operator inspection and guarded retraction share one bounded read.
+    /// Open once and read at most limit+1 bytes: a journal growing after open
+    /// cannot bypass a metadata-only check or redirect a subsequent reopen.
+    pub fn operator_directives(&self) -> Result<Vec<Directive>, FleetError> {
+        use std::io::Read;
+        const MAX_BYTES: u64 = 32 * 1024 * 1024;
+        let path = self.directives_path();
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(FleetError::Io {
+                    action: "open operator directives".into(),
+                    source,
+                })
+            }
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| FleetError::Io {
+                action: "read operator directives".into(),
+                source,
+            })?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(FleetError::Refused(
+                "standing directive inspection exceeds 32 MiB".into(),
+            ));
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        Ok(self.fold_directive_events(self.parse_directive_events(&text)))
     }
 
     /// The LIVE directives, oldest first: the directive log folded in file
@@ -502,12 +695,16 @@ impl Board {
     /// list. Directives with no id (legacy lines) are all live, none
     /// retractable.
     pub fn read_directives(&self) -> Result<Vec<Directive>, FleetError> {
+        Ok(self.fold_directive_events(self.directive_events()?))
+    }
+
+    fn fold_directive_events(&self, events: Vec<DirectiveEvent>) -> Vec<Directive> {
         // Slot per put, in file order; a retraction empties its slot, so the
         // survivors stay oldest-first without a re-sort.
         let mut slots: Vec<Option<Directive>> = Vec::new();
         let mut slot_of: HashMap<String, usize> = HashMap::new();
         let mut legacy = 0usize;
-        for event in self.directive_events()? {
+        for event in events {
             match event {
                 DirectiveEvent::Put(d) if !is_keyed(&d.id) => {
                     legacy += 1;
@@ -534,7 +731,7 @@ impl Board {
                 "directives without an id (written before ids existed) cannot be retracted"
             );
         }
-        Ok(slots.into_iter().flatten().collect())
+        slots.into_iter().flatten().collect()
     }
 }
 
@@ -631,9 +828,31 @@ const SETTLE_INTERVAL: Duration = Duration::from_millis(5);
 /// that is "being written", not corruption, so wait for it to settle (bounded)
 /// instead of surfacing a spurious parse error.
 fn read_claim(path: &Path) -> Result<Option<ClaimRecord>, FleetError> {
+    read_claim_limited(path, None)
+}
+
+fn read_claim_limited(
+    path: &Path,
+    max_bytes: Option<u64>,
+) -> Result<Option<ClaimRecord>, FleetError> {
     let mut attempts = 0;
     loop {
-        match std::fs::read(path) {
+        let bytes = if let Some(limit) = max_bytes {
+            use std::io::Read;
+            std::fs::File::open(path).and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(limit + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > limit {
+                    return Err(std::io::Error::other(
+                        "operator claim record exceeds 65536-byte bound",
+                    ));
+                }
+                Ok(bytes)
+            })
+        } else {
+            std::fs::read(path)
+        };
+        match bytes {
             Ok(bytes) if bytes.is_empty() && attempts < SETTLE_ATTEMPTS => {
                 attempts += 1;
                 std::thread::sleep(SETTLE_INTERVAL);
@@ -1261,4 +1480,26 @@ mod tests {
         .unwrap();
         assert_eq!(line, serde_json::json!({ "retract": "x" }));
     }
+}
+
+/// Canonical receipt for one persisted operator acquisition, scoped by its caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorClaimLease {
+    pub work_unit: String,
+    pub owner: String,
+    pub token: String,
+    pub acquired_at: String,
+    pub lease_expires_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum OperatorClaimOutcome {
+    Granted { lease: OperatorClaimLease },
+    Denied { holder: String },
+}
+fn validate_operator_key(key: &str) -> Result<(), FleetError> {
+    if key.is_empty() || key.len() > 512 || key.trim() != key || key.chars().any(char::is_control) {
+        return Err(FleetError::Refused("invalid operator work unit".into()));
+    }
+    Ok(())
 }

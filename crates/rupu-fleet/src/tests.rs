@@ -944,14 +944,23 @@ fn expected_run_rejects_groups_missing_and_departed_recipients() {
         member("review", "sub_one", None, None),
     );
     let op = Bus::open(tmp.path(), address::OPERATOR);
-    for to in ["broadcast", "role:review", "missing"] {
+    for to in [
+        "broadcast",
+        "role:review",
+        "step:scan",
+        "parent",
+        "operator",
+    ] {
         let mut msg = operator(to, "no delivery", false);
         msg.expected_run_id = Some("sub_one".into());
-        assert!(matches!(
-            op.operator_send(msg),
-            Err(FleetError::RecipientChanged)
-        ));
+        assert!(matches!(op.operator_send(msg), Err(FleetError::Refused(_))));
     }
+    let mut missing = operator("missing", "no delivery", true);
+    missing.expected_run_id = Some("sub_one".into());
+    assert!(matches!(
+        op.operator_send(missing),
+        Err(FleetError::RecipientChanged)
+    ));
     recipient.leave("done").unwrap();
     let mut msg = operator("lynx#1", "no delivery", false);
     msg.expected_run_id = Some("sub_one".into());

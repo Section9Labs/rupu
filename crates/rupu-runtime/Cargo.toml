@@ -12,6 +12,7 @@ publish = false
 workspace = true
 
 [dependencies]
+toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -25,12 +26,15 @@ tokio = { workspace = true }
 tracing.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
+rustix.workspace = true
+hmac.workspace = true
 
 # In-workspace (needed by provider_factory)
 rupu-providers = { path = "../rupu-providers" }
 rupu-auth = { path = "../rupu-auth" }
 rupu-agent = { path = "../rupu-agent" }
 rupu-config = { path = "../rupu-config" }
+rupu-mcp-client = { path = "../rupu-mcp-client" }
 rupu-tools = { path = "../rupu-tools" }
 rupu-fleet = { workspace = true }
 rupu-coverage = { path = "../rupu-coverage" }
@@ -45,7 +49,6 @@ tokio-util.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
-toml.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 rupu-auth = { path = "../rupu-auth" }
 rupu-providers = { path = "../rupu-providers" }
@@ -53,5 +56,4 @@ httpmock.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serial_test.workspace = true
-rustix.workspace = true
 insta.workspace = true

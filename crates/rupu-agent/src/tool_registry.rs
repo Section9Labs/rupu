@@ -7,14 +7,14 @@
 //! (`report_finding` for `findings.report`) still resolves
 //! ([`ToolRegistry::resolve`]).
 
-use rupu_tools::{AliasScope, Tool};
+use rupu_tools::{AliasScope, BoundTool, Tool};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Canonical tool name → implementation.
 #[derive(Clone)]
 pub struct ToolRegistry {
-    tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    tools: BTreeMap<String, Arc<BoundTool>>,
     alias_scope: AliasScope,
 }
 
@@ -38,14 +38,19 @@ impl ToolRegistry {
     /// Register `tool` under its canonical name, replacing any tool already
     /// registered under it.
     pub fn insert(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name(), tool);
+        self.insert_bound(Arc::new(BoundTool::builtin(tool)));
+    }
+
+    /// Insert the binding captured by grant resolution, never a later discovery result.
+    pub fn insert_bound(&mut self, tool: Arc<BoundTool>) {
+        self.tools.insert(tool.name().to_owned(), tool);
     }
 
     /// The tool `name` resolves to: inside a flow lead a lead-scoped alias
     /// first (`coverage.status` → `goal.coverage`), then a canonical name,
     /// then any registered tool's alias (an alias scoped to a flow lead only
     /// ever belongs to a tool registered in a lead).
-    pub fn resolve(&self, name: &str) -> Option<Arc<dyn Tool>> {
+    pub fn resolve(&self, name: &str) -> Option<Arc<BoundTool>> {
         if self.alias_scope == AliasScope::FlowLead {
             let scoped = self.tools.values().find(|t| {
                 t.descriptor()
@@ -67,7 +72,7 @@ impl ToolRegistry {
     }
 
     /// Alias-aware lookup; see [`Self::resolve`].
-    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+    pub fn get(&self, name: &str) -> Option<Arc<BoundTool>> {
         self.resolve(name)
     }
 

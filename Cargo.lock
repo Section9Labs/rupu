@@ -4644,6 +4644,7 @@ dependencies = [
  "reqwest-middleware",
  "rupu-netflow",
  "rupu-providers",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serial_test",
@@ -4719,6 +4720,7 @@ dependencies = [
  "rupu-fleet",
  "rupu-launch",
  "rupu-mcp",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
@@ -4747,10 +4749,12 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ulid",
  "unicode-width",
+ "url",
  "which",
  "whoami",
  "zip",
@@ -4771,12 +4775,14 @@ dependencies = [
 name = "rupu-config"
 version = "0.88.0"
 dependencies = [
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4836,6 +4842,7 @@ dependencies = [
  "rupu-fleet",
  "rupu-launch",
  "rupu-mcp",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-orchestrator",
  "rupu-providers",
@@ -4852,6 +4859,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
  "serial_test",
  "sha2",
  "subtle",
@@ -4870,6 +4878,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "url",
+ "whoami",
 ]
 
 [[package]]
@@ -4959,6 +4968,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rupu-mcp-client"
+version = "0.88.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "reqwest 0.12.28",
+ "reqwest-middleware",
+ "rupu-auth",
+ "rupu-config",
+ "rupu-netflow",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "rupu-netflow"
 version = "0.88.0"
 dependencies = [
@@ -4970,6 +4997,7 @@ dependencies = [
  "httpmock",
  "reqwest 0.12.28",
  "reqwest-middleware",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serial_test",
@@ -5079,6 +5107,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
+ "hmac",
  "httpmock",
  "insta",
  "rupu-agent",
@@ -5087,6 +5116,7 @@ dependencies = [
  "rupu-config",
  "rupu-coverage",
  "rupu-fleet",
+ "rupu-mcp-client",
  "rupu-netflow",
  "rupu-netwatch",
  "rupu-providers",
@@ -5135,6 +5165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

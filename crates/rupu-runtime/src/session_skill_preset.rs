@@ -8,6 +8,18 @@ use rupu_skills::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "session_skill_full_inventory.rs"]
+mod full_inventory;
+pub use full_inventory::*;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetInventory {
+    pub upstream_repository: String,
+    pub upstream_commit: String,
+    pub expected_entries: Vec<String>,
+    pub local_entries: Vec<String>,
+}
+
 pub const PRESET_ID: &str = "rupu-session-v1";
 pub const PRESET_VERSION: u32 = 1;
 pub const PRESET_ENTRIES: &[&str] = &[
@@ -49,6 +61,11 @@ pub struct SkillDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillPlan {
     pub preset: PresetMetadata,
+    /// Full-preset expected inventory, including absent entries. This does not
+    /// assert installed provenance, external executable/service availability,
+    /// or tool permission. Existing v1 wire payloads omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<PresetInventory>,
     /// The actual combined explicit, preload, and preset selections.
     pub selected: Vec<FrozenSkill>,
     /// All qualified preset grant additions; these never contain a wildcard.
@@ -71,6 +88,8 @@ impl SkillPlan {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkillPlanError {
+    #[error("unknown session skill preset: {0}")]
+    UnknownPreset(String),
     #[error("cannot discover {layer} skills: {source}")]
     Discovery {
         layer: Layer,
@@ -90,12 +109,55 @@ pub fn plan(
     explicit: &[String],
     preload: &[String],
 ) -> Result<SkillPlan, SkillPlanError> {
+    plan_entries(dirs, enabled, explicit, preload, false)
+}
+
+/// Explicit full-suite selection; omitted/v1/none retain their existing meaning.
+/// A qualified inventory prevents unrelated installs from enlarging this preset.
+pub fn plan_for(
+    dirs: &LayerDirs,
+    preset: Option<&str>,
+    explicit: &[String],
+    preload: &[String],
+) -> Result<SkillPlan, SkillPlanError> {
+    match preset {
+        None | Some(PRESET_ID) => plan(dirs, true, explicit, preload),
+        Some("none") => plan(dirs, false, explicit, preload),
+        Some(FULL_PRESET_ID) => plan_entries(dirs, true, explicit, preload, true),
+        Some(other) => Err(SkillPlanError::UnknownPreset(other.into())),
+    }
+}
+
+pub fn valid_preset(preset: &str) -> bool {
+    matches!(preset, PRESET_ID | FULL_PRESET_ID | "none")
+}
+
+fn plan_entries(
+    dirs: &LayerDirs,
+    enabled: bool,
+    explicit: &[String],
+    preload: &[String],
+    full: bool,
+) -> Result<SkillPlan, SkillPlanError> {
     let mut out = SkillPlan {
         preset: PresetMetadata {
-            id: PRESET_ID.into(),
-            version: PRESET_VERSION,
+            id: if full { FULL_PRESET_ID } else { PRESET_ID }.into(),
+            version: if full {
+                FULL_PRESET_VERSION
+            } else {
+                PRESET_VERSION
+            },
             enabled,
         },
+        inventory: full.then(|| PresetInventory {
+            upstream_repository: FULL_PRESET_REPOSITORY.into(),
+            upstream_commit: FULL_PRESET_COMMIT.into(),
+            expected_entries: FULL_PRESET_ENTRIES.iter().map(|s| (*s).into()).collect(),
+            local_entries: FULL_PRESET_LOCAL_ENTRIES
+                .iter()
+                .map(|s| (*s).into())
+                .collect(),
+        }),
         selected: Vec::new(),
         defaults: Vec::new(),
         preload_defaults: Vec::new(),
@@ -119,7 +181,11 @@ pub fn plan(
     // both-layer errors before optional defaults are considered.
     let requested = resolve_run_skills(&catalog, &[request])?;
     if enabled {
-        for &qualified in PRESET_ENTRIES {
+        for &qualified in if full {
+            FULL_PRESET_ENTRIES
+        } else {
+            PRESET_ENTRIES
+        } {
             let name = qualified.strip_prefix("global:").expect("global preset");
             if requested.get(name).is_some() {
                 continue;
@@ -557,3 +623,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "session_skill_full_tests.rs"]
+mod full_tests;

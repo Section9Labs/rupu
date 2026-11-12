@@ -217,7 +217,151 @@ fn sniff_kind(p: &Path) -> std::io::Result<ArtifactKind> {
     })
 }
 
+/// Walk resolved artifact components beneath a captured workspace directory.
+/// Refuse a symlink introduced after resolution, including parent components.
+#[cfg(unix)]
+fn open_captured_file(workspace: &Path, source: &Path) -> std::io::Result<File> {
+    use rustix::fs::{open, openat, Mode, OFlags};
+    let rel = source
+        .strip_prefix(workspace)
+        .map_err(|_| std::io::Error::other("artifact escaped workspace"))?;
+    let mut parent = open(
+        workspace,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut components = rel.components().peekable();
+    while let Some(part) = components.next() {
+        let std::path::Component::Normal(name) = part else {
+            return Err(std::io::Error::other("invalid artifact component"));
+        };
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        if components.peek().is_some() {
+            flags |= OFlags::DIRECTORY;
+        }
+        let next = openat(&parent, name, flags, Mode::empty())?;
+        if components.peek().is_none() {
+            return Ok(File::from(next));
+        }
+        parent = next;
+    }
+    Err(std::io::Error::other("artifact is workspace directory"))
+}
+
+#[cfg(not(unix))]
+fn open_captured_file(_: &Path, _: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::other(
+        "immutable import artifact capture requires no-follow file handles",
+    ))
+}
+
 impl ArtifactStore {
+    /// Private review capture. Unlike legacy ingest, external files are refused,
+    /// and actual bytes (not just stat sizes) are bounded. Hash, copy and kind
+    /// all come from one source handle. No live artifact store should be passed.
+    pub(crate) fn capture_import(
+        &self,
+        workspace: &Path,
+        requested: &[ArtifactRef],
+        limits: IngestLimits,
+    ) -> Result<Vec<ArtifactRef>, ArtifactError> {
+        let files = self.resolve(workspace, requested, limits.max_files)?;
+        let ws = fs::canonicalize(workspace).map_err(|source| ArtifactError::Io {
+            path: workspace.display().to_string(),
+            source,
+        })?;
+        let mut left = limits.max_total_bytes;
+        let mut result = Vec::new();
+        for (path, abs, listed) in files {
+            if listed > limits.max_file_bytes {
+                return Err(ArtifactError::Path {
+                    path,
+                    reason: "immutable import does not support external artifacts",
+                });
+            }
+            let io = |source| ArtifactError::Io {
+                path: path.clone(),
+                source,
+            };
+            let mut input = open_captured_file(&ws, &abs).map_err(io)?;
+            if !input.metadata().map_err(io)?.is_file() {
+                return Err(ArtifactError::Path {
+                    path,
+                    reason: "immutable import requires a regular artifact file",
+                });
+            }
+            create_store_dir(&self.root).map_err(io)?;
+            let temp = TempFile::new(self.root.join(format!("{}.capture", ulid::Ulid::new())));
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp.path)
+                .map_err(io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                output
+                    .set_permissions(fs::Permissions::from_mode(0o600))
+                    .map_err(io)?;
+            }
+            let cap = limits.max_file_bytes.min(left);
+            let mut hash = Sha256::new();
+            let mut size = 0u64;
+            let mut head = Vec::new();
+            let mut buffer = [0u8; CHUNK];
+            loop {
+                let n = input.read(&mut buffer).map_err(io)?;
+                if n == 0 {
+                    break;
+                }
+                size = size
+                    .checked_add(n as u64)
+                    .ok_or_else(|| ArtifactError::Path {
+                        path: path.clone(),
+                        reason: "artifact size overflow",
+                    })?;
+                if size > cap {
+                    return Err(ArtifactError::Path {
+                        path,
+                        reason: "immutable import artifact exceeds its actual-byte budget",
+                    });
+                }
+                head.extend_from_slice(&buffer[..n.min(8192usize.saturating_sub(head.len()))]);
+                hash.update(&buffer[..n]);
+                output.write_all(&buffer[..n]).map_err(io)?;
+            }
+            output.sync_all().map_err(io)?;
+            drop(output);
+            let sha256 = hex(&hash.finalize());
+            let dest = self.blob_path(&sha256);
+            let shard = dest.parent().expect("blob parent");
+            fs::create_dir_all(shard).map_err(io)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(shard, fs::Permissions::from_mode(0o700)).map_err(io)?;
+            }
+            // Replace a prior private blob with these verified captured bytes.
+            fs::rename(&temp.path, &dest).map_err(io)?;
+            temp.disarm();
+            left -= size;
+            let kind = if !head.contains(&0) && std::str::from_utf8(&head).is_ok() {
+                ArtifactKind::Text
+            } else {
+                ArtifactKind::Binary
+            };
+            result.push(ArtifactRef {
+                path,
+                sha256,
+                size,
+                kind: Some(kind),
+                stored: Some(ArtifactStorage::Copied),
+                host: None,
+            });
+        }
+        Ok(result)
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }

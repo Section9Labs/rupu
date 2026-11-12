@@ -1693,7 +1693,7 @@ impl AnthropicClient {
 /// output_config.effort …"), so misclassifying one of those as pre-adaptive
 /// breaks every explicit-effort request on it, on both the OAuth and api-key
 /// paths.
-fn model_supports_adaptive_thinking(model: &str) -> bool {
+pub fn model_supports_adaptive_thinking(model: &str) -> bool {
     if crate::model_registry::strip_1m(model)
         .to_ascii_lowercase()
         .contains("haiku")

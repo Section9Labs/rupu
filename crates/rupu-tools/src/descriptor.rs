@@ -64,6 +64,11 @@ pub enum Service {
     Netflow,
     /// The skills a run was granted (`skills.load`).
     Skills,
+    /// Bounded readers bound to exactly one root session turn.
+    SessionContext,
+    SessionWorkflows,
+    RunInspection,
+    RunNetflows,
 }
 
 impl Service {
@@ -81,6 +86,10 @@ impl Service {
             Service::WorkflowGenerator => "workflow_generator",
             Service::Netflow => "netflow",
             Service::Skills => "skills",
+            Service::SessionContext => "session_context",
+            Service::SessionWorkflows => "session_workflows",
+            Service::RunInspection => "run_inspection",
+            Service::RunNetflows => "run_netflows",
         }
     }
 }

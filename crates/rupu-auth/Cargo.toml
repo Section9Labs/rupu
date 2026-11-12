@@ -31,6 +31,9 @@ fs2.workspace = true
 rupu-providers = { path = "../rupu-providers" }
 rupu-netflow = { workspace = true, features = ["http"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 httpmock.workspace = true
 tempfile.workspace = true

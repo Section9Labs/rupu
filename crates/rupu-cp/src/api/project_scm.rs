@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 
 const MAX_CHANGES: usize = 200;
 const MAX_DIFF: usize = 256 * 1024;
+pub(super) static REVIEW_READERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 static READERS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(2)));
 
 #[derive(Default, Deserialize, schemars::JsonSchema)]
@@ -75,10 +76,145 @@ pub async fn context(
     Ok(Json(value))
 }
 
+/// Every target is captured from a prior checkout/review observation. These
+/// fields are preconditions, not authority overrides or write/CAS promises.
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReviewDetailQuery {
+    pub host: Option<String>,
+    pub expected_origin: String,
+    pub expected_account: String,
+    pub expected_branch: String,
+    pub expected_head: String,
+    #[serde(default)]
+    pub include_diff: bool,
+}
+
+pub async fn review_detail(
+    State(s): State<AppState>,
+    Path((ws_id, number)): Path<(String, u32)>,
+    Query(q): Query<ReviewDetailQuery>,
+) -> ApiResult<Json<Value>> {
+    super::fleet::require_local(q.host.as_deref(), "project review detail")?;
+    if number == 0
+        || q.expected_account.is_empty()
+        || q.expected_head.is_empty()
+        || q.expected_branch.is_empty()
+        || q.expected_origin.is_empty()
+        || q.expected_account.len() > 256
+        || q.expected_head.len() > 128
+        || q.expected_branch.len() > 1024
+        || q.expected_origin.len() > 4096
+    {
+        return Err(ApiError::bad_request(
+            "A complete captured review selection is required",
+        ));
+    }
+    let _permit = REVIEW_READERS.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Review readers are busy; retry after the current observation".into(),
+        )
+    })?;
+    let s = crate::repos::snapshot_state(&s)
+        .await
+        .map_err(|_| ApiError::bad_gateway("SCM enrollment unavailable"))?;
+    let port = s.repos.clone().ok_or_else(|| {
+        ApiError(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "SCM review adapter unavailable".into(),
+        )
+    })?;
+    // Reuse exact-root, local-host, registered-project observation. Never accept
+    // an arbitrary cwd, repository or account from the request as authority.
+    let Json(observed) = context(
+        State(s),
+        Path(ws_id.clone()),
+        Query(ContextQuery::default()),
+    )
+    .await
+    .map_err(|e| {
+        if e.0 == axum::http::StatusCode::CONFLICT {
+            ApiError(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Checkout readers are busy; retry after the current observation".into(),
+            )
+        } else {
+            e
+        }
+    })?;
+    if observed["state"] != "ready"
+        || observed["branch"].as_str() != Some(q.expected_branch.as_str())
+        || observed["repository"]["home_url"].as_str() != Some(q.expected_origin.as_str())
+    {
+        return Err(ApiError::conflict(
+            "Repository or branch changed; refresh repository context",
+        ));
+    }
+    let repository = &observed["repository"];
+    let platform = repository["forge"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| ApiError::conflict("Repository platform is unavailable"))?;
+    let repo = rupu_scm::RepoRef {
+        platform,
+        owner: repository["owner"]
+            .as_str()
+            .ok_or_else(|| ApiError::conflict("Repository owner is unavailable"))?
+            .into(),
+        repo: repository["name"]
+            .as_str()
+            .ok_or_else(|| ApiError::conflict("Repository name is unavailable"))?
+            .into(),
+    };
+    let origin_host = url::Url::parse(&q.expected_origin)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .ok_or_else(|| ApiError::bad_request("Origin authority is unavailable"))?;
+    let cwd = observed["checkout_path"]
+        .as_str()
+        .ok_or_else(|| ApiError::conflict("Checkout path is unavailable"))?;
+    let selection = crate::repos::ReviewSelection {
+        account: q.expected_account,
+        branch: q.expected_branch,
+        head: q.expected_head,
+        include_diff: q.include_diff,
+    };
+    let mut result = tokio::time::timeout(
+        Duration::from_secs(25),
+        port.review_detail(&repo, FsPath::new(cwd), &origin_host, number, &selection),
+    )
+    .await
+    .map_err(|_| {
+        ApiError(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "Review detail deadline exceeded; refresh to retry".into(),
+        )
+    })?
+    .map_err(|e| match e {
+        crate::repos::RepoListError::SelectionChanged => {
+            ApiError::conflict("Review or account changed; refresh repository context")
+        }
+        _ => ApiError(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Review detail unavailable from the owning account".into(),
+        ),
+    })?;
+    result["ws_id"] = json!(ws_id);
+    result["host_id"] = json!("local");
+    result["repository"] = repository.clone();
+    result["observed_at"] = json!(chrono::Utc::now().to_rfc3339());
+    result["atomic"] = json!(false);
+    Ok(Json(result))
+}
+
 async fn review_context(port: Option<Arc<dyn crate::repos::RepoLister>>, value: &Value) -> Value {
     let unavailable = |reason: &str| json!({"state":"unavailable","reason":reason,"reviews":[],"truncated":false});
     let Some(port) = port else {
         return unavailable("This control plane has no SCM review adapter");
+    };
+    let port = match port.snapshot().await {
+        Ok(current) => current.unwrap_or(port),
+        Err(_) => return unavailable("Current SCM enrollment unavailable"),
     };
     let Some(branch) = value["branch"].as_str().filter(|b| !b.is_empty()) else {
         return unavailable("The checkout has no current branch");
@@ -328,6 +464,104 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"state":"queried","reviews":[],"truncated":false}))
         }
+    }
+    struct DetailSpy(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl crate::repos::RepoLister for DetailSpy {
+        async fn list(&self) -> Result<Vec<crate::repos::RepoEntry>, crate::repos::RepoListError> {
+            panic!("No repository enumeration")
+        }
+        async fn review_detail(
+            &self,
+            repo: &rupu_scm::RepoRef,
+            cwd: &FsPath,
+            origin_host: &str,
+            number: u32,
+            selection: &crate::repos::ReviewSelection,
+        ) -> Result<Value, crate::repos::RepoListError> {
+            assert_eq!(repo.owner, "example");
+            assert_eq!(repo.repo, "repo");
+            assert_eq!(origin_host, "github.com");
+            assert!(cwd.is_absolute());
+            assert_eq!(number, 9);
+            assert_eq!(selection.account, "fixture");
+            assert_eq!(selection.head, "captured-review-head");
+            assert!(!selection.include_diff);
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(
+                json!({"state":"queried","account":"fixture","number":9,"branch":selection.branch,"head_sha":selection.head}),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn review_detail_requires_registered_local_project_and_captured_origin_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let (project, repo) = committed();
+        repo.remote("origin", "https://github.com/example/repo.git")
+            .unwrap();
+        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+        let spy = Arc::new(DetailSpy(std::sync::atomic::AtomicUsize::new(0)));
+        let state = AppState::new(home.path().into(), rupu_config::PricingConfig::default())
+            .with_repos(Some(spy.clone()));
+        let ws = rupu_workspace::register(
+            &rupu_workspace::WorkspaceStore {
+                root: home.path().join("workspaces"),
+            },
+            project.path(),
+        )
+        .unwrap();
+        let query = || ReviewDetailQuery {
+            host: None,
+            expected_origin: "https://github.com/example/repo".into(),
+            expected_account: "fixture".into(),
+            expected_branch: branch.clone(),
+            expected_head: "captured-review-head".into(),
+            include_diff: false,
+        };
+        let mut remote = query();
+        remote.host = Some("other-host".into());
+        assert!(review_detail(
+            State(state.clone()),
+            Path((ws.id.clone(), 9)),
+            Query(remote)
+        )
+        .await
+        .is_err());
+        let mut wrong_origin = query();
+        wrong_origin.expected_origin = "https://github.com/foreign/repo".into();
+        assert_eq!(
+            review_detail(
+                State(state.clone()),
+                Path((ws.id.clone(), 9)),
+                Query(wrong_origin)
+            )
+            .await
+            .unwrap_err()
+            .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        let mut wrong_branch = query();
+        wrong_branch.expected_branch = "other".into();
+        assert_eq!(
+            review_detail(
+                State(state.clone()),
+                Path((ws.id.clone(), 9)),
+                Query(wrong_branch)
+            )
+            .await
+            .unwrap_err()
+            .0,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(spy.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let Json(result) = review_detail(State(state), Path((ws.id.clone(), 9)), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(spy.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(result["ws_id"], ws.id);
+        assert_eq!(result["host_id"], "local");
+        assert_eq!(result["repository"]["owner"], "example");
+        assert_eq!(result["atomic"], false);
     }
     #[tokio::test]
     async fn remote_review_requires_explicit_query() {

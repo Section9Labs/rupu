@@ -4,9 +4,7 @@
 //! (`rupu_runtime::assembly`) is the one production caller; the agent loop
 //! builds its registry from the result and nothing else.
 
-use rupu_tools::{
-    AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, ToolCatalog, ToolContext,
-};
+use rupu_tools::{AliasScope, AmbientGrant, GrantError, GrantInputs, ResolvedGrant, ToolContext};
 
 /// What a run's grant is resolved from.
 pub struct RunGrantInputs<'a> {
@@ -35,7 +33,7 @@ pub struct RunGrantInputs<'a> {
 /// engagement, skills, the origin's grant) and the run's services.
 pub fn resolve_run_grant(inputs: RunGrantInputs<'_>) -> Result<ResolvedGrant, GrantError> {
     let ctx = inputs.tool_context;
-    let catalog = ToolCatalog::builtin();
+    let catalog = &ctx.services.tool_catalog;
     let engagement = ctx
         .services
         .findings

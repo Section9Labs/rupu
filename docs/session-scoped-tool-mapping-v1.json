@@ -1,0 +1,1891 @@
+{
+  "schema_version": 1,
+  "source_base": "a42e3beaa5736998fabcf9513976545044e326de",
+  "classification": "Static operator specs only; not installed tools/list, runtime grant, or parity claim. Dynamic root expansion, wait and optional catalog composition are separate.",
+  "default_preset": "rupu-session-tools-v2",
+  "default_declared_tools": [
+    "session.context",
+    "session.workflows",
+    "run.inspect",
+    "run.netflows",
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "grep",
+    "glob",
+    "ast_grep",
+    "agents.list",
+    "agents.get",
+    "workflows.list",
+    "workflows.get",
+    "workflows.generate",
+    "catalog.search",
+    "dispatch",
+    "join",
+    "coverage.mark",
+    "coverage.status",
+    "coverage.remaining",
+    "coverage.concerns.search",
+    "coverage.concerns.detail",
+    "findings.report",
+    "findings.verify",
+    "findings.query",
+    "findings.tag",
+    "assets.mark",
+    "scm.repos.list",
+    "scm.repos.get",
+    "scm.branches.list",
+    "scm.branches.create",
+    "scm.files.read",
+    "scm.prs.list",
+    "scm.prs.get",
+    "scm.prs.diff",
+    "scm.prs.comment",
+    "scm.prs.create",
+    "issues.list",
+    "issues.get",
+    "issues.comments",
+    "issues.comment",
+    "issues.create",
+    "issues.update_state",
+    "github.workflows_dispatch",
+    "gitlab.pipeline_trigger"
+  ],
+  "operator_specs": [
+    {
+      "operator_name": "agentiflows.list",
+      "method": "GET",
+      "route": "/api/agentiflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 9
+    },
+    {
+      "operator_name": "agentiflows.get",
+      "method": "GET",
+      "route": "/api/agentiflows/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 15
+    },
+    {
+      "operator_name": "agentiflows.snapshot",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/snapshot",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 21
+    },
+    {
+      "operator_name": "agentiflows.snapshot_pages",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/snapshot/pages",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 28
+    },
+    {
+      "operator_name": "agentiflows.events",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/events",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 35
+    },
+    {
+      "operator_name": "agentiflows.usage_timeline",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/usage-timeline",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 41
+    },
+    {
+      "operator_name": "agentiflows.children",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/children",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 47
+    },
+    {
+      "operator_name": "agentiflows.unit_output",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/units/:unit_id/output",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 53
+    },
+    {
+      "operator_name": "agentiflows.board",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/board",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 59
+    },
+    {
+      "operator_name": "agentiflows.generated",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/generated/:handle",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 66
+    },
+    {
+      "operator_name": "agentiflows.steer",
+      "method": "POST",
+      "route": "/api/agentiflows/:id/steer",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 73
+    },
+    {
+      "operator_name": "agentiflows.run",
+      "method": "POST",
+      "route": "/api/agentiflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 80
+    },
+    {
+      "operator_name": "agentiflows.stop",
+      "method": "POST",
+      "route": "/api/agentiflows/:id/stop",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 89
+    },
+    {
+      "operator_name": "agentiflow_defs.list",
+      "method": "GET",
+      "route": "/api/agentiflow-defs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 98
+    },
+    {
+      "operator_name": "agentiflow_defs.get",
+      "method": "GET",
+      "route": "/api/agentiflow-defs/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 105
+    },
+    {
+      "operator_name": "agentiflow_defs.create",
+      "method": "POST",
+      "route": "/api/agentiflow-defs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 112
+    },
+    {
+      "operator_name": "agentiflow_defs.save",
+      "method": "PUT",
+      "route": "/api/agentiflow-defs/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 120
+    },
+    {
+      "operator_name": "agentiflow_defs.delete",
+      "method": "DELETE",
+      "route": "/api/agentiflow-defs/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 128
+    },
+    {
+      "operator_name": "agentiflow_defs.validate",
+      "method": "POST",
+      "route": "/api/agentiflow-defs/validate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/agentiflows.rs",
+      "source_line": 135
+    },
+    {
+      "operator_name": "workflows.list",
+      "method": "GET",
+      "route": "/api/workflows",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "workflows.list",
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 11
+    },
+    {
+      "operator_name": "workflows.run",
+      "method": "POST",
+      "route": "/api/workflows/:name/run",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 17
+    },
+    {
+      "operator_name": "agents.list",
+      "method": "GET",
+      "route": "/api/agents",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "agents.list",
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 25
+    },
+    {
+      "operator_name": "agents.run",
+      "method": "POST",
+      "route": "/api/agents/:name/run",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 31
+    },
+    {
+      "operator_name": "agents.get",
+      "method": "GET",
+      "route": "/api/agents/:name",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "agents.get",
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 39
+    },
+    {
+      "operator_name": "agents.create",
+      "method": "POST",
+      "route": "/api/agents",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 45
+    },
+    {
+      "operator_name": "agents.save",
+      "method": "PUT",
+      "route": "/api/agents/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 52
+    },
+    {
+      "operator_name": "agents.delete",
+      "method": "DELETE",
+      "route": "/api/agents/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 60
+    },
+    {
+      "operator_name": "agents.generate",
+      "method": "POST",
+      "route": "/api/agents/generate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 67
+    },
+    {
+      "operator_name": "workflows.get",
+      "method": "GET",
+      "route": "/api/workflows/:name",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "workflows.get",
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 75
+    },
+    {
+      "operator_name": "workflows.create",
+      "method": "POST",
+      "route": "/api/workflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 81
+    },
+    {
+      "operator_name": "workflows.save",
+      "method": "PUT",
+      "route": "/api/workflows/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 88
+    },
+    {
+      "operator_name": "workflows.delete",
+      "method": "DELETE",
+      "route": "/api/workflows/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 96
+    },
+    {
+      "operator_name": "workflows.validate",
+      "method": "POST",
+      "route": "/api/workflows/validate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 103
+    },
+    {
+      "operator_name": "workflows.generate",
+      "method": "POST",
+      "route": "/api/workflows/generate",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "workflows.generate",
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 111
+    },
+    {
+      "operator_name": "generate.models",
+      "method": "GET",
+      "route": "/api/generate/models",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 119
+    },
+    {
+      "operator_name": "autoflows.list",
+      "method": "GET",
+      "route": "/api/autoflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 125
+    },
+    {
+      "operator_name": "autoflows.enable",
+      "method": "POST",
+      "route": "/api/autoflows/:name/enable",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 131
+    },
+    {
+      "operator_name": "autoflows.disable",
+      "method": "POST",
+      "route": "/api/autoflows/:name/disable",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 138
+    },
+    {
+      "operator_name": "claims.list",
+      "method": "GET",
+      "route": "/api/autoflows/claims",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 145
+    },
+    {
+      "operator_name": "claims.release",
+      "method": "POST",
+      "route": "/api/autoflows/claims/release",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 151
+    },
+    {
+      "operator_name": "claims.requeue",
+      "method": "POST",
+      "route": "/api/autoflows/claims/requeue",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 159
+    },
+    {
+      "operator_name": "autoflows.get",
+      "method": "GET",
+      "route": "/api/autoflows/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 167
+    },
+    {
+      "operator_name": "autoflows.explain",
+      "method": "GET",
+      "route": "/api/autoflows/explain",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 174
+    },
+    {
+      "operator_name": "autoflows.doctor",
+      "method": "GET",
+      "route": "/api/autoflows/doctor",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 181
+    },
+    {
+      "operator_name": "autoflows.wakes",
+      "method": "GET",
+      "route": "/api/autoflows/wakes",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 188
+    },
+    {
+      "operator_name": "autoflows.run",
+      "method": "POST",
+      "route": "/api/autoflows/:name/run",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 195
+    },
+    {
+      "operator_name": "claims.repair",
+      "method": "POST",
+      "route": "/api/autoflows/claims/repair",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 204
+    },
+    {
+      "operator_name": "skills.list",
+      "method": "GET",
+      "route": "/api/skills",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 213
+    },
+    {
+      "operator_name": "skills.get",
+      "method": "GET",
+      "route": "/api/skills/:layer/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 220
+    },
+    {
+      "operator_name": "tools.list",
+      "method": "GET",
+      "route": "/api/tools",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 227
+    },
+    {
+      "operator_name": "models.list",
+      "method": "GET",
+      "route": "/api/models",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 233
+    },
+    {
+      "operator_name": "models.refresh",
+      "method": "POST",
+      "route": "/api/models/refresh",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 239
+    },
+    {
+      "operator_name": "workflows.run_yaml",
+      "method": "POST",
+      "route": "/api/workflows/run",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 248
+    },
+    {
+      "operator_name": "agents.validate",
+      "method": "POST",
+      "route": "/api/agents/validate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 256
+    },
+    {
+      "operator_name": "agents.validate_all",
+      "method": "GET",
+      "route": "/api/agents/validate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 264
+    },
+    {
+      "operator_name": "skills.install",
+      "method": "POST",
+      "route": "/api/skills/install",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 272
+    },
+    {
+      "operator_name": "skills.update",
+      "method": "POST",
+      "route": "/api/skills/update",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 282
+    },
+    {
+      "operator_name": "skills.validate",
+      "method": "POST",
+      "route": "/api/skills/validate",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/definitions.rs",
+      "source_line": 291
+    },
+    {
+      "operator_name": "findings.list",
+      "method": "GET",
+      "route": "/api/findings",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "findings.get",
+      "method": "GET",
+      "route": "/api/findings/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 17
+    },
+    {
+      "operator_name": "findings.tags",
+      "method": "GET",
+      "route": "/api/findings/tags",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 24
+    },
+    {
+      "operator_name": "findings.tag",
+      "method": "POST",
+      "route": "/api/findings/tags",
+      "classification": "existing_runtime_name_with_distinct_scope",
+      "runtime_binding": "findings.tag",
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 31
+    },
+    {
+      "operator_name": "findings.export",
+      "method": "GET",
+      "route": "/api/findings/:id/export",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 38
+    },
+    {
+      "operator_name": "findings.export_many",
+      "method": "POST",
+      "route": "/api/findings/export",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 46
+    },
+    {
+      "operator_name": "findings.artifact",
+      "method": "GET",
+      "route": "/api/findings/:id/artifacts/:sha256",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 55
+    },
+    {
+      "operator_name": "findings.import",
+      "method": "POST",
+      "route": "/api/findings/import",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 63
+    },
+    {
+      "operator_name": "findings.schema",
+      "method": "GET",
+      "route": "/api/findings/schema",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 71
+    },
+    {
+      "operator_name": "coverage.list",
+      "method": "GET",
+      "route": "/api/coverage",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 78
+    },
+    {
+      "operator_name": "coverage.get",
+      "method": "GET",
+      "route": "/api/coverage/:target",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 84
+    },
+    {
+      "operator_name": "coverage.audit",
+      "method": "GET",
+      "route": "/api/coverage/:target/audit",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 91
+    },
+    {
+      "operator_name": "coverage.catalog",
+      "method": "GET",
+      "route": "/api/coverage/:target/catalog",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 98
+    },
+    {
+      "operator_name": "coverage.runs",
+      "method": "GET",
+      "route": "/api/coverage/:target/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 105
+    },
+    {
+      "operator_name": "coverage.diff",
+      "method": "GET",
+      "route": "/api/coverage/:target/diff",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 112
+    },
+    {
+      "operator_name": "coverage.gap",
+      "method": "GET",
+      "route": "/api/coverage/:target/gap",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 119
+    },
+    {
+      "operator_name": "coverage.rerun_preview",
+      "method": "GET",
+      "route": "/api/coverage/:target/rerun-preview",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 126
+    },
+    {
+      "operator_name": "coverage.rerun",
+      "method": "POST",
+      "route": "/api/coverage/:target/rerun",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 133
+    },
+    {
+      "operator_name": "coverage.templates",
+      "method": "GET",
+      "route": "/api/coverage/templates",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 142
+    },
+    {
+      "operator_name": "coverage.template",
+      "method": "GET",
+      "route": "/api/coverage/templates/:name",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 148
+    },
+    {
+      "operator_name": "assets.list",
+      "method": "GET",
+      "route": "/api/assets",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/findings.rs",
+      "source_line": 154
+    },
+    {
+      "operator_name": "hosts.list",
+      "method": "GET",
+      "route": "/api/hosts",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "hosts.registered",
+      "method": "GET",
+      "route": "/api/hosts/registered",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 16
+    },
+    {
+      "operator_name": "hosts.add",
+      "method": "POST",
+      "route": "/api/hosts",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 22
+    },
+    {
+      "operator_name": "hosts.add_ssh",
+      "method": "POST",
+      "route": "/api/hosts/ssh",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 29
+    },
+    {
+      "operator_name": "hosts.add_bucket",
+      "method": "POST",
+      "route": "/api/hosts/bucket",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 36
+    },
+    {
+      "operator_name": "hosts.enroll_node",
+      "method": "POST",
+      "route": "/api/hosts/node",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 43
+    },
+    {
+      "operator_name": "hosts.remove",
+      "method": "DELETE",
+      "route": "/api/hosts/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 50
+    },
+    {
+      "operator_name": "workers.list",
+      "method": "GET",
+      "route": "/api/workers",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 56
+    },
+    {
+      "operator_name": "host.info",
+      "method": "GET",
+      "route": "/api/host/info",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 62
+    },
+    {
+      "operator_name": "config.get",
+      "method": "GET",
+      "route": "/api/config",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 68
+    },
+    {
+      "operator_name": "config.put_global",
+      "method": "PUT",
+      "route": "/api/config/global",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 75
+    },
+    {
+      "operator_name": "config.put_customer",
+      "method": "PUT",
+      "route": "/api/config/customer/:slug",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 83
+    },
+    {
+      "operator_name": "config.put_project",
+      "method": "PUT",
+      "route": "/api/config/project/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 91
+    },
+    {
+      "operator_name": "config.put_policy",
+      "method": "PUT",
+      "route": "/api/config/policy",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 99
+    },
+    {
+      "operator_name": "customers.list",
+      "method": "GET",
+      "route": "/api/customers",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 107
+    },
+    {
+      "operator_name": "customers.create",
+      "method": "POST",
+      "route": "/api/customers",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 114
+    },
+    {
+      "operator_name": "customers.get",
+      "method": "GET",
+      "route": "/api/customers/:slug",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 121
+    },
+    {
+      "operator_name": "customers.update",
+      "method": "PATCH",
+      "route": "/api/customers/:slug",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 128
+    },
+    {
+      "operator_name": "customers.delete",
+      "method": "DELETE",
+      "route": "/api/customers/:slug",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 135
+    },
+    {
+      "operator_name": "customers.archive",
+      "method": "POST",
+      "route": "/api/customers/:slug/archive",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 141
+    },
+    {
+      "operator_name": "customers.unarchive",
+      "method": "POST",
+      "route": "/api/customers/:slug/unarchive",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 147
+    },
+    {
+      "operator_name": "customers.assign_project",
+      "method": "PUT",
+      "route": "/api/customers/:slug/projects/:ws_id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 153
+    },
+    {
+      "operator_name": "customers.unassign_project",
+      "method": "DELETE",
+      "route": "/api/customers/:slug/projects/:ws_id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 159
+    },
+    {
+      "operator_name": "launch.preview",
+      "method": "POST",
+      "route": "/api/launch/preview",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 165
+    },
+    {
+      "operator_name": "repos.list",
+      "method": "GET",
+      "route": "/api/repos",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/fleet.rs",
+      "source_line": 173
+    },
+    {
+      "operator_name": "netflow.run",
+      "method": "GET",
+      "route": "/api/runs/:id/netflow",
+      "classification": "new_scoped_projection_only",
+      "runtime_binding": "run.netflows",
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 9
+    },
+    {
+      "operator_name": "netflow.agentiflow",
+      "method": "GET",
+      "route": "/api/agentiflows/:id/netflow",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 16
+    },
+    {
+      "operator_name": "netflow.project",
+      "method": "GET",
+      "route": "/api/projects/:id/netflow",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 23
+    },
+    {
+      "operator_name": "netflow.global",
+      "method": "GET",
+      "route": "/api/netflow",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 30
+    },
+    {
+      "operator_name": "netflow.graph",
+      "method": "GET",
+      "route": "/api/netflow/graph",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 37
+    },
+    {
+      "operator_name": "netflow.explorer",
+      "method": "GET",
+      "route": "/api/netflow/explorer",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 44
+    },
+    {
+      "operator_name": "netflow.index",
+      "method": "GET",
+      "route": "/api/netflow/index",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 51
+    },
+    {
+      "operator_name": "netflow.latest",
+      "method": "GET",
+      "route": "/api/netflow/latest",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 57
+    },
+    {
+      "operator_name": "usage.get",
+      "method": "GET",
+      "route": "/api/usage",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 64
+    },
+    {
+      "operator_name": "usage.timeline",
+      "method": "GET",
+      "route": "/api/usage/timeline",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 71
+    },
+    {
+      "operator_name": "usage.runs",
+      "method": "GET",
+      "route": "/api/usage/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 78
+    },
+    {
+      "operator_name": "usage.outliers",
+      "method": "GET",
+      "route": "/api/usage/outliers",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 85
+    },
+    {
+      "operator_name": "dashboard.get",
+      "method": "GET",
+      "route": "/api/dashboard",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/observe.rs",
+      "source_line": 92
+    },
+    {
+      "operator_name": "cron.list",
+      "method": "GET",
+      "route": "/api/cron",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/ops_admin.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "cron.events",
+      "method": "GET",
+      "route": "/api/cron/events",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/ops_admin.rs",
+      "source_line": 17
+    },
+    {
+      "operator_name": "cron.tick",
+      "method": "POST",
+      "route": "/api/cron/tick",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/ops_admin.rs",
+      "source_line": 24
+    },
+    {
+      "operator_name": "maintenance.prune",
+      "method": "POST",
+      "route": "/api/maintenance/prune",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/ops_admin.rs",
+      "source_line": 33
+    },
+    {
+      "operator_name": "projects.list",
+      "method": "GET",
+      "route": "/api/projects",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 11
+    },
+    {
+      "operator_name": "projects.register",
+      "method": "POST",
+      "route": "/api/projects",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 18
+    },
+    {
+      "operator_name": "projects.get",
+      "method": "GET",
+      "route": "/api/projects/:ws_id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 26
+    },
+    {
+      "operator_name": "projects.scm",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/scm",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 32
+    },
+    {
+      "operator_name": "projects.runs",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 40
+    },
+    {
+      "operator_name": "projects.sessions",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/sessions",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 47
+    },
+    {
+      "operator_name": "projects.start_session",
+      "method": "POST",
+      "route": "/api/projects/:ws_id/sessions",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 54
+    },
+    {
+      "operator_name": "projects.agents",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/agents",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 62
+    },
+    {
+      "operator_name": "projects.workflows",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/workflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 68
+    },
+    {
+      "operator_name": "projects.autoflows",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/autoflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 74
+    },
+    {
+      "operator_name": "projects.coverage",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/coverage",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 80
+    },
+    {
+      "operator_name": "projects.coverage_assessed",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/coverage/assessed",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 86
+    },
+    {
+      "operator_name": "projects.tree",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/tree",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 92
+    },
+    {
+      "operator_name": "projects.source",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/source",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 99
+    },
+    {
+      "operator_name": "projects.files",
+      "method": "GET",
+      "route": "/api/projects/:ws_id/files",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/projects.rs",
+      "source_line": 106
+    },
+    {
+      "operator_name": "query.fields",
+      "method": "GET",
+      "route": "/api/query/:list/fields",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/query.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "query.check",
+      "method": "POST",
+      "route": "/api/query/:list/check",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/query.rs",
+      "source_line": 16
+    },
+    {
+      "operator_name": "runs.list",
+      "method": "GET",
+      "route": "/api/runs/workflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 12
+    },
+    {
+      "operator_name": "runs.get",
+      "method": "GET",
+      "route": "/api/runs/:id",
+      "classification": "new_scoped_projection_only",
+      "runtime_binding": "run.inspect",
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 19
+    },
+    {
+      "operator_name": "runs.attempts",
+      "method": "GET",
+      "route": "/api/runs/:id/attempts",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 26
+    },
+    {
+      "operator_name": "runs.approve",
+      "method": "POST",
+      "route": "/api/runs/:id/approve",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 33
+    },
+    {
+      "operator_name": "runs.reject",
+      "method": "POST",
+      "route": "/api/runs/:id/reject",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 41
+    },
+    {
+      "operator_name": "runs.cancel",
+      "method": "POST",
+      "route": "/api/runs/:id/cancel",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 50
+    },
+    {
+      "operator_name": "runs.list_all",
+      "method": "GET",
+      "route": "/api/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 59
+    },
+    {
+      "operator_name": "runs.archived",
+      "method": "GET",
+      "route": "/api/runs/archived",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 66
+    },
+    {
+      "operator_name": "runs.delete",
+      "method": "DELETE",
+      "route": "/api/runs/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 73
+    },
+    {
+      "operator_name": "runs.archive",
+      "method": "POST",
+      "route": "/api/runs/:id/archive",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 80
+    },
+    {
+      "operator_name": "runs.restore",
+      "method": "POST",
+      "route": "/api/runs/:id/restore",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 87
+    },
+    {
+      "operator_name": "runs.pause",
+      "method": "POST",
+      "route": "/api/runs/:id/pause",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 94
+    },
+    {
+      "operator_name": "runs.resume",
+      "method": "POST",
+      "route": "/api/runs/:id/resume",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 101
+    },
+    {
+      "operator_name": "runs.graph",
+      "method": "GET",
+      "route": "/api/runs/:id/graph",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 109
+    },
+    {
+      "operator_name": "runs.transcript_search",
+      "method": "GET",
+      "route": "/api/runs/:id/transcripts/search",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 116
+    },
+    {
+      "operator_name": "runs.children",
+      "method": "GET",
+      "route": "/api/runs/:id/children",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 122
+    },
+    {
+      "operator_name": "runs.board",
+      "method": "GET",
+      "route": "/api/runs/:id/board",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 128
+    },
+    {
+      "operator_name": "runs.usage",
+      "method": "GET",
+      "route": "/api/runs/:id/usage",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 135
+    },
+    {
+      "operator_name": "runs.usage_timeline",
+      "method": "GET",
+      "route": "/api/runs/:id/usage-timeline",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 142
+    },
+    {
+      "operator_name": "runs.source",
+      "method": "GET",
+      "route": "/api/runs/:id/source",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 149
+    },
+    {
+      "operator_name": "runs.ast",
+      "method": "GET",
+      "route": "/api/runs/:id/ast",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 156
+    },
+    {
+      "operator_name": "runs.autoflow",
+      "method": "GET",
+      "route": "/api/runs/:id/autoflow",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 163
+    },
+    {
+      "operator_name": "agent_runs.list",
+      "method": "GET",
+      "route": "/api/runs/agents",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 169
+    },
+    {
+      "operator_name": "transcripts.get",
+      "method": "GET",
+      "route": "/api/transcript",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 176
+    },
+    {
+      "operator_name": "transcripts.page",
+      "method": "GET",
+      "route": "/api/transcript/page",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 183
+    },
+    {
+      "operator_name": "transcripts.archive",
+      "method": "POST",
+      "route": "/api/transcripts/:id/archive",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 190
+    },
+    {
+      "operator_name": "transcripts.delete",
+      "method": "DELETE",
+      "route": "/api/transcripts/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 197
+    },
+    {
+      "operator_name": "events.recent",
+      "method": "GET",
+      "route": "/api/events",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 204
+    },
+    {
+      "operator_name": "autoflow_runs.list",
+      "method": "GET",
+      "route": "/api/runs/autoflows/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 211
+    },
+    {
+      "operator_name": "autoflow_runs.problems",
+      "method": "GET",
+      "route": "/api/runs/autoflows/problems",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 218
+    },
+    {
+      "operator_name": "autoflow_runs.cycles",
+      "method": "GET",
+      "route": "/api/runs/autoflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 225
+    },
+    {
+      "operator_name": "autoflow_runs.events",
+      "method": "GET",
+      "route": "/api/runs/autoflows/events",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 232
+    },
+    {
+      "operator_name": "runs.retry",
+      "method": "POST",
+      "route": "/api/runs/:id/retry",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 240
+    },
+    {
+      "operator_name": "agent_runs.continue",
+      "method": "POST",
+      "route": "/api/runs/agents/:id/continue",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/runs.rs",
+      "source_line": 249
+    },
+    {
+      "operator_name": "scm_accounts.list",
+      "method": "GET",
+      "route": "/api/scm/accounts",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 11
+    },
+    {
+      "operator_name": "scm_rules.list",
+      "method": "GET",
+      "route": "/api/scm/rules",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 18
+    },
+    {
+      "operator_name": "scm_rules.bind",
+      "method": "POST",
+      "route": "/api/scm/rules",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 25
+    },
+    {
+      "operator_name": "repos.tracked",
+      "method": "GET",
+      "route": "/api/repos/tracked",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 34
+    },
+    {
+      "operator_name": "repos.attach",
+      "method": "POST",
+      "route": "/api/repos/tracked",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 41
+    },
+    {
+      "operator_name": "repos.prefer",
+      "method": "POST",
+      "route": "/api/repos/tracked/prefer",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 49
+    },
+    {
+      "operator_name": "repos.forget",
+      "method": "DELETE",
+      "route": "/api/repos/tracked/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 57
+    },
+    {
+      "operator_name": "auth.status",
+      "method": "GET",
+      "route": "/api/auth/status",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/scm.rs",
+      "source_line": 64
+    },
+    {
+      "operator_name": "projects.session_capabilities",
+      "method": "GET",
+      "route": "/api/projects/:id/session-capabilities",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "sessions.capabilities",
+      "method": "GET",
+      "route": "/api/sessions/:id/capabilities",
+      "classification": "new_scoped_projection_only",
+      "runtime_binding": "session.context",
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 16
+    },
+    {
+      "operator_name": "sessions.workflows",
+      "method": "GET",
+      "route": "/api/sessions/:id/workflows",
+      "classification": "new_scoped_projection_only",
+      "runtime_binding": "session.workflows",
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 22
+    },
+    {
+      "operator_name": "sessions.attach_workflow",
+      "method": "POST",
+      "route": "/api/sessions/:id/workflows",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 28
+    },
+    {
+      "operator_name": "projects.workflow_history",
+      "method": "GET",
+      "route": "/api/projects/:id/workflow-history",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 34
+    },
+    {
+      "operator_name": "sessions.list",
+      "method": "GET",
+      "route": "/api/sessions",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 40
+    },
+    {
+      "operator_name": "sessions.get",
+      "method": "GET",
+      "route": "/api/sessions/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 47
+    },
+    {
+      "operator_name": "sessions.turns",
+      "method": "GET",
+      "route": "/api/sessions/:id/runs",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 54
+    },
+    {
+      "operator_name": "sessions.usage_timeline",
+      "method": "GET",
+      "route": "/api/sessions/:id/usage-timeline",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 61
+    },
+    {
+      "operator_name": "sessions.archive",
+      "method": "POST",
+      "route": "/api/sessions/:id/archive",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 68
+    },
+    {
+      "operator_name": "sessions.restore",
+      "method": "POST",
+      "route": "/api/sessions/:id/restore",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 75
+    },
+    {
+      "operator_name": "sessions.delete",
+      "method": "DELETE",
+      "route": "/api/sessions/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 82
+    },
+    {
+      "operator_name": "sessions.start",
+      "method": "POST",
+      "route": "/api/agents/:name/session",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 89
+    },
+    {
+      "operator_name": "sessions.send",
+      "method": "POST",
+      "route": "/api/sessions/:id/send",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 97
+    },
+    {
+      "operator_name": "messages.list",
+      "method": "GET",
+      "route": "/api/{root}/:id/messages",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 106
+    },
+    {
+      "operator_name": "messages.send",
+      "method": "POST",
+      "route": "/api/{root}/:id/messages",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 113
+    },
+    {
+      "operator_name": "sessions.stop",
+      "method": "POST",
+      "route": "/api/sessions/:id/stop",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 121
+    },
+    {
+      "operator_name": "sessions.compact",
+      "method": "POST",
+      "route": "/api/sessions/:id/compact",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/sessions.rs",
+      "source_line": 129
+    },
+    {
+      "operator_name": "fleet.list",
+      "method": "GET",
+      "route": "/api/fleet",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/setup.rs",
+      "source_line": 10
+    },
+    {
+      "operator_name": "fleet.install",
+      "method": "POST",
+      "route": "/api/fleet/install",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/setup.rs",
+      "source_line": 17
+    },
+    {
+      "operator_name": "projects.init",
+      "method": "POST",
+      "route": "/api/projects/init",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/setup.rs",
+      "source_line": 26
+    },
+    {
+      "operator_name": "engagement_profiles.list",
+      "method": "GET",
+      "route": "/api/engagement-profiles",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/setup.rs",
+      "source_line": 35
+    },
+    {
+      "operator_name": "engagement_profiles.get",
+      "method": "GET",
+      "route": "/api/engagement-profiles/:id",
+      "classification": "operator_only_not_delegated",
+      "runtime_binding": null,
+      "source": "crates/rupu-cp/src/mcp/ops/setup.rs",
+      "source_line": 42
+    }
+  ],
+  "new_binding_scope": {
+    "session.context": "implicit own session and current turn snapshot",
+    "session.workflows": "recorded links of own session only",
+    "run.inspect": "current turn or positive recorded descendant chain",
+    "run.netflows": "current turn or positive recorded descendant chain, sanitized bounded local ledger summary"
+  },
+  "authority": "No operator router pass-through. Same-name runtime tools keep existing services, scopes, grant and permission policy. Other specs remain operator-only pending explicit scoped review."
+}

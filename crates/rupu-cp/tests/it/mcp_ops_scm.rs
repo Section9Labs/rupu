@@ -25,6 +25,14 @@ async fn scm_tools_are_listed_with_their_required_arguments() {
         ("repos.prefer", &["repo", "path"]),
         ("repos.forget", &["id"]),
         ("auth.status", &[]),
+        (
+            "issues.discussion",
+            &["tracker", "number", "project", "account", "expected_origin"],
+        ),
+        (
+            "issues.discussion_text",
+            &["tracker", "number", "project", "account", "expected_origin"],
+        ),
     ];
     assert_required_args(addr, table).await;
 
@@ -42,6 +50,8 @@ async fn scm_tools_are_listed_with_their_required_arguments() {
         "scm_rules.list",
         "repos.tracked",
         "auth.status",
+        "issues.discussion",
+        "issues.discussion_text",
     ] {
         assert_eq!(hints(read)["readOnlyHint"], json!(true), "{read}");
     }
@@ -305,5 +315,29 @@ async fn no_answer_carries_a_stored_secret() {
     for (what, answer) in &answers {
         assert!(!answer.contains(SECRET), "{what} leaked a secret: {answer}");
         assert!(!answer.contains("x-access-token"), "{what}: {answer}");
+    }
+}
+
+#[tokio::test]
+async fn discussion_routes_have_operator_parity_without_an_installed_reader() {
+    let (addr, _tmp) = spawn_operator_with(seed, None).await;
+    for (tool, suffix) in [
+        ("issues.discussion", "discussion"),
+        ("issues.discussion_text", "discussion/text"),
+    ] {
+        let args = json!({"tracker":"github","number":"7","project":"org/repo","account":"work","expected_origin":"https://api.github.com"});
+        let result = call_tool(addr, tool, args).await;
+        assert!(is_error(&result), "{result}");
+        assert!(text_of(&result).starts_with("HTTP 503"), "{result}");
+        let mut url =
+            reqwest::Url::parse(&format!("http://{addr}/api/issues/github/7/{suffix}")).unwrap();
+        url.query_pairs_mut()
+            .append_pair("project", "org/repo")
+            .append_pair("account", "work")
+            .append_pair("expected_origin", "https://api.github.com");
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.status().as_u16(), 503);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "adapter_missing");
     }
 }

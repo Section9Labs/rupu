@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
+        .merge(super::session_mcp::routes())
+        .merge(super::mcp_servers::routes())
         .merge(orchestration::routes())
         .merge(super::session_workflows::routes())
         .merge(super::session_capabilities::routes())
@@ -2810,7 +2812,12 @@ fn settings_response(
     }
     let dto = active_session(s, id, "settings")?;
     let dir = s.global_dir.join("sessions").join(id);
-    let settings = if let Some(settings) = update {
+    let settings = if let Some(mut settings) = update {
+        // This existing endpoint edits builtin settings only. Older editors
+        // cannot clear or replace a frozen MCP override by omitting its field.
+        settings.mcp = rupu_runtime::session_settings::SessionSettings::read(&dir)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .mcp;
         settings
             .validate()
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -2827,7 +2834,7 @@ fn settings_response(
     .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(serde_json::json!({
         "session_id": id, "host_id": "local", "settings": settings,
-        "defaults": { "provider": dto.provider_name, "model": dto.model, "tools": record["agent_tools"] },
+        "defaults": { "provider": dto.provider_name, "model": dto.model, "effort": record["effort"], "tools": record["agent_tools"] },
         "applies": "next_turn", "permission_mode": record["permission_mode"],
         "tools": crate::api::tools::catalog(),
         "history": "The conversation is retained. The selected provider receives Rupu's normalized message history on the next turn. Provider-specific options and learned model limits are re-resolved when the model changes."

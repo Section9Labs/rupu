@@ -1360,7 +1360,12 @@ mod tests {
         let (conn, _run_store, _bucket, _tmp) = make_conn();
         let err = conn
             .start_session(SessionStartRequest {
+                tool_ceiling: None,
+                mcp_tools: None,
+                mcp_catalog_revision: None,
+                effort: None,
                 skill_preset: None,
+                tools: None,
                 agent: "a".into(),
                 provider: None,
                 model: None,

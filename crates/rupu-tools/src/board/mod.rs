@@ -273,6 +273,7 @@ pub(crate) fn sent(receipt: SendReceipt, mut fields: Value) -> ToolOutput {
         from_codename: m.from_codename,
         to: m.to,
         kind: m.kind.as_str().to_string(),
+        post_kind: m.post_kind.map(|kind| kind.as_str().to_string()),
         body: m.body,
         delivery,
     });

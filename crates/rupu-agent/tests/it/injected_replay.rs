@@ -50,6 +50,7 @@ impl TurnCollector for Scripted {
                     from_codename: None,
                     to: Some("reader".into()),
                     kind: "direct".into(),
+                    post_kind: None,
                     body: format!("note {}", ctx.turn_index),
                     urgent: false,
                 }],
@@ -309,7 +310,9 @@ async fn a_continued_run_receipts_what_its_predecessor_never_saw() {
 }
 
 /// An operator message on turn 0, framed as the operator's instruction.
-struct FromOperator;
+struct FromOperator {
+    post_kind: Option<&'static str>,
+}
 
 impl TurnCollector for FromOperator {
     fn name(&self) -> &str {
@@ -331,7 +334,13 @@ impl TurnCollector for FromOperator {
                 from: "operator".into(),
                 from_codename: None,
                 to: Some("reader".into()),
-                kind: "operator".into(),
+                kind: if self.post_kind.is_some() {
+                    "post"
+                } else {
+                    "operator"
+                }
+                .into(),
+                post_kind: self.post_kind.map(str::to_owned),
                 body: "read notes.txt first".into(),
                 urgent: true,
             }],
@@ -341,6 +350,15 @@ impl TurnCollector for FromOperator {
 
 #[tokio::test]
 async fn an_operator_injection_replays_as_the_operators_instruction() {
+    assert_operator_replay(None).await;
+}
+
+#[tokio::test]
+async fn an_addressed_operator_board_post_retains_subtype_and_instruction_replay() {
+    assert_operator_replay(Some("question")).await;
+}
+
+async fn assert_operator_replay(post_kind: Option<&'static str>) {
     let tmp = tempfile::tempdir().unwrap();
     let transcript = tmp.path().join("t.jsonl");
     let provider = CapturingMockProvider::new(vec![
@@ -359,8 +377,14 @@ async fn an_operator_injection_replays_as_the_operators_instruction() {
         Arc::new(Scripted::default()),
         transcript.clone(),
     );
-    o.collectors = vec![Arc::new(FromOperator)];
+    o.collectors = vec![Arc::new(FromOperator { post_kind })];
     let result = run_agent(o).await.unwrap();
+
+    let events = events(&transcript);
+    assert!(events.iter().any(|event| matches!(event, Event::Message {
+        id, direction: MessageDirection::Received, kind, post_kind: recorded, ..
+    } if id == "msg_op" && kind == (if post_kind.is_some() { "post" } else { "operator" })
+        && recorded.as_deref() == post_kind)));
 
     let first = serde_json::to_string(&captured.lock().unwrap()[0].messages).unwrap();
     assert!(

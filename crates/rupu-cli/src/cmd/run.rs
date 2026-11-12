@@ -14,7 +14,7 @@ use rupu_agent::{load_agent_in, resolve_mode};
 use rupu_runtime::WorkerKind;
 use rupu_tools::{PermissionMode, PermissionPolicy, PromptAnswer, PromptRequest, Prompter};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tracing::warn;
@@ -24,6 +24,9 @@ use ulid::Ulid;
 pub struct Args {
     /// Agent name (matches an `agents/*.md` file).
     pub agent: String,
+    /// Exact installed global definition and registered execution-project proof.
+    #[arg(long, hide = true)]
+    pub exact_agent_definition: Option<String>,
     /// Optional target reference, e.g. `github:owner/repo#42`.
     /// See `docs/scm.md#target-syntax` for the full grammar.
     /// Distinguished from `prompt` by parsing as a RunTarget.
@@ -167,6 +170,12 @@ pub struct Args {
     /// rebuilds.
     #[arg(long = "continue", value_name = "AGENT_RUN_ID")]
     pub continue_from: Option<String>,
+    /// Internal one-shot replacement intent. Never recorded as a continuing action.
+    #[arg(long, hide = true, requires = "continue_from", conflicts_with_all = ["skills", "preload_skills", "engagement_profiles", "launch_lists"], value_parser = rupu_runtime::continuation_options::ContinuationListOverrides::decode)]
+    pub continue_options: Option<rupu_runtime::continuation_options::ContinuationListOverrides>,
+    /// Normalized resolved launch lists, recorded to preserve explicit empty selections.
+    #[arg(long, hide = true, value_parser = rupu_runtime::continuation_options::ContinuationListOverrides::decode)]
+    pub launch_lists: Option<rupu_runtime::continuation_options::ContinuationListOverrides>,
     /// Model for this run, overriding the agent's `model:` and the config
     /// default.
     #[arg(long, value_name = "MODEL")]
@@ -221,6 +230,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
     use clap::ValueEnum;
     let Args {
         agent,
+        exact_agent_definition,
         target,
         prompt: _,
         prompt_flag: _,
@@ -242,6 +252,8 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         no_messaging,
         messaging_tools,
         continue_from: _,
+        continue_options: _,
+        launch_lists,
         model,
         provider,
         launch:
@@ -270,6 +282,7 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
     );
     let values = [
         ("run-id", Some(run_id.to_string())),
+        ("exact-agent-definition", exact_agent_definition.clone()),
         ("mode", mode.clone()),
         (
             "view",
@@ -283,6 +296,12 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
         ("findings-profile", findings_profile.map(|p| p.to_string())),
         ("cyber", cyber.map(|c| c.as_wire().to_string())),
         ("skill-bundle", skill_bundle.clone()),
+        (
+            "launch-lists",
+            launch_lists
+                .as_ref()
+                .map(|v| serde_json::to_string(v).expect("string-list serialization")),
+        ),
         ("model", model.clone()),
         ("provider", provider.clone()),
         ("launch-depth", launch_depth.map(|d| d.to_string())),
@@ -337,7 +356,9 @@ fn launch_argv(args: &Args, run_id: &str) -> Vec<String> {
 ///
 /// It names every field of [`Args`] with no `..`, as [`launch_argv`] does,
 /// so a new flag fails to compile until its merge is decided here.
-fn restore_launch(recorded: Args, now: Args) -> Args {
+fn restore_launch(mut recorded: Args, mut now: Args) -> Args {
+    hydrate_launch_lists(&mut recorded);
+    hydrate_launch_lists(&mut now);
     fn pick<T>(given: bool, now: T, recorded: T) -> T {
         if given {
             now
@@ -347,6 +368,7 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
     }
     let Args {
         agent,
+        exact_agent_definition,
         target,
         prompt,
         prompt_flag,
@@ -368,12 +390,17 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         no_messaging,
         messaging_tools,
         continue_from,
+        continue_options,
+        launch_lists,
         model,
         provider,
         launch,
         explicit,
     } = now;
     let given = |id: &str| explicit.has(id);
+    let skills_given = given("skills") || launch_lists.as_ref().is_some_and(|v| v.skills.is_some());
+    let preload_given = given("preload_skills") || launch_lists.as_ref().is_some_and(|v| v.preload_skills.is_some());
+    let profiles_given = given("engagement_profiles") || launch_lists.as_ref().is_some_and(|v| v.engagement_profiles.is_some());
     let dest = given("into") || given("tmp");
     let space = given("message_space") || given("participant");
     let messaging = given("no_messaging") || given("messaging_tools");
@@ -393,6 +420,11 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
     .any(given);
     Args {
         agent,
+        exact_agent_definition: pick(
+            given("exact_agent_definition"),
+            exact_agent_definition,
+            recorded.exact_agent_definition,
+        ),
         target: pick(given("target"), target, recorded.target),
         prompt,
         prompt_flag,
@@ -412,13 +444,13 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         ),
         cyber: pick(given("cyber"), cyber, recorded.cyber),
         engagement_profiles: pick(
-            given("engagement_profiles"),
+            profiles_given,
             engagement_profiles,
             recorded.engagement_profiles,
         ),
-        skills: pick(given("skills"), skills, recorded.skills),
+        skills: pick(skills_given, skills, recorded.skills),
         preload_skills: pick(
-            given("preload_skills"),
+            preload_given,
             preload_skills,
             recorded.preload_skills,
         ),
@@ -426,11 +458,59 @@ fn restore_launch(recorded: Args, now: Args) -> Args {
         no_messaging: pick(messaging, no_messaging, recorded.no_messaging),
         messaging_tools: pick(messaging, messaging_tools, recorded.messaging_tools),
         continue_from,
+        continue_options,
+        launch_lists: pick(given("launch_lists"), launch_lists, recorded.launch_lists),
         model: pick(given("model"), model, recorded.model),
         provider: pick(given("provider"), provider, recorded.provider),
         launch: pick(linked, launch, recorded.launch),
         explicit,
     }
+}
+
+/// The normalized record is not an override of new explicit command flags.
+fn hydrate_launch_lists(args: &mut Args) {
+    if let Some(saved) = &args.launch_lists {
+        if !args.explicit.has("skills") {
+            if let Some(v) = &saved.skills {
+                args.skills = v.clone();
+            }
+        }
+        if !args.explicit.has("preload_skills") {
+            if let Some(v) = &saved.preload_skills {
+                args.preload_skills = v.clone();
+            }
+        }
+        if !args.explicit.has("engagement_profiles") {
+            if let Some(v) = &saved.engagement_profiles {
+                args.engagement_profiles = v.clone();
+            }
+        }
+    }
+}
+
+/// Called after both recorded-command restore and pre-command skill carrying.
+/// All three selected lists are recorded, including empty values. No agent or
+/// shipped-bundle declarations are changed by this launch-level selection.
+fn resolve_continuation_lists(args: &mut Args) -> anyhow::Result<()> {
+    let changed = args.continue_options.is_some();
+    if let Some(options) = args.continue_options.take() {
+        options.validate().map_err(anyhow::Error::msg)?;
+        options.apply(
+            &mut args.skills,
+            &mut args.preload_skills,
+            &mut args.engagement_profiles,
+        );
+    }
+    if changed || args.launch_lists.is_some() {
+        let resolved = rupu_runtime::continuation_options::ContinuationListOverrides::resolved(
+            args.skills.clone(),
+            args.preload_skills.clone(),
+            args.engagement_profiles.clone(),
+        );
+        resolved.validate().map_err(anyhow::Error::msg)?;
+        args.launch_lists = Some(resolved);
+    }
+    Ok(())
 }
 
 fn parse_findings_profile(s: &str) -> Result<rupu_coverage::FindingProfile, String> {
@@ -1029,12 +1109,37 @@ struct RunListReport {
     summary: RunListSummary,
 }
 
-pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
+/// Pin a registered execution root for exact launches. Legacy launches retain
+/// ancestor discovery; an absent own .rupu does not require an exact launch to
+/// inherit another project's configuration, skills or artifact directories.
+fn launch_project_root(
+    global: &Path,
+    pwd: &Path,
+    proof: Option<&str>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(raw) = proof {
+        #[cfg(unix)]
+        {
+            let binding = rupu_runtime::exact_agent::Binding::decode(raw)?;
+            rupu_runtime::exact_agent::load(global, &binding, pwd)?;
+            return Ok(Some(PathBuf::from(binding.project_path)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (global, raw);
+            anyhow::bail!("exact global agent execution is unavailable on this platform");
+        }
+    }
+    paths::project_root_for(pwd)
+}
+
+pub(crate) async fn run_inner(mut args: Args) -> anyhow::Result<()> {
+    hydrate_launch_lists(&mut args);
     let global = paths::global_dir()?;
     paths::ensure_dir(&global)?;
 
     let pwd = std::env::current_dir()?;
-    let project_root = paths::project_root_for(&pwd)?;
+    let project_root = launch_project_root(&global, &pwd, args.exact_agent_definition.as_deref())?;
     let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
 
     // `--continue <agent_run_id>` restores the command the continued run was
@@ -1064,6 +1169,14 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     } else {
         args
     };
+    // Restored exact launches also retain their explicit execution root. A
+    // registered project without .rupu uses global defaults, not an ancestor layer.
+    let project_root = if args.exact_agent_definition.is_some() {
+        launch_project_root(&global, &pwd, args.exact_agent_definition.as_deref())?
+    } else {
+        project_root
+    };
+    let transcripts = paths::transcripts_dir(&global, project_root.as_deref());
     // The run the launch skills came from, so a failure to resolve them
     // says where they came from.
     let mut skills_carried_from: Option<String> = None;
@@ -1078,6 +1191,8 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
             skills_carried_from = Some(prev);
         }
     }
+
+    resolve_continuation_lists(&mut args)?;
 
     // Both-or-neither, refused before anything is touched.
     let space =
@@ -1101,12 +1216,42 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
         Some(m) => rupu_skills::ship::overlay_for(&rupu_skills::ship::cache_dir(&global), m)?,
         None => Vec::new(),
     };
-    let spec = load_agent_in(
-        &global,
-        project_agents_parent.as_deref(),
-        &args.agent,
-        &skill_overlay,
-    )?;
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        args.exact_agent_definition.is_none(),
+        "exact global agent execution is unavailable on this platform"
+    );
+    #[cfg(unix)]
+    let exact = args.exact_agent_definition.as_deref().map(|raw| -> anyhow::Result<_> {
+        anyhow::ensure!(args.target.is_none() && args.into.is_none() && !args.tmp && space.is_none() && args.launch.link().is_none(), "exact global execution cannot change its reviewed project or inherit a process launch link");
+        let binding = rupu_runtime::exact_agent::Binding::decode(raw)?;
+        anyhow::ensure!(binding.effective_name == args.agent, "effective agent differs from exact definition binding");
+        let loaded = rupu_runtime::exact_agent::load(&global, &binding, &pwd)?;
+        anyhow::ensure!(project_root.as_deref() == Some(Path::new(&binding.project_path)), "execution project discovery differs from reviewed root");
+        Ok(loaded)
+    }).transpose()?;
+    let load_default = || {
+        load_agent_in(
+            &global,
+            project_agents_parent.as_deref(),
+            &args.agent,
+            &skill_overlay,
+        )
+    };
+    #[cfg(unix)]
+    let spec = if let Some(loaded) = &exact {
+        rupu_agent::loader::validate_loaded_agent_in(
+            &loaded.spec,
+            &global,
+            project_agents_parent.as_deref(),
+            &skill_overlay,
+        )?;
+        loaded.spec.clone()
+    } else {
+        load_default()?
+    };
+    #[cfg(not(unix))]
+    let spec = load_default()?;
 
     // Resolve config (global + customer + project).
     let cfg_paths = paths::config_paths(&global, project_root.as_deref(), &pwd)?;
@@ -1138,6 +1283,21 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
     let ws_store = rupu_workspace::WorkspaceStore {
         root: global.join("workspaces"),
     };
+    #[cfg(unix)]
+    let ws = if let Some(loaded) = &exact {
+        // Use the exact selected registration, never path-deduplicating upsert.
+        let ws: rupu_workspace::Workspace = toml::from_str(&loaded.registration_raw)?;
+        anyhow::ensure!(
+            ws.id == loaded.review.binding.workspace_id
+                && ws.path == loaded.review.binding.project_path,
+            "execution registration mismatch"
+        );
+        rupu_runtime::exact_agent::load(&global, &loaded.review.binding, &pwd)?;
+        ws
+    } else {
+        rupu_workspace::upsert(&ws_store, &pwd)?
+    };
+    #[cfg(not(unix))]
     let ws = rupu_workspace::upsert(&ws_store, &pwd)?;
     if let Err(err) = crate::cmd::repos::auto_track_checkout(&global, &pwd) {
         warn!(path = %pwd.display(), error = %err, "failed to auto-track checkout");
@@ -1906,7 +2066,7 @@ pub(crate) async fn run_inner(args: Args) -> anyhow::Result<()> {
                         rupu_transcript::Event::Outcome { .. }
                         | rupu_transcript::Event::Recovery { .. }
                         | rupu_transcript::Event::AssistantBlock { .. }
-                        | rupu_transcript::Event::Unknown { .. } => {
+                        | rupu_transcript::Event::ToolApproval { .. } | rupu_transcript::Event::Unknown { .. } => {
                             crate::output::outcome_row::print_outcome_event(&mut printer, &ev);
                         }
                         _ => {}
@@ -2142,6 +2302,16 @@ fn carry_unrecorded(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
         };
+    }
+    if let Some(selected) = &args.launch_lists {
+        let skills_inherit = !args.explicit.has("skills") && selected.skills.is_none();
+        let preload_inherit = !args.explicit.has("preload_skills") && selected.preload_skills.is_none();
+        if !skills_inherit && !preload_inherit { return Ok(false); }
+        let (skills, preload) = rupu_agent::continuation::launch_skills(transcript)?;
+        let carried = (skills_inherit && !skills.is_empty()) || (preload_inherit && !preload.is_empty());
+        if skills_inherit { args.skills = skills; }
+        if preload_inherit { args.preload_skills = preload; }
+        return Ok(carried);
     }
     if !args.skills.is_empty() || !args.preload_skills.is_empty() {
         return Ok(false);
@@ -3041,6 +3211,80 @@ mod continue_restore_tests {
         parse_launch_args(argv.iter().map(|s| s.to_string()).collect()).unwrap()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exact_registered_root_uses_own_config_layers_without_parent_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let global = base.join("home");
+        let parent = base.join("parent");
+        let project = parent.join("nested");
+        std::fs::create_dir_all(global.join("agents")).unwrap();
+        std::fs::create_dir_all(global.join("workspaces")).unwrap();
+        std::fs::create_dir_all(parent.join(".rupu/transcripts")).unwrap();
+        std::fs::create_dir_all(parent.join(".rupu/skills")).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            parent.join(".rupu/config.toml"),
+            "[agent]\nmodel='parent-only'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            global.join("agents/selected.md"),
+            "---\nname: analyst\n---\nGlobal\n",
+        )
+        .unwrap();
+        std::fs::write(
+            global.join("workspaces/ws_selected.toml"),
+            format!(
+                "id='ws_selected'\npath='{}'\ncreated_at='2026-11-09T00:00:00Z'\n",
+                project.display()
+            ),
+        )
+        .unwrap();
+        let binding = rupu_runtime::exact_agent::review(&global, "selected.md", "ws_selected")
+            .unwrap()
+            .review
+            .binding;
+        let proof = serde_json::to_string(&binding).unwrap();
+        let exact = super::launch_project_root(&global, &project, Some(&proof)).unwrap();
+        assert_eq!(exact.as_deref(), Some(project.as_path()));
+        let config = crate::paths::config_paths(&global, exact.as_deref(), &project).unwrap();
+        assert_eq!(config.project, Some(project.join(".rupu/config.toml")));
+        assert_eq!(
+            rupu_workspace::project_layer_dir(&global, exact.as_deref()),
+            Some(project.join(".rupu"))
+        );
+        assert_eq!(
+            crate::paths::transcripts_dir(&global, exact.as_deref()),
+            global.join("transcripts")
+        );
+        assert_eq!(
+            super::launch_project_root(&global, &project, None).unwrap(),
+            Some(parent)
+        );
+        std::fs::write(
+            global.join("agents/selected.md"),
+            "---\nname: analyst\n---\nChanged\n",
+        )
+        .unwrap();
+        assert!(super::launch_project_root(&global, &project, Some(&proof)).is_err());
+    }
+
+    #[test]
+    fn exact_definition_proof_roundtrips_and_is_retained_by_continue() {
+        let proof = r#"{"file_key":"selected.md","definition_revision":"abc"}"#;
+        let original = parse(&["analyst", "--exact-agent-definition", proof]);
+        let rendered = launch_argv(&original, "run_original");
+        let restored = parse_launch_args(rendered).unwrap();
+        assert_eq!(restored.exact_agent_definition.as_deref(), Some(proof));
+        let continued = restore_launch(
+            restored,
+            parse(&["analyst", "--continue", "run_original", "--prompt", "next"]),
+        );
+        assert_eq!(continued.exact_agent_definition.as_deref(), Some(proof));
+    }
+
     /// An original command with every kind of flag, in the order
     /// [`launch_argv`] renders them.
     const RECORDED: &[&str] = &[
@@ -3327,5 +3571,208 @@ mod continue_restore_tests {
             continued_checkout(cwd.path(), "repo", Some(&into), true, true),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod explicit_continuation_list_tests {
+    use super::*;
+    fn parse(values: &[&str]) -> Args {
+        parse_launch_args(values.iter().map(|v| v.to_string()).collect()).unwrap()
+    }
+    #[test]
+    fn clear_one_list_inherits_other_lists_and_preserves_mode_and_bundle() {
+        let recorded = parse(&[
+            "agent",
+            "--mode=readonly",
+            "--skill=project:inspect",
+            "--preload-skill=global:notes",
+            "--engagement-profile=network",
+            "--skill-bundle={}",
+        ]);
+        let mut selected = restore_launch(
+            recorded,
+            parse(&[
+                "agent",
+                "--continue=run_original",
+                r#"--continue-options={"skills":[]}"#,
+            ]),
+        );
+        resolve_continuation_lists(&mut selected).unwrap();
+        assert!(selected.skills.is_empty());
+        assert_eq!(selected.preload_skills, ["global:notes"]);
+        assert_eq!(selected.engagement_profiles, ["network"]);
+        assert_eq!(selected.mode.as_deref(), Some("readonly"));
+        assert_eq!(selected.skill_bundle.as_deref(), Some("{}"));
+        assert!(selected.continue_options.is_none());
+        let saved = launch_argv(&selected, "run_next");
+        assert!(!saved
+            .iter()
+            .any(|s| s.starts_with("--continue-options=") || s.starts_with("--continue=")));
+        assert!(saved.iter().any(|s| s.starts_with("--launch-lists=")));
+        let mut again = restore_launch(
+            parse_launch_args(saved).unwrap(),
+            parse(&["agent", "--continue=run_next"]),
+        );
+        resolve_continuation_lists(&mut again).unwrap();
+        assert!(again.skills.is_empty());
+        assert_eq!(again.preload_skills, ["global:notes"]);
+        assert_eq!(again.engagement_profiles, ["network"]);
+    }
+    #[test]
+    fn newer_cli_replacement_wins_over_recorded_resolved_marker() {
+        let recorded = parse(&[
+            "agent",
+            r#"--launch-lists={"skills":[],"preload_skills":["notes"],"engagement_profiles":[]}"#,
+        ]);
+        let mut selected = restore_launch(
+            recorded,
+            parse(&[
+                "agent",
+                "--continue=run_next",
+                "--skill=inspect",
+                "--engagement-profile=web",
+            ]),
+        );
+        resolve_continuation_lists(&mut selected).unwrap();
+        assert_eq!(selected.skills, ["inspect"]);
+        assert_eq!(selected.preload_skills, ["notes"]);
+        assert_eq!(selected.engagement_profiles, ["web"]);
+        let saved = launch_argv(&selected, "run_third");
+        let restored = restore_launch(
+            parse_launch_args(saved).unwrap(),
+            parse(&["agent", "--continue=run_third"]),
+        );
+        assert_eq!(restored.skills, ["inspect"]);
+        assert_eq!(restored.preload_skills, ["notes"]);
+    }
+    #[test]
+    fn explicit_normalized_marker_counts_as_selected_but_command_flags_win() {
+        let original = parse(&["agent", "--skill=old", "--preload-skill=old-notes", "--engagement-profile=network"]);
+        let now = parse(&["agent", "--continue=run_original", r#"--launch-lists={"skills":[],"preload_skills":[],"engagement_profiles":[]}"#, "--skill=new"]);
+        let mut selected = restore_launch(original, now);
+        resolve_continuation_lists(&mut selected).unwrap();
+        assert_eq!(selected.skills, ["new"]);
+        assert!(selected.preload_skills.is_empty() && selected.engagement_profiles.is_empty());
+    }
+
+    #[test]
+    fn all_clear_and_later_partial_replacement_do_not_revive_old_values() {
+        let recorded = parse(&[
+            "agent",
+            "--skill=old",
+            "--preload-skill=notes",
+            "--engagement-profile=network",
+        ]);
+        let mut selected = restore_launch(
+            recorded,
+            parse(&[
+                "agent",
+                "--continue=run_original",
+                r#"--continue-options={"skills":[],"preload_skills":[],"engagement_profiles":[]}"#,
+            ]),
+        );
+        resolve_continuation_lists(&mut selected).unwrap();
+        let saved = launch_argv(&selected, "run_next");
+        let mut again = restore_launch(
+            parse_launch_args(saved).unwrap(),
+            parse(&[
+                "agent",
+                "--continue=run_next",
+                r#"--continue-options={"preload_skills":["new"]}"#,
+            ]),
+        );
+        resolve_continuation_lists(&mut again).unwrap();
+        assert!(again.skills.is_empty());
+        assert_eq!(again.preload_skills, ["new"]);
+        assert!(again.engagement_profiles.is_empty());
+    }
+    #[test]
+    fn old_transcript_carry_is_resolved_before_independent_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.jsonl");
+        let event = rupu_transcript::Event::RunStart {
+            run_id: "run_original".into(),
+            workspace_id: "ws_test".into(),
+            agent: "agent".into(),
+            provider: "mock".into(),
+            model: "mock".into(),
+            started_at: chrono::Utc::now(),
+            mode: rupu_transcript::RunMode::Readonly,
+            schema: None,
+            system_prompt: None,
+            codename: None,
+            customer: None,
+            launch_skills: vec!["inspect".into()],
+            launch_preload_skills: vec!["notes".into()],
+            launch_args: vec![],
+        };
+        std::fs::write(&path, serde_json::to_string(&event).unwrap() + "\n").unwrap();
+        for (raw, expected_skills, expected_preload) in [
+            (r#"--continue-options={"skills":[]}"#, vec![], vec!["notes"]),
+            (
+                r#"--continue-options={"preload_skills":[]}"#,
+                vec!["inspect"],
+                vec![],
+            ),
+            (
+                r#"--continue-options={"skills":["replacement"]}"#,
+                vec!["replacement"],
+                vec!["notes"],
+            ),
+        ] {
+            let mut args = parse(&["agent", "--continue=run_original", raw]);
+            assert!(carry_unrecorded(tmp.path(), "run_original", &path, &mut args).unwrap());
+            resolve_continuation_lists(&mut args).unwrap();
+            assert_eq!(args.skills, expected_skills);
+            assert_eq!(args.preload_skills, expected_preload);
+        }
+        for (raw, expected_skills, expected_preload) in [
+            (r#"--launch-lists={"skills":[]}"#, vec![], vec!["notes"]),
+            (r#"--launch-lists={"preload_skills":[]}"#, vec!["inspect"], vec![]),
+            (r#"--launch-lists={"skills":["replacement"]}"#, vec!["replacement"], vec!["notes"]),
+            (r#"--launch-lists={"skills":[],"preload_skills":[],"engagement_profiles":[]}"#, vec![], vec![]),
+        ] {
+            let mut args = parse(&["agent", "--continue=run_original", raw]);
+            hydrate_launch_lists(&mut args);
+            carry_unrecorded(tmp.path(), "run_original", &path, &mut args).unwrap();
+            resolve_continuation_lists(&mut args).unwrap();
+            assert_eq!(args.skills, expected_skills);
+            assert_eq!(args.preload_skills, expected_preload);
+        }
+    }
+    #[test]
+    fn explicit_request_flag_rejects_legacy_list_conflicts_and_fresh_launch() {
+        for values in [
+            vec!["agent", r#"--continue-options={"skills":[]}"#],
+            vec![
+                "agent",
+                "--continue=run_original",
+                "--skill=inspect",
+                r#"--continue-options={"skills":[]}"#,
+            ],
+            vec![
+                "agent",
+                "--continue=run_original",
+                "--preload-skill=notes",
+                r#"--continue-options={"skills":[]}"#,
+            ],
+            vec![
+                "agent",
+                "--continue=run_original",
+                "--engagement-profile=code",
+                r#"--continue-options={"skills":[]}"#,
+            ],
+        ] {
+            assert!(parse_launch_args(values.into_iter().map(str::to_string).collect()).is_err());
+        }
+        // The preexisting continuation path records no new normalized marker.
+        let mut legacy = restore_launch(
+            parse(&["agent", "--skill=old"]),
+            parse(&["agent", "--continue=run_original"]),
+        );
+        resolve_continuation_lists(&mut legacy).unwrap();
+        assert_eq!(legacy.skills, ["old"]);
+        assert!(legacy.launch_lists.is_none());
     }
 }

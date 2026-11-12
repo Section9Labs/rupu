@@ -2313,6 +2313,9 @@ async fn get_global_netflow(
     Ok(Json(resp))
 }
 
+/// Opt-in local-only graph selection and explicit local ownership receipt.
+pub(crate) const LOCAL_RUN_GRAPH_FEATURE: &str = "netflow.local_run_graph.v1";
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GraphQuery {
     /// `run:<id>`, `project:<id>`, or absent for global. An unrecognized
@@ -2329,6 +2332,10 @@ pub(crate) struct GraphQuery {
     /// [`parse_time_range`] the other three routes use.
     pub from: Option<String>,
     pub to: Option<String>,
+    /// Require directly retained local run artifacts. Valid only with run:<id>;
+    /// no remote probe/proxy or synthesized unpersisted record is accepted.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 /// `?from=`/`?to=` query parameters accepted by every netflow-read route
@@ -2519,6 +2526,54 @@ async fn run_scoped_flows_for_graph(
     }
 }
 
+/// The local-only route never enters the federated resolver. It resolves and
+/// reloads actual local recorded artifacts inside one blocking read operation.
+async fn local_run_scoped_flows_for_graph(
+    state: AppState,
+    run_id: String,
+    range: rupu_netflow::ledger::TimeRange,
+) -> ApiResult<Vec<(String, FlowRecord)>> {
+    super::runs::validate_id(&run_id)?;
+    run_blocking(move || {
+        let location = super::run_resolve::local_run_location(&state, &run_id)
+            .ok_or_else(|| ApiError::not_found("run artifacts are not recorded locally"))?;
+        let (store, project_path) = match location {
+            RunLocation::Global => (Arc::clone(&state.run_store), None),
+            RunLocation::ProjectLocal { path } => (
+                Arc::new(RunStore::new(path.join(".rupu").join("runs"))),
+                Some(path),
+            ),
+            _ => {
+                return Err(ApiError::not_found(
+                    "run artifacts are not recorded locally",
+                ));
+            }
+        };
+        let record = store
+            .load(&run_id)
+            .map_err(|e| run_not_found_or_internal(&run_id, e))?;
+        if record.id != run_id {
+            return Err(ApiError::conflict("recorded run identity mismatch"));
+        }
+        let workspace = project_path.unwrap_or(record.workspace_path);
+        let index = index_for(&state);
+        let flows = run_scoped_flows_and_dropped(
+            &*index,
+            &store,
+            &run_id,
+            &workspace,
+            &state.global_dir,
+            &range,
+        )
+        .0;
+        Ok(flows
+            .into_iter()
+            .map(|flow| (run_id.clone(), flow))
+            .collect())
+    })
+    .await?
+}
+
 /// `GET /api/netflow/graph?scope=&from=&to=` — the bipartite
 /// source↔endpoint graph (`rupu_netflow::ledger::graph_view` does the
 /// actual bipartite build; this only resolves `scope` to the (run id, flow)
@@ -2530,9 +2585,23 @@ async fn run_scoped_flows_for_graph(
 async fn get_netflow_graph(
     State(state): State<AppState>,
     Query(q): Query<GraphQuery>,
-) -> ApiResult<Json<rupu_netflow::ledger::GraphView>> {
+) -> ApiResult<Json<serde_json::Value>> {
+    let local_run = if q.local_only {
+        let run_id = q
+            .scope
+            .as_deref()
+            .and_then(|scope| scope.strip_prefix("run:"))
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| ApiError::bad_request("local_only requires scope=run:<id>"))?;
+        super::runs::validate_id(run_id)?;
+        Some(run_id)
+    } else {
+        None
+    };
     let range = parse_time_range(&q.from, &q.to)?;
-    let flows = if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
+    let flows = if let Some(run_id) = local_run {
+        local_run_scoped_flows_for_graph(state.clone(), run_id.to_string(), range).await?
+    } else if let Some(run_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("run:")) {
         run_scoped_flows_for_graph(&state, run_id, &range).await?
     } else if let Some(project_id) = q.scope.as_deref().and_then(|s| s.strip_prefix("project:")) {
         let workspace = workspace_for_project(&state, project_id)?;
@@ -2555,7 +2624,13 @@ async fn get_netflow_graph(
         let index = index_for(&state);
         run_blocking(move || read_all_workspaces_sync(&*index, &global_dir, &range).0).await?
     };
-    Ok(Json(rupu_netflow::ledger::graph_view(&flows)))
+    let mut graph = serde_json::to_value(rupu_netflow::ledger::graph_view(&flows))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Some(run_id) = local_run {
+        graph["scope"] = serde_json::Value::String(format!("run:{run_id}"));
+        graph["host_id"] = serde_json::Value::String("local".to_string());
+    }
+    Ok(Json(graph))
 }
 
 // ── Explorer endpoint (GET /api/netflow/explorer) ───────────────────────

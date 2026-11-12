@@ -124,10 +124,17 @@ pub(super) fn ops() -> Vec<OpSpec> {
         )
         .query::<coverage::GapQuery>(),
         op(
+            "coverage.rerun_preview",
+            Method::GET,
+            "/api/coverage/:target/rerun-preview",
+            "Read the recorded inputs of a replayable coverage run without launching it.\n\n`target`, `ws_id` and `run` identify the original run. Returns `{target_id, ws_id, host_id, replays, manifest_fingerprint, recorded}`; recorded provider/model are historical, not effective launch configuration. Pass the opaque fingerprint as `expected_manifest_fingerprint` to `coverage.rerun` to reject a changed manifest. `HTTP 404` for an unknown target or run, `409` for a continued run or wrong recorded workspace, `501` for a non-agent run or remote host. Local-only; works on a read-only control plane.",
+        )
+        .query::<coverage::RerunPreviewQuery>(),
+        op(
             "coverage.rerun",
             Method::POST,
             "/api/coverage/:target/rerun",
-            "Replay a recorded agent run on its coverage target, appending a new run to the target.\n\n`target` is the target id, `run` the full id of the run to replay (from `coverage.runs`); `ws_id` picks the workspace. The run's agent, prompt, permission mode and launch skills start again, detached, in the workspace it was recorded in. Returns `202 {run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `coverage.diff`. `HTTP 404` for an unknown target or run, `409` for a continued run or one recorded in another workspace, `501` for a non-agent run. Local-only.",
+            "Replay a recorded agent run on its coverage target, appending a new run to the target.\n\n`target` is the target id, `run` the full id of the run to replay (from `coverage.runs`); `ws_id` picks the workspace. Optional `expected_manifest_fingerprint` from `coverage.rerun_preview` rejects a changed manifest with `409` before dispatch. The run's agent, prompt, permission mode and launch skills start again, detached, in the workspace it was recorded in. Returns `202 {run_id, host_id, agent, target_id, ws_id, replays}` once started; diff the two with `coverage.diff`. `HTTP 404` for an unknown target or run, `409` for a continued run or one recorded in another workspace, `501` for a non-agent run. Local-only.",
         )
         .query::<coverage::RerunQuery>()
         .body::<coverage::RerunBody>()

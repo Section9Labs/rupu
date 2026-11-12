@@ -181,6 +181,7 @@ fn roundtrip_message_and_injected_with_a_pinned_wire_shape() {
         from_codename: Some("cobalt-harbor/lynx#1".into()),
         to: Some("role:recon".into()),
         kind: "direct".into(),
+        post_kind: None,
         body: "hi".into(),
         urgent: false,
         via: MessageVia::Tool,
@@ -207,4 +208,19 @@ fn roundtrip_message_and_injected_with_a_pinned_wire_shape() {
         serde_json::to_value(&injected).unwrap()["type"],
         serde_json::json!("injected")
     );
+}
+
+#[test]
+fn message_post_subtype_is_additive_and_legacy_absence_stays_absent() {
+    let legacy = serde_json::json!({"type":"message","data":{
+        "id":"msg_post","direction":"received","from":"operator","to":"reader",
+        "kind":"post","body":"Please review","via":"injected"
+    }});
+    let decoded: Event = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+    let mut current = legacy;
+    current["data"]["post_kind"] = serde_json::json!("question");
+    let decoded: Event = serde_json::from_value(current.clone()).unwrap();
+    assert_roundtrip(&decoded);
+    assert_eq!(serde_json::to_value(decoded).unwrap(), current);
 }

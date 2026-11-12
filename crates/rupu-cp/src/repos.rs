@@ -1,6 +1,7 @@
 //! `RepoLister` port — lists repos from the logged-in SCM accounts. rupu-cp
 //! defines it; rupu-cli's `cp serve` provides the registry-backed adapter.
 use serde::Serialize;
+pub mod review_pages;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RepoEntry {
@@ -20,17 +21,88 @@ pub struct RepoEntry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepoListError {
+    #[error("review selection changed; refresh repository context")]
+    SelectionChanged,
     #[error("failed to list repos: {0}")]
     Backend(String),
 }
 
+/// Captured read selection, never an account override. Resolution still follows
+/// the owning checkout's configured rules before equality is checked.
+pub struct ReviewSelection {
+    pub account: String,
+    pub branch: String,
+    pub head: String,
+    pub include_diff: bool,
+}
+
 #[async_trait::async_trait]
 pub trait RepoLister: Send + Sync {
+    /// Capture current credentials/configuration once for this request. The
+    /// returned adapter must retain its identity while inputs are unchanged:
+    /// issue cursors and prepared writes are bound to that identity. `None`
+    /// means this adapter is already an immutable snapshot.
+    async fn snapshot(&self) -> Result<Option<std::sync::Arc<dyn RepoLister>>, RepoListError> {
+        Ok(None)
+    }
+    fn forge_writer(&self) -> Option<&dyn crate::forge_writer::ForgeWriter> {
+        None
+    }
+    fn issue_reader(&self) -> Option<&dyn crate::issue_reader::IssueReader> {
+        None
+    }
     async fn list(&self) -> Result<Vec<RepoEntry>, RepoListError>;
+
+    fn supports_review_pages(&self) -> bool {
+        false
+    }
+
+    async fn review_page_identity(
+        &self,
+        _repo: &rupu_scm::RepoRef,
+        _cwd: &std::path::Path,
+        _origin: &str,
+        _number: u32,
+        _selection: &ReviewSelection,
+    ) -> Result<review_pages::Identity, RepoListError> {
+        Err(RepoListError::Backend(
+            "review continuation unavailable".into(),
+        ))
+    }
+
+    // Keep owner, selection and continuation preconditions explicit at this boundary.
+    #[allow(clippy::too_many_arguments)]
+    async fn review_page(
+        &self,
+        _repo: &rupu_scm::RepoRef,
+        _cwd: &std::path::Path,
+        _origin: &str,
+        _number: u32,
+        _selection: &ReviewSelection,
+        _expected: Option<&review_pages::Identity>,
+        _request: &review_pages::Request,
+    ) -> Result<review_pages::Page, RepoListError> {
+        Err(RepoListError::Backend(
+            "review continuation unavailable".into(),
+        ))
+    }
 
     /// Explicit read-only query through this CP's owning account-selection rules.
     /// Kept optional for older/read-only adapters; never infer authorization from
     /// the presence of account configuration or a local checkout.
+    async fn review_detail(
+        &self,
+        _repo: &rupu_scm::RepoRef,
+        _cwd: &std::path::Path,
+        _origin_host: &str,
+        _number: u32,
+        _selection: &ReviewSelection,
+    ) -> Result<serde_json::Value, RepoListError> {
+        Err(RepoListError::Backend(
+            "review detail adapter unavailable".into(),
+        ))
+    }
+
     async fn reviews(
         &self,
         _repo: &rupu_scm::RepoRef,
@@ -40,4 +112,19 @@ pub trait RepoLister: Send + Sync {
     ) -> Result<serde_json::Value, RepoListError> {
         Err(RepoListError::Backend("review adapter unavailable".into()))
     }
+}
+
+/// Pin one immutable SCM adapter for a whole request, including its synchronous
+/// account/capability checks. Never swap a connector halfway through a read or
+/// mutation preflight, and never fall back to a stale adapter on refresh error.
+pub async fn snapshot_state(
+    state: &crate::state::AppState,
+) -> Result<crate::state::AppState, RepoListError> {
+    let mut state = state.clone();
+    if let Some(port) = &state.repos {
+        if let Some(current) = port.snapshot().await? {
+            state.repos = Some(current);
+        }
+    }
+    Ok(state)
 }
