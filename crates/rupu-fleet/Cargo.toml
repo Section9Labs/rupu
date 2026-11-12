@@ -18,6 +18,7 @@ rustix = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
