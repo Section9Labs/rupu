@@ -373,9 +373,9 @@ fn excluded_is_exactly_the_spec_list() {
 
 #[test]
 fn the_operator_tool_count_is_pinned() {
-    assert_eq!(ops().len(), 205 + if cfg!(unix) { 6 } else { 0 });
+    assert_eq!(ops().len(), 210 + if cfg!(unix) { 6 } else { 0 });
     assert_eq!(
         pinned_tool_names().len(),
-        205 + if cfg!(unix) { 6 } else { 0 }
+        210 + if cfg!(unix) { 6 } else { 0 }
     );
 }
