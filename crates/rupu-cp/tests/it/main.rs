@@ -74,5 +74,6 @@ mod source;
 mod sse;
 mod supplied_identity;
 mod transcript;
+mod transcript_availability;
 mod usage;
 mod workers;

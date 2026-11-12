@@ -157,6 +157,62 @@ describe('TranscriptPanel load errors', () => {
     expect(await screen.findByText('Failed to load transcript')).toBeInTheDocument();
     expect(screen.getByText('path is outside the allowed roots')).toBeInTheDocument();
   });
+
+  const missing = 'recorded transcript is not available yet';
+  const streamed: TranscriptEvent = {
+    type: 'assistant_message', data: { content: 'The recording is now streaming.' },
+  };
+
+  function mountPending() {
+    let rejectSnapshot: (error: ApiError) => void = () => {};
+    vi.spyOn(api, 'getTranscript').mockImplementation(() => new Promise((_resolve, reject) => {
+      rejectSnapshot = reject;
+    }));
+    let onEvent: (event: TranscriptEvent, id?: number) => void = () => {};
+    vi.spyOn(api, 'subscribeTranscript').mockImplementation((_path, callback) => {
+      onEvent = callback;
+      return () => {};
+    });
+    render(<MemoryRouter><TranscriptPanel path="/t/run-1.jsonl" live /></MemoryRouter>);
+    return {
+      emit: () => act(() => onEvent(streamed, 1)),
+      fail: (status: number, reason: string) => act(async () => {
+        rejectSnapshot(new ApiError(status, reason, JSON.stringify({ error: reason })));
+      }),
+    };
+  }
+
+  it('keeps missing history explicit until a valid live event arrives', async () => {
+    const panel = mountPending();
+    await panel.fail(404, missing);
+    expect(screen.getByText(missing)).toBeInTheDocument();
+    expect(screen.queryByText('No transcript events yet.')).not.toBeInTheDocument();
+    panel.emit();
+    expect(await screen.findByText('The recording is now streaming.')).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load transcript')).not.toBeInTheDocument();
+  });
+
+  it('does not let a late missing snapshot hide already received live events', async () => {
+    const panel = mountPending();
+    panel.emit();
+    await panel.fail(404, missing);
+    expect(await screen.findByText('The recording is now streaming.')).toBeInTheDocument();
+    expect(screen.queryByText('Failed to load transcript')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [401, 'unauthorized'],
+    [400, 'path is outside the allowed roots'],
+    [404, 'host missing not found'],
+    [500, 'cannot read transcript'],
+  ])('preserves unrelated HTTP %s failures even when SSE supplies events', async (status, reason) => {
+    const panel = mountPending();
+    await panel.fail(Number(status), String(reason));
+    panel.emit();
+    expect(screen.getByText('Failed to load transcript')).toBeInTheDocument();
+    expect(screen.getByText(String(reason))).toBeInTheDocument();
+    expect(screen.queryByText('The recording is now streaming.')).not.toBeInTheDocument();
+  });
 });
 
 describe('TranscriptPanel remote reads', () => {

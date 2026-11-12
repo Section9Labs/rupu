@@ -9,7 +9,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
-import { api, apiErrorMessage } from '../lib/api';
+import { api, ApiError, apiErrorMessage } from '../lib/api';
 import type { TranscriptEvent } from '../lib/transcript';
 import { cn } from '../lib/cn';
 import { formatDuration } from '../lib/duration';
@@ -24,7 +24,7 @@ import { filterCounts } from './transcript/eventKind';
 import type { FilterKind } from './transcript/eventKind';
 import { AgentName } from './codename/AgentName';
 
-type LoadState = 'loading' | 'ready' | 'error';
+type LoadState = 'loading' | 'ready' | 'unavailable' | 'error';
 
 /**
  * Combine the REST snapshot with the live SSE stream into one event list.
@@ -154,8 +154,13 @@ export default function TranscriptPanel({
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        setErrorMsg(apiErrorMessage(err));
-        setState('error');
+        const message = apiErrorMessage(err);
+        setErrorMsg(message);
+        // A fresh turn may not have created its file when REST reads it.
+        // Only this specific absence can be superseded by real SSE events;
+        // authorization, host and other read failures must remain visible.
+        setState(err instanceof ApiError && err.status === 404 &&
+          message === 'recorded transcript is not available yet' ? 'unavailable' : 'error');
       });
 
     return () => {
@@ -268,7 +273,7 @@ export default function TranscriptPanel({
     );
   }
 
-  if (state === 'error') {
+  if (state === 'error' || (state === 'unavailable' && stream.length === 0)) {
     return (
       <div className="m-3 rounded-lg border border-err/30 bg-err-bg p-4 text-sm text-err">
         <div className="flex items-center gap-1.5 font-medium">
