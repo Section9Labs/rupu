@@ -269,7 +269,11 @@ impl Broker {
         let guard = self.storage_gate.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
-            operation(&mut Store::open(&root)?)
+            // Drop the store (and its file lease) before releasing the gate.
+            // A temporary in the tail expression outlives local variables,
+            // allowing the next job to encounter our still-held file lease.
+            let mut store = Store::open(&root)?;
+            operation(&mut store)
         })
         .await
         .map_err(|_| store::Error::Invalid)?
@@ -823,4 +827,26 @@ async fn cancelled_observer_does_not_release_running_storage_job() {
     })
     .await
     .unwrap();
+}
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_storage_jobs_release_the_file_lease_before_the_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let broker = Broker::open(root.path().into()).unwrap();
+    let mut jobs = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        let broker = broker.clone();
+        jobs.spawn(async move {
+            for _ in 0..4 {
+                broker.storage(|_| Ok(())).await?;
+            }
+            Ok::<_, store::Error>(())
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        result
+            .unwrap()
+            .expect("serialized jobs must not contend on their own file lease");
+    }
 }
