@@ -222,8 +222,8 @@ fn current_record(dir: &File, expected: &RunRecord) -> io::Result<RunRecord> {
 
 struct State {
     snapshot: ExecutionObservation,
-    owner_lock: Option<File>,
-    generation_lock: Option<File>,
+    owner_lock: Option<disk::OwnedLock>,
+    generation_lock: Option<disk::OwnedLock>,
     active: bool,
 }
 struct Inner {
@@ -528,7 +528,7 @@ pub fn revoke_for_owner(run_dir: &Path, record: &RunRecord, _reason: &str) -> io
 #[cfg(unix)]
 pub(crate) struct RetryGuard {
     dir: File,
-    _mutation: File,
+    _mutation: disk::OwnedLock,
 }
 #[cfg(unix)]
 impl RetryGuard {
@@ -546,7 +546,7 @@ impl RetryGuard {
             .ok_or_else(|| invalid("run owner missing"))?;
         serde_json::from_slice(&data).map_err(|_| invalid("run owner malformed"))
     }
-    pub(crate) fn idle_owner(&self, record: &RunRecord) -> io::Result<File> {
+    pub(crate) fn idle_owner(&self, record: &RunRecord) -> io::Result<disk::OwnedLock> {
         let idle = disk::lock(&self.dir, OWNER_LOCK_FILE, true)?;
         let mut bytes = 0;
         if let Some(data) = disk::read(&self.dir, CANCELLATION_FILE, 4096, &mut bytes)? {

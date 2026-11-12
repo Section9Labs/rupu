@@ -8,6 +8,23 @@ use std::{
 #[cfg(unix)]
 use rustix::fs::{self, AtFlags, FileType, FlockOperation, Mode, OFlags};
 
+/// An exclusively acquired lock, separate from anchored directory handles.
+/// Explicitly unlock on normal drop: a fork or duplicated descriptor can keep
+/// the open-file description alive after this owner's File has closed.
+/// Abrupt termination cannot run Drop; CLOEXEC still bounds inheritance across
+/// exec, but a retained duplicate must close before crash release is complete.
+#[derive(Debug)]
+pub(crate) struct OwnedLock {
+    file: File,
+}
+
+impl Drop for OwnedLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = fs::flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn open_run_directory(path: &Path) -> io::Result<File> {
     use std::path::Component;
@@ -70,16 +87,17 @@ fn verify(dir: &File, name: &str, file: &File, empty: bool) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn lock(dir: &File, name: &str, create: bool) -> io::Result<File> {
+pub(super) fn lock(dir: &File, name: &str, create: bool) -> io::Result<OwnedLock> {
     let file = regular(dir, name, create, false)?;
     verify(dir, name, &file, true)?;
     fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
-    verify(dir, name, &file, true)?;
-    Ok(file)
+    let owned = OwnedLock { file };
+    verify(dir, name, &owned.file, true)?;
+    Ok(owned)
 }
 
 /// Producers tolerate short observation reads, but never continue unlocked.
-pub(super) fn mutation_lock(dir: &File, create: bool) -> io::Result<File> {
+pub(super) fn mutation_lock(dir: &File, create: bool) -> io::Result<OwnedLock> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         match lock(dir, super::MUTATION_LOCK_FILE, create) {
@@ -96,28 +114,34 @@ pub(super) fn mutation_lock(dir: &File, create: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-pub(super) fn new_lock(dir: &File, name: &str) -> io::Result<File> {
+pub(super) fn new_lock(dir: &File, name: &str) -> io::Result<OwnedLock> {
     let file = regular(dir, name, true, true)?;
     fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
-    verify(dir, name, &file, true)?;
-    Ok(file)
+    let owned = OwnedLock { file };
+    verify(dir, name, &owned.file, true)?;
+    Ok(owned)
 }
 
 #[cfg(unix)]
 pub(super) fn is_locked(dir: &File, name: &str) -> io::Result<bool> {
     let file = regular(dir, name, false, false)?;
     verify(dir, name, &file, true)?;
-    let locked = match fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => false,
+    match fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let owned = OwnedLock { file };
+            verify(dir, name, &owned.file, true)?;
+            Ok(false)
+        }
         Err(error)
             if error == rustix::io::Errno::WOULDBLOCK || error == rustix::io::Errno::AGAIN =>
         {
-            true
+            // This descriptor never acquired the lock. Closing it must not
+            // call Unlock against the owner's open-file description.
+            verify(dir, name, &file, true)?;
+            Ok(true)
         }
-        Err(error) => return Err(error.into()),
-    };
-    verify(dir, name, &file, true)?;
-    Ok(locked)
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(unix)]
@@ -236,11 +260,11 @@ pub(super) fn open_run_directory(_: &Path) -> io::Result<File> {
     unsupported()
 }
 #[cfg(not(unix))]
-pub(super) fn lock(_: &File, _: &str, _: bool) -> io::Result<File> {
+pub(super) fn lock(_: &File, _: &str, _: bool) -> io::Result<OwnedLock> {
     unsupported()
 }
 #[cfg(not(unix))]
-pub(super) fn new_lock(_: &File, _: &str) -> io::Result<File> {
+pub(super) fn new_lock(_: &File, _: &str) -> io::Result<OwnedLock> {
     unsupported()
 }
 #[cfg(not(unix))]
@@ -262,4 +286,57 @@ pub(super) fn read(_: &File, _: &str, _: usize, _: &mut usize) -> io::Result<Opt
 #[cfg(not(unix))]
 pub(super) fn atomic_write(_: &File, _: &str, _: &[u8]) -> io::Result<()> {
     unsupported()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_locks_unlock_with_duplicates_and_old_close_preserves_new_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = File::open(temp.path()).unwrap();
+        for name in [
+            super::super::OWNER_LOCK_FILE,
+            super::super::MUTATION_LOCK_FILE,
+            "execution-generation-duplicate-fixture.lock",
+        ] {
+            let owned = if name == super::super::MUTATION_LOCK_FILE {
+                mutation_lock(&dir, true).unwrap()
+            } else if name == super::super::OWNER_LOCK_FILE {
+                lock(&dir, name, true).unwrap()
+            } else {
+                new_lock(&dir, name).unwrap()
+            };
+            let retained_duplicate = owned.file.try_clone().unwrap();
+            assert!(is_locked(&dir, name).unwrap());
+            drop(owned);
+            // The duplicate is still open. Only explicit Unlock permits a
+            // new owner to acquire this same inode now.
+            let next = lock(&dir, name, false).unwrap();
+            drop(retained_duplicate);
+            assert!(is_locked(&dir, name).unwrap());
+            assert!(lock(&dir, name, false).is_err());
+            drop(next);
+            assert!(!is_locked(&dir, name).unwrap());
+            let _after_probe = lock(&dir, name, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn unsuccessful_lock_and_probe_never_unlock_the_incumbent() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = File::open(temp.path()).unwrap();
+        let name = super::super::OWNER_LOCK_FILE;
+        let owned = lock(&dir, name, true).unwrap();
+        for _ in 0..3 {
+            assert!(is_locked(&dir, name).unwrap());
+            assert!(
+                matches!(lock(&dir, name, false), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        }
+        assert!(is_locked(&dir, name).unwrap());
+        drop(owned);
+        assert!(!is_locked(&dir, name).unwrap());
+    }
 }
