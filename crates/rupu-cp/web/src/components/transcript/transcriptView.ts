@@ -650,6 +650,9 @@ export function buildTranscriptView(events: TranscriptEvent[]): TranscriptView {
       }
 
       case 'notice': {
+        // Runtime provenance for exact Queue links, retained in the raw event
+        // stream. It is not a conversational update or an operator warning.
+        if (data.kind === 'work_queue_execution') break;
         ensureTurn().blocks.push({
           kind: 'notice',
           noticeKind: asString(data.kind) ?? '',

@@ -2046,10 +2046,20 @@ pub async fn run_agent_full(opts: AgentRunOpts) -> RunExit {
     }
 }
 
+struct QueueExecutionGuard(Option<Arc<dyn rupu_tools::work_queue::WorkQueuePort>>);
+impl Drop for QueueExecutionGuard {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.0 {
+            queue.finish_execution();
+        }
+    }
+}
+
 async fn run_agent_inner(
     opts: &mut Run,
     messages: &mut Vec<Message>,
 ) -> Result<RunResult, RunError> {
+    let _queue_execution = QueueExecutionGuard(opts.tool_context.services.work_queue.clone());
     // Truncate/create a fresh, empty transcript, then hold an
     // APPEND-mode writer for the rest of the run. This is deliberate,
     // not equivalent-by-accident to `JsonlWriter::create`: the
@@ -2212,6 +2222,17 @@ async fn run_agent_inner(
         launch_preload_skills: opts.id.launch_preload_skills.clone(),
         launch_args: opts.id.launch_args.clone(),
     })?;
+    if let Some(queue) = &opts.tool_context.services.work_queue {
+        writer.write(&Event::Notice {
+            kind: "work_queue_execution".into(),
+            message: serde_json::json!(queue.actor()).to_string(),
+        })?;
+    } else if let Some(reason) = &opts.tool_context.services.work_queue_unavailable_reason {
+        writer.write(&Event::Notice {
+            kind: "work_queue_unavailable".into(),
+            message: reason.clone(),
+        })?;
+    }
     // One notice per run, before the first turn: what the run resolved, and
     // where each number came from (spec 2026-09-30 §6.6).
     writer.write(&Event::Notice {
@@ -3362,6 +3383,8 @@ async fn run_agent_inner(
                 // same turn never inherits a stale id.
                 let mut call_ctx = opts.tool_context.clone();
                 call_ctx.call = rupu_tools::CallContext {
+                    turn_index: Some(turn_idx),
+                    call_sequence: Some(call_sequence as u64),
                     tool_call_id: Some(call_id.clone()),
                     spawn_ceiling,
                     called_as: Some(tool_name.clone()),

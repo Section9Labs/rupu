@@ -3369,6 +3369,7 @@ pool:
             kind: "flow_lead".into(),
             parent_run_id: None,
             pid: None,
+            work_execution_id: None,
         })
         .unwrap();
         bus

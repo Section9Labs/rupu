@@ -318,6 +318,10 @@ pub struct ToolServices {
     /// never messages and launches no child never joins it, so it costs
     /// nothing.
     pub message_space: Option<Arc<rupu_fleet::Bus>>,
+    /// Exact owner and execution bound by the runtime; never operator MCP.
+    pub work_queue: Option<Arc<dyn crate::work_queue::WorkQueuePort>>,
+    /// Trusted availability reason for unsupported legacy/runtime placements.
+    pub work_queue_unavailable_reason: Option<String>,
     /// A flow's live goals, coverage and budget, behind `goal.*` /
     /// `budget.status`. Set by an agentiflow for its lead.
     pub run_status: Option<Arc<dyn crate::ports::RunStatus>>,
@@ -367,6 +371,9 @@ impl ToolServices {
         }
         if self.message_bus.is_some() {
             s.insert(Service::MessageBus);
+        }
+        if self.message_bus.is_some() && self.work_queue.is_some() {
+            s.insert(Service::WorkQueue);
         }
         if self.run_status.is_some() {
             s.insert(Service::RunStatus);
@@ -423,6 +430,7 @@ impl std::fmt::Debug for ToolServices {
             .field("prompter", &self.prompter.as_ref().map(|_| "<prompter>"))
             .field("message_bus", &self.message_bus)
             .field("message_space", &self.message_space)
+            .field("work_queue", &self.work_queue.as_ref().map(|_| "<work queue>"))
             .field(
                 "run_status",
                 &self.run_status.as_ref().map(|_| "<run status>"),
@@ -440,6 +448,9 @@ impl std::fmt::Debug for ToolServices {
 /// What the agent loop sets for one tool call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallContext {
+    /// Runtime coordinates, independent of potentially repeated provider call IDs.
+    pub turn_index: Option<u32>,
+    pub call_sequence: Option<u64>,
     /// The model's tool-call id for the invocation in flight — attributes a
     /// bash call's captured connections to that call.
     pub tool_call_id: Option<String>,

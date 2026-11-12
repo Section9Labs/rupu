@@ -643,6 +643,7 @@ mod tests {
             codename: None,
             agent: participant.into(),
             run_id: format!("run_{participant}"),
+            work_execution_id: None,
             step_id: None,
             unit: None,
             kind: "flow_lead".into(),

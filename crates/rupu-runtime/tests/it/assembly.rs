@@ -796,8 +796,14 @@ async fn every_run_joins_its_space_and_takes_part_unless_opted_out() {
     joined(&run, "run_star");
 
     let default = agent(&home, "provider: anthropic\nmodel: claude-sonnet-4-6");
+    // The standalone launcher creates its exact owner before assembly and
+    // selects a supported recording root. Exercise that production layout so
+    // the durable Queue grant is tested alongside legacy messaging defaults.
+    std::fs::create_dir_all(home.runs().join("run_default")).unwrap();
+    let mut default_launch = launch(&home, default, Origin::Standalone, "run_default");
+    default_launch.transcript_path = home.global().join("transcripts/run_default.jsonl");
     let run = assembler
-        .assemble(launch(&home, default, Origin::Standalone, "run_default"))
+        .assemble(default_launch)
         .await
         .unwrap();
     assert_eq!(tools(&run), (true, true, true), "no `tools:` takes part too");

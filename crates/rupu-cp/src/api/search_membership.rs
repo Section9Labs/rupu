@@ -66,6 +66,24 @@ fn add(
     Ok(())
 }
 pub(crate) fn capture(owner: Owner, id: &str, cancel: &AtomicBool) -> ApiResult<Captured> {
+    capture_inner(owner, id, cancel, false)
+}
+
+/// Queue-only proof includes starts recorded before a workflow step finishes.
+/// Legacy children/search pages retain their existing membership semantics.
+pub(crate) fn capture_work_owner(
+    owner: Owner,
+    id: &str,
+    cancel: &AtomicBool,
+) -> ApiResult<Captured> {
+    capture_inner(owner, id, cancel, true)
+}
+fn capture_inner(
+    owner: Owner,
+    id: &str,
+    cancel: &AtomicBool,
+    include_attempts: bool,
+) -> ApiResult<Captured> {
     cancelled(cancel)?;
     valid_id(id)?;
     let stores = child_stores(&owner)?;
@@ -95,6 +113,61 @@ pub(crate) fn capture(owner: Owner, id: &str, cancel: &AtomicBool) -> ApiResult<
             select_child_store(&mut reader, &stores, &run)?
         };
         let directory = reader.root.join(&run);
+        let mut exact_attempts = BTreeMap::<String, serde_json::Value>::new();
+        if include_attempts && !(agentiflow && index == 0) {
+            if let Some(text) = reader.lines(&directory.join("attempts.jsonl"))? {
+                for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                    cancelled(cancel)?;
+                    let mut attempt = match serde_json::from_str::<
+                        rupu_orchestrator::runs::AttemptRecord,
+                    >(line)
+                    {
+                        Ok(row)
+                            if row.v == 1
+                                && !row.step_id.is_empty()
+                                && row.step_id.len() <= 256
+                                && !row.step_id.contains('\0') =>
+                        {
+                            row
+                        }
+                        _ => {
+                            reader.evidence.malformed_rows += 1;
+                            continue;
+                        }
+                    };
+                    let local = attempt.host.as_deref().is_none_or(|h| h == "local");
+                    if local {
+                        attempt.host = None;
+                    }
+                    let identity = serde_json::to_value(&attempt)
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
+                    if exact_attempts
+                        .insert(attempt.agent_run_id.clone(), identity.clone())
+                        .is_some_and(|prior| prior != identity)
+                    {
+                        return Err(ApiError::conflict(
+                            "Queue attempt membership has conflicting execution identities",
+                        ));
+                    }
+                    if !local {
+                        remote += 1;
+                        continue;
+                    }
+                    add(
+                        &mut members,
+                        &mut seen,
+                        Member {
+                            run_id: attempt.agent_run_id,
+                            parent: Some(index),
+                            source: "workflow_attempt",
+                            lead_round: None,
+                            path: Some(attempt.transcript_path),
+                        },
+                        &mut weight,
+                    )?;
+                }
+            }
+        }
         // Step result membership includes nested workflows and fan-out units;
         // explicit remote records never resolve against this machine's paths.
         if let Some(text) = if agentiflow && index == 0 {
@@ -117,6 +190,15 @@ pub(crate) fn capture(owner: Owner, id: &str, cancel: &AtomicBool) -> ApiResult<
                         for (run_id, path) in candidates {
                             if run_id.is_empty() {
                                 continue;
+                            }
+                            if let Some(attempt) = exact_attempts.get(&run_id) {
+                                if attempt["step_id"].as_str() != Some(record.step_id.as_str())
+                                    || attempt["host"].is_null() != local
+                                {
+                                    return Err(ApiError::conflict(
+                                        "Queue step result contradicts its recorded attempt",
+                                    ));
+                                }
                             }
                             if !local {
                                 remote += 1;

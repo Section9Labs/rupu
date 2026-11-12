@@ -11,6 +11,7 @@
 //! `seen` line says otherwise), never a received message the log lacks.
 
 mod operator_board;
+mod work_queue;
 pub use operator_board::OperatorBoardWrite;
 
 use crate::address::{self, Address};
@@ -265,6 +266,7 @@ impl Bus {
             &ParticipantEvent::Left {
                 address: self.participant.clone(),
                 run_id: member.run_id,
+                work_execution_id: member.work_execution_id,
                 status: status.to_string(),
                 at: now(),
             },
@@ -294,6 +296,7 @@ impl Bus {
                 &ParticipantEvent::Left {
                     address: p.address.clone(),
                     run_id: p.member.run_id.clone(),
+                    work_execution_id: p.member.work_execution_id.clone(),
                     status: status.to_string(),
                     at: at.clone(),
                 },
