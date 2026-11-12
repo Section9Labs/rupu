@@ -80,6 +80,7 @@ pub(super) struct CapturedLedger {
     pub raw_records: Vec<serde_json::Value>,
 }
 impl CapturedLedger {
+    #[cfg(test)]
     pub fn paths(&self) -> CoveragePaths {
         CoveragePaths::new(&self.workspace_path, &self.target_id)
     }

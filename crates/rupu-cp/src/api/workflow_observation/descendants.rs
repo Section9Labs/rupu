@@ -383,17 +383,6 @@ fn ledger_match(bytes: &[u8], hop: &Hop, handle: &str) -> ApiResult<()> {
     }
     Ok(())
 }
-/// Called only with a MAC-authenticated or freshly cache-selected sealed Hop.
-pub(super) fn validate_edge(
-    s: &AppState,
-    a: &Authority,
-    hop: &Hop,
-    cancel: &CancellationToken,
-) -> ApiResult<()> {
-    let scope = scope(s, a)?;
-    validate_edge_scoped(&scope, hop, cancel)?;
-    scope.verify(s, a)
-}
 pub(super) fn validate_edge_scoped(
     scope: &DirectoryScope,
     hop: &Hop,

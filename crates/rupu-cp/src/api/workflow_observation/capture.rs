@@ -249,6 +249,7 @@ impl Builder {
 pub(super) fn capture(s: &AppState, id: &str, ws: &str) -> ApiResult<Captured> {
     capture_window(s, id, ws, Window::Prefix)
 }
+#[cfg(test)]
 pub(super) fn capture_window(
     s: &AppState,
     id: &str,

@@ -385,7 +385,7 @@ async fn cache_entry_bound_evicts_without_recapturing_on_continuation() {
         .unwrap()
         .0;
     for _ in 0..4 {
-        page(State(s.clone()), Path(FLOW.into()), Query(q(None, None, 1)))
+        let _ = page(State(s.clone()), Path(FLOW.into()), Query(q(None, None, 1)))
             .await
             .unwrap();
     }

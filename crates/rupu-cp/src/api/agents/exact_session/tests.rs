@@ -249,7 +249,7 @@ async fn exact_conversation_preserves_unset_empty_and_custom_declarations() {
         v.tools = selected.clone();
         v.skills = vec!["global:review".into()];
         v.mcp_tools = None;
-        start(State(s), Json(v)).await.unwrap();
+        let _ = start(State(s), Json(v)).await.unwrap();
         let calls = spy.0.lock().unwrap();
         assert_eq!(calls[0].0.tools, selected);
         assert!(calls[0].0.mcp_tools.is_none());
@@ -267,7 +267,7 @@ async fn exact_conversation_preserves_optional_ceiling_and_rejects_unknown_names
             .binding;
         let mut request = body(binding);
         request.tool_ceiling = ceiling.clone();
-        start(State(s), Json(request)).await.unwrap();
+        let _ = start(State(s), Json(request)).await.unwrap();
         assert_eq!(spy.0.lock().unwrap()[0].0.tool_ceiling, ceiling);
     }
     for names in [

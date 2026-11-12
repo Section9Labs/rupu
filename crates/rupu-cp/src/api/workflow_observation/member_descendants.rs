@@ -1,6 +1,5 @@
 //! Bounded sealed ancestry proof. Catalog rows never become caller path authority.
 use super::*;
-use std::io::Read as _;
 use tokio_util::sync::CancellationToken;
 const MAX_DEPTH: usize = 16;
 const MAX_PROLOGUE: usize = 64 * 1024;

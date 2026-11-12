@@ -133,7 +133,7 @@ async fn partial_scope_and_liveness_override_never_fall_back_to_legacy_delete() 
 #[tokio::test]
 async fn legacy_delete_and_archive_remain_legacy_but_archive_rejects_exact_claim() {
     let (_t, s, calls) = fixture(false);
-    super::super::delete_transcript(
+    let _ = super::super::delete_transcript(
         State(s.clone()),
         Path("run_exact".into()),
         Query(TranscriptHostQuery::default()),

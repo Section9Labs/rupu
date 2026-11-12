@@ -285,7 +285,7 @@ mod write_file_tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("agent.md");
         std::fs::write(&path, "keep unreadable content").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
         let result = write_file(&path, "replacement", false);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(result.unwrap(), FileAction::Skipped);
