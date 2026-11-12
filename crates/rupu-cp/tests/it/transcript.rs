@@ -78,11 +78,10 @@ fn validator_accepts_in_root_jsonl_rejects_escape() {
     assert!(v(&dotdot, &roots).is_err());
 }
 
-/// A valid in-root transcript that does not exist yet → 200 with empty events
-/// (not an error), so the UI can open a freshly-sent turn before its worker has
-/// written the `.jsonl`.
+/// A missing recording is unavailable, not evidence of an empty transcript.
+/// Live clients can still subscribe before the worker creates its `.jsonl`.
 #[tokio::test]
-async fn get_transcript_empty_when_file_absent() {
+async fn get_transcript_unavailable_when_file_absent() {
     use axum::http::StatusCode;
 
     let root = tempfile::tempdir().unwrap();
@@ -105,9 +104,10 @@ async fn get_transcript_empty_when_file_absent() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["events"].as_array().unwrap().len(), 0);
+    assert_eq!(body["error"], "recorded transcript is not available yet");
+    assert!(body.get("events").is_none());
 }
 
 #[tokio::test]

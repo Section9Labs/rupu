@@ -1256,11 +1256,13 @@ pub(crate) async fn read_transcript_file(
 /// The blocking body of [`read_transcript_file`], once its path checks
 /// passed.
 fn read_transcript_blocking(p: &Path) -> Result<serde_json::Value, HostConnectorError> {
-    if !p.exists() {
-        return Ok(serde_json::json!({ "events": [], "summary": null }));
-    }
     let events: Vec<rupu_transcript::Event> = rupu_transcript::JsonlReader::iter(p)
-        .map_err(|e| HostConnectorError::Invalid(e.to_string()))?
+        .map_err(|e| match e {
+            rupu_transcript::ReadError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+                HostConnectorError::NotFound("recorded transcript is not available yet".into())
+            }
+            other => HostConnectorError::Invalid(other.to_string()),
+        })?
         .filter_map(Result::ok)
         .collect();
     let summary = rupu_transcript::JsonlReader::summary(p).ok();

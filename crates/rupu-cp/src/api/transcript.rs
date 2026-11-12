@@ -182,13 +182,15 @@ fn reads_unmapped_path_locally(raw: &Path, mapped: &Path, serves_local_mirror: b
 }
 
 /// Read a local transcript file into the `{events, summary, unparsed}` page.
-/// A missing file is an empty page (a freshly-sent turn's transcript).
+/// An absent recording is unavailable, not evidence of an empty transcript.
+/// The live-tail endpoint still waits for a freshly-sent turn's file.
 fn read_local_page(path: &Path) -> ApiResult<serde_json::Value> {
-    if !path.exists() {
-        return Ok(serde_json::json!({ "events": [], "summary": null }));
-    }
-    let (events, unparsed) =
-        read_events_counting_unparsed(path).map_err(|e| ApiError::internal(e.to_string()))?;
+    let (events, unparsed) = read_events_counting_unparsed(path).map_err(|e| match e {
+        rupu_transcript::ReadError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound => {
+            ApiError::not_found("recorded transcript is not available yet")
+        }
+        other => ApiError::internal(other.to_string()),
+    })?;
     let summary = rupu_transcript::JsonlReader::summary(path).ok();
     Ok(serde_json::json!({ "events": events, "summary": summary, "unparsed": unparsed }))
 }
@@ -309,7 +311,7 @@ pub fn routes() -> Router<AppState> {
 /// `GET /api/transcript?path=<path>[&host=<id>&run=<id>]`
 ///
 /// Without `?host=` (or `?host=local`): validate the path against local
-/// allowed roots and read from disk (unchanged behaviour).
+/// allowed roots and read from disk (404 when the recording is absent).
 ///
 /// With `?host=<remote-id>`: read through the connector's lazy transcript
 /// cache (spec §3.3). A validated local file wins outright; otherwise a
