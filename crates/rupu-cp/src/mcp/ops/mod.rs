@@ -80,6 +80,12 @@ pub(crate) fn op(
 }
 
 impl OpSpec {
+    /// Repeating the same arguments replays a durable receipt without another effect.
+    pub(crate) fn idempotent(mut self) -> Self {
+        self.hints.idempotent = true;
+        self
+    }
+
     /// The handler's query struct.
     pub(crate) fn query<T: schemars::JsonSchema>(mut self) -> Self {
         self.query = schema::<T>;

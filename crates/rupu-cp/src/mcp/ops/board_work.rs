@@ -16,9 +16,9 @@ pub(super) fn ops() -> Vec<OpSpec> {
             .query::<board_work::TimelineQuery>(),
         op("board.work.post", Method::POST, "/api/{root}/:id/board/work",
             "Post durable Board work as the authenticated operator.\n\nSupply owner_token, request_id, expected_queue_id (null only for an uninitialized queue), expected_revision and operation {action:post,title,instructions}. Expected revision is the queue revision. Identical retries use the same request ID; retain it for uncertain outcomes. The receipt reports execution_effect:none: posting does not launch or assign a worker.")
-            .query::<board_work::HostQuery>().body::<board_work::PostRequest>(),
+            .query::<board_work::HostQuery>().body::<board_work::PostRequest>().idempotent(),
         op("board.work.transitions", Method::POST, "/api/{root}/:id/board/work/:work_id/transitions",
             "Cancel or requeue Board work as the authenticated operator.\n\nSupply owner_token, request_id, expected_queue_id, expected_revision and operation {action:cancel|requeue,reason}. Expected revision is the item revision. Neither action stops an executor; prior_attempt_may_still_run preserves that uncertainty. Requeue keeps prior attempts and results. Operator tools cannot claim, choose an executor or submit a worker result.")
-            .query::<board_work::HostQuery>().body::<board_work::TransitionRequest>(),
+            .query::<board_work::HostQuery>().body::<board_work::TransitionRequest>().idempotent(),
     ]
 }

@@ -390,6 +390,8 @@ fn mcp_schema_exposes_operator_actions_only() {
         assert!(!schema.contains(forbidden), "{schema}");
     }
     let post = work.iter().find(|t| t.name == "board.work.post").unwrap();
+    assert!(post.hints.idempotent && !post.hints.read_only);
+    assert!(transitions.hints.idempotent && !transitions.hints.read_only);
     for required in [
         "id",
         "owner_token",
