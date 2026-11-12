@@ -7,7 +7,7 @@ use crate::{Board, Bus, Member, OperatorVia};
 use std::{fs, path::Path};
 
 fn fixture() -> tempfile::TempDir {
-    tempfile::tempdir_in("/private/tmp").unwrap()
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
 }
 fn operator(root: &Path) -> Bus {
     Bus::open(root, "operator")
@@ -352,6 +352,15 @@ fn same_run_different_execution_and_stale_leave_cannot_inherit_attempt() {
         .unwrap();
     assert!(requeued.receipt.prior_attempt_may_still_run);
     assert!(requeued.current_item.prior_attempt_may_still_run);
+    let listed = op
+        .board
+        .work_list(WorkPageQuery {
+            filters: WorkFilters::default(),
+            limit: 50,
+            cursor: None,
+        })
+        .unwrap();
+    assert!(listed.items[0].prior_attempt_may_still_run);
     assert_eq!(
         requeued.current_item.latest_attempt.unwrap().closure,
         Some(WorkAttemptClosure::Requeued)

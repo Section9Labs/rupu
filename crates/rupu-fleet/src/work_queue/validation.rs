@@ -278,6 +278,7 @@ pub(crate) fn summary(item: &WorkItem) -> WorkItemSummary {
             .as_ref()
             .and_then(|a| a.executor.clone()),
         attempt_count: item.attempt_count,
+        prior_attempt_may_still_run: item.prior_attempt_may_still_run,
     }
 }
 

@@ -204,6 +204,7 @@ pub struct WorkItemSummary {
     pub claimant: Option<WorkActor>,
     pub executor: Option<WorkActor>,
     pub attempt_count: u64,
+    pub prior_attempt_may_still_run: bool,
 }
 
 /// Claimant and executor identities are independently captured once. Executor
