@@ -29,7 +29,11 @@ fn read_with<T: DeserializeOwned>(
 ) -> Result<Option<T>, FleetError> {
     use crate::retention_lease::open_directory;
     use rustix::fs::{openat, statat, AtFlags, FileType, Mode, OFlags};
-    use std::{fs::File, io::Read, os::unix::fs::MetadataExt};
+    use std::{
+        fs::File,
+        io::{BufReader, Read},
+        os::unix::fs::MetadataExt,
+    };
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
     let failure = || refused("Queue owner record changed, is unsafe, or is unavailable");
     let dir = open_directory(directory).map_err(|_| failure())?;
@@ -80,7 +84,9 @@ fn read_with<T: DeserializeOwned>(
         return Err(refused("Queue owner record exceeds 16 MiB bound"));
     }
     let mut bounded = (&mut file).take(MAX_BYTES + 1);
-    let value = serde_json::from_reader(&mut bounded)
+    // serde_json consumes bytes individually. Buffer inside the existing read
+    // bound so large session histories do not cause one file read per byte.
+    let value = serde_json::from_reader(BufReader::new(&mut bounded))
         .map_err(|_| refused("Queue owner record is malformed or exceeds bound"))?;
     if MAX_BYTES + 1 - bounded.limit() > MAX_BYTES
         || stamp(&file)? != before
