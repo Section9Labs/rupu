@@ -13,6 +13,9 @@ mod log;
 mod mailbox;
 mod participants;
 mod types;
+pub mod work_queue;
+
+pub use work_queue::types::*;
 
 pub use address::{Address, AddressError};
 pub use board::{Board, OperatorClaimLease, OperatorClaimOutcome};
