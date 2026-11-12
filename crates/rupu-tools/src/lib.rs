@@ -52,6 +52,7 @@ pub mod session_reads;
 pub mod skills;
 pub mod tool;
 pub mod tool_ceiling;
+pub mod work_queue;
 
 mod path_scope;
 mod proc_tree;

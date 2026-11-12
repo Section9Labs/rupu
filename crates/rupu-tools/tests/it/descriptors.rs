@@ -42,6 +42,8 @@ fn production_impls() -> usize {
         include_str!("../../src/goal/mod.rs"),
         include_str!("../../src/budget/mod.rs"),
         include_str!("../../src/skills/mod.rs"),
+        include_str!("../../src/session_reads.rs"),
+        include_str!("../../src/work_queue.rs"),
     ];
     homes
         .iter()
@@ -54,8 +56,27 @@ fn production_impls() -> usize {
 
 #[test]
 fn every_tool_impl_has_a_catalog_descriptor() {
+    // These bodies intentionally serve explicit descriptor families. Count
+    // their additional descriptors, while the body test below checks each
+    // actual catalog entry resolves to its identical descriptor pointer.
+    let session_family = [
+        &rupu_tools::session_reads::CONTEXT,
+        &rupu_tools::session_reads::WORKFLOWS,
+        &rupu_tools::session_reads::INSPECT,
+        &rupu_tools::session_reads::NETFLOWS,
+    ];
+    for descriptor in session_family
+        .iter()
+        .copied()
+        .chain(rupu_tools::work_queue::DESCRIPTORS.iter().copied())
+    {
+        assert!(ToolCatalog::all()
+            .iter()
+            .any(|known| std::ptr::eq(*known, descriptor)));
+    }
     assert_eq!(
-        production_impls(),
+        production_impls() + session_family.len() - 1 + rupu_tools::work_queue::DESCRIPTORS.len()
+            - 1,
         ToolCatalog::all().len(),
         "a `Tool` impl was added or removed without updating `catalog::ALL` \
          (or a descriptor was listed for a tool that no longer exists)"
@@ -202,6 +223,8 @@ fn full_context() -> ToolContext {
         std::path::Path::new("/nonexistent/af"),
         "lead",
     )));
+    s.work_queue = Some(Arc::new(DescriptorQueue));
+    s.session_reads = Some(Arc::new(DescriptorSessionReads));
     s.run_status = Some(Arc::new(crate::support::StubStatus::default()));
     s.catalog = Some(Arc::new(crate::support::StubCatalog::default()));
     let global = tempfile::tempdir().unwrap();
@@ -214,6 +237,78 @@ fn full_context() -> ToolContext {
     .unwrap();
     s.skills = Some(crate::support::resolved(global.path(), &["pdf"]));
     ctx
+}
+
+/// Catalog construction only: invoking this fixture is a test error. No owner
+/// record, Queue store, provider, or filesystem mutation is needed to enumerate.
+struct DescriptorQueue;
+impl rupu_tools::work_queue::WorkQueuePort for DescriptorQueue {
+    fn binding(&self) -> rupu_tools::work_queue::WorkOwnerBinding {
+        panic!("descriptor-only fixture")
+    }
+    fn actor(&self) -> rupu_fleet::WorkActor {
+        panic!("descriptor-only fixture")
+    }
+    fn finish_execution(&self) {}
+    fn list(
+        &self,
+        _: rupu_fleet::WorkPageQuery,
+    ) -> Result<rupu_fleet::WorkPage, rupu_fleet::WorkError> {
+        panic!("descriptor-only fixture")
+    }
+    fn get(&self, _: &str) -> Result<rupu_fleet::WorkItem, rupu_fleet::WorkError> {
+        panic!("descriptor-only fixture")
+    }
+    fn timeline(
+        &self,
+        _: rupu_fleet::WorkTimelineQuery,
+    ) -> Result<rupu_fleet::WorkTimelinePage, rupu_fleet::WorkError> {
+        panic!("descriptor-only fixture")
+    }
+    fn apply(
+        &self,
+        _: rupu_fleet::WorkCommand,
+        _: rupu_fleet::WorkSource,
+    ) -> Result<rupu_fleet::WorkReply, rupu_fleet::WorkError> {
+        panic!("descriptor-only fixture")
+    }
+}
+struct DescriptorSessionReads;
+impl rupu_tools::ports::SessionReadPort for DescriptorSessionReads {
+    fn permits(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "session.context" | "session.workflows" | "run.inspect" | "run.netflows"
+        )
+    }
+    fn read(
+        &self,
+        _: rupu_tools::ports::SessionReadRequest,
+        _: &ToolContext,
+    ) -> Result<serde_json::Value, rupu_tools::PortError> {
+        panic!("descriptor-only fixture")
+    }
+}
+
+#[test]
+fn queue_body_and_service_require_both_bus_and_exact_runtime_binding() {
+    let mut context = full_context();
+    context.services.work_queue = None;
+    for descriptor in rupu_tools::work_queue::DESCRIPTORS {
+        assert!(rupu_tools::bodies::body(descriptor.name, &context).is_none());
+        assert!(!context
+            .services
+            .provided(false)
+            .missing_for(descriptor)
+            .is_empty());
+    }
+    context.services.work_queue = Some(Arc::new(DescriptorQueue));
+    context.services.message_bus = None;
+    assert!(!context
+        .services
+        .provided(false)
+        .contains(rupu_tools::Service::WorkQueue));
+    assert!(rupu_tools::bodies::body("board.work_post", &context).is_none());
 }
 
 /// `skills.load` needs a skill the model may load (spec §2.4): a run whose

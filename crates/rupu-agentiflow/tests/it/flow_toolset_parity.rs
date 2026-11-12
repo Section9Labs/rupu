@@ -277,6 +277,9 @@ fn agentiflow_messaging_false_strips_the_leads_messaging_tools() {
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
     assert!(on.iter().any(|n| n == "board.directive"), "{on:?}");
+    for descriptor in rupu_tools::work_queue::DESCRIPTORS {
+        assert!(on.iter().any(|name| name == descriptor.name), "{} in {on:?}", descriptor.name);
+    }
 }
 
 #[test]
