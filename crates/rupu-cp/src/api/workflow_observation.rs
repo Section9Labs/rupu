@@ -3,6 +3,7 @@ mod capture;
 mod descendant_routes;
 mod descendants;
 mod event_emitters;
+mod executing;
 mod frontier;
 mod input;
 mod member;
@@ -37,6 +38,7 @@ use tokio::sync::Semaphore;
 
 pub(crate) use process_logs::FEATURE as PROCESS_LOG_FEATURE;
 pub(crate) const EVENT_EMITTER_FEATURE: &str = "workflow.observation.event_emitters.v1";
+pub(crate) const EXECUTING_STEPS_FEATURE: &str = "workflow.observation.executing_steps.v1";
 pub(crate) const LIVE_FEATURE: &str = "workflow.observation.live.v1";
 pub(crate) const DESCENDANT_FEATURE: &str = "workflow.observation.descendants.v1";
 pub(crate) const LATEST_PAGE_FEATURE: &str = "workflow.observation.latest_page.v1";

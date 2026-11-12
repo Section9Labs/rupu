@@ -38,6 +38,7 @@ pub(super) struct Input {
     pub window: Window,
     start: Instant,
     witnesses: BTreeMap<String, Option<Stamp>>,
+    execution: Option<String>,
 }
 pub(super) struct Read {
     pub bytes: Vec<u8>,
@@ -81,6 +82,7 @@ impl Input {
             window: Window::Prefix,
             start: Instant::now(),
             witnesses: BTreeMap::new(),
+            execution: None,
         })
     }
     pub fn deadline(&self) -> ApiResult<()> {
@@ -119,9 +121,25 @@ impl Input {
         self.deadline()
     }
     pub fn frontier(&self, run: &str, workspace: &str, store_kind: &str, epoch: &str) -> String {
-        let bytes = serde_json::to_vec(&(run, workspace, store_kind, epoch, &self.witnesses))
-            .expect("metadata witnesses");
+        let bytes = serde_json::to_vec(&(
+            run,
+            workspace,
+            store_kind,
+            epoch,
+            &self.witnesses,
+            &self.execution,
+        ))
+        .expect("metadata witnesses");
         format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+    /// Bind the single qualified scheduler snapshot used by this response to
+    /// both capture content and frontier comparison. Its saved observation time
+    /// is stable; HTTP read time and byte accounting are deliberately excluded.
+    pub fn bind_execution(&mut self, bytes: &[u8]) {
+        self.hash.update(super::EXECUTING_STEPS_FEATURE.as_bytes());
+        self.hash.update((bytes.len() as u64).to_le_bytes());
+        self.hash.update(bytes);
+        self.execution = Some(format!("sha256:{:x}", Sha256::digest(bytes)));
     }
     pub fn read(&mut self, name: &str, max: usize, prefix: bool) -> ApiResult<Option<Read>> {
         let Some((mut file, before)) = self.file(name)? else {

@@ -50,13 +50,16 @@ pub(super) fn read(s: &AppState, id: &str, ws: &str, known: Option<&str>) -> Api
     ] {
         opened.input.observe(name)?;
     }
+    let execution = executing::Observation::read(&opened)?;
     opened.verify(id, ws)?;
+    execution.bind(&mut opened.input);
     let stamp = opened
         .input
         .frontier(id, ws, opened.store_kind, &s.workflow_observations.epoch);
     let value = json!({"schema":LIVE_FEATURE,"run_id":id,"workspace_id":ws,"host_id":"local","store_kind":opened.store_kind,
         "frontier":stamp,"changed":known!=Some(stamp.as_str()),"observed_at":chrono::Utc::now(),"comparison":"metadata_read_time",
-        "run":serde_json::from_slice::<Value>(&opened.owner_bytes).expect("validated owner"),"input_bytes":opened.input.bytes});
+        "run":serde_json::from_slice::<Value>(&opened.owner_bytes).expect("validated owner"),"input_bytes":opened.input.bytes,
+        "executing_steps":execution.value,"execution_input_bytes":execution.input_bytes});
     if serde_json::to_vec(&value).expect("frontier JSON").len() > MAX_PAGE {
         return Err(too_large("workflow frontier response limit"));
     }

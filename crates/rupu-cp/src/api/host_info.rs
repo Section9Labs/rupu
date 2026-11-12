@@ -135,6 +135,8 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             #[cfg(unix)]
             features.push(super::workflow_observation::LIVE_FEATURE.to_string());
             #[cfg(unix)]
+            features.push(super::workflow_observation::EXECUTING_STEPS_FEATURE.to_string());
+            #[cfg(unix)]
             features.push(super::workflow_observation::LATEST_PAGE_FEATURE.to_string());
             #[cfg(unix)]
             features.push(super::workflow_observation::DESCENDANT_FEATURE.to_string());
