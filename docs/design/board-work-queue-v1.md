@@ -1,6 +1,6 @@
 # Board work queue v1
 
-Status: proposed contract for native integration; implementation is not deployed.
+Status: implemented backend contract for review and native integration; not deployed.
 
 The Board needs a durable work item that connects a request, its pickup, the
 execution that reports progress, and its result. Existing posts, directives,
@@ -85,7 +85,18 @@ that the current participant slot has not been replaced. The message-space
 lock precedes the queue lock, serializing this check with join/leave. A new
 launch at the same address, or a later lead round, cannot inherit ownership.
 Owner and execution context are bound at assembly; a guessed path or a
-continuation symlink alone cannot establish authority.
+continuation symlink alone cannot establish authority. Supported launch placements
+and explicit unavailable cases are listed in
+[the runtime binding contract](board-work-queue-runtime-v1.md).
+
+The runtime records a `work_queue_execution` Notice immediately after RunStart.
+Its message is the serialized trusted WorkActor. Source resolution checks that
+immediate marker, the run/agent identity and recorded owner membership; it never
+searches for a later matching marker. Available targets include `execution_id`.
+Clients must retain and revalidate it against the loaded raw recording before
+opening the conversation, and keep this internal marker out of conversation text.
+Missing or mismatched markers make the source unavailable without discarding the
+recorded Queue result.
 
 Mutation lock order is retention lifecycle lease, message-space Bus lock, then
 SQLite transaction. The lease remains held through commit so supported archive
@@ -118,6 +129,11 @@ rewrite the entire queue. The initial storage mode is rollback journal with
 Safe opens reject links/special files and unexpected sidecars. No queue
 correctness depends on best-effort legacy journals or mailbox delivery. This
 is a locally owned store, not a hostile-filesystem sandbox.
+
+First initialization builds, commits, closes and syncs a private database in the
+same directory before publishing it with a no-replace rename and directory sync.
+An interrupted initialization cannot expose an incomplete final schema. Existing
+malformed final databases are refused and never silently initialized again.
 
 Commands carry `request_id`, `expected_queue_id`, and `expected_revision`.
 The expected queue ID fences replacement/reinitialization of a database inside
@@ -190,6 +206,18 @@ writable; old active-owner tokens cannot write a moved or replaced directory.
 Completed workflow/standalone/Agentiflow owners are read-only. Runtime agents
 commit their own result while their exact launch remains authorized.
 
+A standalone CLI run creates its terminal run record after execution. An identical
+operator request committed before that record existed remains recoverable through
+a narrowly validated historical token: the same directory identity, a complete
+terminal standalone record and the recorded root participant must agree. This path
+can only recover an existing receipt; it cannot initialize a Queue or admit new
+work. Changed retry payloads still conflict.
+
+Owner records are bounded at 16 MiB and read through anchored regular-file handles.
+Replacement during a read is refused; legitimate atomic session saves between
+reads preserve the immutable owner identity. An oversized record is explicit
+unavailability or a capacity error, never an empty Queue.
+
 Queue filters initially support a state and claimant run ID. Queue order is
 descending creation sequence; timeline order is ascending event sequence.
 The default limit is 50, maximum 200, and serialized responses are capped at
@@ -228,6 +256,10 @@ Source resolution is separate from stored provenance:
 reason?, transcript?}`. Available transcript targets are emitted only after
 validating the exact owner/run/recording relationship. Missing transcript
 bytes do not change the committed queue result or silently clear its locator.
+Trusted configured-root aliases and this exact owner's active/archive move are
+normalized consistently; unrelated prefixes and descendant symlinks are refused.
+The bounded source resolver proves at most 16 captured launch roots per response;
+sources that exceed its proof budget remain explicitly unsupported.
 
 ## Validation and native handoff
 
