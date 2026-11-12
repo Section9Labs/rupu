@@ -24,7 +24,7 @@ The envelope has these fields:
 | `run_id`, `workspace_id`, `host_id` | Exact validated owner; supported host is `local` |
 | `owner_started_at` | Recorded owner identity, in addition to anchored directory validation |
 | `execution_generation` | Opaque scheduler ownership generation, or null when unavailable |
-| `revision` | Canonical decimal string increasing within one generation, or null |
+| `revision` | Canonical positive UInt64 decimal string increasing within one generation, or null |
 | `observed_at` | Scheduler snapshot time, never a substituted HTTP response time |
 | `validity` | `current`, `stale`, or `unavailable` |
 | `complete` | Whether the captured member array is complete for this scope |
@@ -56,9 +56,9 @@ Ordinary DAG activation begins after its semaphore permit is acquired. The
 legacy sequential driver uses the same body boundary. Inline branch, split,
 join, loop, gate decision and rejection cleanup bodies use explicit activation
 scopes. Notification hooks remain inside their parent gate activation: their
-legacy synthetic IDs are not unique authored workflow step identities. Parked human approval and semaphore-queued work
-are absent. Recursive loop schedulers share the owner and carry their actual
-iteration coordinates. Tokio task boundaries explicitly propagate context.
+legacy synthetic IDs are not unique authored workflow step identities. Parked
+human approval and semaphore-queued work are absent. Recursive loop schedulers
+share the owner and carry their actual iteration coordinates. Tokio task boundaries explicitly propagate context.
 
 A normal body return removes only that activation. Abnormal return, dropped
 future, panic, or abort invalidates the whole generation rather than claiming
@@ -79,11 +79,18 @@ teardown revokes current authority; retained data becomes historical evidence.
 Local cooperating Unix schedulers hold a dedicated fail-closed per-run
 ownership lock and a unique per-generation lifetime lock. A generation-specific
 lock prevents a new owner from making an old saved snapshot look live during
-replacement initialization. Mutation and revocation serialize separately. Producers wait at most two
-seconds for the mutation lock and never proceed unlocked; readers use an
-immediate probe. Ordinary polling contention therefore does not immediately
+replacement initialization. Mutation and revocation serialize separately.
+Producers wait at most two seconds for the mutation lock and never proceed
+unlocked; readers use an immediate probe. Ordinary polling contention therefore does not immediately
 revoke a producer. A stored producer on a supported platform refuses to start
 if its ownership cannot be established, including a conflicting live owner.
+
+Owned lock guards explicitly unlock on normal destruction, even if another
+descriptor still references the same open-file description. Failed lock
+acquisitions never unlock an incumbent. Abrupt termination cannot run that
+destructor: CLOEXEC closes descriptors across exec, but a surviving duplicate
+or pre-exec fork can retain the lock until its descriptor closes. A lock
+witness is therefore a cooperating lifetime observation, not a process probe.
 
 The reader opens bounded regular files relative to the already validated run
 directory, validates file identity, and probes that exact generation's lock.
@@ -107,6 +114,9 @@ A cached capture remains point-in-time evidence, including its original
 execution observation. The API must not splice a fresh execution set into an
 older capture. Live clients request `refresh=true` and use fresh frontier
 observations; failed polls or transport loss downgrade live emphasis.
+Freshness is based on successful observation receipt, not the age of
+`observed_at`: a long-running, unchanged body can retain an old scheduler
+publication time while a fresh read witnesses current ownership.
 
 The execution snapshot is limited to 256 members and 256 KiB, with bounded
 identifiers and ancestry. Overflow never yields a truncated complete set.
@@ -118,6 +128,8 @@ Clients compare revisions only within the same generation and exact owner.
 A new generation replaces the old live set. Capability absence, malformed or
 missing envelope, unsupported validity, incomplete set, stale owner, revision
 regression, or contradictory same-revision membership prevents live emphasis.
+At an equal revision, witness loss may legitimately downgrade validity without
+changing the member array; reject contradictory membership, not that downgrade.
 Recorded evidence remains inspectable.
 
 ## Validation boundary
@@ -132,8 +144,8 @@ remote cancellation, deployment, or installed-app acceptance.
 
 Validation on the implemented code:
 
-- `cargo test --offline -p rupu-orchestrator --lib`: 606 tests passed, including
-  23 ownership/storage fixtures and 14 scheduler integration fixtures.
+- `cargo test --offline -p rupu-orchestrator --lib`: 608 tests passed, including
+  25 ownership/storage fixtures and 14 scheduler integration fixtures.
 - `cargo test --offline --no-default-features -p rupu-cp --lib
   api::workflow_observation::tests`: 50 tests passed, including eight execution
   observation fixtures through the production routes.
@@ -143,4 +155,5 @@ Validation on the implemented code:
 These checks used Homebrew Rust/Cargo 1.99 on macOS. The repository-pinned 1.95
 toolchain was unavailable and is not certified by this validation. PDF, rebuilt
 CP web assets, production packaging, and installed/native live behavior were
-outside these checks. Existing warnings in unchanged CP code remain.
+outside these checks. The pause fixture synchronizes with actual provider-body
+entry; its bounded watchdogs do not assume a fixed dispatch latency.
