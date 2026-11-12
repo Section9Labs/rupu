@@ -632,6 +632,22 @@ fn process_worker() {
         // rollback journal that the public Bus must recover before replay.
         std::process::exit(0);
     }
+    if std::env::var("RUPU_QUEUE_PROCESS_MODE").as_deref() == Ok("initialize") {
+        let stage: u8 = std::env::var("RUPU_QUEUE_INIT_STAGE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        disk::INIT_CRASH.with(|value| value.set(stage));
+        let request: WorkCommand =
+            serde_json::from_str(&std::env::var("RUPU_QUEUE_PROCESS_REQUEST").unwrap()).unwrap();
+        let _ = operator(Path::new(&root)).operator_work_apply(
+            request,
+            OperatorVia::Cp,
+            || Ok(()),
+            || Ok(()),
+        );
+        panic!("initialization crash stage was not reached");
+    }
     let request: WorkCommand =
         serde_json::from_str(&std::env::var("RUPU_QUEUE_PROCESS_REQUEST").unwrap()).unwrap();
     let actor = std::env::var("RUPU_QUEUE_PROCESS_ACTOR").unwrap();
@@ -890,4 +906,90 @@ fn page_metadata_and_rows_share_one_read_snapshot_during_writes() {
     }
     writer.join().unwrap();
     assert_eq!(op.board.work_snapshot().unwrap().capacity.item_count, 25);
+}
+
+#[test]
+fn initialization_restart_never_exposes_an_incomplete_final_database() {
+    for stage in 1..=5 {
+        let dir = fixture();
+        let op = operator(dir.path());
+        let command = WorkCommand {
+            request_id: "first_post_retry".into(),
+            expected_queue_id: None,
+            expected_revision: 0,
+            operation: WorkOperation::Post {
+                title: "First item".into(),
+                instructions: "Survive interruption during initialization".into(),
+            },
+        };
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("work_queue::tests::process_worker")
+            .arg("--exact")
+            .env("RUPU_QUEUE_PROCESS_ROOT", dir.path())
+            .env("RUPU_QUEUE_PROCESS_MODE", "initialize")
+            .env("RUPU_QUEUE_INIT_STAGE", stage.to_string())
+            .env(
+                "RUPU_QUEUE_PROCESS_REQUEST",
+                serde_json::to_string(&command).unwrap(),
+            )
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "initialization stage {stage}");
+        let final_path = dir.path().join("board").join(disk::DATABASE_NAME);
+        assert_eq!(
+            final_path.exists(),
+            stage >= 4,
+            "initialization stage {stage}"
+        );
+        let before = op.board.work_snapshot().unwrap();
+        assert_eq!(before.availability, WorkAvailability::NotInitialized);
+        assert_eq!(before.revision, 0);
+        assert_eq!(before.capacity.item_count, 0);
+        let committed = op
+            .operator_work_apply(command.clone(), OperatorVia::Cp, || Ok(()), || Ok(()))
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(committed.current_item.revision, 1);
+        let replayed = op
+            .operator_work_apply(
+                command,
+                OperatorVia::Cp,
+                || Ok(()),
+                || panic!("durable first-post retry"),
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.receipt, committed.receipt);
+        assert_eq!(op.board.work_snapshot().unwrap().capacity.item_count, 1);
+    }
+}
+
+#[test]
+fn malformed_final_database_is_never_reinitialized_or_replaced() {
+    for contents in [Vec::new(), b"not a SQLite database".to_vec()] {
+        let dir = fixture();
+        let board = dir.path().join("board");
+        fs::create_dir(&board).unwrap();
+        let path = board.join(disk::DATABASE_NAME);
+        fs::write(&path, &contents).unwrap();
+        let command = WorkCommand {
+            request_id: "must_not_repair".into(),
+            expected_queue_id: None,
+            expected_revision: 0,
+            operation: WorkOperation::Post {
+                title: "Do not replace".into(),
+                instructions: "Malformed final storage requires explicit handling".into(),
+            },
+        };
+        let result = operator(dir.path()).operator_work_apply(
+            command,
+            OperatorVia::Cp,
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(matches!(result, Err(WorkError::Corrupt(_))));
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(fs::read_dir(&board).unwrap().count(), 1);
+    }
 }

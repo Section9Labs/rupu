@@ -4,13 +4,24 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs, io,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 pub(crate) const DATABASE_NAME: &str = "work-queue.sqlite3";
 const APPLICATION_ID: i64 = 0x52575131;
+
+#[cfg(test)]
+thread_local! { pub(crate) static INIT_CRASH: std::cell::Cell<u8> = const {std::cell::Cell::new(0)}; }
+
+#[cfg(test)]
+fn initialization_crash(stage: u8) {
+    if INIT_CRASH.with(|value| value.get()) == stage {
+        // Subprocess tests intentionally bypass Drop and SQLite rollback.
+        std::process::exit(0);
+    }
+}
 
 pub(crate) struct Store {
     pub conn: Connection,
@@ -159,28 +170,11 @@ impl Store {
             &board.join(format!("{DATABASE_NAME}-journal")),
             DEFAULT_DATABASE_MAX_BYTES + 1024 * 1024,
         )?;
-        let mut created = false;
         if regular(&path, DEFAULT_DATABASE_MAX_BYTES)?.is_none() {
             if !create {
                 return Ok(None);
             }
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-                .open(&path)
-            {
-                Ok(file) => {
-                    file.sync_all().map_err(io_error)?;
-                    fs::File::open(&board)
-                        .and_then(|f| f.sync_all())
-                        .map_err(io_error)?;
-                    created = true;
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                Err(e) => return Err(io_error(e)),
-            }
+            initialize(&board)?;
         }
         let metadata =
             regular(&path, DEFAULT_DATABASE_MAX_BYTES)?.ok_or(WorkError::OwnerChanged)?;
@@ -194,47 +188,7 @@ impl Store {
             flags | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .map_err(sql_error)?;
-        conn.busy_timeout(Duration::from_millis(250))
-            .map_err(sql_error)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")
-            .map_err(sql_error)?;
-        if writable {
-            let mode: String = conn
-                .pragma_update_and_check(None, "journal_mode", "DELETE", |r| r.get(0))
-                .map_err(sql_error)?;
-            if !mode.eq_ignore_ascii_case("delete") {
-                return Err(WorkError::Persistence(
-                    "Queue rollback-journal mode could not be established".into(),
-                ));
-            }
-            conn.pragma_update(None, "synchronous", "EXTRA")
-                .map_err(sql_error)?;
-            let synchronous: i64 = conn
-                .pragma_query_value(None, "synchronous", |r| r.get(0))
-                .map_err(sql_error)?;
-            if synchronous != 3 {
-                return Err(WorkError::Persistence(
-                    "Queue EXTRA durability could not be established".into(),
-                ));
-            }
-            #[cfg(target_os = "macos")]
-            {
-                conn.pragma_update(None, "fullfsync", true)
-                    .map_err(sql_error)?;
-                let enabled: i64 = conn
-                    .pragma_query_value(None, "fullfsync", |r| r.get(0))
-                    .map_err(sql_error)?;
-                if enabled != 1 {
-                    return Err(WorkError::Persistence("Queue fullfsync unavailable".into()));
-                }
-            }
-            if created {
-                init(&conn)?;
-            }
-        } else {
-            conn.pragma_update(None, "query_only", true)
-                .map_err(sql_error)?;
-        }
+        configure(&conn, writable)?;
         let application: i64 = conn
             .pragma_query_value(None, "application_id", |r| r.get(0))
             .map_err(sql_error)?;
@@ -293,6 +247,133 @@ impl Store {
     }
 }
 
+fn configure(conn: &Connection, writable: bool) -> Result<(), WorkError> {
+    conn.busy_timeout(Duration::from_millis(250))
+        .map_err(sql_error)?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF;")
+        .map_err(sql_error)?;
+    if !writable {
+        conn.pragma_update(None, "query_only", true)
+            .map_err(sql_error)?;
+        return Ok(());
+    }
+    let mode: String = conn
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .map_err(sql_error)?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(WorkError::Persistence(
+            "Queue rollback-journal mode could not be established".into(),
+        ));
+    }
+    conn.pragma_update(None, "synchronous", "EXTRA")
+        .map_err(sql_error)?;
+    let synchronous: i64 = conn
+        .pragma_query_value(None, "synchronous", |row| row.get(0))
+        .map_err(sql_error)?;
+    if synchronous != 3 {
+        return Err(WorkError::Persistence(
+            "Queue EXTRA durability could not be established".into(),
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        conn.pragma_update(None, "fullfsync", true)
+            .map_err(sql_error)?;
+        let enabled: i64 = conn
+            .pragma_query_value(None, "fullfsync", |row| row.get(0))
+            .map_err(sql_error)?;
+        if enabled != 1 {
+            return Err(WorkError::Persistence("Queue fullfsync unavailable".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Publish only a complete, closed, synced schema. The caller holds the Bus
+/// lock, and NOREPLACE additionally prevents clobbering any unexpected final
+/// file. A process exit can leave an unpublished staging file; readers never
+/// mistake it for a Queue or attempt to reconstruct/repair the final database.
+fn initialize(board: &Path) -> Result<(), WorkError> {
+    use rustix::fs::{Mode, OFlags, RenameFlags};
+    let directory = fs::File::from(
+        rustix::fs::open(
+            board,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io_error)?,
+    );
+    let name = format!(".work-queue-init-{}.sqlite3", ulid::Ulid::new());
+    let path = board.join(&name);
+    let file = fs::File::from(
+        rustix::fs::openat(
+            &directory,
+            name.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(io_error)?,
+    );
+    let original_identity = identity(&file.metadata().map_err(io_error)?);
+    let result = (|| {
+        #[cfg(test)]
+        initialization_crash(1);
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .map_err(sql_error)?;
+        configure(&conn, true)?;
+        init(&conn)?;
+        let meta = read_meta(&conn)?;
+        if meta.queue_id.is_some() || meta.revision != 0 {
+            return Err(WorkError::Corrupt(
+                "initial Queue schema is not empty".into(),
+            ));
+        }
+        conn.close().map_err(|(_, error)| sql_error(error))?;
+        file.sync_all().map_err(io_error)?;
+        let staged = regular(&path, DEFAULT_DATABASE_MAX_BYTES)?.ok_or(WorkError::OwnerChanged)?;
+        if identity(&staged) != original_identity
+            || identity(&fs::metadata(board).map_err(io_error)?)
+                != identity(&directory.metadata().map_err(io_error)?)
+        {
+            return Err(WorkError::OwnerChanged);
+        }
+        #[cfg(test)]
+        initialization_crash(3);
+        rustix::fs::renameat_with(
+            &directory,
+            name.as_str(),
+            &directory,
+            DATABASE_NAME,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            if error == rustix::io::Errno::EXIST {
+                WorkError::OwnerChanged
+            } else {
+                io_error(error)
+            }
+        })?;
+        #[cfg(test)]
+        initialization_crash(4);
+        directory.sync_all().map_err(io_error)?;
+        #[cfg(test)]
+        initialization_crash(5);
+        Ok(())
+    })();
+    // Only names exclusively allocated by this invocation are cleanup targets.
+    // A published final database is never removed after an uncertain sync.
+    for suffix in ["", "-journal"] {
+        let temporary = format!("{name}{suffix}");
+        let _ = rustix::fs::unlinkat(&directory, temporary.as_str(), rustix::fs::AtFlags::empty());
+    }
+    result
+}
+
 pub(crate) fn number(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value: i64 = row.get(index)?;
     u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
@@ -312,8 +393,10 @@ fn init(conn: &Connection) -> Result<(), WorkError> {
         CREATE TABLE receipts (actor TEXT NOT NULL, request_id TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL CHECK(length(CAST(payload AS BLOB))<=262144), PRIMARY KEY(actor,request_id)) STRICT;
         CREATE TABLE counts (state TEXT NOT NULL, claimant TEXT NOT NULL, count INTEGER NOT NULL CHECK(count>=0), PRIMARY KEY(state,claimant)) STRICT;
         PRAGMA application_id=1381454129;
-        PRAGMA user_version=1;
-        COMMIT;").map_err(sql_error)?;
+        PRAGMA user_version=1;").map_err(sql_error)?;
+    #[cfg(test)]
+    initialization_crash(2);
+    conn.execute_batch("COMMIT;").map_err(sql_error)?;
     Ok(())
 }
 
