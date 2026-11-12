@@ -13917,12 +13917,14 @@ steps:
     // ("SLOW-1") a normal, fast-completing provider instead.
     struct FanoutPauseFactory {
         block_slow: bool,
+        slow_started: Arc<tokio::sync::Notify>,
         seen: Mutex<Vec<String>>,
     }
     impl FanoutPauseFactory {
         fn new(block_slow: bool) -> Self {
             Self {
                 block_slow,
+                slow_started: Arc::new(tokio::sync::Notify::new()),
                 seen: Mutex::new(Vec::new()),
             }
         }
@@ -13939,7 +13941,9 @@ steps:
             self.seen.lock().unwrap().push(rendered_prompt.clone());
             let provider: Box<dyn LlmProvider> =
                 if self.block_slow && rendered_prompt.contains("SLOW") {
-                    Box::new(BlockingProvider)
+                    Box::new(FanoutBlockingProvider {
+                        started: Arc::clone(&self.slow_started),
+                    })
                 } else {
                     Box::new(MockProvider::new(vec![ScriptedTurn::AssistantText {
                         text: format!("done: {rendered_prompt}"),
@@ -13949,6 +13953,36 @@ steps:
                     }]))
                 };
             make_agent_opts(provider, agent_name, request)
+        }
+    }
+
+    /// Signals from the actual provider body, after the agent's pause check.
+    /// Factory entry alone does not prove the unit reached its mid-turn wait.
+    struct FanoutBlockingProvider {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FanoutBlockingProvider {
+        async fn send(&mut self, req: &LlmRequest) -> Result<LlmResponse, ProviderError> {
+            self.started.notify_one();
+            BlockingProvider.send(req).await
+        }
+
+        async fn stream(
+            &mut self,
+            req: &LlmRequest,
+            _on_event: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<LlmResponse, ProviderError> {
+            self.send(req).await
+        }
+
+        fn default_model(&self) -> &str {
+            "mock-1"
+        }
+
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::Anthropic
         }
     }
 
@@ -13970,10 +14004,6 @@ steps:
         // --- Phase 1: pause while unit 1 is mid-turn. ---
         let token = CancellationToken::new();
         let token2 = token.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            token2.cancel();
-        });
 
         let sink1 = Arc::new(CollectingSink::default());
         let factory1 = Arc::new(FanoutPauseFactory::new(true));
@@ -13985,7 +14015,17 @@ steps:
         );
         opts1.pause = Some(token);
 
-        let res1 = run_workflow(opts1).await.expect("phase 1 returns Ok");
+        // Wait for the slow provider itself. A wall-clock delay can expire
+        // while unit 0 is still completing and pause before unit 1 starts.
+        let (res1, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(run_workflow(opts1), async {
+                factory1.slow_started.notified().await;
+                token2.cancel();
+            })
+        })
+        .await
+        .expect("slow unit must start and acknowledge the pause");
+        let res1 = res1.expect("phase 1 returns Ok");
         let awaiting = res1.awaiting.expect("must pause mid-fan-out");
         assert_eq!(awaiting.reason, PauseReason::Manual);
         assert_eq!(awaiting.step_id, "process");
@@ -14032,7 +14072,10 @@ steps:
             ..Default::default()
         });
 
-        let res2 = run_workflow(opts2).await.expect("resume completes");
+        let res2 = tokio::time::timeout(Duration::from_secs(30), run_workflow(opts2))
+            .await
+            .expect("fan-out resume must not hang")
+            .expect("resume completes");
         assert!(res2.awaiting.is_none(), "resumed run runs to completion");
         assert_eq!(res2.step_results.len(), 1);
         let step = &res2.step_results[0];
@@ -16252,7 +16295,10 @@ loops:
     ) -> (String, Vec<StepResult>) {
         let factory = ResumableRefineFactory::new(false_calls);
         let opts = store_opts(wf.clone(), factory, tmp, Arc::clone(store), None, None);
-        let res = tokio::time::timeout(Duration::from_secs(5), run_workflow(opts))
+        // This setup executes the real disk-backed loop and persists every
+        // step and execution snapshot. Keep a bounded deadlock watchdog while
+        // allowing filesystem contention from the concurrent full suite.
+        let res = tokio::time::timeout(Duration::from_secs(30), run_workflow(opts))
             .await
             .expect("full run must not hang")
             .expect("full run must converge and complete");
