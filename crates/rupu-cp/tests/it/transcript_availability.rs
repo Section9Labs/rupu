@@ -185,7 +185,7 @@ async fn unreadable_file_is_an_error_not_empty_history() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("run.jsonl");
     std::fs::write(&path, event()).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
     // Root may bypass mode bits; do not claim a permission-denied fixture then.
     if std::fs::File::open(&path).is_ok() {
         eprintln!("mode bits do not deny reads for this user; skipping");
