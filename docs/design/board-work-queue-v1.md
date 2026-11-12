@@ -87,6 +87,13 @@ launch at the same address, or a later lead round, cannot inherit ownership.
 Owner and execution context are bound at assembly; a guessed path or a
 continuation symlink alone cannot establish authority.
 
+Mutation lock order is retention lifecycle lease, message-space Bus lock, then
+SQLite transaction. The lease remains held through commit so supported archive
+operations cannot move the owner between validation and publication. Current
+roster authorization uses bounded strict parsing; malformed later joins/leaves
+cannot expose an older participant as current. Exact execution IDs also fence
+stale leave events from an earlier round.
+
 Each event is itself a durable source reference. An agent result links to the
 exact execution/recording and call that reported it. Operator posts have no
 invented sending run or transcript. Message notification is not part of the
@@ -210,6 +217,11 @@ machine readable: `{error: {code, message, retry: "none" | "refresh" |
 "same_request", request_id?}}`. An uncertain commit uses `same_request`;
 revision/owner/cursor conflicts use `refresh`. Nothing reports a successful
 result before the queue commit.
+
+Metadata, counts, capacity and returned rows are read in one database read
+transaction. A legitimate hot rollback journal may require controlled writable
+recovery; archived read-only access reports that need explicitly instead of
+deleting the journal, recreating storage or returning an empty queue.
 
 Source resolution is separate from stored provenance:
 `{recorded, availability: "available" | "unavailable" | "unsupported",

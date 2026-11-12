@@ -7,6 +7,7 @@ fn member(agent: &str, run: &str, step: Option<&str>, parent: Option<&str>) -> M
         codename: None,
         agent: agent.into(),
         run_id: run.into(),
+        work_execution_id: None,
         step_id: step.map(str::to_string),
         unit: None,
         kind: "workflow_step".into(),
