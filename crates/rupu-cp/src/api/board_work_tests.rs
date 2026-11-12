@@ -1,5 +1,5 @@
 use super::*;
-use rupu_fleet::work_queue::{WorkActor, WorkRecording, WorkRecordingAnchor, WorkSource};
+use rupu_fleet::work_queue::types::{WorkActor, WorkRecording, WorkRecordingAnchor, WorkSource};
 use std::fs;
 
 fn session(root: &Path, archive: bool, path: &Path) -> owner::Context {
@@ -14,8 +14,17 @@ fn session(root: &Path, archive: bool, path: &Path) -> owner::Context {
     if transcripts_dir.file_name().is_some_and(|s| s == "archive") {
         transcripts_dir = transcripts_dir.parent().unwrap().to_path_buf();
     }
-    fs::write(dir.join("session.json"),json!({"session_id":"ses_source","status":"idle","workspace_id":"ws_test","transcripts_dir":transcripts_dir,"created_at":"2026-11-12T00:00:00Z",
-        "runs":[{"run_id":"run_turn","transcript_path":path}]}).to_string()).unwrap();
+    let record:rupu_runtime::sessions::SessionRecord=serde_json::from_value(json!({
+        "version":1,"session_id":"ses_source","agent_name":"reviewer","provider_name":"mock","model":"fixture",
+        "agent_system_prompt":"Fixture","max_turns":50,"permission_mode":"readonly","no_stream":false,
+        "status":"idle","workspace_id":"ws_test","workspace_path":root,"transcripts_dir":transcripts_dir,
+        "created_at":"2026-11-12T00:00:00Z","updated_at":"2026-11-12T00:00:00Z",
+        "runs":[{"run_id":"run_turn","transcript_path":path,"prompt":"Fixture turn","started_at":"2026-11-12T00:00:00Z"}]})).unwrap();
+    fs::write(
+        dir.join("session.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
     owner::resolve(root, MessageRoute::Sessions, "ses_source", false).unwrap()
 }
 fn actor(anchor: WorkRecordingAnchor, path: &str, round: Option<u32>) -> WorkActor {
@@ -351,4 +360,192 @@ fn missing_or_replaced_execution_marker_never_resolves_as_the_original_launch() 
         source::Resolver::new(&ctx).actor(&who, None)["availability"],
         "unavailable"
     );
+}
+
+#[test]
+fn active_workflow_attempts_and_their_recorded_children_have_exact_sources() {
+    use rupu_orchestrator::runs::{AttemptRecord, RunRecord, RunStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let store = RunStore::new(root.join("runs"));
+    let record:RunRecord=serde_json::from_value(json!({"id":"run_workflow","workflow_name":"review","status":"running","inputs":{},
+        "workspace_id":"ws_test","workspace_path":root,"transcript_dir":root.join("transcripts"),"started_at":"2026-11-12T00:00:00Z"})).unwrap();
+    store.create(record, "name: review\nsteps: []\n").unwrap();
+    let directory = root.join("runs/run_workflow");
+    let path = directory.join("steps/review/run_step.jsonl");
+    prologue(&path, "run_step");
+    let mut who = actor(
+        WorkRecordingAnchor::Owner,
+        "steps/review/run_step.jsonl",
+        None,
+    );
+    if let WorkActor::Agent { run_id, .. } = &mut who {
+        *run_id = "run_step".into();
+    }
+    marker(&path, &who);
+    let attempt = AttemptRecord {
+        v: 1,
+        step_id: "review".into(),
+        unit_index: None,
+        sub_id: None,
+        agent_run_id: "run_step".into(),
+        transcript_path: path.clone(),
+        host: None,
+        continued_from: None,
+        started_at: "2026-11-12T00:00:00Z".parse().unwrap(),
+    };
+    store.append_attempt("run_workflow", &attempt).unwrap();
+    // Same exact identity may be recorded twice without manufacturing a new edge.
+    store.append_attempt("run_workflow", &attempt).unwrap();
+    let ctx = owner::resolve(&root, MessageRoute::Runs, "run_workflow", false).unwrap();
+    let value = source::Resolver::new(&ctx).actor(&who, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    let child_path = root.join("runs/run_step/sub/run_child/transcript.jsonl");
+    prologue(&child_path, "run_child");
+    let mut child = actor(
+        WorkRecordingAnchor::GlobalRuns,
+        "run_step/sub/run_child/transcript.jsonl",
+        None,
+    );
+    if let WorkActor::Agent { run_id, .. } = &mut child {
+        *run_id = "run_child".into();
+    }
+    marker(&child_path, &child);
+    let mut started = rupu_launch::ledger::Started::new(
+        "child",
+        rupu_tools::ChildKind::Subagent,
+        "reviewer",
+        "run_child",
+        std::process::id(),
+        1,
+    );
+    started.transcript = Some(child_path);
+    fs::write(
+        root.join("runs/run_step/children.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&rupu_launch::ledger::LedgerLine::Started(started)).unwrap()
+        ),
+    )
+    .unwrap();
+    let value = source::Resolver::new(&ctx).actor(&child, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    // Legacy search must not acquire the opt-in active-attempt membership.
+    let old = crate::api::children::pages::capture::search::capture(
+        crate::api::children::pages::Owner {
+            global: root.clone(),
+            runs: root.join("runs"),
+        },
+        "run_workflow",
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(!old.members.iter().any(|m| m.run_id == "run_step"));
+    let mut remote = attempt.clone();
+    remote.host = Some("remote".into());
+    fs::write(
+        directory.join("attempts.jsonl"),
+        format!("{}\n", serde_json::to_string(&remote).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&who, None)["availability"],
+        "unsupported"
+    );
+    let mut conflicting = attempt.clone();
+    conflicting.step_id = "another-step".into();
+    fs::write(
+        directory.join("attempts.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&attempt).unwrap(),
+            serde_json::to_string(&conflicting).unwrap()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&who, None)["availability"],
+        "unsupported"
+    );
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&child, None)["availability"],
+        "unsupported"
+    );
+    let mut unrelated = attempt;
+    unrelated.agent_run_id = "run_unrelated".into();
+    fs::write(
+        directory.join("attempts.jsonl"),
+        format!("{}\n", serde_json::to_string(&unrelated).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&who, None)["availability"],
+        "unsupported"
+    );
+}
+
+#[test]
+fn large_serialized_session_record_stays_bounded_and_does_not_leak_prompts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let path = root.join("transcripts/run_turn.jsonl");
+    prologue(&path, "run_turn");
+    let ctx = session(&root, false, &path);
+    let record_path = ctx.directory.join("session.json");
+    let mut record: rupu_runtime::sessions::SessionRecord =
+        serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    record.runs[0].prompt = "PRIVATE_FIXTURE_PROMPT_".repeat(100_000);
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert!(bytes.len() > 1024 * 1024);
+    fs::write(&record_path, bytes).unwrap();
+    let who = actor(
+        WorkRecordingAnchor::GlobalTranscripts,
+        "run_turn.jsonl",
+        None,
+    );
+    marker(&path, &who);
+    let ctx = owner::resolve(&root, MessageRoute::Sessions, "ses_source", false).unwrap();
+    let value = source::Resolver::new(&ctx).actor(&who, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    assert!(!value.to_string().contains("PRIVATE_FIXTURE_PROMPT_"));
+    // The same bounded canonical session proof supports children of this turn.
+    let child_path = root.join("runs/run_turn/sub/run_child/transcript.jsonl");
+    prologue(&child_path, "run_child");
+    let mut child = actor(
+        WorkRecordingAnchor::GlobalRuns,
+        "run_turn/sub/run_child/transcript.jsonl",
+        None,
+    );
+    if let WorkActor::Agent { run_id, .. } = &mut child {
+        *run_id = "run_child".into();
+    }
+    marker(&child_path, &child);
+    let mut start = rupu_launch::ledger::Started::new(
+        "child",
+        rupu_tools::ChildKind::Subagent,
+        "reviewer",
+        "run_child",
+        std::process::id(),
+        1,
+    );
+    start.transcript = Some(child_path);
+    fs::write(
+        root.join("runs/run_turn/children.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&rupu_launch::ledger::LedgerLine::Started(start)).unwrap()
+        ),
+    )
+    .unwrap();
+    let value = source::Resolver::new(&ctx).actor(&child, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&record_path)
+        .unwrap();
+    file.set_len(16 * 1024 * 1024 + 1).unwrap();
+    let error = owner::resolve(&root, MessageRoute::Sessions, "ses_source", false)
+        .err()
+        .unwrap();
+    assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }

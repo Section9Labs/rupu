@@ -5,7 +5,7 @@ use crate::api::children::pages::{
     Owner as ChildrenOwner,
 };
 use crate::api::{fs_open::open_anchored_regular_file, transcript::page};
-use rupu_fleet::work_queue::{
+use rupu_fleet::work_queue::types::{
     WorkActor, WorkItem, WorkItemSummary, WorkRecordingAnchor, WorkSource,
 };
 use rupu_runtime::services::operator::RootKind;
@@ -319,20 +319,32 @@ fn descendant(
     path: &Path,
     captures: &mut HashMap<String, Option<Captured>>,
 ) -> bool {
-    let roots: Vec<String> = if ctx.owner.kind == RootKind::Session {
+    let mut roots: Vec<String> = if ctx.owner.kind == RootKind::Session {
         ctx.record["runs"]
             .as_array()
             .into_iter()
             .flatten()
+            .rev()
             .filter_map(|r| r["run_id"].as_str().map(str::to_owned))
             .collect()
     } else {
         vec![ctx.owner.id.clone()]
     };
+    // A direct subagent locator identifies its parent turn. Prefer that exact
+    // canonical session member before spending the bounded capture budget on
+    // other turns; a long session must still resolve its current execution.
+    if let Some(parent) = path
+        .strip_prefix(ctx.global.join("runs"))
+        .ok()
+        .and_then(|p| p.components().next())
+        .and_then(|c| c.as_os_str().to_str())
+    {
+        roots.sort_by_key(|root| root != parent);
+    }
     for root in roots {
         if !captures.contains_key(&root) {
             // Keep availability work bounded across a 200-row queue page.
-            // A later exact-item read can resolve a source beyond this budget.
+            // Sources whose proof exceeds this budget remain explicitly unsupported.
             if captures.len() >= 16 {
                 return false;
             }
@@ -340,7 +352,7 @@ fn descendant(
                 global: ctx.global.clone(),
                 runs: ctx.global.join("runs"),
             };
-            let captured = search::capture(owner, &root, &AtomicBool::new(false)).ok();
+            let captured = search::capture_work_owner(owner, &root, &AtomicBool::new(false)).ok();
             captures.insert(root.clone(), captured);
         }
         let Some(Some(capture)) = captures.get(&root) else {
@@ -358,7 +370,7 @@ fn descendant(
         while let Some(parent) = capture.members[current].parent {
             if !matches!(
                 capture.members[current].source,
-                "children_ledger" | "workflow_step"
+                "children_ledger" | "workflow_step" | "workflow_attempt"
             ) || parent >= current
             {
                 valid = false;

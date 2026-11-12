@@ -4,7 +4,7 @@ use crate::{
     api::{fs_open::open_anchored_regular_file, transcript::page},
     host::messages::MessageRoute,
 };
-use rupu_runtime::services::operator::{Liveness, MessageRoot, RootKind};
+use rupu_runtime::services::operator::{MessageRoot, RootKind};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -13,6 +13,10 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
+
+// Session owner records contain past prompts as well as immutable ownership.
+// Bound that input independently of the 1 MiB queue response/page budget.
+const MAX_OWNER_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 pub(super) struct Owner {
@@ -31,6 +35,48 @@ pub(super) struct Context {
     pub global: PathBuf,
     pub directory: PathBuf,
     pub record: Value,
+}
+
+// Use the already bounded record; the legacy liveness helper rereads all
+// session history without this route's byte fence. Standalone authority uses
+// the shared bounded roster reader, never process presence by itself.
+fn live(root: &MessageRoot, record: &Value) -> bool {
+    let runner = || match &record["runner_pid"] {
+        Value::Null => true,
+        value => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .is_some_and(rupu_orchestrator::runs::pid_is_running),
+    };
+    match root.kind {
+        RootKind::Session => matches!(
+            record["status"].as_str(),
+            Some("idle" | "running" | "failed")
+        ),
+        RootKind::Workflow => {
+            matches!(record["status"].as_str(), Some("running" | "pending")) && runner()
+        }
+        RootKind::Agentiflow => record["status"] == "running" && runner(),
+        RootKind::Standalone => {
+            if matches!(
+                record["status"].as_str(),
+                Some("completed" | "failed" | "rejected" | "cancelled")
+            ) {
+                return false;
+            }
+            rupu_fleet::Roster::read_work_authority(&root.space.join("participants.jsonl"))
+                .ok()
+                .is_some_and(|roster| {
+                    roster.participants().any(|p| {
+                        p.live
+                            && p.member.run_id == root.id
+                            && p.member
+                                .pid
+                                .is_some_and(rupu_orchestrator::runs::pid_is_running)
+                    })
+                })
+        }
+    }
 }
 
 fn directory(path: &Path, required: bool) -> Result<bool> {
@@ -59,15 +105,20 @@ fn record(path: &Path, optional: bool) -> Result<Value> {
             .map_err(|e| Error::internal(e.to_string()))?,
     )
     .map_err(|_| Error::owner_changed())?;
-    if stamp.len > 1024 * 1024 {
-        return Err(Error::invalid("Board owner record exceeds 1 MiB"));
+    if stamp.len > MAX_OWNER_BYTES as u64 {
+        return Err(Error::new(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "work_capacity",
+            "Board owner record exceeds 16 MiB",
+            "none",
+        ));
     }
     let mut bytes = Vec::new();
     (&mut file)
-        .take(1024 * 1024 + 1)
+        .take((MAX_OWNER_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::internal(e.to_string()))?;
-    if bytes.len() > 1024 * 1024 {
+    if bytes.len() > MAX_OWNER_BYTES {
         return Err(Error::owner_changed());
     }
     page::check_stamp(path, &file, &stamp).map_err(|_| Error::owner_changed())?;
@@ -134,12 +185,7 @@ pub(super) fn resolve(
         id: id.into(),
         space,
     };
-    let writable = service
-        && !archived
-        && matches!(
-            root.liveness(&global, &rupu_orchestrator::runs::pid_is_running),
-            Liveness::Live
-        );
+    let writable = service && !archived && live(&root, &record);
     let metadata = fs::metadata(&dir).map_err(|_| Error::owner_changed())?;
     let mut digest = Sha256::new();
     digest.update(b"rupu.board-work.owner.v1\0");

@@ -111,7 +111,9 @@ impl Roster {
     /// Strict bounded authority read for Queue mutations. Legacy display reads
     /// keep their tolerant behavior; an unreadable later event must never make
     /// an older execution authoritative for work.
-    pub(crate) fn read_work_authority(path: &Path) -> Result<Self, crate::WorkError> {
+    /// Bounded strict roster parsing for work coordination. This is evidence
+    /// about recorded participants, not owner authorization by itself.
+    pub fn read_work_authority(path: &Path) -> Result<Self, crate::WorkError> {
         use std::{
             io::Read,
             os::unix::fs::{MetadataExt, OpenOptionsExt},

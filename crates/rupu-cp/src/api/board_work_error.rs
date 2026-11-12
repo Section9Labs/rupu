@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rupu_fleet::work_queue::WorkError;
+use rupu_fleet::work_queue::types::WorkError;
 use serde_json::json;
 
 pub(super) type Result<T> = std::result::Result<T, Error>;

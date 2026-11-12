@@ -21,7 +21,7 @@ use axum::{
     Json, Router,
 };
 use error::{Error, Result};
-use rupu_fleet::{work_queue::*, Board, Bus, FleetError, OperatorVia};
+use rupu_fleet::{work_queue::types::*, Board, Bus, FleetError, OperatorVia};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -131,7 +131,7 @@ fn identifier(id: &str) -> Result<()> {
         || id.len() > 128
         || !id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
     {
         return Err(Error::invalid("Invalid bounded work identifier"));
     }
@@ -501,28 +501,33 @@ fn mutate(
     }
     let request_id = command.request_id.clone();
     let check_owner = || {
-        let current = owner::resolve(global, route, id, true)
-            .map_err(|_| FleetError::Refused("Board owner changed".into()))?;
+        let current =
+            owner::resolve(global, route, id, true).map_err(|_| FleetError::RecipientChanged)?;
         if current.owner.token != ctx.owner.token || current.owner.archived {
-            return Err(FleetError::Refused("Board owner changed".into()));
+            return Err(FleetError::RecipientChanged);
         }
         Ok(())
     };
     let check_live = || {
         let current =
-            owner::resolve(global, route, id, true).map_err(|e| FleetError::Refused(e.message))?;
+            owner::resolve(global, route, id, true).map_err(|_| FleetError::RecipientChanged)?;
         if !current.owner.writable {
             return Err(FleetError::Refused("Board owner is read-only".into()));
         }
         Ok(())
     };
     // In-process MCP is still the authenticated CP operator, never an agent.
-    let reply = Bus::open(&ctx.root.space, rupu_fleet::address::OPERATOR).operator_work_apply(
-        command,
-        OperatorVia::Cp,
-        check_owner,
-        check_live,
-    )?;
+    let reply = Bus::open(&ctx.root.space, rupu_fleet::address::OPERATOR)
+        .operator_work_apply(command, OperatorVia::Cp, check_owner, check_live)
+        .map_err(|error| match error {
+            WorkError::Fleet(FleetError::RecipientChanged) => Error::owner_changed(),
+            WorkError::Fleet(FleetError::Refused(reason))
+                if reason == "Board owner is read-only" =>
+            {
+                Error::from(WorkError::ReadOnly(reason))
+            }
+            other => Error::from(other),
+        })?;
     let current_item = source::Resolver::new(&ctx).item(&reply.current_item);
     bounded(0, |_| {
         Ok(
