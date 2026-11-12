@@ -44,6 +44,10 @@ fn assert_noncurrent(value: &Value) {
 #[tokio::test]
 async fn executing_steps_change_frontier_and_source_generation_without_transcript_append() {
     let (_tmp, s, path, owner) = executing_fixture();
+    // RunStore::create initializes the result journal. Prove its bytes stay
+    // unchanged; absence is not part of the production storage contract.
+    let original_results = fs::read(path.join("step_results.jsonl")).unwrap();
+    assert!(!path.join("events.jsonl").exists());
     let original = latest(&s).await;
     let first = poll(&s, original["frontier"].as_str()).await;
     assert_eq!(first["changed"], false);
@@ -98,7 +102,10 @@ async fn executing_steps_change_frontier_and_source_generation_without_transcrip
     assert_eq!(capture["sections"].as_object().unwrap().len(), 6);
     assert!(capture["execution_input_bytes"].as_u64().unwrap() > 0);
     assert!(!path.join("events.jsonl").exists());
-    assert!(!path.join("step_results.jsonl").exists());
+    assert_eq!(
+        fs::read(path.join("step_results.jsonl")).unwrap(),
+        original_results
+    );
     active.finish().unwrap();
     owner.finish().unwrap();
 }
