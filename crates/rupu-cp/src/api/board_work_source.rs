@@ -84,6 +84,23 @@ fn relative(path: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
         && Path::new(path).extension().is_some_and(|x| x == "jsonl")
 }
+// Only aliases supplied by trusted configuration/registration and this exact
+// selected owner's lifecycle movement are rewritten. Descendant symlinks are
+// still refused by the anchored file opener; this never canonicalizes a model
+// supplied path or guesses another owner/run.
+fn normalized(mut path: PathBuf, aliases: &[(PathBuf, PathBuf)]) -> PathBuf {
+    for (from, to) in aliases {
+        if let Ok(relative) = path.strip_prefix(from) {
+            if relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+            {
+                path = to.join(relative);
+            }
+        }
+    }
+    path
+}
 fn resolve(
     ctx: &Context,
     actor: &WorkActor,
@@ -91,6 +108,7 @@ fn resolve(
 ) -> Value {
     let WorkActor::Agent {
         run_id,
+        execution_id,
         agent,
         recording,
         ..
@@ -101,6 +119,18 @@ fn resolve(
     if !relative(&recording.relative_path) {
         return unavailable("invalid_recording_locator");
     }
+    let mut aliases = vec![(ctx.configured_global.clone(), ctx.global.clone())];
+    let collections: &[&str] = match ctx.owner.kind {
+        RootKind::Session => &["sessions", "sessions-archive"],
+        RootKind::Workflow | RootKind::Standalone => &["runs", "runs-archive"],
+        RootKind::Agentiflow => &["agentiflows"],
+    };
+    aliases.extend(collections.iter().map(|collection| {
+        (
+            ctx.global.join(collection).join(&ctx.owner.id),
+            ctx.directory.clone(),
+        )
+    }));
     let anchor = match recording.anchor {
         WorkRecordingAnchor::Owner => ctx.directory.clone(),
         WorkRecordingAnchor::GlobalTranscripts => ctx.global.join("transcripts"),
@@ -115,13 +145,15 @@ fn resolve(
             let Ok(Some(workspace)) = store.load(id) else {
                 return unsupported("project_registration_unavailable");
             };
-            let Ok(path) = PathBuf::from(workspace.path).canonicalize() else {
+            let configured = PathBuf::from(workspace.path);
+            let Ok(path) = configured.canonicalize() else {
                 return unavailable("project_directory_unavailable");
             };
+            aliases.push((configured, path.clone()));
             path.join(".rupu/transcripts")
         }
     };
-    let mut path = anchor.join(&recording.relative_path);
+    let mut path = normalized(anchor.join(&recording.relative_path), &aliases);
     let project = recording
         .workspace_id
         .as_deref()
@@ -144,21 +176,8 @@ fn resolve(
         let Some(transcripts_dir) = ctx.record["transcripts_dir"].as_str() else {
             return unsupported("session_transcript_root_unavailable");
         };
-        let mut transcript_root = PathBuf::from(transcripts_dir);
-        let mut member_path = PathBuf::from(recorded_path);
-        // Owner-relative recordings move with their session directory. Preserve
-        // the exact relative subdirectory when rebasing an archive/restore.
-        if recording.anchor == WorkRecordingAnchor::Owner {
-            for collection in ["sessions", "sessions-archive"] {
-                let original = ctx.global.join(collection).join(&ctx.owner.id);
-                if let Ok(relative) = transcript_root.strip_prefix(&original) {
-                    transcript_root = ctx.directory.join(relative);
-                }
-                if let Ok(relative) = member_path.strip_prefix(&original) {
-                    member_path = ctx.directory.join(relative);
-                }
-            }
-        }
+        let transcript_root = normalized(PathBuf::from(transcripts_dir), &aliases);
+        let member_path = normalized(PathBuf::from(recorded_path), &aliases);
         let name = format!("{run_id}.jsonl");
         let valid_root = transcript_root
             .strip_prefix(&anchor)
@@ -195,7 +214,7 @@ fn resolve(
             || (ctx.owner.kind == RootKind::Agentiflow
                 && *run_id == ctx.owner.id
                 && recording.round.is_some());
-        if !exact_root && !descendant(ctx, run_id, &path, captures) {
+        if !exact_root && !descendant(ctx, run_id, &path, captures, &aliases) {
             return unsupported("recorded_execution_membership_unavailable");
         }
     }
@@ -209,7 +228,7 @@ fn resolve(
         {
             return unavailable("descendant_recording_identity_mismatch");
         }
-        if !descendant(ctx, run_id, &path, captures) {
+        if !descendant(ctx, run_id, &path, captures, &aliases) {
             return unsupported("recorded_descendant_membership_unavailable");
         }
     } else if recording.anchor != WorkRecordingAnchor::Owner && ctx.owner.kind != RootKind::Session
@@ -220,7 +239,7 @@ fn resolve(
             return unavailable("run_recording_identity_mismatch");
         }
         if !(ctx.owner.kind == RootKind::Standalone && *run_id == ctx.owner.id)
-            && !descendant(ctx, run_id, &path, captures)
+            && !descendant(ctx, run_id, &path, captures, &aliases)
         {
             return unsupported("recorded_execution_membership_unavailable");
         }
@@ -306,7 +325,8 @@ fn resolve(
         return unavailable("recording_identity_mismatch");
     }
     json!({"availability":"available","transcript":{
-        "host":"local","path":path,"run_id":run_id,"workspace_id":workspace_id,"round":recording.round
+        "host":"local","path":path,"run_id":run_id,"execution_id":execution_id,
+        "workspace_id":workspace_id,"round":recording.round
     }})
 }
 
@@ -318,6 +338,7 @@ fn descendant(
     run: &str,
     path: &Path,
     captures: &mut HashMap<String, Option<Captured>>,
+    aliases: &[(PathBuf, PathBuf)],
 ) -> bool {
     let mut roots: Vec<String> = if ctx.owner.kind == RootKind::Session {
         ctx.record["runs"]
@@ -358,11 +379,12 @@ fn descendant(
         let Some(Some(capture)) = captures.get(&root) else {
             continue;
         };
-        let Some(index) = capture
-            .members
-            .iter()
-            .position(|m| m.run_id == run && m.path.as_deref() == Some(path))
-        else {
+        let Some(index) = capture.members.iter().position(|m| {
+            m.run_id == run
+                && m.path
+                    .as_ref()
+                    .is_some_and(|p| normalized(p.clone(), aliases) == path)
+        }) else {
             continue;
         };
         let mut current = index;

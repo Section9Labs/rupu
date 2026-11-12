@@ -549,3 +549,126 @@ fn large_serialized_session_record_stays_bounded_and_does_not_leak_prompts() {
         .unwrap();
     assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[cfg(unix)]
+#[test]
+fn trusted_configured_root_aliases_preserve_exact_active_and_archived_session_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    for (n, archived, anchor, relative) in [
+        (
+            0,
+            false,
+            WorkRecordingAnchor::GlobalTranscripts,
+            "run_turn.jsonl",
+        ),
+        (
+            1,
+            true,
+            WorkRecordingAnchor::GlobalTranscripts,
+            "run_turn.jsonl",
+        ),
+        (2, false, WorkRecordingAnchor::Owner, "turns/run_turn.jsonl"),
+        (3, true, WorkRecordingAnchor::Owner, "turns/run_turn.jsonl"),
+    ] {
+        let real = base.join(format!("real-{n}"));
+        fs::create_dir(&real).unwrap();
+        let configured = base.join(format!("alias-{n}"));
+        std::os::unix::fs::symlink(&real, &configured).unwrap();
+        let transcript_root = if anchor == WorkRecordingAnchor::Owner {
+            configured
+                .join(if archived {
+                    "sessions-archive"
+                } else {
+                    "sessions"
+                })
+                .join("ses_source/turns")
+        } else {
+            configured.join("transcripts")
+        };
+        let path = if archived {
+            transcript_root.join("archive/run_turn.jsonl")
+        } else {
+            transcript_root.join("run_turn.jsonl")
+        };
+        prologue(&path, "run_turn");
+        let who = actor(anchor, relative, None);
+        marker(&path, &who);
+        let ctx = session(&configured, archived, &path);
+        let value = source::Resolver::new(&ctx).actor(&who, None);
+        assert_eq!(value["availability"], "available", "case {n}: {value}");
+        assert_eq!(
+            value["transcript"]["path"],
+            json!(path.canonicalize().unwrap())
+        );
+        assert_eq!(value["recorded"]["actor"], json!(who));
+    }
+}
+
+#[test]
+fn workflow_archive_restore_rebases_only_its_proven_owner_prefix() {
+    use rupu_orchestrator::runs::{AttemptRecord, RunRecord, RunStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let store = RunStore::new(root.join("runs"));
+    let record:RunRecord=serde_json::from_value(json!({"id":"run_workflow","workflow_name":"review","status":"completed","inputs":{},
+        "workspace_id":"ws_test","workspace_path":root,"transcript_dir":root.join("transcripts"),"started_at":"2026-11-12T00:00:00Z"})).unwrap();
+    store.create(record, "name: review\nsteps: []\n").unwrap();
+    let path = root.join("runs/run_workflow/steps/review/run_step.jsonl");
+    prologue(&path, "run_step");
+    let mut who = actor(
+        WorkRecordingAnchor::Owner,
+        "steps/review/run_step.jsonl",
+        None,
+    );
+    if let WorkActor::Agent { run_id, .. } = &mut who {
+        *run_id = "run_step".into();
+    }
+    marker(&path, &who);
+    let attempt = AttemptRecord {
+        v: 1,
+        step_id: "review".into(),
+        unit_index: None,
+        sub_id: None,
+        agent_run_id: "run_step".into(),
+        transcript_path: path.clone(),
+        host: None,
+        continued_from: None,
+        started_at: "2026-11-12T00:00:00Z".parse().unwrap(),
+    };
+    store.append_attempt("run_workflow", &attempt).unwrap();
+    let ctx = owner::resolve(&root, MessageRoute::Runs, "run_workflow", false).unwrap();
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&who, None)["availability"],
+        "available"
+    );
+    store.archive("run_workflow").unwrap();
+    let ctx = owner::resolve(&root, MessageRoute::Runs, "run_workflow", false).unwrap();
+    let value = source::Resolver::new(&ctx).actor(&who, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    assert_eq!(
+        value["transcript"]["path"],
+        json!(root.join("runs-archive/run_workflow/steps/review/run_step.jsonl"))
+    );
+    let mut unrelated = attempt.clone();
+    unrelated.transcript_path = root.join("runs/run_unrelated/steps/review/run_step.jsonl");
+    fs::write(
+        root.join("runs-archive/run_workflow/attempts.jsonl"),
+        format!("{}\n", serde_json::to_string(&unrelated).unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        source::Resolver::new(&ctx).actor(&who, None)["availability"],
+        "unsupported"
+    );
+    fs::write(
+        root.join("runs-archive/run_workflow/attempts.jsonl"),
+        format!("{}\n", serde_json::to_string(&attempt).unwrap()),
+    )
+    .unwrap();
+    store.restore("run_workflow").unwrap();
+    let ctx = owner::resolve(&root, MessageRoute::Runs, "run_workflow", false).unwrap();
+    let value = source::Resolver::new(&ctx).actor(&who, None);
+    assert_eq!(value["availability"], "available", "{value}");
+    assert_eq!(value["transcript"]["path"], json!(path));
+}

@@ -33,6 +33,7 @@ pub(super) struct Context {
     pub owner: Owner,
     pub root: MessageRoot,
     pub global: PathBuf,
+    pub configured_global: PathBuf,
     pub directory: PathBuf,
     pub record: Value,
 }
@@ -133,6 +134,7 @@ pub(super) fn resolve(
     if MessageRoute::of_id(id) != Some(route) {
         return Err(Error::missing("Board owner does not match this route"));
     }
+    let configured_global = global.to_path_buf();
     let global = global
         .canonicalize()
         .map_err(|_| Error::missing("Global owner root is unavailable"))?;
@@ -228,6 +230,7 @@ pub(super) fn resolve(
         },
         root,
         global,
+        configured_global,
         directory: dir,
         record,
     })
