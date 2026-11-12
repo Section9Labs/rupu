@@ -126,7 +126,7 @@ provider: anthropic
 model: claude-opus-5
 fallbacks:
   - model: claude-sonnet-5-5          # same provider as the run
-  - provider: openai-codex            # another provider
+  - provider: openai                  # another provider
     model: gpt-5.6-cyber
 ---
 ```
@@ -137,9 +137,18 @@ fallbacks:
 [recovery]
 fallbacks = [
   { model = "claude-sonnet-5-5" },
-  { provider = "openai-codex", model = "gpt-5.6-cyber" },
+  { provider = "openai", model = "gpt-5.6-cyber" },
 ]
 ```
+
+A `provider` names a built-in vendor (`anthropic`, `openai`, `gemini`, `copilot`)
+or an account declared under `[providers.<name>]`. `openai-codex` with a hyphen
+is the display id transcripts and pricing use for the OpenAI client, not a
+built-in name; a chain entry may name it only with
+`[providers.openai-codex] kind = "openai_codex"` declared and logged in. A hop
+to another model carries none of the agent's model-specific pins, the Daybreak
+`cyber` program included (see
+[agent-format.md](agent-format.md#cyber)).
 
 Both forms reject unknown keys, so a typo in an entry is a load error and not a
 silent no-op.

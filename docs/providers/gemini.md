@@ -50,11 +50,9 @@ On a machine with no browser:
 rupu auth login --account gemini --mode device
 ```
 
-rupu prints a Google sign-in URL. Open it in a browser on any machine, sign in, and paste the code Google's page (`codeassist.google.com/authcode`) shows. rupu stores the result as the account's `sso` credential, exactly as `--mode sso` does, and sets up the Code Assist project afterwards.
+rupu prints a Google sign-in URL. Open it in a browser on any machine, sign in, and paste the code Google's page (`codeassist.google.com/authcode`) shows. rupu stores the result as the account's `sso` credential, exactly as `--mode sso` does, and sets up the Code Assist project afterwards. The URL and the prompt go to stderr and the code is read from one line of stdin (a terminal or a pipe); the only stdout line is `rupu: stored gemini sso credential`. See [providers.md](../providers.md#device-login---mode-device) for the full contract.
 
 Google's consent screen appears on every device login: the URL carries `prompt=consent` and `access_type=offline` so that Google always returns a refresh token. If it returns none, the login fails with a message to revoke "Gemini CLI" at https://myaccount.google.com/permissions and retry, and nothing is stored.
-
-> Not yet verified against Google: this flow follows Gemini CLI's manual login and has not been run against a live Google account.
 
 ## Configuration
 

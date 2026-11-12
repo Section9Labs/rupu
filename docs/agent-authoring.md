@@ -225,6 +225,10 @@ Recommended traits:
 - Keep `description:` short and useful; it becomes your agent catalog.
 - Prefer explicit `provider`, `model`, `tools`, and `permissionMode` in checked-in files.
 - Version the prompt like code. Small prompt changes can materially change behavior.
+- Do not name an agent `rupu-session`. That name is reserved for the session agent
+  compiled into the binary, which is resolved before either agents directory is read,
+  so a file with that `name:` is never the agent that runs. See
+  [using-rupu.md](using-rupu.md#built-in-session-rupu-session).
 
 ---
 

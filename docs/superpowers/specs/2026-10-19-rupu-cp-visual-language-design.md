@@ -1,6 +1,6 @@
 # rupu CP — common visual language + app-wide rollout
 
-**Status:** design, approved in direction (mocks reviewed 2026-10-19)
+**Status:** rolled out. Foundation components, the Dashboard, the lists and Settings landed first; the app-wide migration followed in groups: Build (#905), Fleet (#910), Customers (#911), Usage (#912) and the detail pages (#913, the last group). Kept bespoke on purpose: `FindingDetail` (a report-document viewer with a stateful back link and its own `ReportHeader`), `SessionDetail`'s chat-style header, `CustomerDetail`'s card header (breadcrumb, customer dot, slug chip, accounts, Edit / Archive) and the Usage page's two-column live header. Mocks reviewed 2026-10-19.
 **Surface mode:** Operate (app screens worked in daily)
 **Scope:** The rupu Control Plane web UI (`crates/rupu-cp/web`). Pure frontend UI/UX — a dashboard/admin interface. No backend or data-model change beyond what a screen genuinely needs.
 

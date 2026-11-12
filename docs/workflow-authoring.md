@@ -241,6 +241,28 @@ This is the practical way to get "agentic orchestration" without pretending the 
 
 ---
 
+## Scoped definitions and revision-pinned launches
+
+A workflow saved under `<repo>/.rupu/workflows/` shadows a global one of the same
+`name:` for that project, so a project can carry its own version of a shared workflow.
+The control plane addresses the two layers explicitly: `scope_kind: project` with the
+project's `scope_id` selects that definition and only that one, `scope_kind: global`
+the global one, and a missing selected definition is a 404 rather than a fallback to
+the other layer. Each definition carries a `revision` (`sha256:` of its raw YAML).
+
+A save with `expected_revision` is refused with a 409 when the file changed since you
+read it, before anything is written, so two editors cannot overwrite each other. A launch
+with `expected_revision` (and the explicit scope) is refused the same way, and otherwise
+pins the exact YAML it read into `<global>/cp/workflow-launches/` and runs that file, so
+the run executes the definition you reviewed even if the catalog file changes a moment
+later. The pin covers the workflow only: the agents it names, provider and model
+configuration and any files the steps read resolve from the execution workspace at run
+time. Contract and request shapes:
+[workflow-scoped-revision-api.md](workflow-scoped-revision-api.md); routes:
+[cp-api.md](cp-api.md#launch-agents-and-workflows).
+
+---
+
 ## Workflow authoring checklist
 
 Before you commit a workflow, verify that:
