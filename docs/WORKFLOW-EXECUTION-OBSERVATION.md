@@ -54,8 +54,9 @@ its own generation; recorded terminal status alone is not proof of no work.
 
 Ordinary DAG activation begins after its semaphore permit is acquired. The
 legacy sequential driver uses the same body boundary. Inline branch, split,
-join, loop, gate decision, notification and rejection cleanup bodies use
-explicit activation scopes. Parked human approval and semaphore-queued work
+join, loop, gate decision and rejection cleanup bodies use explicit activation
+scopes. Notification hooks remain inside their parent gate activation: their
+legacy synthetic IDs are not unique authored workflow step identities. Parked human approval and semaphore-queued work
 are absent. Recursive loop schedulers share the owner and carry their actual
 iteration coordinates. Tokio task boundaries explicitly propagate context.
 
@@ -66,6 +67,9 @@ remote-dispatch behavior is not strengthened by observation. A manual pause
 request does not remove running bodies; acknowledged drain and body exit do.
 
 Cancellation revocation and admission use the same strict mutation protocol.
+An explicit terminal-to-running retry clears its cancellation barrier only
+while holding that protocol and after proving the prior owner has released
+its lifetime lock. Ordinary status changes do not silently clear revocation.
 An invalidated generation cannot admit another observation member. A previous
 generation's late completion cannot alter a resumed generation. Ownership
 teardown revokes current authority; retained data becomes historical evidence.
@@ -75,7 +79,11 @@ teardown revokes current authority; retained data becomes historical evidence.
 Local cooperating Unix schedulers hold a dedicated fail-closed per-run
 ownership lock and a unique per-generation lifetime lock. A generation-specific
 lock prevents a new owner from making an old saved snapshot look live during
-replacement initialization. Mutation and revocation serialize separately.
+replacement initialization. Mutation and revocation serialize separately. Producers wait at most two
+seconds for the mutation lock and never proceed unlocked; readers use an
+immediate probe. Ordinary polling contention therefore does not immediately
+revoke a producer. A stored producer on a supported platform refuses to start
+if its ownership cannot be established, including a conflicting live owner.
 
 The reader opens bounded regular files relative to the already validated run
 directory, validates file identity, and probes that exact generation's lock.
