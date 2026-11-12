@@ -1517,6 +1517,8 @@ pub async fn run_workflow(
         run_workflow_body(
             &opts,
             run_id,
+            &resolved_inputs,
+            workflow_default_continue,
             step_results,
             approved_step_id,
             run_record_opt.as_ref(),
@@ -1530,6 +1532,8 @@ pub async fn run_workflow(
 async fn run_workflow_body(
     opts: &OrchestratorRunOpts,
     run_id: String,
+    resolved_inputs: &BTreeMap<String, String>,
+    workflow_default_continue: bool,
     mut step_results: Vec<StepResult>,
     approved_step_id: Option<String>,
     run_record_opt: Option<&crate::runs::RunRecord>,
