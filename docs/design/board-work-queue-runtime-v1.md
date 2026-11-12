@@ -43,8 +43,12 @@ replay remains separate from new-write authority.
 Every mutation takes the retention lifecycle lease before the Bus lock and
 storage transaction. Owner directory identity and immutable owner-record identity
 are checked again under the guard. Mutable session history/status saves do not
-change owner identity. Archive, replacement and termination cannot silently
-transfer authority.
+change owner identity. Owner records are projected with a 16 MiB read bound;
+larger records report Queue unavailability explicitly. Archive, replacement and
+termination cannot silently transfer authority.
+Metadata uses fd-anchored, no-follow, nonblocking opens and checks that the
+regular file remains the same throughout each read. Concurrent replacement is
+refused; a legitimate atomic session save between reads keeps its authority.
 
 The collector reads at most eight queued items and four active items per state
 (claimed, working, blocked). It reports source-scoped counts and pagination;

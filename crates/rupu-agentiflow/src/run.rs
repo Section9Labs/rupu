@@ -806,13 +806,14 @@ pub fn run_agentiflow(opts: RunAgentiflowOpts) -> Result<EnvelopeOutcome, Agenti
                     .staying(),
             );
             // The lead joins before the record says `running`, so from then on
-            // the operator reaches it, before its first round too. Each
-            // round's join (the assembler's) finds this member and writes
-            // nothing.
+            // the operator reaches it, before its first round too. The
+            // assembler replaces this preliminary member with the exact
+            // Queue execution identity when each round is assembled.
             let member = rupu_fleet::Member {
                 codename: Some(lead_codename.clone()),
                 agent: lead.agent.name.clone(),
                 run_id: id.clone(),
+                work_execution_id: None,
                 step_id: None,
                 unit: None,
                 kind: rupu_runtime::services::messaging::member_kind(

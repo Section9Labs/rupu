@@ -40,7 +40,7 @@ flow_lead:
   grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
-  origin_grant: "origin:flow_lead: board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report dispatch join workflows.generate"
+  origin_grant: "origin:flow_lead: board.work_post board.work_list board.work_get board.work_timeline board.work_claim board.work_start board.work_block board.work_resume board.work_complete board.work_fail board.claim board.release board.post board.read board.directive board.retract msg.send goal.status goal.coverage budget.status agents.list agents.get workflows.list workflows.get catalog.search findings.report dispatch join workflows.generate"
   messaging: "declared:*,origin:flow_lead"
   narrowed: []
 flow_unit:
@@ -81,7 +81,7 @@ flow_unit:
   grant_offers_dispatch: true
   grant_offers_issues_create: true
   grant_offers_agents_list: true
-  origin_grant: "origin:flow_unit: board.claim board.release board.post board.read msg.send"
+  origin_grant: "origin:flow_unit: board.work_post board.work_list board.work_get board.work_timeline board.work_claim board.work_start board.work_block board.work_resume board.work_complete board.work_fail board.claim board.release board.post board.read msg.send"
   messaging: "declared:*,origin:flow_unit"
   narrowed: []
 session_turn:

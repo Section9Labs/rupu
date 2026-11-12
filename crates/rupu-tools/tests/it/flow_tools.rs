@@ -738,7 +738,10 @@ fn star_never_grants_directive_or_retract() {
     let star = resolve(&["*"]);
     assert!(star.offers("board.post") && star.offers("agents.list"));
     assert!(!star.offers("board.directive") && !star.offers("board.retract"));
-    assert!(star.skipped.iter().all(|u| !u.tool.starts_with("board.")));
+    assert!(star.skipped.iter().all(|u| !matches!(u.tool.as_str(), "board.directive" | "board.retract")));
+    let queue_skipped: Vec<_> = star.skipped.iter().filter(|u| u.tool.starts_with("board.")).collect();
+    assert_eq!(queue_skipped.len(), rupu_tools::work_queue::DESCRIPTORS.len());
+    assert!(queue_skipped.iter().all(|u| u.tool.starts_with("board.work_") && u.missing == vec![rupu_tools::Service::WorkQueue]));
     for explicit in [&["board.directive", "board.retract"][..], &["board.*"][..]] {
         let g = resolve(explicit);
         assert!(

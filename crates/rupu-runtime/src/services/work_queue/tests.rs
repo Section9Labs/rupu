@@ -189,10 +189,13 @@ fn mutable_session_save_is_allowed_but_replaced_owner_record_is_fenced() {
         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     record.updated_at = chrono::Utc::now();
     record.total_turns = 11;
-    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let temporary = path.with_extension("new");
+    fs::write(&temporary, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::rename(&temporary, &path).unwrap();
     let first = queue.apply(post("before_replacement"), source()).unwrap();
     record.created_at += chrono::Duration::seconds(1);
-    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(&temporary, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::rename(&temporary, &path).unwrap();
     let next = WorkCommand {
         request_id: "after_replacement".into(),
         expected_queue_id: Some(first.receipt.queue_id),
@@ -203,6 +206,41 @@ fn mutable_session_save_is_allowed_but_replaced_owner_record_is_fenced() {
         },
     };
     assert!(queue.apply(next, source()).is_err());
+}
+
+#[test]
+fn production_session_history_above_256_kib_keeps_exact_queue_authority() {
+    let home = Home::new();
+    let spec = home.session();
+    let path = home.global.join("sessions/ses_queue/session.json");
+    let mut session: crate::sessions::SessionRecord =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    session
+        .message_history
+        .push(rupu_providers::types::Message::user(
+            &"recorded project discussion ".repeat(20_000),
+        ));
+    let bytes = serde_json::to_vec(&session).unwrap();
+    assert!(bytes.len() > 256 * 1024);
+    fs::write(&path, bytes).unwrap();
+    let (queue, _) = home.queue(&spec, "exec_long_session");
+    let first = queue.apply(post("long_history"), source()).unwrap();
+    session
+        .message_history
+        .push(rupu_providers::types::Message::assistant(
+            "Continue the existing project work",
+        ));
+    session.updated_at = chrono::Utc::now();
+    fs::write(&path, serde_json::to_vec(&session).unwrap()).unwrap();
+    let claim = WorkCommand {
+        request_id: "long_history_claim".into(),
+        expected_queue_id: Some(first.receipt.queue_id),
+        expected_revision: first.current_item.revision,
+        operation: WorkOperation::Claim {
+            work_id: first.current_item.work_id,
+        },
+    };
+    assert!(queue.apply(claim, source()).is_ok());
 }
 
 #[test]
@@ -456,6 +494,18 @@ async fn tools_reject_forged_authority_and_record_runtime_source_structurally() 
         policy.decide(tool.descriptor(), &input, &mut Default::default()),
         rupu_tools::Decision::Allow
     ));
+    let lifecycle = RetentionLease::try_acquire(&home.global).unwrap();
+    let busy = tool.invoke(input.clone(), &ctx).await.unwrap();
+    assert!(busy.error.is_some());
+    let retry = busy.structured.as_ref().unwrap();
+    assert_eq!(retry["error"]["code"], "work_busy");
+    assert_eq!(retry["error"]["retry"], "same_request");
+    assert_eq!(retry["error"]["request_id"], "tool_post");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&busy.stdout).unwrap(),
+        *retry
+    );
+    drop(lifecycle);
     let out = tool.invoke(input, &ctx).await.unwrap();
     assert!(out.error.is_none());
     let structured = out.structured.unwrap();
@@ -599,5 +649,22 @@ async fn assembled_execution_stamps_duplicate_ids_and_denied_call_positions() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
+    let start = events
+        .iter()
+        .position(|e| matches!(e, rupu_transcript::Event::RunStart { .. }))
+        .unwrap();
+    let marker = events.iter().position(|e| matches!(e, rupu_transcript::Event::Notice { kind, .. } if kind == "work_queue_execution")).unwrap();
+    let first_turn = events
+        .iter()
+        .position(|e| matches!(e, rupu_transcript::Event::TurnStart { .. }))
+        .unwrap();
+    assert!(start < marker && marker < first_turn);
+    let rupu_transcript::Event::Notice { message, .. } = &events[marker] else {
+        panic!()
+    };
+    assert_eq!(
+        serde_json::from_str::<WorkActor>(message).unwrap(),
+        queue.actor()
+    );
     assert_eq!(events.iter().filter(|e| matches!(e,rupu_transcript::Event::ToolResult {structured:Some(v),..} if v.get("receipt").is_some())).count(),3);
 }

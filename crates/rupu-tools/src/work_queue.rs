@@ -1,7 +1,7 @@
 //! Durable Board work. Authority belongs to the runtime port, never tool JSON.
 use crate::{Effect, Service, Tool, ToolContext, ToolDescriptor, ToolError, ToolOutput};
 use async_trait::async_trait;
-use rupu_fleet::work_queue::*;
+use rupu_fleet::work_queue::types::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{path::PathBuf, sync::Arc};

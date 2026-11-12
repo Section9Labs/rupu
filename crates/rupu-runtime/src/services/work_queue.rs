@@ -5,17 +5,19 @@ use crate::{
     retention_lease::RetentionLease,
 };
 use rupu_agent::{Cadence, Injection, InjectionKind, TurnCollector, TurnContext};
-use rupu_fleet::{work_queue::*, Bus, FleetError};
+use rupu_fleet::{work_queue::types::*, Bus, FleetError};
 use rupu_tools::work_queue::{WorkOwnerBinding, WorkOwnerKind, WorkQueuePort};
 use std::{
     fs,
-    io::Read,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
+
+#[path = "work_queue/record.rs"]
+mod record;
 
 fn refused(message: impl Into<String>) -> FleetError {
     FleetError::Refused(message.into())
@@ -124,27 +126,12 @@ fn owner_record(owner: &WorkOwnerBinding) -> Result<Option<OwnerRecord>, FleetEr
         WorkOwnerKind::Agentiflow => "agentiflow.json",
         _ => "run.json",
     };
-    let path = owner.directory.join(file);
-    match fs::symlink_metadata(&path) {
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && owner.kind == WorkOwnerKind::Standalone =>
-        {
-            return Ok(None)
-        }
-        Err(e) => return Err(refused(format!("Queue owner record unavailable: {e}"))),
-        Ok(_) => (),
-    }
-    regular_path(&path, false)?;
-    let f = fs::File::open(path).map_err(|e| refused(e.to_string()))?;
     // Stream projection parsing: message_history is skipped, not materialized.
-    if f.metadata().map_err(|e| refused(e.to_string()))?.len() > 64 * 1024 * 1024 {
-        return Err(refused("Queue owner record exceeds 64 MiB bound"));
-    }
-    let limited = f.take(64 * 1024 * 1024 + 1);
+    // The reader pins the opened regular file for this read only; legitimate
+    // atomic record saves between reads retain the immutable owner identity.
     let record = if owner.kind == WorkOwnerKind::Session {
-        let r: SessionOwnerRecord = serde_json::from_reader(limited)
-            .map_err(|_| refused("session Queue owner record is malformed or exceeds bound"))?;
+        let r: SessionOwnerRecord = record::read(&owner.directory, file)?
+            .ok_or_else(|| refused("session Queue owner record is missing"))?;
         if r.session_id != owner.id {
             return Err(refused("session Queue owner identity differs"));
         }
@@ -161,8 +148,11 @@ fn owner_record(owner: &WorkOwnerBinding) -> Result<Option<OwnerRecord>, FleetEr
             workspace_id: Some(r.workspace_id),
         }
     } else {
-        let r: RunOwnerRecord = serde_json::from_reader(limited)
-            .map_err(|_| refused("run Queue owner record is malformed or exceeds bound"))?;
+        let r: RunOwnerRecord = match record::read(&owner.directory, file)? {
+            Some(record) => record,
+            None if owner.kind == WorkOwnerKind::Standalone => return Ok(None),
+            None => return Err(refused("run Queue owner record is missing")),
+        };
         if r.id != owner.id {
             return Err(refused("run Queue owner identity differs"));
         }
@@ -258,15 +248,15 @@ impl WorkQueuePort for RuntimeQueue {
         self.active.store(false, Ordering::Release);
     }
     fn list(&self, query: WorkPageQuery) -> Result<WorkPage, WorkError> {
-        self.owner_current()?;
+        self.owner_current().map_err(|_| WorkError::OwnerChanged)?;
         self.bus.board.work_list(query)
     }
     fn get(&self, id: &str) -> Result<WorkItem, WorkError> {
-        self.owner_current()?;
+        self.owner_current().map_err(|_| WorkError::OwnerChanged)?;
         self.bus.board.work_get(id)
     }
     fn timeline(&self, query: WorkTimelineQuery) -> Result<WorkTimelinePage, WorkError> {
-        self.owner_current()?;
+        self.owner_current().map_err(|_| WorkError::OwnerChanged)?;
         self.bus.board.work_timeline(query)
     }
     fn apply(&self, command: WorkCommand, source: WorkSource) -> Result<WorkReply, WorkError> {
@@ -277,7 +267,7 @@ impl WorkQueuePort for RuntimeQueue {
                 WorkError::Persistence(format!("Queue lifecycle guard: {e}"))
             }
         })?;
-        self.owner_current()?;
+        self.owner_current().map_err(|_| WorkError::OwnerChanged)?;
         self.bus.work_apply(
             command,
             WorkContext {

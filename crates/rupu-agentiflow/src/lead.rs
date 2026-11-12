@@ -1531,6 +1531,23 @@ mod tests {
         })
     }
 
+    #[test]
+    fn queue_round_identity_follows_the_exact_lead_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut driver = new_driver(lead_cfg(dir.path(), 3), scripted_factory(vec![])).unwrap();
+        let (first, _, _) = driver.round_launch(&round(0));
+        driver.total_turns = 3;
+        let (next, _, _) = driver.round_launch(&round(1));
+        assert_eq!(first.run_id, next.run_id, "lead run identity is reused");
+        assert_eq!(first.services.work_queue_round, Some(0));
+        assert_eq!(next.services.work_queue_round, Some(1));
+        assert_eq!(first.transcript_path, dir.path().join("lead.r0.jsonl"));
+        assert_eq!(next.transcript_path, dir.path().join("lead.r1.jsonl"));
+        assert_eq!(next.prompt.turn_index_offset, 3);
+        assert!(first.services.work_queue_owner.is_none());
+        assert!(next.services.work_queue_owner.is_none(), "a round establishes its own execution authority");
+    }
+
     /// R1: the lead resolves its model limits (here its frontmatter pins)
     /// and carries its `fallbacks:` ladder — it used to run on
     /// `ModelLimits::unknown()` with no recovery at all. Its frontmatter
@@ -1698,6 +1715,7 @@ mod tests {
                 codename: None,
                 agent: participant.into(),
                 run_id: format!("run_{participant}"),
+                work_execution_id: None,
                 step_id: None,
                 unit: None,
                 kind: "flow_unit".into(),
