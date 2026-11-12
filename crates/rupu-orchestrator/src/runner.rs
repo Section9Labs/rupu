@@ -1629,9 +1629,9 @@ async fn run_workflow_body(
     let outcome = loop {
         let outcome = if path_scoped {
             run_scheduler_scoped(
-                &opts,
+                opts,
                 &run_id,
-                &resolved_inputs,
+                resolved_inputs,
                 workflow_default_continue,
                 Some(&gate_book),
                 &mut step_results,
@@ -1641,9 +1641,9 @@ async fn run_workflow_body(
             .await
         } else {
             run_steps_inner(
-                &opts,
+                opts,
                 &run_id,
-                &resolved_inputs,
+                resolved_inputs,
                 workflow_default_continue,
                 Some(&gate_book),
                 &mut step_results,
