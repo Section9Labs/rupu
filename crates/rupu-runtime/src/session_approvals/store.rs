@@ -245,6 +245,15 @@ pub struct Store {
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // fork may briefly retain a duplicate until CLOEXEC runs. Closing only
+        // our descriptor would leave that shared flock held in the meantime.
+        // Explicit unlock ends this owner's lease before the broker gate opens.
+        let _ = FileExt::unlock(&self._lease);
+    }
+}
+
 impl Store {
     /// `global` already exists. The lease is nonblocking and must be dropped
     /// before waiting for a user, IPC or tool. It is not an execution lease.

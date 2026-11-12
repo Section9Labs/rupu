@@ -838,3 +838,22 @@ fn archived_known_outcomes_exceed_active_lifetime_count_limit() {
     );
     assert!(store.active_records().unwrap().len() < 65);
 }
+
+#[test]
+fn dropping_store_releases_lease_even_with_a_duplicated_descriptor() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    // Models the shared open-file description briefly inherited across fork,
+    // before CLOEXEC closes the child's copy.
+    let inherited = store._lease.try_clone().unwrap();
+    assert!(Store::open(root.path()).is_err());
+    drop(store);
+    let next = Store::open(root.path()).expect("owner drop must explicitly release the lease");
+    drop(inherited);
+    assert!(
+        Store::open(root.path()).is_err(),
+        "the new owner still holds its lease"
+    );
+    drop(next);
+    assert!(Store::open(root.path()).is_ok());
+}

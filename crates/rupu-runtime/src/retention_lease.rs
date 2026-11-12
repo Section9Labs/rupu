@@ -18,6 +18,15 @@ pub struct RetentionLease {
     _root: File,
 }
 
+impl Drop for RetentionLease {
+    fn drop(&mut self) {
+        // A fork can retain the open-file description until exec. End this
+        // owner's lease explicitly instead of waiting for every copy to close.
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self._lock, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 impl RetentionLease {
     /// Acquire the exact configured global root's lease without waiting.
     ///
@@ -277,4 +286,19 @@ mod tests {
         drop(held);
         probe(false);
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn dropping_lifecycle_lease_unlocks_a_duplicated_descriptor() {
+    let root = tempfile::tempdir().unwrap();
+    let held = RetentionLease::try_acquire(root.path()).unwrap();
+    let inherited = held._lock.try_clone().unwrap();
+    assert!(RetentionLease::try_acquire(root.path()).is_err());
+    drop(held);
+    let next = RetentionLease::try_acquire(root.path()).unwrap();
+    drop(inherited);
+    assert!(RetentionLease::try_acquire(root.path()).is_err());
+    drop(next);
+    assert!(RetentionLease::try_acquire(root.path()).is_ok());
 }
