@@ -10,14 +10,12 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, Metadata},
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
-    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -109,42 +107,12 @@ struct Cursor {
     position: u64,
 }
 
-/// Same process-local random-key pattern as attempt_snapshot::Cache. No token
-/// is trusted across CP restarts and no bearer credential enters a cursor.
-fn mac() -> Hmac<Sha256> {
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    let secret = KEY.get_or_init(|| {
-        let mut secret = [0; 32];
-        for chunk in secret.chunks_mut(8) {
-            chunk.copy_from_slice(&ulid::Ulid::new().to_bytes()[8..]);
-        }
-        secret
-    });
-    Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts a 32-byte key")
-}
-
 fn encode(cursor: &Cursor) -> ApiResult<String> {
-    let bytes = serde_json::to_vec(cursor).map_err(internal)?;
-    let mut signer = mac();
-    signer.update(&bytes);
-    Ok(format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(&bytes),
-        URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes())
-    ))
+    crate::api::recorded_cursor::encode("", cursor)
 }
 fn decode(token: &str) -> ApiResult<Cursor> {
     let invalid = || ApiError::bad_request("invalid transcript page cursor");
-    if token.len() > 16 * 1024 {
-        return Err(invalid());
-    }
-    let (payload, signature) = token.split_once('.').ok_or_else(invalid)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
-    let signature = URL_SAFE_NO_PAD.decode(signature).map_err(|_| invalid())?;
-    let mut verifier = mac();
-    verifier.update(&bytes);
-    verifier.verify_slice(&signature).map_err(|_| invalid())?;
-    let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let cursor: Cursor = crate::api::recorded_cursor::decode("", token).map_err(|_| invalid())?;
     if cursor.version != 1 || cursor.offset > cursor.stamp.len {
         return Err(invalid());
     }
@@ -243,9 +211,10 @@ fn read_page(path: &Path, query: &PageQuery, scope: String) -> ApiResult<Page> {
         offset: 0,
         position: 0,
     });
-    let mut signer = mac();
-    signer.update(&serde_json::to_vec(&(&cursor.scope, &cursor.file, &stamp)).map_err(internal)?);
-    let snapshot = URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes());
+    let snapshot = crate::api::recorded_cursor::signature(
+        "",
+        &serde_json::to_vec(&(&cursor.scope, &cursor.file, &stamp)).map_err(internal)?,
+    );
     let mut page = Page {
         version: 1,
         path: query.path.clone(),
@@ -341,6 +310,8 @@ pub(crate) struct Line {
     pub(crate) blank: bool,
     pub(crate) oversized: bool,
     pub(crate) complete: bool,
+    /// True only for a newline, unlike complete which also admits snapshot EOF.
+    pub(crate) terminated: bool,
 }
 
 /// Match str::trim's Unicode whitespace semantics across buffer boundaries,
@@ -384,6 +355,7 @@ pub(crate) fn read_line(reader: &mut impl BufRead, remaining: u64) -> std::io::R
         blank: true,
         oversized: false,
         complete: false,
+        terminated: false,
     };
     let mut blank = BlankLine::default();
     while out.consumed < remaining {
@@ -408,6 +380,7 @@ pub(crate) fn read_line(reader: &mut impl BufRead, remaining: u64) -> std::io::R
         reader.consume(take);
         if end.is_some() {
             out.complete = true;
+            out.terminated = true;
             break;
         }
     }
@@ -447,12 +420,11 @@ pub(crate) fn search_locator(
         offset,
         position,
     };
-    let mut signer = mac();
-    signer.update(
-        &serde_json::to_vec(&(&cursor.scope, &cursor.file, &cursor.stamp)).map_err(internal)?,
-    );
     Ok((
-        URL_SAFE_NO_PAD.encode(signer.finalize().into_bytes()),
+        crate::api::recorded_cursor::signature(
+            "",
+            &serde_json::to_vec(&(&cursor.scope, &cursor.file, &cursor.stamp)).map_err(internal)?,
+        ),
         encode(&cursor)?,
     ))
 }

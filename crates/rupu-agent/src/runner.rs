@@ -3441,6 +3441,7 @@ async fn run_agent_inner(
                                     from_codename,
                                     to,
                                     kind,
+                                    post_kind,
                                     body,
                                     delivery,
                                 } => {
@@ -3454,6 +3455,7 @@ async fn run_agent_inner(
                                         body,
                                         urgent: false,
                                         via: rupu_transcript::MessageVia::Tool,
+                                        post_kind,
                                         delivery: Some(delivery),
                                     })?;
                                 }
@@ -3901,6 +3903,7 @@ fn record_injection(
             from_codename: m.from_codename.clone(),
             to: m.to.clone(),
             kind: m.kind.clone(),
+            post_kind: m.post_kind.clone(),
             body: m.body.clone(),
             urgent: m.urgent,
             via: rupu_transcript::MessageVia::Injected,

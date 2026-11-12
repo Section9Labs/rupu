@@ -43,6 +43,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .merge(crate::api::messages::routes())
         .merge(crate::api::children::routes())
         .merge(crate::api::board::routes())
+        .merge(crate::api::coordination_history::routes())
         .merge(crate::api::operator_board::routes())
         .merge(crate::api::assets::routes())
         .merge(crate::api::autoflows::routes())

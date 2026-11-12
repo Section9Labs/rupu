@@ -58,6 +58,8 @@ pub struct InjectedMessage {
     pub to: Option<String>,
     /// `direct`, `broadcast`, `directive`, `operator`.
     pub kind: String,
+    /// Board subtype, independent of operator instruction framing.
+    pub post_kind: Option<String>,
     pub body: String,
     pub urgent: bool,
 }

@@ -586,6 +586,8 @@ pub enum DerivedEvent {
         to: Option<String>,
         /// `post`, `direct`, `broadcast`, `directive`, `retract`.
         kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_kind: Option<String>,
         body: String,
         /// `resolved` / `undelivered`, as logged.
         delivery: serde_json::Value,

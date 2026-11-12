@@ -509,6 +509,9 @@ pub enum Event {
         /// `post`, `direct`, `broadcast`, `directive`, `retract`,
         /// `operator`.
         kind: String,
+        /// Recorded board subtype; absent in legacy messages and non-posts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_kind: Option<String>,
         body: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         urgent: bool,

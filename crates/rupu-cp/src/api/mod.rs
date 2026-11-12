@@ -9,6 +9,8 @@ pub mod autoflow_claims;
 pub mod autoflow_runs;
 pub mod autoflows;
 pub mod board;
+pub(crate) mod coordination_history;
+pub(crate) mod recorded_cursor;
 pub mod operator_board;
 pub mod children;
 pub mod code;
