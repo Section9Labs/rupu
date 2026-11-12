@@ -126,6 +126,16 @@ impl AmbientGrant {
     pub fn flow_lead() -> Self {
         Self {
             tools: vec![
+                "board.work_post",
+                "board.work_list",
+                "board.work_get",
+                "board.work_timeline",
+                "board.work_claim",
+                "board.work_start",
+                "board.work_block",
+                "board.work_resume",
+                "board.work_complete",
+                "board.work_fail",
                 "board.claim",
                 "board.release",
                 "board.post",
@@ -155,6 +165,16 @@ impl AmbientGrant {
     pub fn flow_unit() -> Self {
         Self {
             tools: vec![
+                "board.work_post",
+                "board.work_list",
+                "board.work_get",
+                "board.work_timeline",
+                "board.work_claim",
+                "board.work_start",
+                "board.work_block",
+                "board.work_resume",
+                "board.work_complete",
+                "board.work_fail",
                 "board.claim",
                 "board.release",
                 "board.post",
@@ -170,6 +190,16 @@ impl AmbientGrant {
 /// F1d D1), and what a workflow's `messaging: true` grants its steps (spec
 /// F1a §7): the board and `msg.send`, without the authority tools.
 pub const WORKFLOW_MESSAGING: &[&str] = &[
+    "board.work_post",
+    "board.work_list",
+    "board.work_get",
+    "board.work_timeline",
+    "board.work_claim",
+    "board.work_start",
+    "board.work_block",
+    "board.work_resume",
+    "board.work_complete",
+    "board.work_fail",
     "board.claim",
     "board.release",
     "board.post",

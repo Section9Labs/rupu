@@ -719,6 +719,7 @@ impl RunAgentLeadDriver {
             hooks: Default::default(),
             pause: Some(pause.clone()),
             services: LaunchServices {
+                work_queue_round: Some(ctx.round),
                 launcher: self.cfg.launcher.clone(),
                 workflow_generator: self.cfg.workflow_generator.clone(),
                 flow_pool: self.cfg.flow_pool.clone(),

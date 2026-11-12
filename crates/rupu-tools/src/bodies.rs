@@ -35,6 +35,11 @@ pub fn body(name: &str, ctx: &ToolContext) -> Option<Arc<dyn Tool>> {
             .as_ref()
             .is_some_and(|reads| reads.permits(name))
     };
+    if bus && services.work_queue.is_some() {
+        if let Some(tool) = crate::work_queue::body(name) {
+            return Some(tool);
+        }
+    }
     let t: Arc<dyn Tool> = match name {
         // core
         "bash" => Arc::new(BashTool),

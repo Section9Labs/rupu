@@ -316,6 +316,7 @@ impl Vetted {
 /// What a child takes from the call that launched it.
 #[derive(Clone)]
 struct Caller {
+    work_queue_owner: Option<rupu_tools::work_queue::WorkOwnerBinding>,
     identity: Arc<RunIdentity>,
     workspace: WorkspaceBinding,
     ceiling: PermissionMode,
@@ -338,6 +339,7 @@ impl Caller {
     fn of(ctx: &ToolContext) -> Self {
         let permission = SpawnPermission::from_ctx(ctx);
         Self {
+            work_queue_owner: ctx.services.work_queue.as_ref().map(|q| q.binding()),
             identity: Arc::clone(&ctx.identity),
             workspace: WorkspaceBinding {
                 id: ctx.workspace.id.clone(),
@@ -1054,6 +1056,7 @@ impl RunLauncher {
             // `finish` stops an abandoned child at its next safe boundary.
             pause: Some(child.stop.clone()),
             services: LaunchServices {
+                work_queue_owner: from.work_queue_owner.clone(),
                 authorizer: from.authorizer.clone(),
                 launcher: Some(Arc::clone(&self) as Arc<dyn Launcher>),
                 workflow_generator: from.generator.clone(),

@@ -6,3 +6,5 @@ pub mod board;
 pub mod messaging;
 pub mod operator;
 pub mod session_compaction;
+
+pub mod work_queue;
