@@ -64,6 +64,26 @@ function toolResult(callId: string, output: string, durationMs = 10): Transcript
 // ---------------------------------------------------------------------------
 
 describe('buildTranscriptView — header / footer', () => {
+  it('keeps Queue execution provenance out of conversation without changing raw events', () => {
+    const marker: TranscriptEvent = {
+      type: 'notice',
+      data: { kind: 'work_queue_execution', message: '{"execution_id":"execution_one"}' },
+    };
+    const events = [RUN_START, marker];
+    const original = JSON.stringify(events);
+    expect(buildTranscriptView(events).turns).toEqual([]);
+    expect(JSON.stringify(events)).toBe(original);
+
+    const warning: TranscriptEvent = {
+      type: 'notice', data: { kind: 'permission_mode_degraded', message: 'Approval is unavailable.' },
+    };
+    const blocks = buildTranscriptView([...events, warning, ASSISTANT]).turns.flatMap((t) => t.blocks);
+    expect(buildTranscriptView([...events, warning, ASSISTANT])).toEqual(
+      buildTranscriptView([RUN_START, warning, ASSISTANT]),
+    );
+    expect(blocks[0]).toMatchObject({ noticeKind: 'permission_mode_degraded' });
+  });
+
   it('carries run_start.codename into the header', () => {
     const ev: TranscriptEvent = {
       type: 'run_start',
