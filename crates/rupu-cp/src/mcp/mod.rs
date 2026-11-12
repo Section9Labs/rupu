@@ -114,6 +114,7 @@ pub(crate) fn sources(
         Arc::new(Shadowed {
             inner: Arc::clone(inner),
             shadowed,
+            denied_prefix: Some("board.work_"),
         }) as Arc<dyn ToolSource>
     });
     let mut seen = BTreeSet::new();
@@ -128,6 +129,7 @@ pub(crate) fn sources(
             Arc::new(Shadowed {
                 inner: source,
                 shadowed,
+                denied_prefix: None,
             })
         });
     }
@@ -138,6 +140,7 @@ pub(crate) fn sources(
 struct Shadowed {
     inner: Arc<dyn ToolSource>,
     shadowed: BTreeSet<String>,
+    denied_prefix: Option<&'static str>,
 }
 
 #[async_trait]
@@ -146,12 +149,21 @@ impl ToolSource for Shadowed {
         self.inner
             .tools()
             .into_iter()
-            .filter(|t| !self.shadowed.contains(&t.name))
+            .filter(|t| {
+                !self.shadowed.contains(&t.name)
+                    && !self
+                        .denied_prefix
+                        .is_some_and(|prefix| t.name.starts_with(prefix))
+            })
             .collect()
     }
 
     async fn call(&self, name: &str, args: Value, cx: &CallCx) -> Option<ToolResult> {
-        if self.shadowed.contains(name) {
+        if self.shadowed.contains(name)
+            || self
+                .denied_prefix
+                .is_some_and(|prefix| name.starts_with(prefix))
+        {
             return None;
         }
         self.inner.call(name, args, cx).await
@@ -265,7 +277,12 @@ mod tests {
         assert!(names.contains(&"ordinary.read".into()));
         assert!(!names.iter().any(|n| n.starts_with("board.work_")));
         let filtered = composed.last().unwrap();
-        for name in ["board.work_claim", "board.work_complete", "board.work_post"] {
+        for name in [
+            "board.work_claim",
+            "board.work_complete",
+            "board.work_post",
+            "board.work_unlisted",
+        ] {
             assert!(filtered
                 .call(name, Value::Null, &CallCx::default())
                 .await
