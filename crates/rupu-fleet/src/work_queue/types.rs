@@ -62,6 +62,9 @@ pub struct WorkRecording {
 #[serde(rename_all = "snake_case")]
 pub enum WorkRecordingAnchor {
     Owner,
+    /// Exact runtime-owned child recording under global/runs. The runtime and
+    /// resolver must validate descendant membership in the selected owner.
+    GlobalRuns,
     GlobalTranscripts,
     ProjectTranscripts,
 }
@@ -201,6 +204,7 @@ pub struct WorkItemSummary {
     pub claimant: Option<WorkActor>,
     pub executor: Option<WorkActor>,
     pub attempt_count: u64,
+    pub prior_attempt_may_still_run: bool,
 }
 
 /// Claimant and executor identities are independently captured once. Executor
@@ -280,6 +284,12 @@ pub struct WorkReply {
     pub replayed: bool,
     pub current_item: WorkItem,
     pub queue_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkDetail {
+    pub snapshot: WorkSnapshot,
+    pub item: WorkItem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +403,7 @@ pub struct WorkPage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkTimelinePage {
+    pub snapshot: WorkSnapshot,
     pub queue_id: String,
     pub work_id: String,
     pub source_item_revision: u64,
@@ -459,4 +470,46 @@ pub enum WorkError {
     Reconciliation { request_id: String, message: String },
     #[error(transparent)]
     Fleet(#[from] FleetError),
+}
+
+impl WorkError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidInput(_) => "work_invalid_input",
+            Self::Denied(_) => "work_actor_denied",
+            Self::NotFound { .. } => "work_not_found",
+            Self::OwnerChanged => "work_owner_changed",
+            Self::ReadOnly(_) => "work_read_only",
+            Self::RevisionConflict { .. } => "work_revision_changed",
+            Self::AttemptConflict => "work_attempt_changed",
+            Self::IdempotencyConflict { .. } => "work_request_conflict",
+            Self::TransitionConflict { .. } => "work_transition_conflict",
+            Self::CursorConflict => "work_cursor_changed",
+            Self::Capacity { .. } => "work_capacity",
+            Self::Busy => "work_busy",
+            Self::UnsupportedSchema { .. } => "work_unsupported_schema",
+            Self::Corrupt(_) => "work_corrupt",
+            Self::Persistence(_) => "work_persistence",
+            Self::Reconciliation { .. } => "work_reconcile",
+            Self::Fleet(_) => "work_refused",
+        }
+    }
+    pub fn retry(&self) -> &'static str {
+        match self {
+            Self::Busy | Self::Reconciliation { .. } => "same_request",
+            Self::OwnerChanged
+            | Self::RevisionConflict { .. }
+            | Self::AttemptConflict
+            | Self::CursorConflict => "refresh",
+            _ => "none",
+        }
+    }
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Reconciliation { request_id, .. } | Self::IdempotencyConflict { request_id } => {
+                Some(request_id)
+            }
+            _ => None,
+        }
+    }
 }
