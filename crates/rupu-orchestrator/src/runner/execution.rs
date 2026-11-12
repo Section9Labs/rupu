@@ -34,14 +34,38 @@ pub(super) async fn observe_run<T>(
     // complete set. Ownership failure is therefore fatal before polling a body.
     // Legacy in-memory and unsupported-platform invocations have no such owner.
     let owner = match opts.run_store.as_ref().zip(record) {
-        Some((store, record)) if crate::execution_observation::supported() => Some(
-            ExecutionOwner::start(&store.root.join(run_id), record).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("execution observation ownership: {error}"),
-                )
-            })?,
-        ),
+        Some((store, record)) if crate::execution_observation::supported() => {
+            match ExecutionOwner::start(&store.root.join(run_id), record) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    let error = RunWorkflowError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!("execution observation ownership: {error}"),
+                    ));
+                    // No step body has been polled. The storage helper proves
+                    // this exact record is still unowned before failing it and
+                    // appending its terminal event; an incumbent, a changed
+                    // owner, or an already terminal run is left untouched.
+                    let expected = record.clone();
+                    let detail = error.to_string();
+                    match store
+                        .blocking(move |store| {
+                            store.fail_unowned_execution(&expected, &detail, chrono::Utc::now())
+                        })
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            warn!(%run_id, "execution startup failed; current run ownership/state was preserved")
+                        }
+                        Err(persist_error) => {
+                            warn!(%run_id, %persist_error, "could not safely record execution startup failure")
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
         _ => None,
     };
     let context = owner.as_ref().map(|owner| Context {

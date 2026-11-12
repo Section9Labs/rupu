@@ -535,6 +535,8 @@ steps:
         );
     assert_eq!(h.entered().await, "cleanup");
     let first = h.snapshot();
+    let record_before = serde_json::to_value(h.store.load(RUN).unwrap()).unwrap();
+    let events_before = std::fs::read_to_string(h.store.events_path(RUN)).unwrap_or_default();
     let rejected = run_reject_cleanup(duplicate, "gate", "rejected", "human", None).await;
     assert!(matches!(rejected, Err(RunWorkflowError::Io(_))));
     assert!(h.entered.try_recv().is_err());
@@ -542,12 +544,82 @@ steps:
     current(&after);
     assert_eq!(first.execution_generation, after.execution_generation);
     assert_eq!(first.members, after.members);
+    assert_eq!(
+        serde_json::to_value(h.store.load(RUN).unwrap()).unwrap(),
+        record_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.store.events_path(RUN)).unwrap_or_default(),
+        events_before
+    );
     h.release("cleanup");
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn fresh_owner_start_failure_is_terminal_without_polling_a_step_body() {
+    let mut h = Harness::new(
+        r#"
+name: executing-start-failure
+steps:
+  - id: work
+    agent: worker
+    prompt: never entered
+"#,
+        &[],
+    );
+    // The run directory can be created normally, and the ownership locks are
+    // usable. Only the generation snapshot destination is unsafe to replace.
+    let unsafe_destination = h
+        .store
+        .root
+        .join(RUN)
+        .join(crate::execution_observation::SNAPSHOT_FILE);
+    std::fs::create_dir_all(&unsafe_destination).unwrap();
+    let outcome = run_workflow(h.opts()).await;
+    let error = match outcome {
+        Err(RunWorkflowError::Io(error)) => error,
+        other => panic!("expected ownership I/O failure, got {other:?}"),
+    };
+    assert!(error
+        .to_string()
+        .contains("execution observation ownership"));
+    assert!(
+        h.entered.try_recv().is_err(),
+        "no factory call is permitted before ownership"
+    );
+    assert!(
+        unsafe_destination.is_dir(),
+        "unsafe destination must remain untouched"
+    );
+    let record = h.store.load(RUN).unwrap();
+    assert_eq!(record.status, crate::runs::RunStatus::Failed);
+    assert!(record.finished_at.is_some());
+    assert!(record.runner_pid.is_none());
+    assert!(record.active_step_id.is_none());
+    assert!(record
+        .error_message
+        .as_deref()
+        .unwrap()
+        .contains(&error.to_string()));
+    assert!(h.prior().is_empty());
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(h.store.events_path(RUN))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "only the helper's terminal event is recorded"
+    );
+    assert_eq!(events[0]["type"], "run_failed");
+    assert_eq!(events[0]["run_id"], RUN);
+    assert_eq!(events[0]["error"].as_str(), record.error_message.as_deref());
 }
 
 #[tokio::test]
