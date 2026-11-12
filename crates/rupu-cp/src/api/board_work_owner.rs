@@ -36,6 +36,65 @@ pub(super) struct Context {
     pub configured_global: PathBuf,
     pub directory: PathBuf,
     pub record: Value,
+    /// Only a validated terminal standalone owner may recover a receipt made
+    /// before the CLI first wrote run.json. This never authorizes a new action.
+    pub absent_record_token: Option<String>,
+}
+
+fn owner_token(dir: &Path, key: &str, record: &Value, metadata: &fs::Metadata) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"rupu.board-work.owner.v1\0");
+    digest.update(dir.as_os_str().as_encoded_bytes());
+    digest.update(
+        json!([
+            record[key],
+            record["created_at"],
+            record["started_at"],
+            record["workflow_name"],
+            record["workspace_id"],
+            record["workspace_path"],
+            record["project_root"]
+        ])
+        .to_string()
+        .as_bytes(),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    digest.update(format!("{:?}", metadata.created()).as_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn terminal_standalone_matches_roster(root: &MessageRoot, record: &Value) -> bool {
+    if root.kind != RootKind::Standalone {
+        return false;
+    }
+    let Ok(record) = serde_json::from_value::<rupu_orchestrator::runs::RunRecord>(record.clone())
+    else {
+        return false;
+    };
+    if record.id != root.id || !record.status.is_terminal() {
+        return false;
+    }
+    let Some(agent) = record
+        .workflow_name
+        .strip_prefix(rupu_orchestrator::AGENT_RUN_PREFIX)
+    else {
+        return false;
+    };
+    let Ok(roster) =
+        rupu_fleet::Roster::read_work_authority(&root.space.join("participants.jsonl"))
+    else {
+        return false;
+    };
+    let mut matches = roster.participants().filter(|p| p.member.run_id == root.id);
+    matches.next().is_some_and(|p| {
+        p.member.kind == "standalone" && p.member.agent == agent && p.member.parent_run_id.is_none()
+    }) && matches.next().is_none()
 }
 
 // Use the already bounded record; the legacy liveness helper rereads all
@@ -189,37 +248,16 @@ pub(super) fn resolve(
     };
     let writable = service && !archived && live(&root, &record);
     let metadata = fs::metadata(&dir).map_err(|_| Error::owner_changed())?;
-    let mut digest = Sha256::new();
-    digest.update(b"rupu.board-work.owner.v1\0");
-    digest.update(dir.as_os_str().as_encoded_bytes());
-    digest.update(
-        json!([
-            record[key],
-            record["created_at"],
-            record["started_at"],
-            record["workflow_name"],
-            record["workspace_id"],
-            record["workspace_path"],
-            record["project_root"]
-        ])
-        .to_string()
-        .as_bytes(),
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        digest.update(metadata.dev().to_le_bytes());
-        digest.update(metadata.ino().to_le_bytes());
-    }
-    #[cfg(not(unix))]
-    digest.update(format!("{:?}", metadata.created()).as_bytes());
+    let token = owner_token(&dir, key, &record, &metadata);
+    let absent_record_token = (!archived && terminal_standalone_matches_roster(&root, &record))
+        .then(|| owner_token(&dir, key, &Value::Null, &metadata));
     Ok(Context {
         owner: Owner {
             route: route.segment(),
             kind,
             id: id.into(),
             host: "local",
-            token: format!("{:x}", digest.finalize()),
+            token,
             archived,
             writable,
             allowed_actions: if writable {
@@ -233,6 +271,7 @@ pub(super) fn resolve(
         configured_global,
         directory: dir,
         record,
+        absent_record_token,
     })
 }
 pub(super) fn unchanged(ctx: &Context, route: MessageRoute, service: bool) -> Result<()> {

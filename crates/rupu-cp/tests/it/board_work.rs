@@ -501,6 +501,111 @@ async fn completed_owner_refuses_new_actions_but_recovers_an_existing_receipt() 
 }
 
 #[tokio::test]
+async fn standalone_first_terminal_record_recovers_only_an_identical_prior_receipt() {
+    use rupu_orchestrator::runs::{RunRecord, RunStore};
+    use rupu_runtime::standalone_run_metadata::{
+        metadata_path_for_run, write_metadata, StandaloneRunMetadata,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let router = fixture_app(&root, true, None);
+    let store = RunStore::new(root.join("runs"));
+    for (id, posted) in [("run_standalone", true), ("run_no_receipt", false)] {
+        let dir = root.join("runs").join(id);
+        let bus = rupu_fleet::Bus::open(&dir.join("messages"), "main");
+        bus.join(rupu_fleet::Member {
+            agent: "reviewer".into(),
+            run_id: id.into(),
+            kind: "standalone".into(),
+            work_execution_id: Some("fixture_execution".into()),
+            pid: Some(std::process::id()),
+            ..Default::default()
+        })
+        .unwrap();
+        let metadata: StandaloneRunMetadata = serde_json::from_value(json!({
+            "version":1,"run_id":id,"workspace_path":root,"backend_id":"local_checkout",
+            "trigger_source":"run_cli","pid":std::process::id()
+        }))
+        .unwrap();
+        write_metadata(
+            &metadata_path_for_run(&root.join("transcripts"), id),
+            &metadata,
+        )
+        .unwrap();
+        assert!(!dir.join("run.json").exists());
+        let path = format!("/api/runs/{id}/board/work");
+        let before = get(&router, &path).await;
+        assert_eq!(before["owner"]["writable"], true);
+        let input = post_body(&before, "before-terminal-record", "Review");
+        let original = if posted {
+            let (s, reply) = request(&router, "POST", &path, Some(input.clone()), false).await;
+            assert_eq!(s, 200, "{reply}");
+            Some(reply)
+        } else {
+            None
+        };
+        bus.leave("completed").unwrap();
+        let record: RunRecord = serde_json::from_value(json!({
+            "id":id,"workflow_name":"agent:reviewer","status":"completed","inputs":{},
+            "workspace_id":"ws_test","workspace_path":root,"transcript_dir":root.join("transcripts"),
+            "started_at":"2026-11-12T00:00:00Z","finished_at":"2026-11-12T00:01:00Z"
+        })).unwrap();
+        store.create(record.clone(), "").unwrap();
+        let after = get(&router, &path).await;
+        assert_eq!(after["owner"]["writable"], false);
+        assert_ne!(before["owner"]["token"], after["owner"]["token"]);
+        let (s, reply) = request(&router, "POST", &path, Some(input.clone()), false).await;
+        if let Some(original) = original {
+            assert_eq!(s, 200, "{reply}");
+            assert_eq!(reply["replayed"], true);
+            assert_eq!(reply["receipt"], original["receipt"]);
+            let mut changed = input.clone();
+            changed["operation"]["title"] = json!("Different payload");
+            let (s, error) = request(&router, "POST", &path, Some(changed), false).await;
+            assert_eq!(s, 409, "{error}");
+            assert_eq!(error["error"]["code"], "work_request_conflict");
+        } else {
+            assert_eq!(s, 409, "{reply}");
+            assert_eq!(reply["error"]["code"], "work_read_only");
+            assert!(!dir.join("messages/board/work-queue.sqlite3").exists());
+            assert_eq!(
+                get(&router, &path).await["snapshot"]["availability"],
+                "not_initialized"
+            );
+        }
+        let mut fresh = input.clone();
+        fresh["request_id"] = json!("fresh-after-terminal-record");
+        let (s, error) = request(&router, "POST", &path, Some(fresh), false).await;
+        assert_eq!(s, 409, "{error}");
+        assert_eq!(error["error"]["code"], "work_read_only");
+
+        let mut mismatched = record.clone();
+        mismatched.workflow_name = "agent:unrelated".into();
+        store.update(&mismatched).unwrap();
+        let (s, error) = request(&router, "POST", &path, Some(input.clone()), false).await;
+        assert_eq!(s, 409, "{error}");
+        assert_eq!(error["error"]["code"], "work_owner_changed");
+        std::fs::write(
+            dir.join("run.json"),
+            json!({"id":id,"workflow_name":"agent:reviewer","status":"completed"}).to_string(),
+        )
+        .unwrap();
+        let (s, error) = request(&router, "POST", &path, Some(input.clone()), false).await;
+        assert_eq!(s, 409, "{error}");
+        assert_eq!(error["error"]["code"], "work_owner_changed");
+        store.update(&record).unwrap();
+        let saved = root.join(format!("saved-{id}"));
+        std::fs::rename(&dir, &saved).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        store.create(record, "").unwrap();
+        std::fs::rename(saved.join("messages"), dir.join("messages")).unwrap();
+        let (s, error) = request(&router, "POST", &path, Some(input), false).await;
+        assert_eq!(s, 409, "{error}");
+        assert_eq!(error["error"]["code"], "work_owner_changed");
+    }
+}
+
+#[tokio::test]
 async fn capabilities_follow_installed_service_and_record_limits_are_explicit() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();

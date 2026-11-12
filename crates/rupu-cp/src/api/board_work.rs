@@ -496,19 +496,31 @@ fn mutate(
             }
         })?;
     let ctx = owner::resolve(global, route, id, true)?;
-    if token != ctx.owner.token || ctx.owner.archived {
+    let receipt_recovery_only = token != ctx.owner.token;
+    if ctx.owner.archived
+        || (receipt_recovery_only && ctx.absent_record_token.as_deref() != Some(token))
+    {
         return Err(Error::owner_changed());
     }
     let request_id = command.request_id.clone();
     let check_owner = || {
         let current =
             owner::resolve(global, route, id, true).map_err(|_| FleetError::RecipientChanged)?;
-        if current.owner.token != ctx.owner.token || current.owner.archived {
+        if current.owner.token != ctx.owner.token
+            || current.owner.archived
+            || (receipt_recovery_only && current.absent_record_token.as_deref() != Some(token))
+        {
             return Err(FleetError::RecipientChanged);
         }
         Ok(())
     };
     let check_live = || {
+        // The CLI's first terminal run.json changes the full owner token. A
+        // validated older token can reach only the existing receipt lookup;
+        // even a later lifecycle change cannot turn that retry into a write.
+        if receipt_recovery_only {
+            return Err(FleetError::Refused("Board owner is read-only".into()));
+        }
         let current =
             owner::resolve(global, route, id, true).map_err(|_| FleetError::RecipientChanged)?;
         if !current.owner.writable {
