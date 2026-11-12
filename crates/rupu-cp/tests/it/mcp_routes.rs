@@ -244,6 +244,12 @@ fn every_route_is_a_tool_or_listed() {
         let board = format!("/api/{}/:id/board/operator", r.segment());
         found.insert(("GET".into(), board.clone()));
         found.insert(("POST".into(), board));
+        let work = format!("/api/{}/:id/board/work", r.segment());
+        found.insert(("GET".into(), work.clone()));
+        found.insert(("POST".into(), work.clone()));
+        found.insert(("GET".into(), format!("{work}/:work_id")));
+        found.insert(("GET".into(), format!("{work}/:work_id/timeline")));
+        found.insert(("POST".into(), format!("{work}/:work_id/transitions")));
     }
     println!("scanned {} method+path pairs", found.len());
     assert!(found.len() >= 155, "scanner found only {}", found.len());

@@ -194,6 +194,10 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             features.push(super::children::search::AGENTIFLOW_CAPABILITY.to_string());
             features.push(super::transcript::page::CAPABILITY.to_string());
             features.push(super::coordination_history::CAPABILITY.to_string());
+            features.push(super::board_work::CAPABILITY.to_string());
+            if s.launcher.is_some() {
+                features.push(super::board_work::MUTATION_CAPABILITY.to_string());
+            }
             features.push(super::event_scan::CAPABILITY.to_string());
             if s.session_starter
                 .as_ref()

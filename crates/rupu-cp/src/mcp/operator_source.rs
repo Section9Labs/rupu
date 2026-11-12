@@ -19,6 +19,7 @@ struct Prepared {
     schema: Value,
     query_keys: Vec<String>,
     has_body: bool,
+    required_nullable_body_keys: Vec<String>,
 }
 
 pub struct OperatorSource {
@@ -36,15 +37,35 @@ impl OperatorSource {
     pub(crate) fn with_ops(inner: axum::Router, ops: Vec<OpSpec>) -> Self {
         let prepared = ops
             .into_iter()
-            .map(|op| Prepared {
-                schema: input_schema(&op),
-                query_keys: lift((op.query)()).0.keys().cloned().collect(),
-                has_body: (op.body)().is_some(),
-                op,
+            .map(|op| {
+                let (body, required) = lift((op.body)());
+                let required_nullable_body_keys = required
+                    .into_iter()
+                    .filter(|key| body.get(key).is_some_and(allows_null))
+                    .collect();
+                Prepared {
+                    schema: input_schema(&op),
+                    query_keys: lift((op.query)()).0.keys().cloned().collect(),
+                    has_body: (op.body)().is_some(),
+                    required_nullable_body_keys,
+                    op,
+                }
             })
             .collect();
         Self { inner, prepared }
     }
+}
+
+fn allows_null(schema: &Value) -> bool {
+    schema["type"] == "null"
+        || schema["type"]
+            .as_array()
+            .is_some_and(|types| types.iter().any(|t| t == "null"))
+        || ["anyOf", "oneOf"].iter().any(|key| {
+            schema[*key]
+                .as_array()
+                .is_some_and(|variants| variants.iter().any(allows_null))
+        })
 }
 
 /// `s` as a `&'static str`, each distinct value allocated once: the
@@ -234,8 +255,10 @@ impl OperatorSource {
             _ => return ToolResult::Error("arguments must be an object".into()),
         };
         let op = &p.op;
-        // Agents send `null` for optional fields: treat it as absent.
-        args.retain(|_, v| !v.is_null());
+        // Agents send `null` for optional fields: treat it as absent. A
+        // required body field may deliberately be nullable (the initial work
+        // queue generation fence); preserve it for typed HTTP validation.
+        args.retain(|key, v| !v.is_null() || p.required_nullable_body_keys.contains(key));
         let props = p.schema["properties"].as_object();
         if let Some(key) = args
             .keys()

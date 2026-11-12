@@ -4,6 +4,7 @@
 //! with [`op`]; [`ops`] is all of them.
 
 mod agentiflows;
+mod board_work;
 mod definitions;
 mod findings;
 mod fleet;
@@ -128,6 +129,7 @@ pub fn ops() -> &'static [OpSpec] {
             runs::ops(),
             sessions::ops(),
             agentiflows::ops(),
+            board_work::ops(),
             definitions::ops(),
             findings::ops(),
             observe::ops(),
