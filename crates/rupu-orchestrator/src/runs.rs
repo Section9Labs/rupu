@@ -4157,6 +4157,62 @@ impl RunStore {
         Ok(true)
     }
 
+    /// Finalize a known pre-body execution-admission failure. The invocation's
+    /// local runner registration is still held, so `live_runner` cannot decide
+    /// this case. Instead, the exact expected owner/status/pid must still match
+    /// under the strict execution mutation lock and the lifetime owner lock
+    /// must be free. An incumbent, changed owner, parked or terminal run is
+    /// preserved. This never clears an execution cancellation barrier.
+    ///
+    /// The successful path appends the terminal `RunFailed` event itself.
+    /// Async callers must use [`RunStore::blocking`]; lock waits are bounded.
+    pub fn fail_unowned_execution(
+        &self,
+        expected: &RunRecord,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RunStoreError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (expected, error, now);
+            Ok(false)
+        }
+        #[cfg(unix)]
+        {
+            if !matches!(expected.status, RunStatus::Pending | RunStatus::Running) {
+                return Ok(false);
+            }
+            let _run_lock = self.lock_run_json(&expected.id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "cannot prove execution startup failure without the run lock",
+                )
+            })?;
+            let proof =
+                crate::execution_observation::RetryGuard::acquire(&self.run_dir(&expected.id))?;
+            let mut current = proof.load()?;
+            if current.id != expected.id
+                || current.workspace_id != expected.workspace_id
+                || current.started_at != expected.started_at
+                || current.workflow_name != expected.workflow_name
+                || current.workspace_path != expected.workspace_path
+                || current.transcript_dir != expected.transcript_dir
+                || current.status != expected.status
+                || current.runner_pid != expected.runner_pid
+                || !matches!(current.status, RunStatus::Pending | RunStatus::Running)
+            {
+                return Ok(false);
+            }
+            let _idle_owner = match proof.idle_owner(&current) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            self.finalize_failed(&mut current, error.to_string(), None, now)?;
+            Ok(true)
+        }
+    }
+
     /// The `Failed` transition [`reap_if_orphaned`](Self::reap_if_orphaned)
     /// and [`fail_in_flight`](Self::fail_in_flight) make for a runner that
     /// is gone: status, finish time, error and its typed cause, no runner

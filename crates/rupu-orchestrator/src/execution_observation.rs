@@ -522,8 +522,9 @@ pub fn revoke_for_owner(run_dir: &Path, record: &RunRecord, _reason: &str) -> io
     }
 }
 
-/// Held only by the explicit terminal-to-running compare-and-set. Starting a
-/// producer never clears a cancel barrier merely because its record says Running.
+/// Strict mutation proof shared by explicit retry and pre-body failure
+/// finalization. Only the terminal-to-running CAS calls `clear_cancelled`.
+/// Starting a producer never clears a barrier because its record says Running.
 #[cfg(unix)]
 pub(crate) struct RetryGuard {
     dir: File,

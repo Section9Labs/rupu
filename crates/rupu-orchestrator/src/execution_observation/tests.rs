@@ -77,6 +77,113 @@ fn duplicate_owner_is_refused_without_revoking_the_incumbent() {
 }
 
 #[test]
+fn pre_body_snapshot_failure_finalizes_own_registered_run_and_emits_terminal_event() {
+    use std::os::unix::fs::symlink;
+    let (temp, store, mut record, _dir) = fixture();
+    record.runner_pid = Some(std::process::id());
+    store.update(&record).unwrap();
+    let _registered = store.register_runner(&record.id);
+    assert_eq!(store.live_runner(&record), Some(std::process::id()));
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"preserve").unwrap();
+    symlink(&outside, path(&store, &record).join(SNAPSHOT_FILE)).unwrap();
+    let failure = match ExecutionOwner::start(&path(&store, &record), &record) {
+        Ok(_) => panic!("unsafe snapshot destination was accepted"),
+        Err(error) => error.to_string(),
+    };
+    let now = Utc::now();
+    assert!(store
+        .fail_unowned_execution(&record, &failure, now)
+        .unwrap());
+    let failed = store.load(&record.id).unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.finished_at, Some(now));
+    assert_eq!(failed.error_message.as_deref(), Some(failure.as_str()));
+    assert!(failed.runner_pid.is_none());
+    let events = fs::read_to_string(path(&store, &record).join("events.jsonl")).unwrap();
+    let event: crate::executor::Event =
+        serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    assert!(
+        matches!(event, crate::executor::Event::RunFailed { run_id, error, .. } if run_id == record.id && error == failure)
+    );
+    assert_eq!(fs::read(outside).unwrap(), b"preserve");
+}
+
+#[test]
+fn pre_body_failure_never_finalizes_an_incumbent_or_changed_run() {
+    let (_temp, store, record, dir) = fixture();
+    let owner = ExecutionOwner::start(&path(&store, &record), &record).unwrap();
+    assert!(!store
+        .fail_unowned_execution(&record, "second owner refused", Utc::now())
+        .unwrap());
+    assert_eq!(store.load(&record.id).unwrap().status, RunStatus::Running);
+    assert_eq!(read(&dir, &record).validity, ExecutionValidity::Current);
+    owner.finish().unwrap();
+    for changed in [
+        {
+            let mut value = record.clone();
+            value.runner_pid = Some(12345);
+            value
+        },
+        {
+            let mut value = record.clone();
+            value.workspace_id = "ws_changed".into();
+            value
+        },
+        {
+            let mut value = record.clone();
+            value.status = RunStatus::Paused;
+            value
+        },
+        {
+            let mut value = record.clone();
+            value.status = RunStatus::Completed;
+            value
+        },
+    ] {
+        store.update(&changed).unwrap();
+        assert!(!store
+            .fail_unowned_execution(&record, "stale startup failure", Utc::now())
+            .unwrap());
+        let preserved = store.load(&record.id).unwrap();
+        assert_eq!(preserved.status, changed.status);
+        assert_eq!(preserved.runner_pid, changed.runner_pid);
+        assert_eq!(preserved.workspace_id, changed.workspace_id);
+    }
+}
+
+#[test]
+fn pre_body_failure_preserves_cancel_barrier_and_fails_closed_without_owner_proof() {
+    use std::os::unix::fs::symlink;
+    let (temp, store, record, _dir) = fixture();
+    store
+        .cancel(&record.id, "fixture", "cancel", Utc::now())
+        .unwrap();
+    let barrier = fs::read(path(&store, &record).join(CANCELLATION_FILE)).unwrap();
+    assert!(!store
+        .fail_unowned_execution(&record, "cancelled startup", Utc::now())
+        .unwrap());
+    assert_eq!(store.load(&record.id).unwrap().status, RunStatus::Cancelled);
+    assert_eq!(
+        fs::read(path(&store, &record).join(CANCELLATION_FILE)).unwrap(),
+        barrier
+    );
+    // No usable owner proof: a run must not be finalized on an assumption.
+    store.update(&record).unwrap();
+    let outside = temp.path().join("owner-lock-outside");
+    fs::write(&outside, b"").unwrap();
+    symlink(&outside, path(&store, &record).join(OWNER_LOCK_FILE)).unwrap();
+    assert!(store
+        .fail_unowned_execution(&record, "unprovable startup", Utc::now())
+        .is_err());
+    assert_eq!(store.load(&record.id).unwrap().status, RunStatus::Running);
+    assert_eq!(
+        fs::read(path(&store, &record).join(CANCELLATION_FILE)).unwrap(),
+        barrier
+    );
+}
+
+#[test]
 fn unfinished_body_revokes_the_whole_generation_even_with_handles_retained() {
     let (_temp, store, record, dir) = fixture();
     let owner = ExecutionOwner::start(&path(&store, &record), &record).unwrap();
