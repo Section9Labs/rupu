@@ -120,6 +120,13 @@ when omitted.
 Schemas are auto-generated from the typed Args structs and exposed on every
 `tools/list` response.
 
+Separate from these connector tools, the control plane reads a registered
+project's own checkout: `GET /api/projects/:ws_id/scm` (the MCP operator tool
+`projects.scm`) returns its branch, status and staged and working diffs through
+libgit2, and with `include_review=true` the current branch's PRs / MRs through
+the account the rules above select for it. See
+[cp-api.md#projects-and-code](cp-api.md#projects-and-code).
+
 ## Configuration
 
 ```toml

@@ -735,10 +735,11 @@ async fn immutable_ceiling_creation_preserves_empty_and_exact_only_contract() {
         .await;
         assert_eq!(status, StatusCode::OK);
     }
-    let calls = starter.0.lock().unwrap();
-    assert_eq!(calls[0].tool_ceiling, Some(vec![]));
-    assert_eq!(calls[1].tool_ceiling, Some(vec!["skills.load".into()]));
-    drop(calls);
+    {
+        let calls = starter.0.lock().unwrap();
+        assert_eq!(calls[0].tool_ceiling, Some(vec![]));
+        assert_eq!(calls[1].tool_ceiling, Some(vec!["skills.load".into()]));
+    }
     for ceiling in [
         json!(["*"]),
         json!(["skill_load"]),

@@ -9,6 +9,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+// Frames are bounded and processed individually; retain the wire DTO construction API.
+#[allow(clippy::large_enum_variant)]
 pub enum ClientFrame {
     Bind {
         session_id: String,

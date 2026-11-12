@@ -267,10 +267,10 @@ pub(super) fn scope(s: &AppState, a: &Authority) -> ApiResult<DirectoryScope> {
             Edge::Ledger { directory, .. } | Edge::Legacy { directory } => directory,
         };
         let child_dir = Path::new(directory).join("sub").join(&hop.child_run_id);
-        if Path::new(&hop.path) == child_dir.join("transcript.jsonl") {
-            if inline.insert(hop.child_run_id.clone(), child_dir).is_some() {
-                return Err(fail("descendant_inline_ancestry_cycle"));
-            }
+        if Path::new(&hop.path) == child_dir.join("transcript.jsonl")
+            && inline.insert(hop.child_run_id.clone(), child_dir).is_some()
+        {
+            return Err(fail("descendant_inline_ancestry_cycle"));
         }
     }
     Ok(DirectoryScope {
@@ -382,17 +382,6 @@ fn ledger_match(bytes: &[u8], hop: &Hop, handle: &str) -> ApiResult<()> {
         return Err(fail("descendant_workflow_requires_navigation"));
     }
     Ok(())
-}
-/// Called only with a MAC-authenticated or freshly cache-selected sealed Hop.
-pub(super) fn validate_edge(
-    s: &AppState,
-    a: &Authority,
-    hop: &Hop,
-    cancel: &CancellationToken,
-) -> ApiResult<()> {
-    let scope = scope(s, a)?;
-    validate_edge_scoped(&scope, hop, cancel)?;
-    scope.verify(s, a)
 }
 pub(super) fn validate_edge_scoped(
     scope: &DirectoryScope,

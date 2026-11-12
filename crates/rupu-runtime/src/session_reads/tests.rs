@@ -99,7 +99,7 @@ fn local_descendant_requires_unique_chain_and_matching_prologue() {
     assert!(f.reads.read(request(), &f.ctx).is_err());
     let started = json!({"t":"started","run_id":"sub_child","transcript":child,"name":"child"});
     let ledger = f.reads.global.path.join("runs/run_owner/children.jsonl");
-    write_lines(&ledger, &[started.clone()]);
+    write_lines(&ledger, std::slice::from_ref(&started));
     assert_eq!(
         f.reads.read(request(), &f.ctx).unwrap()["prologue"]["run_id"],
         "sub_child"
@@ -378,7 +378,7 @@ fn canonical_flow_envelope_is_projected_without_payload() {
     let legacy = serde_json::to_value(LedgerLine::Flow(Box::new(legacy))).unwrap();
     assert!(legacy["ctx"].get("run_id").is_none());
     let path = f.reads.netflow_root.join("run_owner.jsonl");
-    write_lines(&path, &[legacy.clone()]);
+    write_lines(&path, std::slice::from_ref(&legacy));
     let read = || {
         f.reads
             .read(SessionReadRequest::Netflows { ancestry: vec![] }, &f.ctx)

@@ -810,18 +810,13 @@ fn validate_intent(intent: &Intent) -> io::Result<()> {
 fn validate_operation(operation: &Operation) -> io::Result<()> {
     valid_id(&operation.operation_id)?;
     validate_intent(&operation.intent)?;
-    let valid_phase = match (
-        operation.phase,
-        operation.outcome,
-        operation.receipt_version,
-    ) {
-        (Phase::Reserved, None, 1) | (Phase::Dispatching, None, 2) => true,
-        (Phase::Terminal, Some(Outcome::NotSubmitted), 2) => true,
-        (Phase::Terminal, Some(Outcome::Accepted | Outcome::Rejected | Outcome::Unknown), 3) => {
-            true
-        }
-        _ => false,
-    };
+    let valid_phase = matches!(
+        (operation.phase, operation.outcome, operation.receipt_version),
+        (Phase::Reserved, None, 1)
+            | (Phase::Dispatching, None, 2)
+            | (Phase::Terminal, Some(Outcome::NotSubmitted), 2)
+            | (Phase::Terminal, Some(Outcome::Accepted | Outcome::Rejected | Outcome::Unknown), 3)
+    );
     let valid_dispatch = match operation.phase {
         Phase::Reserved => operation.dispatch_marked_at.is_none(),
         Phase::Dispatching => operation.dispatch_marked_at.is_some(),

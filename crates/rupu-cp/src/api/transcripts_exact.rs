@@ -149,18 +149,14 @@ fn check_context(
                     == c.source_kind
                         .as_deref()
                         .map(|kind| kind.ends_with("_archive")) =>
-        {
-            ()
-        }
+        {}
         "unavailable"
             if c.reason
                 .as_ref()
                 .is_some_and(|r| !r.is_empty() && r.len() <= 1024)
                 && c.revision.is_none()
                 && c.effects.is_empty() =>
-        {
-            ()
-        }
+        {}
         _ => return Err(ApiError::internal("invalid exact transcript context state")),
     }
     Ok(())

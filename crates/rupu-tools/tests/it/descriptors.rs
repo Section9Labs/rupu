@@ -51,7 +51,7 @@ fn production_impls() -> usize {
             let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
             prod.matches("impl Tool for ").count()
         })
-        .sum()
+        .sum::<usize>()
 }
 
 #[test]

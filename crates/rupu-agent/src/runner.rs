@@ -3269,7 +3269,7 @@ async fn run_agent_inner(
                 {
                     let authorizer = opts.permission.authorizer().expect("checked above");
                     let request = approval_request(authorizer.as_ref(), &opts.tool_context, &grant,
-                        &descriptor, &input, &call_id, &tool_name, turn_idx, call_sequence as u64)?;
+                        descriptor, &input, &call_id, &tool_name, turn_idx, call_sequence as u64)?;
                     let mut observe = |value| {
                         let record: rupu_transcript::ToolApprovalRecord = serde_json::from_value(value)
                             .map_err(|_| rupu_tools::approval::ApprovalError("invalid broker event".into()))?;

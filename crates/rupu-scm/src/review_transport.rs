@@ -398,9 +398,7 @@ fn validate_path(platform: Platform, path: &str) -> Result<(), ScmError> {
                 if platform == Platform::Gitlab
                     && parts.get(4) == Some(&"jobs")
                     && v == "false" =>
-            {
-                ()
-            }
+            {}
             _ => return Err(bad("Unsupported review query parameter")),
         }
     }

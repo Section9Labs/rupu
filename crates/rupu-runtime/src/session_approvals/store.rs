@@ -245,6 +245,15 @@ pub struct Store {
     _not_sync: std::marker::PhantomData<std::cell::Cell<()>>,
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // fork may briefly retain a duplicate until CLOEXEC runs. Closing only
+        // our descriptor would leave that shared flock held in the meantime.
+        // Explicit unlock ends this owner's lease before the broker gate opens.
+        let _ = FileExt::unlock(&self._lease);
+    }
+}
+
 impl Store {
     /// `global` already exists. The lease is nonblocking and must be dropped
     /// before waiting for a user, IPC or tool. It is not an execution lease.
@@ -950,7 +959,7 @@ impl Store {
     fn record_limit(&self) -> usize {
         #[cfg(test)]
         {
-            return self.record_limit_override.get();
+            self.record_limit_override.get()
         }
         #[cfg(not(test))]
         {
@@ -1043,10 +1052,10 @@ pub(super) fn validate_record(record: &Record) -> Result<()> {
     {
         return Err(Error::Invalid);
     }
-    if record.state == State::Allowed || dispatched {
-        if record.decision.as_ref().map(|d| d.request.decision) != Some(Decision::AllowOnce) {
-            return Err(Error::Invalid);
-        }
+    if (record.state == State::Allowed || dispatched)
+        && record.decision.as_ref().map(|d| d.request.decision) != Some(Decision::AllowOnce)
+    {
+        return Err(Error::Invalid);
     }
     if record.state == State::Pending && record.decision.is_some()
         || record.state == State::Denied

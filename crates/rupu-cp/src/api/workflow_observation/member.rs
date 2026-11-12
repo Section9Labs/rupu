@@ -55,11 +55,7 @@ impl Authority {
     pub(super) fn leaf_path(&self) -> &str {
         self.ancestry.last().map_or(&self.path, |h| &h.path)
     }
-    pub(super) fn leaf_prologue_sha256(&self) -> &str {
-        self.ancestry
-            .last()
-            .map_or(&self.prologue_sha256, |h| &h.prologue_sha256)
-    }
+
 }
 #[path = "member_descendants.rs"]
 mod descendant_proof;
@@ -262,6 +258,8 @@ fn remote(value: &Value) -> bool {
             .is_some_and(|h| !h.is_null() && h.as_str() != Some("local"))
     })
 }
+// Keep owner, selection and continuation preconditions explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn attribution(
     c: &Captured,
     child: &str,
@@ -331,6 +329,7 @@ fn attribution(
     }
     Ok(())
 }
+#[cfg(test)]
 pub(super) fn reauthorize(s: &AppState, authority: &Authority) -> ApiResult<VerifiedMember> {
     reauthorize_with_cancel(s, authority, &tokio_util::sync::CancellationToken::new())
 }

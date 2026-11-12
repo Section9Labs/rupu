@@ -616,6 +616,11 @@ jobs:
           PRERELEASE: ${{ needs.meta.outputs.prerelease }}
         run: |
           set -euo pipefail
+          # nfpm writes the version into the package file names with every
+          # `-` turned into `.` (a beta `0.88.0-beta.2` ships as
+          # `rupu_0.88.0.beta.2_amd64.deb` / `rupu-0.88.0.beta.2-1.x86_64.rpm`),
+          # so the notes must name the packages by that spelling.
+          pkgver="${VERSION//-/.}"
           notes=$(cat <<EOF
           ${CHANNEL} release of rupu \`${VERSION}\`.
 
@@ -626,8 +631,8 @@ jobs:
           | \`rupu-app-darwin-arm64.zip\` | rupu.app as a zip — the same stapled bundle, for scripted installs (see note) |
           | \`rupu-linux-x64\` | Linux x86_64 — static musl |
           | \`rupu-linux-arm64\` | Linux aarch64 — static musl |
-          | \`rupu_${VERSION}_amd64.deb\` / \`rupu_${VERSION}_arm64.deb\` | Debian/Ubuntu package (declares its own deps, installs completions + man page) |
-          | \`rupu-${VERSION}.x86_64.rpm\` / \`rupu-${VERSION}.aarch64.rpm\` | Fedora/RHEL package (declares its own deps, installs completions + man page) |
+          | \`rupu_${pkgver}_amd64.deb\` / \`rupu_${pkgver}_arm64.deb\` | Debian/Ubuntu package (declares its own deps, installs completions + man page) |
+          | \`rupu-${pkgver}-1.x86_64.rpm\` / \`rupu-${pkgver}-1.aarch64.rpm\` | Fedora/RHEL package (declares its own deps, installs completions + man page) |
 
           **rupu.app** is attached by the separate \`release-app\` workflow shortly
           after this release appears, and only when the app changed since the
@@ -642,8 +647,8 @@ jobs:
           system — they pull in dependencies automatically:
 
           \`\`\`sh
-          sudo apt install ./rupu_${VERSION}_amd64.deb
-          sudo dnf install ./rupu-${VERSION}.x86_64.rpm
+          sudo apt install ./rupu_${pkgver}_amd64.deb
+          sudo dnf install ./rupu-${pkgver}-1.x86_64.rpm
           \`\`\`
 
           Prefer \`apt upgrade\`/\`dnf upgrade\` over downloading a \`.deb\`/\`.rpm\`

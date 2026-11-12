@@ -1,6 +1,6 @@
 # Provider reference
 
-Slice B-1 adds four LLM providers, each supporting two authentication modes. This document is the canonical reference for what works, how to configure it, and how to debug it. For step-by-step walkthroughs, see `docs/providers/<name>.md`.
+rupu ships five LLM provider kinds (`anthropic`, `openai`, `gemini`, `copilot` and the generic `openai-compatible`) and shares its credential store with the SCM vendors (`github`, `gitlab`). Every vendor takes an API key; the vendor-specific LLM kinds and both SCM vendors also take an SSO login, and most of those have a device login for a machine with no browser. This document is the canonical reference for what works, how to configure it, and how to debug it. For step-by-step walkthroughs, see `docs/providers/<name>.md`; for the SCM side (scopes, `[scm.<account>]`, routing), see [scm.md](scm.md).
 
 ## Provider × auth-mode matrix
 
@@ -11,8 +11,10 @@ Slice B-1 adds four LLM providers, each supporting two authentication modes. Thi
 | gemini             |   ✓     |  ✓   | ✓ (paste the code) | Browser callback | API key via Google AI Studio (`AIzaSy…`). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login — see [gemini.md](providers/gemini.md#code-assist-project). |
 | copilot            |   ✓     |  ✓   |   ✓    | Device code      | API-key path uses a GitHub PAT (`GITHUB_TOKEN`). Requires paid Copilot.                   |
 | openai-compatible  |   ✓     |  —   |   —    | —                | Generic adapter for any `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …). |
+| github (SCM)       |   ✓     |  ✓   |   ✓    | Device code      | Personal access token OR `gh`-style device-code login; `--mode device` is the same flow. An SCM account, declared under `[scm.<account>]`; see [scm.md](scm.md). |
+| gitlab (SCM)       |   ✓     |  ✓   | ✓ (GitLab 17.9+) | Browser callback | Personal access token OR glab's PKCE login; `--mode device` is GitLab's device authorization grant. gitlab.com or self-managed (`[scm.<account>] base_url` + `oauth_client_id`); see [scm.md](scm.md). |
 
-**Device** is `--mode device`, the login for a machine with no browser — see [Device login](#device-login---mode-device).
+**Device** is `--mode device`, the login for a machine with no browser; see [Device login](#device-login---mode-device). `linear`, `jira`, `local` and `openai-compatible` accounts have no SSO or device login.
 
 Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have `gh auth login` configured.
 
@@ -98,7 +100,13 @@ Vendors with a device login:
 - **copilot**, **github**: the GitHub device-code flow — the same flow as their `--mode sso` (see above).
 - **gitlab**: GitLab's device authorization grant (see below).
 
-Any other vendor refuses with `<kind> has no device login; use --mode api-key`.
+Any other vendor refuses with `<kind> has no device login; use --mode api-key` (an `openai-compatible` account is refused earlier, by `openai-compatible providers only support --mode api-key`). `--mode sso` itself, on a Linux machine with neither `DISPLAY` nor `BROWSER` set, refuses before it binds a listener with `SSO requires a desktop browser. Run with --mode device to log in from any browser, or --mode api-key.`; rupu never switches modes on its own.
+
+**What you see, and where.** Every prompt and progress line (the URL, the code, `Waiting for approval…`, `Paste the code the page shows:`) goes to **stderr**. The only line on **stdout** is the result, `rupu: stored <account> sso credential`, so a script can capture stdout and still show the operator the instructions. The paste prompt (Anthropic, Gemini) reads one line from **stdin** whether or not stdin is a terminal, so the code can arrive through a pipe or a here-string as well as by typing; it has to be the code the page shows for the URL *this* run printed, since each run makes a new one. A pasted or entered code is never echoed back or logged.
+
+**Stored as `sso`.** `device` is a way to log in, not a storage slot. The credential lands in the account's `sso` entry of `~/.rupu/auth.json`, so everything downstream treats it as an SSO login: `rupu auth status` shows `sso`, an agent's `auth: sso` picks it (and the [default precedence](#default-precedence) prefers it over an API key), it refreshes through the same per-vendor path as a browser login, and `rupu auth logout --account <name> --mode device` removes the same entry as `--mode sso`.
+
+**Polling (GitHub, Copilot, GitLab).** These are RFC 8628 device-code flows. rupu polls the token endpoint at the interval the vendor's reply names, else every 5 seconds, never faster than once a second. A `slow_down` reply adds 5 seconds to the interval unless it names a new one; `authorization_pending` keeps polling. The wait ends at the server's `expires_in` (each vendor sets its own code lifetime), or after 15 minutes when the reply names none, with `device-code flow timed out`; any other error (`expired_token`, `access_denied`) ends the login with `device-code flow error: <error>`. OpenAI's flow is not RFC 8628 (see [OpenAI](#openai) below): it polls at the interval OpenAI's reply names (5 seconds when it names none), treats a 403 or 404 while polling as "not yet", and gives up 15 minutes after the first poll with `device login timed out`.
 
 #### Anthropic
 
@@ -136,8 +144,6 @@ rupu auth login --account gemini --mode device
 
 The URL asks Google to show its consent screen on every device login, so that Google always issues a refresh token (without it, an account that had already consented once would get a one-hour token). If Google still returns no refresh token, rupu says `Google returned no refresh token. Revoke "Gemini CLI" at https://myaccount.google.com/permissions and log in again, or use --mode api-key` and stores nothing. The code works once and expires within minutes; if the exchange fails, run the command again for a new URL.
 
-> Not yet verified against Google: this flow is built from Gemini CLI's own manual login and has not been run against a live Google account.
-
 #### OpenAI
 
 ```sh
@@ -150,9 +156,9 @@ rupu auth login --account openai --mode device
 
 1. rupu asks `auth.openai.com` for a one-time code (the login Codex CLI runs for `codex login --device-auth`).
 2. Open `https://auth.openai.com/codex/device` in a browser on any machine, sign in with your ChatGPT account and enter the code.
-3. rupu polls until you approve it, then exchanges the approval for tokens and stores them as `--mode sso` does. A login nobody approves ends after 15 minutes with `device login timed out`.
+3. rupu polls until you approve it, then exchanges the approval for tokens and stores them as `--mode sso` does. A login nobody approves ends after 15 minutes with `device login timed out`; a reply other than "approved" or "not yet" (a 403 or 404) ends it with `device login failed with status <code>`.
 
-Device login is off by default for a ChatGPT account. If rupu says `device login is not enabled for this ChatGPT account`, turn it on in ChatGPT settings → Security (for a workspace, an admin turns it on under workspace permissions) and retry, or log in from a desktop with `--mode sso`.
+Device login is off by default for a ChatGPT account. If rupu says `device login is not enabled for this ChatGPT account. Turn it on in ChatGPT settings → Security (a workspace admin does it under workspace permissions), then retry; or log in from a desktop with --mode sso` (OpenAI answers the code request with a 404), do that and retry.
 
 Only enter a code from a login you started yourself: whoever started the login gets the account the code is approved for.
 
@@ -422,6 +428,8 @@ Where each provider's limits come from:
 | openai-compatible (vLLM, …) | `GET {base_url}/v1/models` | `max_model_len` (fills only the values config left unset) | not reported |
 
 - **OpenAI with an API key** also sends the key, as a Bearer token, to `chatgpt.com/backend-api/codex/models` — the only endpoint beyond `api.openai.com` — to read the Codex catalog's limits. That first call has its own 3-second timeout, so the fallback still fits the 10-second listing budget: if it fails, times out or lists nothing usable, rupu falls back to the ids-only `GET /v1/models`.
+- **The Codex catalog is versioned.** rupu requests it as `/backend-api/codex/models?client_version=0.166.0`. The server filters the catalog by each model's minimum client version, so the pin is protocol compatibility with the Codex CLI release rupu verified against, not rupu's own version, and needs no Codex installation; an older pin (0.50.0) returned an empty catalog even for a valid login.
+- **Hidden models are dropped.** A Codex catalog entry whose `visibility` is anything but `list` is left out (an entry with no `visibility` field is kept, as the public `/v1/models` and gateways have none), and with an API key an entry marked `supported_in_api: false` is left out too. A model that works in your ChatGPT app but that the catalog hides therefore never appears in `rupu models list --provider openai`; to use it, add it under `[[providers.openai.models]]` (the id is still sent as written) and declare its limits there.
 - **Gemini CLI / Code Assist login** exposes no model limits. Declare them yourself with `[[providers.gemini.models]]` (or pin `contextWindowTokens` / `maxTokens` on the agent); with that login, `rupu models refresh --provider gemini` reports that there is no listing rather than pretending to fetch one.
 - **Copilot** reports a prompt limit that is often well below the model's full window (for example 128K of a 400K window); rupu uses the prompt limit as the input limit, and a limit the listing reports as `0` counts as absent, so it falls through to the window size. Its built-in ids only fill gaps beneath the live list and carry no limits.
 - **OpenAI-compatible** limits are unknown unless config or the server provides them — there are no made-up defaults. A LoRA entry with no `max_model_len` of its own takes its parent's.
@@ -429,6 +437,8 @@ Where each provider's limits come from:
 - **Paged listings** (Anthropic, Gemini AI Studio) are fetched 1000 models per page; a server that repeats a page cursor, or lists a model id twice, is cut off rather than looped on or double-listed.
 
 **In the control plane:** Settings → Models lists every provider's cached models with input limit, output cap, source and fetch age, with a **Refetch** button per provider and a **Refetch all** button. It is backed by `GET /api/models` and `POST /api/models/refresh` (body `{}` for all providers, or `{"provider": "<name>"}` for one) and refreshes the control-plane machine's cache only — remote hosts keep their own caches and refresh them when a run launches there. A refetch always tries, even inside the 5-minute pause below; a job that outlives its 10-second wait is reported as `timed out after 10s` and keeps running in the background.
+
+*Reading the responses.* `GET /api/models` reads the cache only (no network) and answers one entry per provider: `{"provider", "fetched_at", "stale", "models": [{"id", "input_tokens", "output_tokens", "source"}]}`. `stale: true` means the cached list is older than its hour; `fetched_at: null` together with `stale: false` means the provider was never fetched (nothing is cached, so nothing is stale), not that it is fresh. `POST /api/models/refresh` answers **200 whenever the refresh ran**, with one `{"provider", "ok", "count", "error"?}` per provider targeted; a provider that could not be refreshed is reported as `ok: false` with its `error` inside that 200, so check each provider's `ok`, not the status code. A body naming an unknown provider, or a malformed body, is a 400; an empty body refreshes every provider.
 
 ### When a refresh fails
 

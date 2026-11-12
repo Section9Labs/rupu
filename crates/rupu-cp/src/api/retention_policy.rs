@@ -174,14 +174,15 @@ async fn preview(
     super::runs::blocking(move || prepare(&s, body).map(Json)).await
 }
 fn prepare(s: &AppState, body: PreviewBody) -> ApiResult<Value> {
-    if !(KINDS.contains(&body.kind.as_str()) && body.authorization_mode.is_none())
-        && !(body.kind == "netflow"
+    if !(KINDS.contains(&body.kind.as_str()) && body.authorization_mode.is_none()
+        || body.kind == "netflow"
             && body.authorization_mode.as_deref() == Some("exact_preview_set"))
     {
         return Err(ApiError::bad_request("archive policy kinds are sessions, transcripts and cleanup; netflow requires explicit exact_preview_set authorization"));
     }
-    if (!body.scopes.global && body.scopes.project_id.is_none())
-        || (!["transcripts", "netflow"].contains(&body.kind.as_str()) && !body.scopes.global)
+    if !body.scopes.global
+        && (body.scopes.project_id.is_none()
+            || !["transcripts", "netflow"].contains(&body.kind.as_str()))
     {
         return Err(ApiError::bad_request(
             "explicit global scope is required for session cleanup",

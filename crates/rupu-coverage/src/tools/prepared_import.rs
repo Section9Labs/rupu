@@ -616,6 +616,8 @@ fn install_blobs(
 }
 
 #[cfg(unix)]
+// Keep the captured ledger inputs and fault-injection hooks explicit at commit.
+#[allow(clippy::too_many_arguments)]
 fn replace_prepared(
     paths: &CoveragePaths,
     parent: &File,

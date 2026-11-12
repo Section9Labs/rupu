@@ -356,7 +356,7 @@ fn publish_page(
     out["observed_at"] = json!(captured_at);
     out["page"] = json!({"id":pid,"ordinal":pages.ordinal,"order":page.order,"completeness":if page.provider_exhausted{"end_observed"}else{"page_only"},"duplicate_observations":duplicates,"items":items,"next_cursor":next});
     pages.ordinal += 1;
-    bounded(out.clone())?;
+    let _ = bounded(out.clone())?;
     Ok(out)
 }
 impl Cache {
@@ -460,7 +460,7 @@ async fn read(
             if obs.created.elapsed() >= TTL {
                 return Err(expired());
             }
-            bounded(out.clone())?;
+            let _ = bounded(out.clone())?;
             pages.frames.insert(
                 fid.into(),
                 Frame {

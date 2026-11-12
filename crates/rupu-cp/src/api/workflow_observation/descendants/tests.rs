@@ -272,7 +272,7 @@ fn remote_edge_and_foreign_child_prologue_are_refused() {
     fs::write(f.dir.join("children.jsonl"), line(&raw)).unwrap();
     let p = page(&f, None, 50).unwrap();
     assert!(selected(&f, &p, 0).is_err());
-    write_ledger(&f, &[value.clone()]);
+    write_ledger(&f, std::slice::from_ref(&value));
     let p = page(&f, None, 50).unwrap();
     fs::write(value.transcript.unwrap(), prologue("run_foreign")).unwrap();
     assert!(selected(&f, &p, 0).is_err());

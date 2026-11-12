@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! Pure call-binding tests: no provider or actual tool dispatch.
 use super::{approval_fingerprint, approval_request};
 use async_trait::async_trait;

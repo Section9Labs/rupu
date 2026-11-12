@@ -70,6 +70,8 @@ pub trait RepoLister: Send + Sync {
         ))
     }
 
+    // Keep owner, selection and continuation preconditions explicit at this boundary.
+    #[allow(clippy::too_many_arguments)]
     async fn review_page(
         &self,
         _repo: &rupu_scm::RepoRef,

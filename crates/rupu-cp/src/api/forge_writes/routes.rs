@@ -351,7 +351,7 @@ async fn prepare(State(s): State<AppState>, Json(body): Json<PrepareBody>) -> Re
     let expires = chrono::Utc::now().timestamp().max(0) as u64 + 600;
     let global = s.global_dir.clone();
     let stored = tokio::task::spawn_blocking(move || {
-        let mut store = journal::Store::open(&global)?;
+        let store = journal::Store::open(&global)?;
         store.compact_intents(chrono::Utc::now().timestamp().max(0) as u64)?;
         store.publish_intent(&id, &digest, &key, expires, payload)
     })
@@ -514,8 +514,8 @@ async fn execute_job(s: AppState, id: String, body: ExecuteBody) -> Result<Value
     let global = s.global_dir.clone();
     let operation_id = body.operation_id.clone();
     let digest = body.expected_digest.clone();
-    let (mut store, reservation) = journal_work(move || {
-        let mut store = journal::Store::open(&global)?;
+    let (store, reservation) = journal_work(move || {
+        let store = journal::Store::open(&global)?;
         let reservation = store.reserve(&operation_id, &id, &digest)?;
         Ok((store, reservation))
     })
@@ -600,7 +600,7 @@ async fn execute_job(s: AppState, id: String, body: ExecuteBody) -> Result<Value
             );
         }
     };
-    let (mut store, ticket) = match journal_work(move || {
+    let (store, ticket) = match journal_work(move || {
         let ticket = store.mark_dispatching(ticket)?;
         Ok((store, ticket))
     })

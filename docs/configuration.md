@@ -153,20 +153,33 @@ An agent's `provider:` names the account. Full narrative reference:
 
 ### `cyber` access programs
 
-On an `openai-codex` account, a `[[providers.openai-codex.models]]` entry may set
+On an OpenAI account (`[providers.openai]`, or an account whose `kind` is
+`openai`, `openai_codex` or `codex`), a `[[providers.<account>.models]]` entry may set
 `cyber` to default OpenAI's [Daybreak](https://developers.openai.com/api/docs/guides/daybreak)
 access program for that model — `standard`, `daybreak_blue`, or `daybreak_red`.
-A run of the matching model then emits the Responses API
+A run whose model `id` matches the entry then emits the Responses API
 `access_programs: { cyber: <value> }` unless an agent's [`cyber:` frontmatter](agent-format.md#cyber)
 or [`rupu run --cyber`](agent-format.md#cyber) overrides it (precedence: flag →
 frontmatter → this config default). The organization/project must already be
-approved for the program, and the value must match the model; an unknown token
-here is ignored with a warning. Ignored by every other provider.
+approved for the program, and the value must match the model. An unknown token
+here is ignored with a warning when the run is assembled (unlike the frontmatter
+key, where an unknown value is a parse error). Ignored by every other provider.
+See [providers/openai.md](providers/openai.md#openai-daybreak-cyber-access) for
+what a fallback hop, a session or a placed unit does with it.
 
 ```toml
-[[providers.openai-codex.models]]
+[[providers.openai.models]]
 id = "gpt-5.6-cyber"
 cyber = "daybreak_red"
+```
+
+`openai-codex` with a hyphen is the display id rupu uses in transcripts and
+pricing, not a built-in provider name. To use it as an account name, declare it
+and log in under it:
+
+```toml
+[providers.openai-codex]
+kind = "openai_codex"
 ```
 
 An `openai-compatible` entry additionally requires `base_url` and `default_model`
@@ -352,7 +365,7 @@ What to do when a model's reply cannot be used or the provider fails the request
 [recovery]
 fallbacks = [
   { model = "claude-sonnet-5-5" },
-  { provider = "openai-codex", model = "gpt-5.6-cyber" },
+  { provider = "openai", model = "gpt-5.6-cyber" },
 ]
 server_side_fallback = true
 ```

@@ -202,7 +202,7 @@ pub struct StartArgs {
     /// lets a caller pass a prompt without it being parsed as a target).
     #[arg(long = "prompt")]
     pub prompt_flag: Option<String>,
-    /// Override permission mode (`ask` | `bypass` | `readonly`).
+    /// Override permission mode (`bypass` | `readonly`; a session cannot run in `ask` mode).
     #[arg(long)]
     pub mode: Option<String>,
     /// Don't render tokens as they arrive, for every turn in this session. The

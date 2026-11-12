@@ -169,17 +169,22 @@ fn agentiflow_root_cursor_rechecks_proof_and_parent_scope() {
     );
 }
 #[test]
-fn agentiflow_family_search_stays_explicitly_unsupported() {
+fn agentiflow_family_search_retains_verified_owner_and_child() {
     let (_tmp, owner, _) = fixture();
-    assert_eq!(
-        status(capture::search::capture(
-            owner,
-            "af_owned",
-            &std::sync::atomic::AtomicBool::new(false)
-        )),
-        StatusCode::NOT_IMPLEMENTED
-    );
+    let captured = capture::search::capture(
+        owner,
+        "af_owned",
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(captured.proof.kind, "agentiflow");
+    assert_eq!(captured.proof.project_id.as_deref(), Some("ws_project"));
+    assert_eq!(captured.members.len(), 2);
+    assert_eq!(captured.members[0].run_id, "af_owned");
+    assert_eq!(captured.members[1].run_id, "sub_actual");
+    assert_eq!(captured.members[1].parent, Some(0));
 }
+
 #[cfg(unix)]
 #[test]
 fn agentiflow_root_refuses_symlinked_proof() {

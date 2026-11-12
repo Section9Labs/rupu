@@ -386,7 +386,10 @@ async fn pending_observation_does_not_contend_with_exact_decision() {
     }
     decide(&b, &event, Decision::Deny).await;
     for reader in readers {
-        assert!(reader.await.unwrap().is_ok());
+        reader
+            .await
+            .unwrap()
+            .expect("concurrent observation must retain store access");
     }
     assert!(matches!(
         read_frame::<_, ServerFrame>(&mut stream).await.unwrap(),

@@ -424,6 +424,8 @@ fn own_timestamp(event: &Event) -> Option<i64> {
     }
 }
 
+// Keep owner, selection and continuation preconditions explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn scan_page(
     global: &std::path::Path,
     root: &std::path::Path,

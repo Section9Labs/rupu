@@ -128,12 +128,6 @@ Download the binary for your platform from the
 [Releases](https://github.com/Section9Labs/rupu/releases) page and place `rupu`
 somewhere on your `$PATH`.
 
-> **Not live yet.** The three community install paths below (AUR, Homebrew,
-> Nix) become available with the first stable release after this lands — that
-> release is what publishes `rupu-bin` to the AUR, pushes the formula to the
-> tap, and fills in the flake's version and hashes. Until then, use the
-> prebuilt binary or the `.deb`/`.rpm` below.
-
 **Arch Linux (AUR):**
 
 ```sh
@@ -245,6 +239,17 @@ repo_gpgcheck=1
 gpgkey=https://rupu.sh/rupu-archive-keyring.asc
 EOF
 sudo dnf install rupu
+```
+
+*Verify a downloaded RPM:* from 0.88.0 every `.rpm` is itself signed with the
+release key (earlier releases signed only the repository metadata), so an RPM
+fetched from the GitHub release page can be checked before it is installed.
+Import the key once, then ask `rpmkeys` for the verdict; every line of its
+output must end in `OK`, and an unsigned package shows digest lines only:
+
+```sh
+sudo rpm --import https://rupu.sh/rupu-archive-keyring.asc
+rpmkeys --checksig --verbose rupu-<version>-1.x86_64.rpm
 ```
 
 *Beta channel:* identical snippets with `stable` → `beta` — in the `Suites:`
@@ -369,8 +374,8 @@ rupu ships five LLM providers. Four support both API-key and SSO auth:
 | copilot   | (PAT via `gh` token)                 | GitHub login (device code)         |   ✓    |
 
 **Device** is `--mode device`: log in from a browser on another machine (for a
-server or VM with no browser); the credential is stored as `sso`. See
-`docs/providers.md`'s "Device login".
+server or VM with no browser); the credential is stored as `sso`. The GitHub
+and GitLab SCM accounts have it too. See `docs/providers.md`'s "Device login".
 
 A fifth, `openai-compatible`, is a user-declared generic adapter for any
 `/v1/chat/completions` endpoint (vLLM, Oracle GenAI, Together, …) — API-key
@@ -383,6 +388,9 @@ rupu auth login --provider anthropic --mode api-key --key sk-ant-XXX
 
 # SSO (opens a browser; Copilot prints a device code instead)
 rupu auth login --provider anthropic --mode sso
+
+# Device login (no browser here: prints a URL and code to use from any browser)
+rupu auth login --provider openai --mode device
 
 # Verify
 rupu auth status
@@ -564,6 +572,8 @@ this repo:
 - [`docs/workflow-format.md`](docs/workflow-format.md) — complete workflow schema reference
 - [`docs/workflow-authoring.md`](docs/workflow-authoring.md) — how to design good workflows
 - [`docs/agentiflows.md`](docs/agentiflows.md) — goal-directed agent fleets (`rupu agentiflow`)
+- [`docs/agentiflow-tutorial.md`](docs/agentiflow-tutorial.md) — an agentiflow end to end, from `rupu fleet install` to its findings
+- [`docs/agentiflow-authoring.md`](docs/agentiflow-authoring.md) — how to write a good agentiflow: the lead, goal targets, budgets and steering
 - [`docs/triggers.md`](docs/triggers.md) — cron, polled-event and webhook triggers
 - [`docs/configuration.md`](docs/configuration.md) — complete `config.toml` reference, including the customer layer
 - [`docs/providers.md`](docs/providers.md) — LLM providers, accounts and auth modes (per-provider pages in [`docs/providers/`](docs/providers/))
@@ -585,7 +595,8 @@ this repo:
 ```
 rupu init [--with-samples] [--git]    Bootstrap .rupu/ in the current dir
 rupu run <agent> [prompt|target]      Run an agent (--continue <id>, --model, --provider,
-                                       --engagement-profile, --findings-profile, --tmp/--into)
+                                       --engagement-profile, --findings-profile, --cyber,
+                                       --tmp/--into)
 rupu run {list, show, pause, resume}  List / inspect runs; pause or resume a run by id
 rupu agent {list, show, edit, create} Manage agents (create --describe drafts one with a model)
 rupu workflow {list, show, edit, create}
@@ -828,7 +839,10 @@ See [`docs/spec.md`](docs/spec.md) for the full architecture. Short version:
   time; use `rupu session start`, `rupu session send`, and `rupu session attach` for
   long-lived agent conversations. Sessions can also be archived, restored, listed with
   `--all|--archived`, pruned by age, permanently deleted with `--force`, or cleaned in
-  bulk with `rupu cleanup`.
+  bulk with `rupu cleanup`. `rupu session start rupu-session` uses the built-in
+  session harness compiled into the binary (a reserved agent name, readonly by
+  default, with the provider and model chosen at launch); see
+  [`docs/using-rupu.md`](docs/using-rupu.md#built-in-session-rupu-session).
 - **Tool policy** lives in each agent's `tools:` and `permissionMode`. A workflow
   step's `actions:` further narrows the connector/MCP subset of that grant for
   the step — it never touches builtin tools (`bash`, `read_file`, `write_file`,
