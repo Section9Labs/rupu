@@ -42,6 +42,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+mod execution;
+
+#[cfg(test)]
+mod execution_tests;
+
 // ---------------------------------------------------------------------------
 // Remote unit dispatch port
 // ---------------------------------------------------------------------------
@@ -1368,24 +1373,23 @@ pub async fn run_workflow(
     //   and seed `step_results` from the persisted history.
     // - In-memory (no run store): an empty `run_id`; persistence
     //   helpers no-op.
-    let (run_id, mut step_results, approved_step_id) =
-        if let Some(resume) = opts.resume_from.clone() {
-            (
-                resume.run_id,
-                resume.prior_step_results,
-                Some(resume.approved_step_id),
-            )
-        } else if opts.run_store.is_some() {
-            // Caller-supplied id (cron-tick polled tier) wins; otherwise
-            // generate a fresh ULID-suffixed id.
-            let id = opts
-                .run_id_override
-                .clone()
-                .unwrap_or_else(|| format!("run_{}", Ulid::new()));
-            (id, Vec::new(), None)
-        } else {
-            (String::new(), Vec::new(), None)
-        };
+    let (run_id, step_results, approved_step_id) = if let Some(resume) = opts.resume_from.clone() {
+        (
+            resume.run_id,
+            resume.prior_step_results,
+            Some(resume.approved_step_id),
+        )
+    } else if opts.run_store.is_some() {
+        // Caller-supplied id (cron-tick polled tier) wins; otherwise
+        // generate a fresh ULID-suffixed id.
+        let id = opts
+            .run_id_override
+            .clone()
+            .unwrap_or_else(|| format!("run_{}", Ulid::new()));
+        (id, Vec::new(), None)
+    } else {
+        (String::new(), Vec::new(), None)
+    };
 
     // Codenames (spec §4.3): the static walk is a pure function of the
     // workflow + run id, so a resume recomputes the same words; dynamic
@@ -1505,6 +1509,31 @@ pub async fn run_workflow(
         None
     };
 
+    let observation_run_id = run_id.clone();
+    execution::observe_run(
+        &opts,
+        &observation_run_id,
+        run_record_opt.as_ref(),
+        run_workflow_body(
+            &opts,
+            run_id,
+            step_results,
+            approved_step_id,
+            run_record_opt.as_ref(),
+        ),
+    )
+    .await
+}
+
+/// The entered runner lifetime, including every gate-decision re-entry and
+/// finalization. Its caller retains both runner ownership guards until return.
+async fn run_workflow_body(
+    opts: &OrchestratorRunOpts,
+    run_id: String,
+    mut step_results: Vec<StepResult>,
+    approved_step_id: Option<String>,
+    run_record_opt: Option<&crate::runs::RunRecord>,
+) -> Result<OrchestratorRunResult, RunWorkflowError> {
     // The gate decisions this runner applies (spec §7: path-scoped). On a
     // resume: every decision recorded on the run; and every gate already
     // parked counts as announced, so a sibling that still waits re-parks
@@ -3398,6 +3427,7 @@ async fn run_scheduler_scoped(
             }
 
             if crate::workflow::is_approval_gate(step) {
+                let executing = execution::enter(&step.id);
                 let ap = step.approval.as_ref().expect("gate has approval");
                 let prompt = match &ap.prompt {
                     Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
@@ -3452,6 +3482,7 @@ async fn run_scheduler_scoped(
                             &mut join_state,
                             &mut cancel_state,
                         );
+                        executing.finish();
                         continue;
                     }
                     Some(decision) => {
@@ -3474,13 +3505,13 @@ async fn run_scheduler_scoped(
                             current_loop_iteration,
                         );
                         if !ap.on_reject.is_empty() {
-                            cleanups.spawn(run_on_reject_chain_task(
+                            cleanups.spawn(execution::inherit(run_on_reject_chain_task(
                                 Arc::clone(&opts_arc),
                                 run_id.to_string(),
                                 step.id.clone(),
                                 ap.on_reject.clone(),
                                 step_results.clone(),
-                            ));
+                            )));
                         }
                         rejected_gates.insert(i);
                         if graph_mode {
@@ -3517,6 +3548,7 @@ async fn run_scheduler_scoped(
                             &mut join_state,
                             &mut cancel_state,
                         );
+                        executing.finish();
                         continue;
                     }
                     None => {}
@@ -3564,6 +3596,7 @@ async fn run_scheduler_scoped(
                             &mut join_state,
                             &mut cancel_state,
                         );
+                        executing.finish();
                         continue;
                     }
                 }
@@ -3605,6 +3638,7 @@ async fn run_scheduler_scoped(
                     timeout_seconds: ap.timeout_seconds,
                 });
                 parked_direct.insert(step.id.clone(), i);
+                executing.finish();
                 continue;
             }
 
@@ -3716,6 +3750,7 @@ async fn run_scheduler_scoped(
             }
 
             if let Some(branch) = &step.branch {
+                let executing = execution::enter(&step.id);
                 let branch_timer = std::time::Instant::now();
                 let started_at = chrono::Utc::now();
                 if let Some(sink) = opts.event_sink.as_ref() {
@@ -3816,11 +3851,13 @@ async fn run_scheduler_scoped(
                     &mut join_state,
                     &mut cancel_state,
                 );
+                executing.finish();
                 continue;
             }
 
             // `split:` orchestration no-op — see this function's doc.
             if step.split.is_some() {
+                let executing = execution::enter(&step.id);
                 let split_timer = std::time::Instant::now();
                 let started_at = chrono::Utc::now();
                 if let Some(sink) = opts.event_sink.as_ref() {
@@ -3875,6 +3912,7 @@ async fn run_scheduler_scoped(
                     &mut join_state,
                     &mut cancel_state,
                 );
+                executing.finish();
                 continue;
             }
 
@@ -3923,6 +3961,7 @@ async fn run_scheduler_scoped(
                         );
                     }
                     let loop_timer = std::time::Instant::now();
+                    let executing = execution::enter(&step.id);
                     let loop_result = Box::pin(run_loop_node(
                         loop_suffix,
                         loop_def,
@@ -3935,6 +3974,7 @@ async fn run_scheduler_scoped(
                         gates,
                     ))
                     .await;
+                    executing.finish_result(&loop_result);
                     match loop_result {
                         Ok(LoopNodeOutcome::Completed(mut result, progress)) => {
                             result.started_at = Some(started_at);
@@ -4128,7 +4168,7 @@ async fn run_scheduler_scoped(
             let run_id_owned = run_id.to_string();
             let step_owned = step.clone();
             let ctx_owned = ctx;
-            let abort_handle = in_flight.spawn(async move {
+            let abort_handle = in_flight.spawn(execution::inherit(async move {
                 let _permit = permit_sem
                     .acquire_owned()
                     .await
@@ -4143,7 +4183,7 @@ async fn run_scheduler_scoped(
                 )
                 .await;
                 (i, outcome)
-            });
+            }));
             // Task 3, spec §8: recorded so a join resolving via `first`/
             // `count` can reach into this exact in-flight slot and abort
             // it (`cancel_state.in_flight_abort`), and so the `JoinError`
@@ -4676,15 +4716,19 @@ async fn run_loop_node(
         // member counted twice in `step_results`, once from the
         // original persist and once from THIS re-merge).
         let seeded_count = iteration_results.len();
-        let outcome = Box::pin(run_scheduler_scoped(
-            opts,
-            run_id,
-            resolved_inputs,
-            workflow_default_continue,
-            Some(gates),
-            &mut iteration_results,
-            cancel,
-            scope,
+        let outcome = Box::pin(execution::iteration(
+            loop_name,
+            iteration,
+            run_scheduler_scoped(
+                opts,
+                run_id,
+                resolved_inputs,
+                workflow_default_continue,
+                Some(gates),
+                &mut iteration_results,
+                cancel,
+                scope,
+            ),
         ))
         .await;
 
@@ -5437,6 +5481,7 @@ fn drain_joins(
         if !joins.resolved.insert(j) {
             continue;
         }
+        let executing = execution::enter(&wf.steps[j].id);
         let winners = joins.arrived.get(&j).cloned().unwrap_or_default();
         let losers: Vec<usize> = predecessors[j]
             .iter()
@@ -5567,6 +5612,7 @@ fn drain_joins(
             ready,
             joins,
         );
+        executing.finish();
         worklist.extend(more);
     }
 }
@@ -5805,6 +5851,7 @@ async fn run_steps_over(
         // always `Some`, so it would otherwise also match the legacy block
         // and pause twice).
         if crate::workflow::is_approval_gate(step) {
+            let executing = execution::enter(&step.id);
             let ap = step.approval.as_ref().expect("gate has approval");
             let prompt = match &ap.prompt {
                 Some(t) => render_step_prompt(t, &ctx, render_mode(opts.strict_templates))
@@ -5833,6 +5880,7 @@ async fn run_steps_over(
                     step_results,
                     None,
                 );
+                executing.finish();
                 continue;
             }
             if let Some(expr) = &ap.auto_approve {
@@ -5854,6 +5902,7 @@ async fn run_steps_over(
                         step_results,
                         None,
                     );
+                    executing.finish();
                     continue;
                 }
             }
@@ -5880,6 +5929,7 @@ async fn run_steps_over(
                     );
                 }
             }
+            executing.finish();
             return Ok(InnerOutcome::Paused {
                 step_id: step.id.clone(),
                 prompt: prompt.clone(),
@@ -5960,6 +6010,7 @@ async fn run_steps_over(
         // (which panics on the absent prompt) or the shared dispatch
         // machinery below; it emits its own StepStarted/StepCompleted pair.
         if let Some(branch) = &step.branch {
+            let executing = execution::enter(&step.id);
             let branch_timer = std::time::Instant::now();
             let started_at = chrono::Utc::now();
             if let Some(sink) = opts.event_sink.as_ref() {
@@ -6014,6 +6065,7 @@ async fn run_steps_over(
             }
             persist_step_result(opts, run_id, &result);
             step_results.push(result);
+            executing.finish();
             continue;
         }
 
@@ -6128,6 +6180,30 @@ enum NodeOutcome {
 /// `started_at` is when the caller emitted this step's `StepStarted`; the
 /// completed result carries it into the step's record.
 async fn run_node(
+    run_id: &str,
+    step: &Step,
+    ctx: &StepContext,
+    opts: &OrchestratorRunOpts,
+    effective_continue_on_error: bool,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> Result<NodeOutcome, RunWorkflowError> {
+    // The DAG caller already holds its permit. The legacy linear driver calls
+    // this same boundary directly, so both observe exactly the entered body.
+    let executing = execution::enter(&step.id);
+    let outcome = run_node_body(
+        run_id,
+        step,
+        ctx,
+        opts,
+        effective_continue_on_error,
+        started_at,
+    )
+    .await;
+    executing.finish_result(&outcome);
+    outcome
+}
+
+async fn run_node_body(
     run_id: &str,
     step: &Step,
     ctx: &StepContext,
@@ -7366,11 +7442,21 @@ pub async fn run_reject_cleanup(
         .as_ref()
         .map(|r| r.run_id.clone())
         .unwrap_or_default();
-    let out = run_reject_chain(opts, rejected_step_id, reason, via, approver).await;
-    if let Some(store) = store.filter(|_| !run_id.is_empty()) {
-        run_before_terminal(&store, &run_id).await;
-    }
-    out
+    // A terminal cleanup is a separate scheduler invocation. Only an existing
+    // exact record can establish its generation; start revalidates that record.
+    let record = match store.as_ref().filter(|_| !run_id.is_empty()) {
+        Some(store) => Some(store.load(&run_id).map_err(map_run_store_err)?),
+        None => None,
+    };
+    let observation_opts = opts.clone();
+    execution::observe_run(&observation_opts, &run_id, record.as_ref(), async {
+        let out = run_reject_chain(opts, rejected_step_id, reason, via, approver).await;
+        if let Some(store) = store.filter(|_| !run_id.is_empty()) {
+            run_before_terminal(&store, &run_id).await;
+        }
+        out
+    })
+    .await
 }
 
 /// [`run_reject_cleanup`]'s body: the gate's rejected result, then its
@@ -7436,6 +7522,7 @@ async fn run_reject_chain(
                 .is_ok_and(|o| o["decision"] == "rejected")
     });
     if !already_recorded {
+        let executing = execution::enter(&gate.id);
         emit_gate_result(
             &opts,
             &run_id,
@@ -7447,6 +7534,7 @@ async fn run_reject_chain(
             &mut step_results,
             None,
         );
+        executing.finish();
     }
 
     // 3. Dispatch each on_reject step through the same per-step
@@ -7546,6 +7634,7 @@ async fn run_on_reject_chain(
 ) -> Result<(), RunWorkflowError> {
     let resolved_inputs = resolve_inputs(&opts.workflow, &opts.inputs)?;
     for step in chain {
+        let executing = execution::enter(&step.id);
         if step.action.is_some() {
             // Action steps dispatch through the same `execute_action_step`
             // helper the main loop uses (Plan 2). `continue_on_error:
@@ -7600,6 +7689,7 @@ async fn run_on_reject_chain(
                 }),
             };
             let duration_ms = step_timer.elapsed().as_millis() as u64;
+            executing.finish_result(&outcome);
             let mut result = match outcome {
                 Ok(result) => {
                     if let Some(sink) = opts.event_sink.as_ref() {
@@ -7741,6 +7831,7 @@ async fn run_on_reject_chain(
             None,
         )
         .await;
+        executing.finish_result(&outcome);
         let duration_ms = step_timer.elapsed().as_millis() as u64;
 
         let (success, error_text, cause) = match outcome {
@@ -8789,7 +8880,7 @@ async fn run_fanout_run_step(
         let store = opts.run_store.clone();
         let workflow_run_id = workflow_run_id.to_string();
 
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::spawn(execution::inherit(async move {
             let _permit = permit_sem
                 .acquire()
                 .await
@@ -8838,7 +8929,7 @@ async fn run_fanout_run_step(
                 }
             }
             (idx, item_value, output, success, transcript_path)
-        }));
+        })));
     }
 
     let mut collected: Vec<(usize, ItemResult)> = Vec::with_capacity(total);
@@ -9411,7 +9502,7 @@ async fn run_fanout_step(
         let resume_plan = dispatch_plans.remove(&idx);
         let replaces = replaced_units.remove(&Some(idx));
 
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::spawn(execution::inherit(async move {
             // Held for the duration of this item's run; dropping it
             // releases a slot back to the pool.
             let _permit = permit_sem
@@ -9959,7 +10050,7 @@ async fn run_fanout_step(
                 paused,
                 codename,
             }
-        }));
+        })));
     }
 
     let mut item_outcomes: Vec<FanoutItemOutcome> = Vec::with_capacity(total);
@@ -10193,7 +10284,7 @@ async fn run_parallel_step(
         let event_sink = opts.event_sink.clone();
         let workflow_run_id = workflow_run_id.to_string();
 
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::spawn(execution::inherit(async move {
             let _permit = permit_sem
                 .acquire_owned()
                 .await
@@ -10297,7 +10388,7 @@ async fn run_parallel_step(
                 raw_error,
                 codename: codename.map(|c| c.to_string()),
             }
-        }));
+        })));
     }
 
     let mut outcomes: Vec<ParallelSubOutcome> = Vec::with_capacity(total);
@@ -11450,7 +11541,7 @@ async fn run_panel_iteration(
         let workflow_name = opts.workflow.name.clone();
         let messaging = opts.workflow.messaging_switch();
 
-        handles.push(tokio::spawn(async move {
+        handles.push(tokio::spawn(execution::inherit(async move {
             let _permit = permit_sem
                 .acquire_owned()
                 .await
@@ -11545,7 +11636,7 @@ async fn run_panel_iteration(
                 raw_error,
                 codename: codename.map(|c| c.to_string()),
             }
-        }));
+        })));
     }
 
     let mut outcomes: Vec<PanelOutcome> = Vec::with_capacity(total);
