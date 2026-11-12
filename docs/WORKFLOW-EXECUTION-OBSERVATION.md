@@ -1,7 +1,7 @@
 # Workflow execution observation v1
 
-Status: implementation and fixture validation in progress. No deployment is
-implied by the capability's presence in source.
+Status: implemented and fixture-validated. Runtime deployment and native live
+acceptance remain separate; source capability does not imply an installed upgrade.
 
 The workflow observation API already captures recorded execution evidence.
 The additive `workflow.observation.executing_steps.v1` capability identifies
@@ -122,11 +122,25 @@ Recorded evidence remains inspectable.
 
 ## Validation boundary
 
-Required fixture checks use dedicated temporary directories and the production
+Fixture checks use dedicated temporary directories and the production
 scheduler, run storage, and observation routes. They cover admitted versus
 queued work, concurrent membership and exact removal, iteration coordinates,
 pause and gate behavior, abnormal teardown, generation replacement,
 cancellation revocation, filesystem constraints, and capture/frontier
 coherence. Fixture evidence does not establish real-provider animation,
-remote cancellation, deployment, or installed-app acceptance. Executed checks
-and their limits will be recorded before publication.
+remote cancellation, deployment, or installed-app acceptance.
+
+Validation on the implemented code:
+
+- `cargo test --offline -p rupu-orchestrator --lib`: 606 tests passed, including
+  23 ownership/storage fixtures and 14 scheduler integration fixtures.
+- `cargo test --offline --no-default-features -p rupu-cp --lib
+  api::workflow_observation::tests`: 50 tests passed, including eight execution
+  observation fixtures through the production routes.
+- `cargo check --offline --no-default-features -p rupu-cli --all-targets`: passed.
+- Scoped Rust formatting and whitespace checks passed.
+
+These checks used Homebrew Rust/Cargo 1.99 on macOS. The repository-pinned 1.95
+toolchain was unavailable and is not certified by this validation. PDF, rebuilt
+CP web assets, production packaging, and installed/native live behavior were
+outside these checks. Existing warnings in unchanged CP code remain.
