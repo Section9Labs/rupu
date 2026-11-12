@@ -18,6 +18,7 @@ pub mod cron_schedule;
 pub mod cron_triggers;
 pub mod event_match;
 pub mod event_vocab;
+pub mod execution_observation;
 pub mod executor;
 pub mod generate;
 pub mod recovery;

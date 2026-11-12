@@ -2018,6 +2018,35 @@ impl RunStore {
         modify: impl FnOnce(&mut RunRecord),
     ) -> Result<Result<RunRecord, RunRecord>, RunStoreError> {
         let _lock = self.lock_run_json(run_id);
+        #[cfg(unix)]
+        if matches!(
+            expected,
+            RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled
+        ) {
+            // An explicit retry is the only path that clears an execution
+            // cancellation barrier. Re-read the CAS input under the strict
+            // observation mutation lock, and exclude an old invocation or
+            // rejection cleanup before publishing Running. A crash between
+            // update and clear remains fail-closed.
+            let retry = crate::execution_observation::RetryGuard::acquire(&self.run_dir(run_id))?;
+            let mut record = retry.load()?;
+            if record.status != expected {
+                return Ok(Err(record));
+            }
+            let original = record.clone();
+            modify(&mut record);
+            let restarting = record.status == RunStatus::Running;
+            let _idle = if restarting {
+                Some(retry.idle_owner(&original)?)
+            } else {
+                None
+            };
+            self.update(&record)?;
+            if restarting {
+                retry.clear_cancelled()?;
+            }
+            return Ok(Ok(record));
+        }
         let mut record = self.load(run_id)?;
         if record.status != expected {
             return Ok(Err(record));
@@ -3987,6 +4016,16 @@ impl RunStore {
             | RunStatus::AwaitingApproval => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
+                // This strict barrier is independent of the legacy run.json
+                // lock's fail-open behavior. Revoke scheduler observations
+                // before publishing cancellation, including before the first
+                // observation exists; a queued producer cannot reauthorize it.
+                crate::execution_observation::revoke_for_owner(
+                    &self.run_dir(run_id),
+                    &record,
+                    "run_cancelled",
+                )
+                .map_err(|e| CancelError::Store(e.to_string()))?;
                 record.status = RunStatus::Cancelled;
                 record.finished_at = Some(now);
                 record.error_message = Some(reason.to_string());
