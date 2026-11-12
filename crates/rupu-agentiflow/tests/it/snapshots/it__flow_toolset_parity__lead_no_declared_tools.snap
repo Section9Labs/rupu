@@ -121,6 +121,246 @@ expression: "lead_toolset(\"[]\")"
       - id
     type: object
   name: board.retract
+- description: "Report this execution's working attempt blocked with a concrete reason. Does not stop or interrupt an agent."
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      reason:
+        type: string
+      request_id:
+        type: string
+      work_attempt_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - work_attempt_id
+      - reason
+    type: object
+  name: board.work_block
+- description: Claim queued work as this exact runtime execution. Returns a new work_attempt_id. Claiming does not start execution or grant additional permissions. Use the current item revision and exact queue ID.
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      request_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+    type: object
+  name: board.work_claim
+- description: "Record this execution's result summary for its working or blocked attempt. This is an executor-reported outcome, not independent verification. Evidence stays in the immutable Queue event."
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      request_id:
+        type: string
+      summary:
+        type: string
+      work_attempt_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - work_attempt_id
+      - summary
+    type: object
+  name: board.work_complete
+- description: "Record why this execution's claimed, working or blocked attempt failed. A later execution cannot inherit it; ask the operator to requeue abandoned work."
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      request_id:
+        type: string
+      summary:
+        type: string
+      work_attempt_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - work_attempt_id
+      - summary
+    type: object
+  name: board.work_fail
+- description: "Read one work item's current state, exact attempt and recorded result. A reported result is not independent verification. Earlier events are in work_timeline."
+  input_schema:
+    additionalProperties: false
+    properties:
+      work_id:
+        type: string
+    required:
+      - work_id
+    type: object
+  name: board.work_get
+- description: "Read a bounded page of durable Board work, newest first, with exact queue identity/revision and count scope. Missing storage is not evidence about legacy Board posts or leases. Pass the returned next cursor unchanged."
+  input_schema:
+    additionalProperties: false
+    properties:
+      claimant_run_id:
+        type: string
+      cursor:
+        description: Exact next object returned by this tool; do not construct or change it.
+        type:
+          - object
+          - "null"
+      limit:
+        default: 50
+        maximum: 200
+        minimum: 1
+        type: integer
+      state:
+        enum:
+          - queued
+          - claimed
+          - working
+          - blocked
+          - completed
+          - failed
+          - cancelled
+        type: string
+    required: []
+    type: object
+  name: board.work_list
+- description: "Post durable queued work in this run's Board. Does not launch or wake an agent. Read work_list for the exact queue ID/revision first; use null expected_queue_id only for an uninitialized queue. Retry an uncertain result with the identical request_id and command."
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      instructions:
+        type: string
+      request_id:
+        type: string
+      title:
+        type: string
+    required:
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - title
+      - instructions
+    type: object
+  name: board.work_post
+- description: Report that this execution resumes its blocked attempt. Does not launch or wake an agent.
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      request_id:
+        type: string
+      work_attempt_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - work_attempt_id
+    type: object
+  name: board.work_resume
+- description: "Explicitly report that this execution is starting its claimed work. Requires this execution's exact work_attempt_id. Does not dispatch a child or run commands."
+  input_schema:
+    additionalProperties: false
+    properties:
+      expected_queue_id:
+        type:
+          - string
+          - "null"
+      expected_revision:
+        minimum: 0
+        type: integer
+      request_id:
+        type: string
+      work_attempt_id:
+        type: string
+      work_id:
+        type: string
+    required:
+      - work_id
+      - request_id
+      - expected_queue_id
+      - expected_revision
+      - work_attempt_id
+    type: object
+  name: board.work_start
+- description: "Read one work item's immutable recorded events, oldest first. Each event preserves the exact execution and source call; missing transcripts do not erase that provenance."
+  input_schema:
+    additionalProperties: false
+    properties:
+      cursor:
+        description: Exact next object returned by this tool; do not construct or change it.
+        type:
+          - object
+          - "null"
+      limit:
+        default: 50
+        maximum: 200
+        minimum: 1
+        type: integer
+      work_id:
+        type: string
+    required:
+      - work_id
+    type: object
+  name: board.work_timeline
 - description: "Re-check the run's budget against what it has spent right now: the lead's own and every unit's usage so far, read fresh. `stage` is `ok`, `soft` (a dimension crossed its soft threshold: converge) or `hard` (a cap is reached and the run stops at the next round check; `tripped` names the dimension). Each dimension the flow sets is reported with its `cap`, what it has used (`spent` for `usd` / `tokens`, `elapsed` rounds completed before this one or `elapsed_secs` for `wall_clock`), what is `remaining` and its own `state`. A `usd` cap nothing can price carries `enforced: false` and a note. `{budget: null}` when the flow sets no budget."
   input_schema:
     properties: {}

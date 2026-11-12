@@ -101,12 +101,25 @@ pub(crate) fn sources(
     wait: Arc<dyn ToolSource>,
     catalog: Option<&Arc<dyn ToolSource>>,
 ) -> Vec<Arc<dyn ToolSource>> {
+    // These catalog tools require an assembled agent execution and invocation.
+    // The CP exposes its separate owner-scoped board.work.* operator tools;
+    // installing a catalog must not additionally grant agent self-claim/result.
+    let catalog = catalog.map(|inner| {
+        let shadowed = inner
+            .tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .filter(|name| name.starts_with("board.work_"))
+            .collect();
+        Arc::new(Shadowed {
+            inner: Arc::clone(inner),
+            shadowed,
+            denied_prefix: Some("board.work_"),
+        }) as Arc<dyn ToolSource>
+    });
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for source in [Some(operator), Some(wait), catalog.cloned()]
-        .into_iter()
-        .flatten()
-    {
+    for source in [Some(operator), Some(wait), catalog].into_iter().flatten() {
         let names: BTreeSet<String> = source.tools().into_iter().map(|t| t.name).collect();
         let shadowed: BTreeSet<String> = names.intersection(&seen).cloned().collect();
         seen.extend(names);
@@ -116,6 +129,7 @@ pub(crate) fn sources(
             Arc::new(Shadowed {
                 inner: source,
                 shadowed,
+                denied_prefix: None,
             })
         });
     }
@@ -126,6 +140,7 @@ pub(crate) fn sources(
 struct Shadowed {
     inner: Arc<dyn ToolSource>,
     shadowed: BTreeSet<String>,
+    denied_prefix: Option<&'static str>,
 }
 
 #[async_trait]
@@ -134,12 +149,21 @@ impl ToolSource for Shadowed {
         self.inner
             .tools()
             .into_iter()
-            .filter(|t| !self.shadowed.contains(&t.name))
+            .filter(|t| {
+                !self.shadowed.contains(&t.name)
+                    && !self
+                        .denied_prefix
+                        .is_some_and(|prefix| t.name.starts_with(prefix))
+            })
             .collect()
     }
 
     async fn call(&self, name: &str, args: Value, cx: &CallCx) -> Option<ToolResult> {
-        if self.shadowed.contains(name) {
+        if self.shadowed.contains(name)
+            || self
+                .denied_prefix
+                .is_some_and(|prefix| name.starts_with(prefix))
+        {
             return None;
         }
         self.inner.call(name, args, cx).await
@@ -210,6 +234,67 @@ async fn check_expected_route(
 mod tests {
     use super::*;
     use tower::ServiceExt as _;
+
+    struct CountingCatalog(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl ToolSource for CountingCatalog {
+        fn tools(&self) -> Vec<ToolDef> {
+            [
+                "board.work_claim",
+                "board.work_complete",
+                "board.work_post",
+                "ordinary.read",
+            ]
+            .into_iter()
+            .map(|name| ToolDef {
+                name: name.into(),
+                description: "Fixture.".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                hints: Default::default(),
+            })
+            .collect()
+        }
+        async fn call(&self, _name: &str, _args: Value, _cx: &CallCx) -> Option<ToolResult> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(ToolResult::Json(serde_json::json!({"called":true})))
+        }
+    }
+    #[tokio::test]
+    async fn operator_catalog_does_not_expose_or_invoke_agent_work_authority() {
+        let catalog = Arc::new(CountingCatalog(std::sync::atomic::AtomicUsize::new(0)));
+        let erased: Arc<dyn ToolSource> = catalog.clone();
+        let composed = sources(
+            Arc::new(operator_source::OperatorSource::new(axum::Router::new())),
+            Arc::new(Listed(vec![])),
+            Some(&erased),
+        );
+        let names: Vec<_> = composed
+            .iter()
+            .flat_map(|s| s.tools())
+            .map(|t| t.name)
+            .collect();
+        assert!(names.contains(&"board.work.post".into()));
+        assert!(names.contains(&"ordinary.read".into()));
+        assert!(!names.iter().any(|n| n.starts_with("board.work_")));
+        let filtered = composed.last().unwrap();
+        for name in [
+            "board.work_claim",
+            "board.work_complete",
+            "board.work_post",
+            "board.work_unlisted",
+        ] {
+            assert!(filtered
+                .call(name, Value::Null, &CallCx::default())
+                .await
+                .is_none());
+        }
+        assert_eq!(catalog.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(filtered
+            .call("ordinary.read", Value::Null, &CallCx::default())
+            .await
+            .is_some());
+        assert_eq!(catalog.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn inner_api_serves_a_get_route_without_a_token() {

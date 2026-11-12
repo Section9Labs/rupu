@@ -59,6 +59,9 @@ toml = "0.8"
 toml_edit = "0.22"
 csv = "1"
 
+# Durable, indexed Board work queues. Bundle SQLite for consistent releases.
+rusqlite = { version = "0.42", features = ["bundled"] }
+
 # Errors
 thiserror = "2"
 anyhow = "1"

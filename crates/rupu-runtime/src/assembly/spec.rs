@@ -106,6 +106,10 @@ pub struct Overrides {
 /// Services the site provides (they belong to the root run, not this one).
 #[derive(Default)]
 pub struct LaunchServices {
+    /// Explicit trusted owner handoff for in-process children, never inferred from a Bus path.
+    pub work_queue_owner: Option<rupu_tools::work_queue::WorkOwnerBinding>,
+    /// Exact Agentiflow lead round supplied by its launch site.
+    pub work_queue_round: Option<u32>,
     /// Verified session/descendant approval channel; absent in legacy launches.
     pub authorizer: Option<Arc<dyn rupu_tools::approval::CallAuthorizer>>,
     /// Explicit tool snapshot for this launch only. Defaults to builtins.

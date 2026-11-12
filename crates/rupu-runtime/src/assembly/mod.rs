@@ -852,6 +852,32 @@ impl RunAssembler {
         };
 
         let message_bus = self.message_space(&spec);
+        let work_execution_id = format!("exec_{}", ulid::Ulid::new());
+        let mut work_queue_unavailable_reason = None;
+        let work_queue = if messaging.takes_part() {
+            message_bus.as_ref().and_then(|bus| {
+                match crate::services::work_queue::bind(
+                    &self.ctx.global,
+                    self.ctx.project_root.as_deref(),
+                    &spec,
+                    Arc::clone(bus),
+                    work_execution_id.clone(),
+                ) {
+                    Ok(queue) => Some(queue),
+                    Err(reason) => {
+                        tracing::debug!(run = %spec.run_id, %reason, "durable Queue unavailable for this execution");
+                        work_queue_unavailable_reason = Some(reason);
+                        None
+                    }
+                }
+            })
+        } else {
+            work_queue_unavailable_reason = Some("messaging is disabled for this launch".into());
+            None
+        };
+        if work_queue.is_none() && work_queue_unavailable_reason.is_none() {
+            work_queue_unavailable_reason = Some("launch has no message space".into());
+        }
         let findings =
             self.ctx
                 .findings
@@ -896,6 +922,8 @@ impl RunAssembler {
                 authorizer: spec.services.authorizer.clone(),
                 message_bus: message_bus.clone().filter(|_| messaging.takes_part()),
                 message_space: message_bus.clone(),
+                work_queue: work_queue.clone(),
+                work_queue_unavailable_reason,
                 run_status: spec.services.run_status.clone(),
                 catalog: spec
                     .services
@@ -1034,6 +1062,7 @@ impl RunAssembler {
         // before every model call (spec F1a §3.1, §5).
         if let Some(bus) = &message_bus {
             let member = rupu_fleet::Member {
+                work_execution_id: work_queue.as_ref().map(|_| work_execution_id.clone()),
                 codename: tool_context.identity.codename.clone(),
                 agent: agent.name.clone(),
                 run_id: tool_context.identity.run_id.clone(),
@@ -1059,6 +1088,9 @@ impl RunAssembler {
                 Err(e) => tracing::warn!(error = %e, "could not join the run's message space"),
             }
             collectors.extend(crate::services::messaging::collectors(bus));
+            if let Some(queue) = work_queue {
+                collectors.push(Arc::new(crate::services::work_queue::QueueCollector { queue }));
+            }
         }
         // A run that can launch hears about its unfinished children every
         // turn (W7 §3.6).

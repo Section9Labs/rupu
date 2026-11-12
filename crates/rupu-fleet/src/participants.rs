@@ -17,6 +17,9 @@ pub struct Member {
     /// The agent it runs: what `role:<agent>` matches.
     pub agent: String,
     pub run_id: String,
+    /// Queue authority minted for one assembled launch, including each lead round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_execution_id: Option<String>,
     /// The workflow step it runs: what `step:<id>` matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
@@ -48,6 +51,8 @@ pub enum ParticipantEvent {
     Left {
         address: String,
         run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_execution_id: Option<String>,
         status: String,
         at: String,
     },
@@ -103,6 +108,67 @@ pub struct Roster {
 }
 
 impl Roster {
+    /// Strict bounded authority read for Queue mutations. Legacy display reads
+    /// keep their tolerant behavior; an unreadable later event must never make
+    /// an older execution authoritative for work.
+    /// Bounded strict roster parsing for work coordination. This is evidence
+    /// about recorded participants, not owner authorization by itself.
+    pub fn read_work_authority(path: &Path) -> Result<Self, crate::WorkError> {
+        use std::{
+            io::Read,
+            os::unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        const MAX_BYTES: u64 = 16 * 1024 * 1024;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(path)
+            .map_err(|e| {
+                crate::WorkError::Denied(format!("participant registry unavailable: {e}"))
+            })?;
+        let before = file
+            .metadata()
+            .map_err(|e| crate::WorkError::Persistence(e.to_string()))?;
+        if !before.is_file() || before.nlink() != 1 || before.len() > MAX_BYTES {
+            return Err(crate::WorkError::Denied(
+                "participant registry is not a bounded regular file".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| crate::WorkError::Persistence(e.to_string()))?;
+        if bytes.len() as u64 > MAX_BYTES || (!bytes.is_empty() && bytes.last() != Some(&b'\n')) {
+            return Err(crate::WorkError::Corrupt(
+                "participant registry is oversized or incomplete".into(),
+            ));
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| crate::WorkError::Corrupt("participant registry is not UTF-8".into()))?;
+        let mut roster = Self::default();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let event = serde_json::from_str::<ParticipantEvent>(line).map_err(|_| {
+                crate::WorkError::Corrupt(
+                    "participant registry contains an unreadable event".into(),
+                )
+            })?;
+            roster.apply(event);
+        }
+        let after = std::fs::symlink_metadata(path).map_err(|_| crate::WorkError::OwnerChanged)?;
+        if !after.is_file()
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+        {
+            return Err(crate::WorkError::OwnerChanged);
+        }
+        Ok(roster)
+    }
+
     pub fn read(path: &Path) -> Result<Self, FleetError> {
         let text = match std::fs::read(path) {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -154,10 +220,14 @@ impl Roster {
             // A `left` of an earlier run of the address (a retried step's
             // first attempt) never ends the run that joined after it.
             ParticipantEvent::Left {
-                address, run_id, ..
+                address,
+                run_id,
+                work_execution_id,
+                ..
             } => {
                 if let Some(p) = self.by_address.get_mut(&address) {
-                    if p.member.run_id == run_id {
+                    if p.member.run_id == run_id && p.member.work_execution_id == work_execution_id
+                    {
                         p.live = false;
                     }
                 }
@@ -323,6 +393,7 @@ mod tests {
                 codename: Some(format!("c/{address}")),
                 agent: agent.into(),
                 run_id: run.into(),
+                work_execution_id: None,
                 step_id: step.map(str::to_string),
                 unit: None,
                 kind: "workflow_step".into(),
@@ -337,6 +408,7 @@ mod tests {
         ParticipantEvent::Left {
             address: address.into(),
             run_id: run.into(),
+            work_execution_id: None,
             status: "done".into(),
             at: "t".into(),
         }

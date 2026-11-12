@@ -4,6 +4,7 @@
 //! with [`op`]; [`ops`] is all of them.
 
 mod agentiflows;
+mod board_work;
 mod definitions;
 mod findings;
 mod fleet;
@@ -79,6 +80,12 @@ pub(crate) fn op(
 }
 
 impl OpSpec {
+    /// Repeating the same arguments replays a durable receipt without another effect.
+    pub(crate) fn idempotent(mut self) -> Self {
+        self.hints.idempotent = true;
+        self
+    }
+
     /// The handler's query struct.
     pub(crate) fn query<T: schemars::JsonSchema>(mut self) -> Self {
         self.query = schema::<T>;
@@ -128,6 +135,7 @@ pub fn ops() -> &'static [OpSpec] {
             runs::ops(),
             sessions::ops(),
             agentiflows::ops(),
+            board_work::ops(),
             definitions::ops(),
             findings::ops(),
             observe::ops(),

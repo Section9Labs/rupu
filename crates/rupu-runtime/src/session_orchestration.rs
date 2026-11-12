@@ -152,6 +152,8 @@ pub fn inspect(
                 || !matches!(d.effect, Effect::Write | Effect::External);
             let reason = if d.needs.contains(&Service::RunStatus) {
                 Some("Requires an Agentiflow goal/budget envelope; this session has none".into())
+            } else if messaging && d.needs.contains(&Service::WorkQueue) {
+                Some("Requires an active execution with an exact Queue owner and recording binding; evaluated when the turn starts. The runtime grant is authoritative".into())
             } else if !service_available {
                 Some("Messaging is disabled for this session".into())
             } else if !granted {
@@ -179,6 +181,18 @@ pub fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queue_configuration_preserves_declaration_without_inventing_runtime_availability() {
+        let declared = vec!["board.work_post".into()];
+        let tools = inspect(false, Some(&declared), true, PermissionMode::Readonly).unwrap();
+        let tool = tools.iter().find(|t| t.name == "board.work_post").unwrap();
+        assert!(tool.declared && tool.granted && tool.permission_allowed);
+        assert!(!tool.available && !tool.service_available);
+        assert_eq!(tool.effect, Effect::Record);
+        assert!(tool.reason.as_deref().unwrap().contains("evaluated when the turn starts"));
+        let off = inspect(false, Some(&declared), false, PermissionMode::Readonly).unwrap();
+        assert_eq!(off.iter().find(|t| t.name == "board.work_post").unwrap().reason.as_deref(), Some("Messaging is disabled for this session"));
+    }
     #[test]
     fn config_revision_is_separate_and_strict() {
         let d = tempfile::tempdir().unwrap();

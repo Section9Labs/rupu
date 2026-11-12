@@ -149,6 +149,129 @@ async fn a_subagent_shares_the_space_in_process() {
     assert!(!child.live);
 }
 
+/// Exercise the production Caller -> LaunchServices -> assembler handoff. The
+/// child shares durable work with its parent but records its own exact run,
+/// execution, transcript and invocation rather than borrowing the parent's.
+#[tokio::test]
+#[serial]
+async fn a_subagent_inherits_only_the_typed_queue_owner() {
+    use rupu_fleet::work_queue::types::{WorkActor, WorkPageQuery, WorkRecordingAnchor};
+    use rupu_runtime::assembly::{LaunchServices, LaunchSpec, Origin};
+
+    let home = Home::new();
+    home.agent(
+        "parent",
+        "provider: anthropic\nmodel: claude-sonnet-4-6\ndispatchableAgents: [poster]",
+    );
+    home.agent(
+        "poster",
+        "provider: anthropic\nmodel: claude-sonnet-4-6\nmaxTurns: 3",
+    );
+    std::fs::create_dir_all(home.runs().join("parent_run_1")).unwrap();
+    let l = home.launcher(config(), None);
+    let _m = MockScript::set(
+        r#"[
+      {"AssistantToolUse":{"text":null,"tool_id":"post_child","tool_name":"board.work_post","tool_input":{"request_id":"child_post","expected_queue_id":null,"expected_revision":0,"title":"Inspect repository changes","instructions":"Compare the implementation with the recorded contract"},"stop":"tool_use"}},
+      {"AssistantText":{"text":"Work recorded","stop":"end_turn"}}
+    ]"#,
+    );
+    let parent = home
+        .assembler(config())
+        .assemble(LaunchSpec {
+            agent: rupu_agent::load_agent(&home.global(), None, "parent").unwrap(),
+            origin: Origin::Standalone,
+            run_id: "parent_run_1".into(),
+            transcript_path: home.global().join("transcripts/parent_run_1.jsonl"),
+            codename: Some(PARENT.into()),
+            prompt: rupu_agent::UserTurn::new("Coordinate the review"),
+            workspace: home.binding(),
+            mode: PermissionMode::Readonly,
+            ceiling: None,
+            prompter: None,
+            overrides: Default::default(),
+            stream: Default::default(),
+            hooks: Default::default(),
+            pause: None,
+            services: LaunchServices::default(),
+            collectors: Vec::new(),
+            link: None,
+        })
+        .await
+        .unwrap();
+    let ctx = &parent.opts.tool_context;
+    let queue = ctx
+        .services
+        .work_queue
+        .as_ref()
+        .expect("supported standalone owner");
+    let status = run(
+        &l,
+        ctx,
+        request(
+            ChildKind::Subagent,
+            "poster",
+            Some("Record the review task"),
+        ),
+    )
+    .await;
+    assert_eq!(status.state, ChildState::Done, "{status:?}");
+    let page = queue
+        .list(WorkPageQuery {
+            filters: Default::default(),
+            limit: 8,
+            cursor: None,
+        })
+        .unwrap();
+    assert_eq!(page.items.len(), 1, "{page:?}");
+    let item = queue.get(&page.items[0].work_id).unwrap();
+    let WorkActor::Agent {
+        run_id,
+        execution_id,
+        recording,
+        agent,
+        ..
+    } = &item.creator
+    else {
+        panic!("agent creator")
+    };
+    assert_eq!(run_id, &status.run_id);
+    assert_eq!(agent, "poster");
+    assert_ne!(item.creator, queue.actor());
+    // This child recording is owner-relative because the standalone parent is
+    // itself the owner. Session/flow descendants use the GlobalRuns anchor.
+    assert_eq!(recording.anchor, WorkRecordingAnchor::Owner);
+    assert_eq!(
+        recording.relative_path,
+        format!("sub/{}/transcript.jsonl", status.run_id)
+    );
+    assert!(execution_id.starts_with("exec_"));
+    let source = item.latest_event.source.as_ref().unwrap();
+    assert_eq!(
+        (
+            source.turn_index,
+            source.call_sequence,
+            source.tool_call_id.as_str()
+        ),
+        (0, 0, "post_child")
+    );
+    let events = crate::support::events(status.transcript.as_deref().unwrap());
+    assert!(events.iter().any(|event| matches!(event,
+        rupu_transcript::Event::Notice { kind, message } if kind == "work_queue_execution"
+        && serde_json::from_str::<WorkActor>(message).ok().as_ref() == Some(&item.creator)
+    )));
+    let bus = ctx.services.message_space.as_ref().unwrap();
+    let roster = bus.roster().unwrap();
+    let child = roster
+        .participants()
+        .find(|p| p.member.run_id == status.run_id)
+        .unwrap();
+    assert_eq!(
+        child.member.work_execution_id.as_deref(),
+        Some(execution_id.as_str())
+    );
+    assert!(!child.live, "completed child leaves the shared roster");
+}
+
 /// Spec F1d D1: a sub-agent whose agent file says nothing about messaging
 /// sends `msg.send to: parent`, and a parent that takes no part in messaging
 /// itself still has a space its children meet it in: the message is in its
