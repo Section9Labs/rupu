@@ -2,7 +2,9 @@
 //! inventory readers, an unreadable or ambiguous ledger aborts the whole scan.
 //! All reads use held descriptors; no component of an input path may be a link.
 
-use rupu_coverage::{CoveragePaths, FindingRecord};
+#[cfg(test)]
+use rupu_coverage::CoveragePaths;
+use rupu_coverage::FindingRecord;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};

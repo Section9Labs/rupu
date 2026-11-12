@@ -232,7 +232,7 @@ mod tests {
         state: &str,
         path: &str,
     ) -> httpmock::Mock<'a> {
-        server.mock(|w,t| {w.method(GET).path("/repos/org/repo/actions/workflows/build.yml").header("x-github-api-version","2022-11-28");t.status(200).json_body(json!({"id":id,"state":state,"path":path,"url":server.url(&format!("/repos/org/repo/actions/workflows/{id}"))}));})
+        server.mock(|w,t| {w.method(GET).path("/repos/org/repo/actions/workflows/build.yml").header("x-github-api-version","2022-11-28");t.status(200).json_body(json!({"id":id,"state":state,"path":path,"url":server.url(format!("/repos/org/repo/actions/workflows/{id}"))}));})
     }
     fn reference<'a>(
         server: &'a MockServer,
@@ -240,7 +240,7 @@ mod tests {
         sha: &str,
         kind: &str,
     ) -> httpmock::Mock<'a> {
-        server.mock(|w,t| {w.method(GET).path(format!("/repos/org/repo/git/ref/{namespace}/main"));t.status(200).json_body(json!({"ref":format!("refs/{namespace}/main"),"url":server.url(&format!("/repos/org/repo/git/refs/{namespace}/main")),"object":{"sha":sha,"type":kind}}));})
+        server.mock(|w,t| {w.method(GET).path(format!("/repos/org/repo/git/ref/{namespace}/main"));t.status(200).json_body(json!({"ref":format!("refs/{namespace}/main"),"url":server.url(format!("/repos/org/repo/git/refs/{namespace}/main")),"object":{"sha":sha,"type":kind}}));})
     }
     fn absent<'a>(server: &'a MockServer, namespace: &str, status: u16) -> httpmock::Mock<'a> {
         server.mock(|w, t| {
@@ -514,7 +514,7 @@ mod tests {
         ] {
             let server = MockServer::start_async().await;
             let _repo = repo(&server);
-            let _flow=server.mock(|w,t|{w.method(GET).path("/repos/org/repo/actions/workflows/42");t.status(200).json_body(json!({"id":returned,"state":"active","path":path,"url":server.url(&format!("/repos/org/repo/actions/workflows/{returned}"))}));});
+            let _flow=server.mock(|w,t|{w.method(GET).path("/repos/org/repo/actions/workflows/42");t.status(200).json_body(json!({"id":returned,"state":"active","path":path,"url":server.url(format!("/repos/org/repo/actions/workflows/{returned}"))}));});
             let _selected = reference(&server, "heads", &"a".repeat(40), "commit");
             let _other = absent(&server, "tags", 404);
             let mut req = request(server.base_url());

@@ -101,15 +101,15 @@ fn explicit_choices_require_revision_and_reject_duplicates_and_unknowns() {
         tool: "query".into(),
     };
     assert!(matches!(
-        catalog.freeze(Some(&[choice.clone()]), None),
+        catalog.freeze(Some(std::slice::from_ref(&choice)), None),
         Err(Error::Stale)
     ));
     assert!(matches!(
-        catalog.freeze(Some(&[choice.clone()]), Some("old")),
+        catalog.freeze(Some(std::slice::from_ref(&choice)), Some("old")),
         Err(Error::Stale)
     ));
     assert!(catalog
-        .freeze(Some(&[choice.clone()]), Some(&catalog.revision))
+        .freeze(Some(std::slice::from_ref(&choice)), Some(&catalog.revision))
         .is_ok());
     assert!(catalog
         .freeze(Some(&[choice.clone(), choice]), Some(&catalog.revision))
@@ -188,8 +188,10 @@ fn missing_and_explicit_empty_builtin_grants_keep_their_authority() {
 
 #[tokio::test]
 async fn old_empty_selection_ignores_new_host_defaults_and_invalid_configuration() {
-    let mut registry = Registry::default();
-    registry.version = 999;
+    let registry = Registry {
+        version: 999,
+        ..Registry::default()
+    };
     let creds = credentials();
     let catalog = assemble(
         &registry,

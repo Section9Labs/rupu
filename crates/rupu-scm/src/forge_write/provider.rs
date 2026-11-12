@@ -1034,7 +1034,7 @@ mod tests {
         req.input.state = Some("closed".into());
         req.input.choice_id = Some("5".into());
         let original = json!({"id":"5","name":"Close","to":{"id":"9","name":"Done","statusCategory":{"key":"done"}}});
-        let before = jira_transition(&req, &[original.clone()]).unwrap().1;
+        let before = jira_transition(&req, std::slice::from_ref(&original)).unwrap().1;
         let mut changed = original.clone();
         changed["to"]["id"] = json!("10");
         assert_ne!(before, jira_transition(&req, &[changed]).unwrap().1);

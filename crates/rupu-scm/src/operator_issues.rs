@@ -78,6 +78,59 @@ pub fn validate_project(issue: &IssueRef) -> Result<(), ScmError> {
     }
 }
 
+/// Dedicated operator transport: no redirect can change authority after auth.
+pub(crate) fn http(
+    tracker: &str,
+    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
+) -> anyhow::Result<reqwest_middleware::ClientWithMiddleware> {
+    Ok(rupu_netflow::http::client_with(
+        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(tracker.into())),
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("rupu-operator-issues"),
+        sink,
+    )?)
+}
+
+pub(crate) fn rejected() -> ScmError {
+    ScmError::BadRequest {
+        message: "Operator issue response failed authority or size validation".into(),
+    }
+}
+
+/// Bound successful and error bodies before JSON decoding. Operator adapters do
+/// at most two issue requests and one comment request, each at most 2 MiB.
+pub(crate) async fn json(mut response: reqwest::Response) -> Result<serde_json::Value, ScmError> {
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    let status = response.status().as_u16();
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_BYTES as u64)
+    {
+        return Err(rejected());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| rejected())? {
+        if chunk.len() > MAX_BYTES.saturating_sub(bytes.len()) {
+            return Err(rejected());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    match status {
+        200..=299 => serde_json::from_slice(&bytes).map_err(|_| rejected()),
+        401 | 403 => Err(ScmError::Forbidden {
+            platform: "issue".into(),
+            message: "Issue account refused".into(),
+        }),
+        404 => Err(ScmError::NotFound {
+            what: "issue".into(),
+        }),
+        429 => Err(ScmError::RateLimited { retry_after: None }),
+        _ => Err(rejected()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,58 +196,5 @@ mod tests {
             };
             assert_eq!(validate_project(&issue).is_ok(), valid);
         }
-    }
-}
-
-/// Dedicated operator transport: no redirect can change authority after auth.
-pub(crate) fn http(
-    tracker: &str,
-    sink: std::sync::Arc<dyn rupu_netflow::FlowSink>,
-) -> anyhow::Result<reqwest_middleware::ClientWithMiddleware> {
-    Ok(rupu_netflow::http::client_with(
-        rupu_netflow::FlowCtx::system(rupu_netflow::Origin::Scm(tracker.into())),
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("rupu-operator-issues"),
-        sink,
-    )?)
-}
-
-pub(crate) fn rejected() -> ScmError {
-    ScmError::BadRequest {
-        message: "Operator issue response failed authority or size validation".into(),
-    }
-}
-
-/// Bound successful and error bodies before JSON decoding. Operator adapters do
-/// at most two issue requests and one comment request, each at most 2 MiB.
-pub(crate) async fn json(mut response: reqwest::Response) -> Result<serde_json::Value, ScmError> {
-    const MAX_BYTES: usize = 2 * 1024 * 1024;
-    let status = response.status().as_u16();
-    if response
-        .content_length()
-        .is_some_and(|n| n > MAX_BYTES as u64)
-    {
-        return Err(rejected());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| rejected())? {
-        if chunk.len() > MAX_BYTES.saturating_sub(bytes.len()) {
-            return Err(rejected());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    match status {
-        200..=299 => serde_json::from_slice(&bytes).map_err(|_| rejected()),
-        401 | 403 => Err(ScmError::Forbidden {
-            platform: "issue".into(),
-            message: "Issue account refused".into(),
-        }),
-        404 => Err(ScmError::NotFound {
-            what: "issue".into(),
-        }),
-        429 => Err(ScmError::RateLimited { retry_after: None }),
-        _ => Err(rejected()),
     }
 }

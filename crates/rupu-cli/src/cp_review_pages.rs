@@ -334,6 +334,8 @@ pub(crate) async fn read_identity(
     }
     Ok(id)
 }
+// Keep owner, selection and continuation preconditions explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read(
     registry: &Registry,
     repo: &RepoRef,

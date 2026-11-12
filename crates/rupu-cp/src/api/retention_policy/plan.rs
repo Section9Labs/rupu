@@ -444,7 +444,7 @@ fn sessions(p: &Policy, s: &mut Scan) -> ApiResult<()> {
         artifacts.sort_by_key(|a| {
             (
                 a.directory,
-                a.relative == PathBuf::from(format!("sessions-archive/{id}/session.json")),
+                a.relative == format!("sessions-archive/{id}/session.json"),
                 std::cmp::Reverse(a.relative.components().count()),
             )
         });

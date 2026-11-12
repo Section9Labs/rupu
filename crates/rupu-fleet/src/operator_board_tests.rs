@@ -113,7 +113,10 @@ fn operator_lease_survives_request_and_stale_release_cannot_remove_successor_or_
         }
     };
     let board = Board::new(tmp.path());
-    assert_eq!(board.operator_leases().unwrap(), [first.clone()]);
+    assert_eq!(
+        board.operator_leases().unwrap().as_slice(),
+        std::slice::from_ref(&first)
+    );
     assert!(!board.operator_release("audit", "wrong").unwrap());
     assert!(board.operator_release("audit", &first.token).unwrap());
     let second = match board

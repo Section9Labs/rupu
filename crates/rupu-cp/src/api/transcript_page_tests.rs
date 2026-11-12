@@ -201,7 +201,7 @@ fn unicode_blank_lines_match_existing_numbered_cursor_semantics() {
 
 #[test]
 fn scan_budget_limits_oversized_and_blank_only_prefixes_without_fake_progress() {
-    for byte in [b'x', b' '] {
+    for byte in *b"x " {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();

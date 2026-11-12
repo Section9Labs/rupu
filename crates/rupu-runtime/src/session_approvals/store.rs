@@ -950,7 +950,7 @@ impl Store {
     fn record_limit(&self) -> usize {
         #[cfg(test)]
         {
-            return self.record_limit_override.get();
+            self.record_limit_override.get()
         }
         #[cfg(not(test))]
         {
@@ -1043,10 +1043,10 @@ pub(super) fn validate_record(record: &Record) -> Result<()> {
     {
         return Err(Error::Invalid);
     }
-    if record.state == State::Allowed || dispatched {
-        if record.decision.as_ref().map(|d| d.request.decision) != Some(Decision::AllowOnce) {
-            return Err(Error::Invalid);
-        }
+    if (record.state == State::Allowed || dispatched)
+        && record.decision.as_ref().map(|d| d.request.decision) != Some(Decision::AllowOnce)
+    {
+        return Err(Error::Invalid);
     }
     if record.state == State::Pending && record.decision.is_some()
         || record.state == State::Denied

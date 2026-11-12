@@ -495,7 +495,7 @@ mod tests {
             });
             ready.await.unwrap();
             let queued = start_backfill(paths.clone(), transcript, Some(lease));
-            let waiter = tokio::spawn(async move { queued.await });
+            let waiter = tokio::spawn(queued);
             waiter.abort();
             let _ = waiter.await;
             assert!(rupu_netflow::ledger::lease::LedgerLease::exclusive(&paths.flows).is_err());

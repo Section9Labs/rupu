@@ -36,6 +36,8 @@ pub const CODENAME_ENV: &str = "RUPU_CODENAME";
 
 /// One `rupu` child invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Launch arguments are short-lived values; keep the public construction API unboxed.
+#[allow(clippy::large_enum_variant)]
 pub enum RunArgv {
     /// `rupu run <agent> …`
     Agent(AgentRun),

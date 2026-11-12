@@ -419,9 +419,7 @@ impl Validation {
             } else {
                 let key = text(&object["key"])?;
                 let suffix = key.strip_prefix(&format!("{}-", self.project))?;
-                if suffix.parse::<u64>().ok().filter(|n| *n > 0).is_none() {
-                    return None;
-                }
+                suffix.parse::<u64>().ok().filter(|n| *n > 0)?;
                 let iid = id(&object["id"])?;
                 if object["self"].as_str()
                     != Some(format!("{}/rest/api/3/issue/{iid}", self.origin).as_str())
@@ -991,7 +989,7 @@ mod tests {
         let server = MockServer::start_async().await;
         for (path, body, expected_empty) in [("/empty", "", true), ("/null", "null", false)] {
             let read = server.mock(|when, then| { when.method(GET).path(path); then.status(200).body(body); });
-            let response = reqwest::Client::new().get(server.url(path)).send().await.unwrap();
+            let response = http("github", Arc::new(rupu_netflow::NullSink)).unwrap().get(server.url(path)).send().await.unwrap();
             let (value, empty) = bounded(response).await.unwrap();
             assert!(value.is_null()); assert_eq!(empty, expected_empty); read.assert_hits(1);
         }

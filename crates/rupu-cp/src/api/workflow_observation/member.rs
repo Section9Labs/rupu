@@ -258,6 +258,8 @@ fn remote(value: &Value) -> bool {
             .is_some_and(|h| !h.is_null() && h.as_str() != Some("local"))
     })
 }
+// Keep owner, selection and continuation preconditions explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn attribution(
     c: &Captured,
     child: &str,

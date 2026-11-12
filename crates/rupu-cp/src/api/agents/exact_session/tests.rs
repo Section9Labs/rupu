@@ -116,7 +116,7 @@ async fn source_and_registration_drift_never_dispatch() {
             s.global_dir.join("workspaces/ws_chosen.toml")
         };
         let mut text = fs::read_to_string(&path).unwrap();
-        text.push_str("\n");
+        text.push('\n');
         fs::write(path, text).unwrap();
         assert_eq!(
             start(State(s), Json(body(b)))

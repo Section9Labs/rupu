@@ -447,7 +447,7 @@ fn exact_step_index_preserves_duplicate_attempts_and_binds_cursor_filter() {
     let a = result(1);
     let mut b = result(1);
     b["step_id"] = json!("different");
-    let first = lines(&[a.clone()]);
+    let first = lines(std::slice::from_ref(&a));
     let middle = lines(&[b]);
     let offset = first.len() + middle.len();
     fs::write(

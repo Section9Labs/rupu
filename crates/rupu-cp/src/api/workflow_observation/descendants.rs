@@ -267,10 +267,10 @@ pub(super) fn scope(s: &AppState, a: &Authority) -> ApiResult<DirectoryScope> {
             Edge::Ledger { directory, .. } | Edge::Legacy { directory } => directory,
         };
         let child_dir = Path::new(directory).join("sub").join(&hop.child_run_id);
-        if Path::new(&hop.path) == child_dir.join("transcript.jsonl") {
-            if inline.insert(hop.child_run_id.clone(), child_dir).is_some() {
-                return Err(fail("descendant_inline_ancestry_cycle"));
-            }
+        if Path::new(&hop.path) == child_dir.join("transcript.jsonl")
+            && inline.insert(hop.child_run_id.clone(), child_dir).is_some()
+        {
+            return Err(fail("descendant_inline_ancestry_cycle"));
         }
     }
     Ok(DirectoryScope {
