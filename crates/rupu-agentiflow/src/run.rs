@@ -1660,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn the_lead_joins_its_space_once_as_the_flow_starts_and_leaves_at_its_end() {
+    fn the_lead_refreshes_its_execution_each_round_and_leaves_at_the_end() {
         let fx = fixture();
         let id = "af_joined";
         let out =
@@ -1676,7 +1676,14 @@ mod tests {
             .iter()
             .map(|l| (l["t"].as_str().unwrap(), l["address"].as_str().unwrap()))
             .collect();
-        assert_eq!(events, [("joined", "lead"), ("left", "lead")], "{lines:?}");
+        assert_eq!(events, [("joined", "lead"), ("joined", "lead"), ("joined", "lead"), ("left", "lead")], "{lines:?}");
+        assert!(lines[0].get("work_execution_id").is_none());
+        let first = lines[1]["work_execution_id"].as_str().unwrap();
+        let second = lines[2]["work_execution_id"].as_str().unwrap();
+        assert!(first.starts_with("exec_"));
+        assert!(second.starts_with("exec_"));
+        assert_ne!(first, second, "each round must have a fresh execution identity");
+        assert_eq!(lines[3]["work_execution_id"], second);
         assert_eq!(lines[0]["kind"], "flow_lead");
         assert_eq!(lines[0]["pid"], std::process::id());
     }

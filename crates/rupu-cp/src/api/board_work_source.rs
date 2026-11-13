@@ -238,8 +238,8 @@ fn resolve(
         if path.file_name().and_then(|n| n.to_str()) != Some(format!("{run_id}.jsonl").as_str()) {
             return unavailable("run_recording_identity_mismatch");
         }
-        if !(ctx.owner.kind == RootKind::Standalone && *run_id == ctx.owner.id)
-            && !descendant(ctx, run_id, &path, captures, &aliases)
+        if !(ctx.owner.kind == RootKind::Standalone && *run_id == ctx.owner.id
+            || descendant(ctx, run_id, &path, captures, &aliases))
         {
             return unsupported("recorded_execution_membership_unavailable");
         }

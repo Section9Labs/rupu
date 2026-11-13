@@ -701,7 +701,20 @@ fn a_bare_continue_restores_the_original_command() {
             .clone()
     };
     let granted = tools("run_second");
-    assert_eq!(granted, tools("run_first"));
+    // Continuation restores command settings, but deliberately has no typed
+    // Queue owner binding. It must not inherit the earlier execution's authority.
+    let mut original = tools("run_first");
+    let entries = original["entries"].as_array_mut().unwrap();
+    let before = entries.len();
+    entries.retain(|entry| !entry["tool"].as_str().unwrap().starts_with("board.work_"));
+    assert_eq!(before - entries.len(), 10);
+    assert_eq!(granted["entries"], original["entries"]);
+    let skipped = granted["skipped"].as_array().unwrap();
+    assert!(!skipped.is_empty());
+    for entry in skipped {
+        assert!(entry["tool"].as_str().unwrap().starts_with("board.work_"));
+        assert_eq!(entry["missing"], serde_json::json!(["work_queue"]));
+    }
     assert!(
         granted.to_string().contains("assets.mark"),
         "the network engagement offers assets.mark: {granted}"
