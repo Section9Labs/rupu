@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(super::session_commands::routes())
+        .merge(super::session_context::routes())
         .merge(super::session_mcp::routes())
         .merge(super::mcp_servers::routes())
         .merge(orchestration::routes())

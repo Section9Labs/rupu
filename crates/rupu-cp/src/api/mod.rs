@@ -81,6 +81,7 @@ pub(crate) mod session_capabilities;
 #[cfg(unix)]
 pub(crate) mod session_approvals;
 pub mod session_commands;
+pub mod session_context;
 pub(crate) mod session_mcp;
 pub(crate) mod session_workflows;
 mod workflow_history_owner;
