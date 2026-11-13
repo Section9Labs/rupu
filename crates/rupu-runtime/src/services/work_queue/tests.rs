@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 use crate::assembly::{LaunchServices, Overrides, ParentRun, WorkspaceBinding};
 use rupu_tools::{PermissionMode, RunIdentity};
