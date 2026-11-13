@@ -21,6 +21,14 @@ pub struct LedgerLease {
     #[cfg(unix)]
     exclusive: bool,
 }
+impl Drop for LedgerLease {
+    fn drop(&mut self) {
+        // A fork can retain the open-file description until exec. End this
+        // owner's lease explicitly instead of waiting for every copy to close.
+        #[cfg(unix)]
+        let _ = rustix::fs::flock(&self.lock, rustix::fs::FlockOperation::Unlock);
+    }
+}
 impl LedgerLease {
     pub fn shared(path: &Path) -> io::Result<Self> {
         Self::acquire(path, false)
@@ -320,6 +328,21 @@ mod tests {
         held.unlink(&meta).unwrap();
         assert!(!path.exists());
         assert!(temp.path().join(".leases/run_fixture.jsonl.lock").exists());
+    }
+    #[test]
+    fn dropping_leases_unlocks_duplicated_descriptors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run_fixture.jsonl");
+        for exclusive in [false, true] {
+            let held = LedgerLease::acquire(&path, exclusive).unwrap();
+            let inherited = held.lock.try_clone().unwrap();
+            drop(held);
+            let next = LedgerLease::exclusive(&path).unwrap();
+            drop(inherited);
+            assert!(LedgerLease::shared(&path).is_err());
+            drop(next);
+            assert!(LedgerLease::shared(&path).is_ok());
+        }
     }
     #[test]
     fn alias_and_directory_replacement_never_redirect_ledger_io() {
