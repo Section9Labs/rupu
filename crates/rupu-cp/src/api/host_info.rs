@@ -182,6 +182,7 @@ async fn get_host_info(State(s): State<AppState>) -> ApiResult<Json<HostInfoResp
             features.push(super::session_workflows::HISTORY_QUERY_CAPABILITY.to_string());
             features.push(super::workflow_history_owner::FEATURE.to_string());
             features.push(super::session_capabilities::FEATURE.to_string());
+            features.push(super::session_context::FEATURE.to_string());
             features.push(super::mcp_servers::FEATURE.to_string());
             if s.token_set && s.launcher.is_some() {
                 features.push(super::mcp_credentials::FEATURE.to_string());
