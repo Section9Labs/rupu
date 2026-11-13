@@ -337,8 +337,10 @@ pub(super) fn capture_mode(
             .keys()
             .map(|key| key.len() + std::mem::size_of::<usize>())
             .sum::<usize>();
+    let execution = executing::Observation::read(&opened)?;
     opened.verify(id, ws)?;
     let input = &mut opened.input;
+    execution.bind(input);
     input.deadline()?;
     let observed = chrono::Utc::now();
     let token = ulid::Ulid::new().to_string();
@@ -351,6 +353,7 @@ pub(super) fn capture_mode(
         "observed_at":observed,"expires_at":observed+chrono::Duration::seconds(600),"freshness":"finite_read_time_capture","archived":archived,"store_kind":store_kind,
         "run":serde_json::from_slice::<Value>(&owner_bytes).expect("validated owner JSON"),"workflow_source":source_info,"sections":evidence,
         "unavailable_rows":builder.unavailable,"captured_rows":builder.rows,"input_bytes":input.bytes,
+        "executing_steps":execution.value,"execution_input_bytes":execution.input_bytes,
         "limits":{"page_bytes":MAX_PAGE,"row_bytes":MAX_ROW,"file_bytes":input::MAX_FILE,"input_bytes":input::MAX_INPUT,"capture_bytes":MAX_CAPTURE,"capture_rows":MAX_ROWS},
         "membership":"recorded_evidence_only; transcript_prologue_verification_required","session_linkage":"not_inferred"});
     if include_event_emitters {

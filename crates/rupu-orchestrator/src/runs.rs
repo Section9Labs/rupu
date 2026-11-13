@@ -2018,6 +2018,35 @@ impl RunStore {
         modify: impl FnOnce(&mut RunRecord),
     ) -> Result<Result<RunRecord, RunRecord>, RunStoreError> {
         let _lock = self.lock_run_json(run_id);
+        #[cfg(unix)]
+        if matches!(
+            expected,
+            RunStatus::Failed | RunStatus::Rejected | RunStatus::Cancelled
+        ) {
+            // An explicit retry is the only path that clears an execution
+            // cancellation barrier. Re-read the CAS input under the strict
+            // observation mutation lock, and exclude an old invocation or
+            // rejection cleanup before publishing Running. A crash between
+            // update and clear remains fail-closed.
+            let retry = crate::execution_observation::RetryGuard::acquire(&self.run_dir(run_id))?;
+            let mut record = retry.load()?;
+            if record.status != expected {
+                return Ok(Err(record));
+            }
+            let original = record.clone();
+            modify(&mut record);
+            let restarting = record.status == RunStatus::Running;
+            let _idle = if restarting {
+                Some(retry.idle_owner(&original)?)
+            } else {
+                None
+            };
+            self.update(&record)?;
+            if restarting {
+                retry.clear_cancelled()?;
+            }
+            return Ok(Ok(record));
+        }
         let mut record = self.load(run_id)?;
         if record.status != expected {
             return Ok(Err(record));
@@ -3987,6 +4016,16 @@ impl RunStore {
             | RunStatus::AwaitingApproval => {
                 let pid = record.runner_pid;
                 let was_running = pid.is_some_and(pid_is_running);
+                // This strict barrier is independent of the legacy run.json
+                // lock's fail-open behavior. Revoke scheduler observations
+                // before publishing cancellation, including before the first
+                // observation exists; a queued producer cannot reauthorize it.
+                crate::execution_observation::revoke_for_owner(
+                    &self.run_dir(run_id),
+                    &record,
+                    "run_cancelled",
+                )
+                .map_err(|e| CancelError::Store(e.to_string()))?;
                 record.status = RunStatus::Cancelled;
                 record.finished_at = Some(now);
                 record.error_message = Some(reason.to_string());
@@ -4116,6 +4155,62 @@ impl RunStore {
         }
         self.finalize_failed(&mut current, error.to_string(), None, now)?;
         Ok(true)
+    }
+
+    /// Finalize a known pre-body execution-admission failure. The invocation's
+    /// local runner registration is still held, so `live_runner` cannot decide
+    /// this case. Instead, the exact expected owner/status/pid must still match
+    /// under the strict execution mutation lock and the lifetime owner lock
+    /// must be free. An incumbent, changed owner, parked or terminal run is
+    /// preserved. This never clears an execution cancellation barrier.
+    ///
+    /// The successful path appends the terminal `RunFailed` event itself.
+    /// Async callers must use [`RunStore::blocking`]; lock waits are bounded.
+    pub fn fail_unowned_execution(
+        &self,
+        expected: &RunRecord,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RunStoreError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (expected, error, now);
+            Ok(false)
+        }
+        #[cfg(unix)]
+        {
+            if !matches!(expected.status, RunStatus::Pending | RunStatus::Running) {
+                return Ok(false);
+            }
+            let _run_lock = self.lock_run_json(&expected.id).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "cannot prove execution startup failure without the run lock",
+                )
+            })?;
+            let proof =
+                crate::execution_observation::RetryGuard::acquire(&self.run_dir(&expected.id))?;
+            let mut current = proof.load()?;
+            if current.id != expected.id
+                || current.workspace_id != expected.workspace_id
+                || current.started_at != expected.started_at
+                || current.workflow_name != expected.workflow_name
+                || current.workspace_path != expected.workspace_path
+                || current.transcript_dir != expected.transcript_dir
+                || current.status != expected.status
+                || current.runner_pid != expected.runner_pid
+                || !matches!(current.status, RunStatus::Pending | RunStatus::Running)
+            {
+                return Ok(false);
+            }
+            let _idle_owner = match proof.idle_owner(&current) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            self.finalize_failed(&mut current, error.to_string(), None, now)?;
+            Ok(true)
+        }
     }
 
     /// The `Failed` transition [`reap_if_orphaned`](Self::reap_if_orphaned)
