@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Agentiflow tutorial</title>
+<meta name="description" content="Walk one agentiflow from an empty machine to reading the results: install the fleet, write a lead and two pool agents, write the definition, run it, watch it, steer it, and read the findings. Then do the same with the stock network-assessment fleet.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub active" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Agentiflow tutorial</h1>
+    <p class="intro">This walks one agentiflow from an empty machine to reading the results: install the fleet, write a lead and two pool agents, write the definition, run it, watch it, steer it, and read the findings. Then it does the same with the <strong>stock network-assessment fleet</strong>, which ships a ready-made lead.</p>
+    <p>
+      For the reference behind each step, see <a class="link" href="/docs/agentiflows.html">Agentiflows</a>; for the authoring patterns
+      (goal recipes, budget tuning, pool design), see <a class="link" href="/docs/agentiflow-authoring.html">Authoring</a>.
+    </p>
+    <div class="callout">
+      <strong>All the targets here are invented.</strong> Point the fleet only at things you are authorized to act on.
+    </div>
+
+    <h2 id="part-1-a-code-review-sweep-from-scratch">Part 1: a code-review sweep from scratch</h2>
+    <p>
+      The goal: review a small service for injection bugs, have a second agent confirm each one, and stop once two are confirmed (or the
+      budget runs out).
+    </p>
+
+    <h3 id="install-the-fleet">1. Install the fleet (optional for this part)</h3>
+    <p><code class="inline">rupu fleet install</code> lays down the stock security-assessment agents and workflows into <code class="inline">~/.rupu</code>:</p>
+    <pre class="code">rupu fleet install
+<span class="c"># add --project to install into the current project's .rupu/ instead</span>
+<span class="c"># add --force to overwrite files you have edited</span></pre>
+    <p>
+      The stock fleet ships a <code class="inline">code-auditor</code> agent (and the generic <code class="inline">assessment-lead</code>, used in Part 2), but no code-review
+      <em>lead</em> and no agentiflow definition, so this part writes its own. Files that already exist are kept unless you pass
+      <code class="inline">--force</code>.
+    </p>
+
+    <h3 id="write-the-pool-agents">2. Write the pool agents</h3>
+    <p>
+      An agentiflow needs a lead plus the specialists it dispatches. Put these in the project you want to review, under
+      <code class="inline">.rupu/agents/</code>.
+    </p>
+    <p>A reviewer that files findings (<code class="inline">.rupu/agents/file-reviewer.md</code>):</p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">file-reviewer</span>
+<span class="k">description</span>: <span class="s">Reviews a set of files for real injection bugs and records each as a finding.</span>
+<span class="k">permissionMode</span>: <span class="s">bypass</span>
+<span class="k">maxTurns</span>: <span class="v">60</span>
+<span class="k">findingsProfile</span>: <span class="s">full</span>
+<span class="k">tools</span>: [<span class="s">read_file</span>, <span class="s">grep</span>, <span class="s">glob</span>, <span class="s">findings.report</span>]
+<span class="c">---</span>
+You review the files you are given for real, exploitable injection bugs
+(SQL, command, template, path). For each genuine issue, call `findings.report`
+with a clear title, the `path` (e.g. `src/db.py:42`), a stated `root_cause`,
+and a `classification` (a CWE id such as CWE-89 for SQL injection). Pin every
+finding to a file and line. No style nits, no guesses: a real bug, or nothing.</pre>
+    <p>A verifier that confirms them (<code class="inline">.rupu/agents/finding-verifier.md</code>):</p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">finding-verifier</span>
+<span class="k">description</span>: <span class="s">Re-checks a finding another run filed and records an independent verdict.</span>
+<span class="k">permissionMode</span>: <span class="s">bypass</span>
+<span class="k">maxTurns</span>: <span class="v">60</span>
+<span class="k">findingsProfile</span>: <span class="s">full</span>
+<span class="k">tools</span>: [<span class="s">read_file</span>, <span class="s">grep</span>, <span class="s">glob</span>, <span class="s">findings.verify</span>]
+<span class="c">---</span>
+You are handed a finding another agent filed. Open the cited file and line,
+establish for yourself whether it is a real, exploitable issue, and record a
+verdict with `findings.verify`: `confirmed` only if you reproduced or
+independently established it, `disputed` if it is wrong, `inconclusive` if you
+could not decide. You are the quality gate between "flagged" and "confirmed".</pre>
+    <p>
+      The lead (<code class="inline">.rupu/agents/review-lead.md</code>). Its <code class="inline">tools:</code> is exactly what it gets on top
+      of the fleet tools, so give it just the read tools it needs to orient:
+    </p>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="s">review-lead</span>
+<span class="k">description</span>: <span class="s">Lead of a goal-directed code-review fleet.</span>
+<span class="k">permissionMode</span>: <span class="s">bypass</span>
+<span class="k">maxTurns</span>: <span class="v">120</span>
+<span class="k">tools</span>: [<span class="s">read_file</span>, <span class="s">grep</span>, <span class="s">glob</span>]
+<span class="c">---</span>
+You are the LEAD of a code-review fleet. Drive the goals below to completion:
+find injection bugs and have them independently confirmed. You orchestrate; you
+do not review the whole codebase yourself.
+
+You hold `dispatch` (start a pool agent on a focused task, get a handle back),
+`join` (collect a dispatched agent's result), the board and mailbox tools, and
+the status tools `goal.status` / `budget.status`. Start by calling
+`agents.list` so you know your pool.
+
+Work in rounds:
+
+1. **Round 1 — map and fan out.** Spend a few quick `grep` / `glob` / `read_file`
+   calls to see the service's modules. Then dispatch `file-reviewer` at two or
+   three tightly-scoped sets of files in parallel, each with a specific worklist.
+   `join` them and read what they found.
+2. **Following rounds — verify.** For each candidate finding, dispatch
+   `finding-verifier` to confirm it independently. `join` and read the verdicts.
+   Check `goal.status`: the goal counts only confirmed findings.
+3. **Keep going** until the goal is met and the budget is healthy
+   (`budget.status`), then finish. Record more than the floor if you find more.
+
+Finish each round with a short summary of what you did.</pre>
+    <p>Validate the agent files before you run:</p>
+    <pre class="code">rupu agent validate <span class="v">--all</span></pre>
+
+    <h3 id="write-the-definition">3. Write the definition</h3>
+    <p>Put it at <code class="inline">.rupu/agentiflows/review-sweep.yaml</code>:</p>
+    <pre class="code"><span class="k">name</span>: <span class="s">review-sweep</span>
+<span class="k">description</span>: <span class="s">Review the billing service for injection bugs and confirm what is found.</span>
+<span class="k">lead</span>: <span class="s">review-lead</span>
+<span class="k">engagement_profiles</span>: [<span class="s">code</span>]
+
+<span class="k">goals</span>:
+  - <span class="k">id</span>: <span class="s">injection</span>
+    <span class="k">objective</span>: <span class="s">"Find and confirm two injection issues (CWE-89 or CWE-78)."</span>
+    <span class="k">target</span>:
+      <span class="k">findings</span>: { <span class="k">classification</span>: <span class="s">"CWE-89"</span> }
+      <span class="k">count_gte</span>: <span class="v">2</span>
+      <span class="k">verified</span>: <span class="v">true</span>
+    <span class="k">verify_with</span>: <span class="s">finding-verifier</span>
+    <span class="k">required</span>: <span class="v">true</span>
+
+<span class="k">budget</span>:
+  <span class="k">usd</span>: <span class="v">15</span>
+  <span class="k">tokens</span>: <span class="v">4000000</span>
+  <span class="k">wall_clock</span>: <span class="s">"2h"</span>
+  <span class="k">soft_at</span>: <span class="v">0.8</span>
+
+<span class="k">scope</span>:
+  <span class="k">authorized</span>: <span class="v">true</span>
+  <span class="k">roots</span>:
+    - { <span class="k">kind</span>: <span class="s">"code:repo"</span>, <span class="k">path</span>: <span class="s">"."</span> }
+
+<span class="k">pool</span>:
+  <span class="k">agents</span>: [<span class="s">review-lead</span>, <span class="s">file-reviewer</span>, <span class="s">finding-verifier</span>]
+
+<span class="k">round</span>:
+  <span class="k">lead_max_turns</span>: <span class="v">40</span>
+  <span class="k">ceiling</span>: { <span class="k">rounds</span>: <span class="v">20</span>, <span class="k">wall_clock</span>: <span class="s">"3h"</span> }</pre>
+    <p>Notes on this definition:</p>
+    <ul>
+      <li><code class="inline">engagement_profiles: [code]</code> types the evidence. The <code class="inline">code</code> profile defines <code class="inline">code:repo</code> and <code class="inline">code:file</code> assets and a <code class="inline">unreviewed &#8594; reviewed</code> depth ladder.</li>
+      <li>The goal is <strong>verified</strong>: a finding counts only after <code class="inline">finding-verifier</code> (a different run) records a <code class="inline">confirmed</code> verdict. <code class="inline">verify_with</code> must name a pool agent, and the reviewers use <code class="inline">findingsProfile: full</code> so their findings can be verified.</li>
+      <li><code class="inline">budget.usd</code> is enforced only if the lead's model is priced; <code class="inline">tokens</code> and <code class="inline">wall_clock</code> always apply. See <a class="link" href="/docs/agentiflow-authoring.html#tuning-budgets">budget tuning</a>.</li>
+      <li>The <code class="inline">ceiling</code> is a hard backstop in case the goal is never met.</li>
+    </ul>
+    <p>
+      There is no CLI dry run: <code class="inline">rupu agentiflow run</code> validates the definition as it launches, and a definition that fails validation is refused before any model call. To check a definition without launching anything, use the control plane or MCP with <code class="inline">cp serve</code> running: <code class="inline">POST /api/agentiflow-defs/validate</code> with body <code class="inline">{"raw": "&lt;the file's contents&gt;"}</code> (plus <code class="inline">scope_id</code> to resolve a project's own profiles) answers <code class="inline">{ok: true, name, lead, engagement_profiles}</code> or a 400 naming the first problem; the MCP tool is <code class="inline">agentiflow_defs.validate</code>.
+    </p>
+    <pre class="code">python3 -c <span class="s">'import json,sys; print(json.dumps({"raw": sys.stdin.read()}))'</span> \
+  &lt; .rupu/agentiflows/review-sweep.yaml \
+  | curl -s -X POST -H <span class="s">"Authorization: Bearer $RUPU_CP_TOKEN"</span> \
+      -H <span class="s">'content-type: application/json'</span> --data-binary @- \
+      http://127.0.0.1:7878/api/agentiflow-defs/validate</pre>
+
+    <h3 id="run-it">4. Run it</h3>
+    <p>From the root of the service you want to review (that directory is the run's workspace):</p>
+    <pre class="code">rupu agentiflow run review-sweep <span class="v">--detach</span>
+<span class="c"># agentiflow review-sweep: run af_01J2ABC... (detached)</span></pre>
+    <p>
+      Drop <code class="inline">--detach</code> to run it in the foreground and see the outcome printed at the end. Detached, it runs in its
+      own process group; follow it next.
+    </p>
+
+    <h3 id="watch-it">5. Watch it</h3>
+    <pre class="code">rupu agentiflow attach <span class="s">af_01J2ABC...</span></pre>
+    <p>
+      <code class="inline">attach</code> prints the event log (each round as it lands) and the lead's transcript for the round in progress,
+      following it until the run ends. Ctrl-C detaches; the run keeps going. For a one-shot snapshot instead of following, use
+      <code class="inline">rupu agentiflow attach af_01J2ABC... --no-follow</code>.
+    </p>
+    <p>For a structured view:</p>
+    <pre class="code">rupu agentiflow status <span class="s">af_01J2ABC...</span>
+<span class="c"># status, rounds, each goal's current/target, budget state and spend</span>
+rupu agentiflow list
+<span class="c"># every run, newest first</span></pre>
+    <p>
+      In the control plane (<code class="inline">rupu cp serve</code>), open <strong>Runs &#8594; Agentiflows</strong> and click the run. The
+      <strong>Flow</strong> map draws the lead's rounds as a spine with each round's reviewers and verifiers branching off it; the
+      <strong>Engagement</strong> tab shows the goal progress bars; the <strong>Token flow</strong> strip shows per-call spend by round.
+    </p>
+
+    <h3 id="steer-it">6. Steer it</h3>
+    <p>Send the lead an operator instruction mid-run:</p>
+    <pre class="code">rupu agentiflow send <span class="s">af_01J2ABC... "Skip the vendored code under third_party/."</span></pre>
+    <p>
+      The lead gets it before its next model call, and the next round recaps it. Add <code class="inline">--now</code> to cut the current
+      round short so the lead turns to it at once. On the web, the <strong>Messages</strong> tab has a composer that does the same.
+    </p>
+
+    <h3 id="read-the-results">7. Read the results</h3>
+    <p>
+      When the goal is met (two confirmed findings), the envelope stops the run as <code class="inline">goals_met</code>. Read what it found:
+    </p>
+    <pre class="code">rupu findings list run:af_01J2ABC...
+<span class="c"># the findings the lead and its units recorded under this run</span>
+rupu findings export <span class="v">--run</span> <span class="s">af_01J2ABC...</span> <span class="v">--to</span> md <span class="v">-o</span> review.md</pre>
+    <p>
+      Or open the run's <strong>Findings</strong> tab in the control plane. The raw record is on disk:
+      <code class="inline">~/.rupu/agentiflows/af_01J2ABC.../events.jsonl</code> has the per-round <code class="inline">round</code> events
+      (goals met, spend, the lead's decision), and the pooled evidence is under the workspace's <code class="inline">.rupu/coverage/</code>.
+    </p>
+    <p>To end a run early:</p>
+    <pre class="code">rupu agentiflow stop <span class="s">af_01J2ABC...</span>        <span class="c"># graceful, at the next round boundary</span>
+rupu agentiflow stop <span class="s">af_01J2ABC...</span> <span class="v">--now</span>  <span class="c"># hard, signal everything now</span></pre>
+
+    <h2 id="part-2-a-network-assessment-with-the-stock-fleet">Part 2: a network assessment with the stock fleet</h2>
+    <p>
+      The stock fleet ships <code class="inline">assessment-lead</code>, a generic lead, plus <code class="inline">recon</code>,
+      <code class="inline">service-analyst</code> and <code class="inline">exploit-verifier</code> and a
+      <code class="inline">network-assessment</code> workflow, so you only write the definition. Reuse them for an authorized network
+      engagement.
+    </p>
+
+    <h3 id="confirm-the-fleet-is-installed">1. Confirm the fleet is installed</h3>
+    <pre class="code">rupu fleet install
+rupu agent list | grep <span class="v">-E</span> <span class="s">'assessment-lead|recon|service-analyst|exploit-verifier'</span></pre>
+
+    <h3 id="write-the-network-definition">2. Write the definition</h3>
+    <p><code class="inline">~/.rupu/agentiflows/net-sweep.yaml</code> (global, so it runs from any directory):</p>
+    <pre class="code"><span class="k">name</span>: <span class="s">net-sweep</span>
+<span class="k">description</span>: <span class="s">Enumerate and test the lab subnet</span>, <span class="s">confirming the real exposures.</span>
+<span class="k">lead</span>: <span class="s">assessment-lead</span>
+<span class="k">engagement_profiles</span>: [<span class="s">network</span>]
+
+<span class="k">goals</span>:
+  - <span class="k">id</span>: <span class="s">tested-hosts</span>
+    <span class="k">objective</span>: <span class="s">"Test the two authorized hosts to the `tested` depth."</span>
+    <span class="k">target</span>:
+      <span class="k">asset</span>: { <span class="k">kind</span>: <span class="s">"network:host"</span> }
+      <span class="k">depth_at_least</span>: <span class="s">tested</span>
+    <span class="k">count_gte</span>: <span class="v">2</span>
+    <span class="k">required</span>: <span class="v">true</span>
+  - <span class="k">id</span>: <span class="s">confirmed</span>
+    <span class="k">objective</span>: <span class="s">"Confirm at least one real exposure."</span>
+    <span class="k">target</span>:
+      <span class="k">findings</span>: {}
+      <span class="k">count_gte</span>: <span class="v">1</span>
+      <span class="k">verified</span>: <span class="v">true</span>
+    <span class="k">verify_with</span>: <span class="s">exploit-verifier</span>
+    <span class="k">required</span>: <span class="v">true</span>
+
+<span class="k">coverage</span>:
+  <span class="k">reach</span>: <span class="v">0.8</span>          <span class="c"># 80% of discovered services...</span>
+  <span class="k">depth</span>: <span class="s">tested</span>       <span class="c"># ...tested or deeper</span>
+  <span class="k">kinds</span>: [<span class="s">network</span>:<span class="s">service</span>]
+
+<span class="k">budget</span>:
+  <span class="k">usd</span>: <span class="v">40</span>
+  <span class="k">wall_clock</span>: <span class="s">"4h"</span>
+  <span class="k">soft_at</span>: <span class="v">0.75</span>
+
+<span class="k">scope</span>:
+  <span class="k">authorized</span>: <span class="v">true</span>
+  <span class="k">mode</span>: <span class="s">active</span>
+  <span class="k">roots</span>:
+    - { <span class="k">kind</span>: <span class="s">"network:host"</span>, <span class="k">host</span>: <span class="s">"10.20.0.11"</span> }
+    - { <span class="k">kind</span>: <span class="s">"network:host"</span>, <span class="k">host</span>: <span class="s">"10.20.0.12"</span> }
+
+<span class="k">pool</span>:
+  <span class="k">agents</span>: [<span class="s">assessment-lead</span>, <span class="s">recon</span>, <span class="s">service-analyst</span>, <span class="s">exploit-verifier</span>]
+  <span class="k">workflows</span>: [<span class="s">network-assessment</span>]
+
+<span class="k">round</span>:
+  <span class="k">lead_max_turns</span>: <span class="v">60</span>
+  <span class="k">ceiling</span>: { <span class="k">rounds</span>: <span class="v">30</span>, <span class="k">wall_clock</span>: <span class="s">"6h"</span> }</pre>
+    <p>Notes:</p>
+    <ul>
+      <li><code class="inline">engagement_profiles: [network]</code> defines <code class="inline">network:host</code> and <code class="inline">network:service</code> assets and a <code class="inline">discovered &#8594; enumerated &#8594; tested &#8594; exploited</code> depth ladder. The goals' kinds and depths are validated against it.</li>
+      <li>The first goal is an <strong>asset goal</strong>: at least two <code class="inline">network:host</code> assets at <code class="inline">tested</code> depth or deeper. Omitting the <code class="inline">locator</code> matches any host; the agents record depth with <code class="inline">assets.mark</code>.</li>
+      <li>The second goal is a <strong>verified findings goal</strong>, confirmed by <code class="inline">exploit-verifier</code> (a pool agent).</li>
+      <li><code class="inline">coverage</code> adds an engagement-wide stop: 80% of discovered services tested. Either the goals or the coverage stop can end the run.</li>
+      <li><code class="inline">pool.workflows: [network-assessment]</code> lets the lead dispatch the stock recon &#8594; analyze &#8594; verify workflow as a unit (<code class="inline">dispatch { kind: "workflow", name: "network-assessment" }</code>), instead of, or alongside, dispatching the agents one by one.</li>
+      <li>The <code class="inline">scope.roots</code> are the authorized hosts, shown to the lead on round 0.</li>
+    </ul>
+
+    <h3 id="price-the-leads-model">3. Price the lead's model (so budget.usd is enforced)</h3>
+    <p>
+      <code class="inline">budget.usd</code> is enforced only when the lead's model has a price. The stock
+      <code class="inline">assessment-lead</code> uses <code class="inline">*</code> tools and whatever provider your config defaults to; add a
+      price if the built-in table doesn't cover it:
+    </p>
+    <pre class="code"><span class="c"># ~/.rupu/config.toml</span>
+<span class="k">[pricing.anthropic."claude-sonnet-4-6"]</span>
+<span class="k">input_per_mtok</span> = <span class="v">3.0</span>
+<span class="k">output_per_mtok</span> = <span class="v">15.0</span></pre>
+    <p>
+      See <a class="link" href="/docs/configuration.html#pricing">Configuration: pricing</a>. Without a price, the <code class="inline">usd</code>
+      cap is dropped at launch (with a warning) and <code class="inline">tokens</code> / <code class="inline">wall_clock</code> still apply.
+    </p>
+
+    <h3 id="run-watch-and-read">4. Run, watch, and read</h3>
+    <pre class="code">rupu agentiflow run net-sweep <span class="v">--detach</span>
+rupu agentiflow attach <span class="s">&lt;id&gt;</span>
+rupu agentiflow status <span class="s">&lt;id&gt;</span></pre>
+    <p>
+      The lead will call <code class="inline">agents.list</code> and <code class="inline">workflows.list</code>, dispatch
+      <code class="inline">recon</code> to enumerate the authorized hosts (recording each with <code class="inline">assets.mark</code>), hand
+      the enumerated services to <code class="inline">service-analyst</code>, and verify the claimed exposures with
+      <code class="inline">exploit-verifier</code>. Watch the <strong>Assets</strong> tab fill in and the coverage fraction climb. When both
+      goals are met (two hosts tested, one exposure confirmed), or 80% of services are tested, the run stops.
+    </p>
+    <pre class="code">rupu findings list run:<span class="s">&lt;id&gt;</span>
+rupu findings export <span class="v">--run</span> <span class="s">&lt;id&gt;</span> <span class="v">--to</span> html <span class="v">-o</span> net-sweep.html</pre>
+
+    <h2 id="where-to-go-next">Where to go next</h2>
+    <ul>
+      <li><a class="link" href="/docs/agentiflow-authoring.html">Authoring</a>: goal-target recipes, budget tuning, verifier setup, steering, and a pool-design checklist.</li>
+      <li><a class="link" href="/docs/agentiflows.html">Agentiflows</a>: the full definition reference, the round loop, and the control-plane and MCP surfaces.</li>
+      <li>The repo ships two example definitions to read: <code class="inline">.rupu/agentiflows/rupu-self-review.yaml</code> and <code class="inline">.rupu/agentiflows/dispatch-kinds-flow.yaml</code>.</li>
+    </ul>
+
+    <!-- prev / next footer nav -->
+    <div class="doc-nav">
+      <a href="/docs/agentiflows.html">&#8592; Agentiflows</a>
+      <a href="/docs/agentiflow-authoring.html">Authoring agentiflows &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>

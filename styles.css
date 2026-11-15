@@ -1,0 +1,302 @@
+/* rupu.sh — landing site.
+   Type first: one statement, one sentence, one action. Pictures arrive after,
+   large and few: the control plane's own run graph, then clips of it at work.
+   Brand kept: near-black, off-white, violet, the ∞ mark. Hand-written, no
+   build step. The graph's own rules live in graph.css (ported from the CP). */
+
+:root {
+  --bg: #0a0a0a;
+  --panel: #141416;
+  --surface: #1b1b1f;
+  --border: #26262a;
+  --border-strong: #3f3f46;
+  --ink: #f5f5f5;
+  --ink-dim: #a1a1aa;
+  --ink-mute: #87878f;
+  --violet: #7c3aed; /* taste-skill-ignore: the brand's accent, kept */
+  --violet-lite: #a78bfa; /* taste-skill-ignore: the brand's accent, kept */
+  --running: #60a5fa;
+  --bg-soft: var(--panel);
+  --line: var(--border-strong);
+  --line-soft: var(--border);
+
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+  --margin: clamp(20px, 3.4vw, 48px);
+  --max: 1280px;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; /* taste-skill-ignore: code and the CP fragment only */
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; overflow-x: clip; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-feature-settings: "cv11", "ss01";
+  font-size: 17px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+a { color: inherit; text-decoration: none; }
+code, pre { font-family: var(--mono); }
+::selection { background: rgba(124,58,237,.45); color: #fff; }
+:focus-visible { outline: 2px solid var(--violet-lite); outline-offset: 4px; border-radius: 4px; }
+
+/* ── The introduction: the mark alone, then the site ─────── */
+.intro { display: none; }
+html.intro-on .intro { position: fixed; inset: 0; z-index: 60; background: var(--bg); transition: opacity 1400ms ease; }
+html.intro-on .intro[data-lift] { opacity: 0; pointer-events: none; }
+.mark-canvas { position: fixed; inset: 0; z-index: 70; pointer-events: none; }
+html.intro-on :is(header.top, main, footer) { opacity: 0; }
+html.intro-on.intro-reveal :is(header.top, main, footer) { opacity: 1; transition: opacity 1100ms ease; }
+html.intro-on .statement .line > span, html.intro-on .hero-sentence, html.intro-on .hero-actions { animation-play-state: paused; }
+html.intro-on.intro-reveal .statement .line > span, html.intro-on.intro-reveal .hero-sentence, html.intro-on.intro-reveal .hero-actions { animation-play-state: running; }
+
+/* ── Top row ──────────────────────────────────────────────── */
+.top {
+  position: absolute; inset: 0 0 auto 0; z-index: 5;
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 28px;
+  padding: 36px var(--margin) 0;
+  max-width: var(--max); margin: 0 auto;
+}
+.brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; font-size: 17px; }
+.mark {
+  display: inline-grid; place-items: center;
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--violet); color: #fff; font-size: 18px; line-height: 1;
+}
+.top-links { display: inline-flex; gap: 24px; font-size: 17px; color: var(--ink-dim); }
+.top-links a:hover { color: var(--ink); }
+
+/* ── Buttons and links ────────────────────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; white-space: nowrap;
+  height: 46px; padding: 0 20px; border-radius: 10px;
+  font-size: 17px; font-weight: 500;
+  transition: transform 160ms var(--ease-out), background-color 160ms ease;
+}
+.btn.primary { background: var(--ink); color: #0a0a0a; }
+.btn.primary:hover { background: #fff; }
+.btn:active { transform: scale(.97); }
+.top-cta { height: 40px; padding: 0 16px; font-size: 15px; }
+.textlink { color: var(--violet-lite); font-weight: 500; }
+.textlink:hover { text-decoration: underline; text-underline-offset: 4px; }
+
+/* ── First screen: the statement ──────────────────────────── */
+main { max-width: var(--max); margin: 0 auto; padding: 0 var(--margin); }
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+  align-items: end;
+  column-gap: 40px;
+  padding: 136px 0 36px;
+}
+.statement {
+  grid-column: 1; grid-row: 1;
+  margin: 0 0 18px;
+  font-size: clamp(44px, 4.6vw, 68px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: -0.04em;
+  text-wrap: balance;
+}
+.statement .line { display: block; overflow: hidden; padding-bottom: .06em; margin-bottom: -.06em; }
+.statement .line > span { display: block; translate: 0 110%; animation: rise 900ms var(--ease-out) forwards; }
+.statement .line:nth-child(2) > span { animation-delay: 110ms; }
+@keyframes rise { to { translate: 0 0; } }
+.hero-sentence {
+  grid-column: 1; grid-row: 2;
+  margin: 0; max-width: 40ch;
+  font-size: 20px; line-height: 1.45; color: var(--ink-dim);
+  animation: fade-up 700ms var(--ease-out) 420ms backwards;
+}
+.hero-actions {
+  grid-column: 2; grid-row: 1 / 3; justify-self: end; align-self: end;
+  display: inline-flex; align-items: center; gap: 22px;
+  animation: fade-up 700ms var(--ease-out) 420ms backwards;
+}
+@keyframes fade-up { from { opacity: 0; translate: 0 12px; } }
+
+/* ── Sections: rhythm ─────────────────────────────────────── */
+main > section + section { margin-top: clamp(120px, 14vw, 200px); }
+.h2 {
+  margin: 0 0 16px;
+  font-size: clamp(32px, 3.6vw, 48px);
+  line-height: 1.05;
+  font-weight: 600;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+}
+
+/* ── The first picture: the run graph ─────────────────────── */
+.graph-section { margin-top: 0 !important; padding-top: 28px; }
+.caption { display: flex; align-items: center; gap: 10px; margin: 16px 0 0; font-size: 15px; color: var(--ink-dim); }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--running); position: relative; flex: none; }
+.live-dot::after {
+  content: ""; position: absolute; inset: -4px; border-radius: 50%;
+  border: 1px solid var(--running); opacity: 0;
+  animation: live-ring 2.2s ease-out infinite;
+}
+@keyframes live-ring { 0% { transform: scale(.6); opacity: .9; } 100% { transform: scale(1.9); opacity: 0; } }
+
+/* ── Hero graph: the CP run graph, real markup (graph.css) ── */
+.hero-graph { margin: 0; min-width: 0; }
+.rg-canvas {
+  position: relative;
+  overflow: hidden;
+  border-radius: 16px;
+  background: radial-gradient(rgba(245,245,245,.09) 1.1px, transparent 1.1px) 0 0 / 20px 20px, var(--panel); /* taste-skill-ignore: the control plane's own canvas ground */
+  --s: 1;
+  --pad: 28px;
+  height: calc(var(--gh, 415) * 1px * var(--s) + var(--pad) * 2);
+}
+.rg-stage {
+  position: absolute; left: var(--pad); top: var(--pad);
+  transform: scale(var(--s)); transform-origin: 0 0;
+}
+.rg-edges { position: absolute; inset: 0; overflow: visible; }
+.rg-stage .gx-node { position: absolute; }
+.gx-node[data-live="0"] .gx-runline, .gx-node:not([data-state="running"]) > .gx-card > .gx-runline { display: none; }
+.gx-subrow:not([data-state="running"]) .gx-runline { display: none; }
+/* the gate's body follows the node's gate phase */
+.gx-node[data-kind="gate"] .gx-gate-idle, .gx-node[data-kind="gate"] .gx-gate-wait, .gx-node[data-kind="gate"] .gx-gate-done { display: none; }
+.gx-node[data-kind="gate"]:not([data-gate]) .gx-gate-idle { display: flex; }
+.gx-node[data-kind="gate"][data-gate="wait"] .gx-gate-wait { display: flex; }
+.gx-node[data-kind="gate"][data-gate="approved"] .gx-gate-done { display: flex; }
+.gx-approve, .gx-btn, .gx-cell, .gx-prow { font: inherit; border: 0; cursor: default; }
+.gx-prow { width: 100%; background: rgb(var(--c-ink) / 0.035); }
+.gx-loop { display: none; }
+.gx-node[data-state="running"] .gx-loop { display: inline-block; }
+.rb { flex: none; }
+.gx-summary { font-family: var(--sans); }
+.gx-summary-item .gx-glyph { width: 11px; height: 11px; }
+.gx-sum-wait { display: none; }
+.gx-summary[data-wait] .gx-sum-wait { display: inline-flex; }
+.rg-stage[data-reset] .gx-node { animation: none; opacity: 0; }
+.rg-stage[data-reset] .gx-e-base { animation: none; stroke-dashoffset: 1; }
+
+
+/* one loop at a time: while the mark is drawn on the canvas the graph's own
+   edges stay hidden, and they cross-fade in, fully drawn, as the canvas fades */
+.rg-stage[data-phase="mark"] .gx-node, .rg-stage[data-phase="morph"] .gx-node { opacity: 0; }
+.rg-stage[data-phase="mark"] .rg-edges, .rg-stage[data-phase="morph"] .rg-edges, .rg-stage[data-phase="landing"] .rg-edges { opacity: 0; }
+.rg-stage .gx-node { transition: opacity 420ms ease; }
+.rg-stage .rg-edges { transition: opacity 900ms ease; }
+.rg-stage[data-phase="landing"] .gx-e-base, .rg-stage[data-phase="run"] .gx-e-base { animation: none; stroke-dashoffset: 0; }
+.rg-stage[data-reset] .gx-node { transition: none; }
+
+/* ── The clips ────────────────────────────────────────────── */
+.show { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); column-gap: 40px; align-items: start; }
+.show.right .show-text { order: 2; }
+.show.right .clip-wrap { order: 1; }
+.show-text p { margin: 0; font-size: 17px; line-height: 1.55; color: var(--ink-dim); max-width: 34ch; }
+.clip-wrap { position: relative; min-width: 0; border-radius: 16px; overflow: hidden; background: var(--panel); aspect-ratio: 1440 / 812; }
+.clip { display: block; width: 100%; height: 100%; object-fit: cover; }
+.clip-play {
+  position: absolute; left: 50%; top: 50%; translate: -50% -50%;
+  display: none; align-items: center; height: 44px; padding: 0 20px; border: 0; border-radius: 999px;
+  background: var(--ink); color: #0a0a0a; font: inherit; font-size: 17px; font-weight: 500; cursor: pointer;
+}
+.clip-wrap[data-paused] .clip-play { display: inline-flex; }
+
+/* ── Onward ───────────────────────────────────────────────── */
+.deeper .h2 { margin-bottom: 18px; }
+.deeper-links { display: flex; flex-wrap: wrap; gap: 10px 28px; font-size: 20px; font-weight: 500; }
+.deeper-links a { color: var(--ink-dim); transition: color 160ms ease; }
+.deeper-links a:hover { color: var(--ink); }
+
+/* ── Three ways in ────────────────────────────────────────── */
+.ways { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); column-gap: 40px; }
+.ways .h2 { grid-column: 1; }
+.ways-statement { grid-column: 2; margin: 0 0 28px; font-size: clamp(22px, 2.3vw, 32px); line-height: 1.3; letter-spacing: -0.02em; max-width: 30ch; }
+.ways .code { grid-column: 2; margin: 0 0 18px; }
+.ways .textlink { grid-column: 2; font-size: 17px; }
+.code {
+  padding: 16px 18px; border-radius: 10px;
+  background: var(--panel); color: var(--ink);
+  font-size: 15px; line-height: 1.6; overflow-x: auto; white-space: pre; max-width: 100%;
+}
+
+/* ── Install ──────────────────────────────────────────────── */
+.install { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); column-gap: 40px; }
+.install .h2 { grid-column: 1 / -1; margin-bottom: 22px; }
+.install-main { grid-column: 1; }
+.install-routes { grid-column: 2; margin: 0; padding: 0; list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 10px 32px; font-size: 17px; color: var(--ink-dim); align-content: start; }
+.install-routes b { display: block; color: var(--ink); font-weight: 500; }
+.install-line {
+  display: inline-flex; align-items: center; gap: 12px;
+  padding: 10px 10px 10px 18px; border-radius: 10px; background: var(--panel);
+  font-size: 17px;
+}
+.install-line code { color: var(--ink); }
+.copy {
+  font: inherit; font-size: 15px; font-weight: 500; cursor: pointer;
+  color: var(--ink); background: var(--surface); border: 0; border-radius: 7px; height: 36px; padding: 0 12px;
+  transition: background-color 160ms ease, transform 120ms var(--ease-out);
+}
+.copy:hover { background: #2a2a2f; }
+.copy:active { transform: scale(.97); }
+.copy[data-done] { color: #4ade80; }
+.install-note { margin: 18px 0 0; max-width: 60ch; font-size: 17px; color: var(--ink-dim); }
+
+/* ── Footer: the name returns ─────────────────────────────── */
+.foot { margin-top: clamp(120px, 14vw, 200px); background: var(--ink); color: #0a0a0a; }
+.foot-inner { max-width: var(--max); margin: 0 auto; padding: 44px var(--margin) 20px; }
+.foot-links { display: flex; flex-wrap: wrap; gap: 24px; font-size: 17px; color: #3f3f46; }
+.foot-links a { color: #0a0a0a; }
+.foot-links a:hover { text-decoration: underline; text-underline-offset: 4px; }
+.foot-mark {
+  display: flex; align-items: center; gap: 14px;
+  margin: 40px 0 0;
+  font-size: 40px;
+  font-weight: 600; line-height: 1; letter-spacing: -0.03em;
+  color: #0a0a0a;
+}
+
+/* ── Entrances: heading, text, then the picture ───────────── */
+.reveal > * { opacity: 0; translate: 0 18px; transition: opacity 700ms var(--ease-out), translate 700ms var(--ease-out); }
+.reveal.in > * { opacity: 1; translate: 0 0; }
+.reveal.in > :nth-child(2) { transition-delay: 70ms; }
+.reveal.in > :nth-child(3) { transition-delay: 140ms; }
+.reveal.in > :nth-child(4) { transition-delay: 210ms; }
+.show.reveal .show-text { opacity: 0; translate: 0 18px; transition: opacity 700ms var(--ease-out), translate 700ms var(--ease-out); }
+.show.reveal.in .show-text { opacity: 1; translate: 0 0; }
+.show.reveal .clip-wrap { opacity: 0; translate: 0 24px; transition: opacity 800ms var(--ease-out) 90ms, translate 800ms var(--ease-out) 90ms; }
+.show.reveal.in .clip-wrap { opacity: 1; translate: 0 0; }
+
+/* ── Phone ────────────────────────────────────────────────── */
+@media (max-width: 860px) {
+  .top { padding-top: 22px; gap: 18px; }
+  .hero { grid-template-columns: 1fr; padding: 112px 0 28px; }
+  .hero-actions { grid-row: 3; }
+  .statement { font-size: clamp(40px, 11vw, 60px); margin-bottom: 16px; }
+  .hero-sentence { grid-column: 1; }
+  .hero-actions { grid-column: 1; grid-row: 4; justify-self: start; margin-top: 22px; flex-wrap: wrap; gap: 14px 22px; }
+  .top { grid-template-columns: 1fr auto auto; gap: 16px; }
+  .top-links { gap: 16px; }
+  .show { grid-template-columns: 1fr; row-gap: 22px; }
+  .show.right .show-text { order: 1; } .show.right .clip-wrap { order: 2; }
+  .ways { grid-template-columns: 1fr; }
+  .ways .h2, .ways-statement, .ways .code, .ways .textlink { grid-column: 1; }
+  .install { grid-template-columns: 1fr; row-gap: 28px; }
+  .install-routes { grid-template-columns: 1fr; }
+  .install-main, .install-routes { grid-column: 1; }
+  .install-line { display: flex; }
+  .install-line code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; }
+  .rg-canvas { --pad: 14px; }
+  .gx-summary { display: none; }
+}
+
+/* ── Reduced motion ───────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .statement .line > span, .hero-sentence, .hero-actions { animation: none; translate: none; }
+  .reveal > *, .show.reveal .show-text, .show.reveal .clip-wrap { opacity: 1; translate: none; transition: none; }
+  .live-dot::after { animation: none; }
+}
+

@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rupu docs — Providers &amp; Auth</title>
+<meta name="description" content="rupu speaks to multiple model providers — every agent picks its own provider, model, and auth, so one workflow can fan work across Anthropic, OpenAI, Gemini, and Copilot at once.">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/docs.css">
+</head>
+<body>
+<div class="docs-shell">
+
+  <!-- ════ SHARED SIDEBAR (copy verbatim into every docs page; set .active) ════ -->
+  <aside class="docs-side">
+    <a class="brand" href="/" aria-label="rupu home">
+      <span class="mark" aria-hidden="true">&#8734;</span>
+      <span class="name">rupu</span>
+    </a>
+    <div class="grp">Start</div>
+    <a class="item" href="/docs/quickstart.html">Quickstart</a>
+    <a class="item" href="/docs/">Overview &amp; install</a>
+    <div class="grp">Concepts</div>
+    <a class="item" href="/docs/agents.html">Agents</a>
+    <a class="item" href="/docs/workflows.html">Workflows</a>
+    <a class="item" href="/docs/workflow-reference.html">Authoring reference</a>
+    <a class="item" href="/docs/autoflows.html">Autoflows</a>
+    <a class="item" href="/docs/agentiflows.html">Agentiflows</a>
+    <a class="item sub" href="/docs/agentiflow-tutorial.html">Tutorial</a>
+    <a class="item sub" href="/docs/agentiflow-authoring.html">Authoring</a>
+    <a class="item" href="/docs/sessions.html">Sessions</a>
+    <a class="item" href="/docs/skills.html">Skills</a>
+    <a class="item" href="/docs/messaging.html">Messaging</a>
+    <a class="item" href="/docs/profiles.html">Engagement profiles</a>
+    <div class="grp">Platform</div>
+    <a class="item active" href="/docs/providers.html">Providers &amp; Auth</a>
+    <a class="item" href="/docs/reliability.html">Recovery &amp; reliability</a>
+    <a class="item" href="/docs/integrations.html">Integrations</a>
+    <a class="item" href="/docs/mcp.html">MCP &amp; tools</a>
+    <a class="item" href="/docs/triggers.html">Triggers</a>
+    <a class="item" href="/docs/control-plane.html">Control plane</a>
+    <a class="item" href="/docs/multi-host.html">Multi-host</a>
+    <a class="item" href="/docs/netflow.html">Netflow</a>
+    <a class="item" href="/docs/coverage.html">Coverage</a>
+    <a class="item" href="/docs/findings.html">Findings</a>
+    <a class="item" href="/docs/customers.html">Customers</a>
+    <div class="grp">Reference</div>
+    <a class="item" href="/docs/cli.html">CLI reference</a>
+    <a class="item" href="/docs/configuration.html">Configuration</a>
+    <a class="item" href="/docs/api.html">HTTP API</a>
+    <a class="item" href="/docs/transcripts.html">Transcript schema</a>
+    <div class="grp">More</div>
+    <a class="item" href="/docs/examples/">Examples</a>
+    <a class="item" href="/#download">Download</a>
+    <a class="item" href="https://github.com/Section9Labs/rupu" target="_blank" rel="noopener">GitHub &#8599;</a>
+  </aside>
+  <!-- ════ /SHARED SIDEBAR ════ -->
+
+  <main class="docs-main">
+    <h1>Providers &amp; Auth</h1>
+    <p class="intro">rupu ships five LLM provider kinds (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code> and the generic <code class="inline">openai-compatible</code>) and shares its credential store with the SCM vendors (<code class="inline">github</code>, <code class="inline">gitlab</code>). Every vendor takes an API key; the vendor-specific LLM kinds and both SCM vendors also take an SSO login, and most of those have a <a class="link" href="#device-login">device login</a> for a machine with no browser. Because every agent picks its <strong>own</strong> provider, model, and credential, a single workflow can run a planner on one model and reviewers on another in the same run.</p>
+    <p>This page is the canonical reference for what works, how to configure it, and how to debug it. For the SCM side (scopes, <code class="inline">[scm.&lt;account&gt;]</code>, routing) see <a class="link" href="/docs/integrations.html">Integrations</a>.</p>
+
+    <h2>The multi-provider model</h2>
+    <p>rupu is not pinned to one vendor. It ships working integrations for <strong>Anthropic, OpenAI, Gemini, and GitHub Copilot</strong>, and the choice is made <em>per agent</em>, not globally. Each agent file declares its <code class="inline">provider</code>, <code class="inline">model</code>, and (optionally) <code class="inline">auth</code> mode in its YAML frontmatter — so when a workflow fans out across several agents, those agents can each talk to a different provider concurrently.</p>
+    <p>That means a real workflow might dispatch a <em>planner</em> step on a Claude model, two <em>reviewer</em> steps on GPT-5 and Gemini, and a long-context <em>search</em> step on Gemini's 1M-token window — all inside one run, each authenticating with its own credential.</p>
+
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>What it's for</th><th>Auth options</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>anthropic</code></td>
+          <td>Claude models. The most-exercised provider in rupu.</td>
+          <td>Console API key <strong>or</strong> Claude.ai SSO (browser callback, or a paste-the-code device login).</td>
+        </tr>
+        <tr>
+          <td><code>openai</code></td>
+          <td>GPT models via the Responses API.</td>
+          <td>Platform API key <strong>or</strong> ChatGPT SSO (browser callback, or Codex device auth). Different endpoints under the hood.</td>
+        </tr>
+        <tr>
+          <td><code>gemini</code></td>
+          <td>Gemini models with very long context windows.</td>
+          <td>Google AI Studio API key (<code>AIzaSy…</code>) <strong>or</strong> SSO via the Gemini CLI / Antigravity login (Cloud Code Assist; browser callback, or a paste-the-code device login).</td>
+        </tr>
+        <tr>
+          <td><code>copilot</code></td>
+          <td>Copilot-hosted models. Requires a paid Copilot subscription.</td>
+          <td>GitHub PAT (<code>GITHUB_TOKEN</code>) <strong>or</strong> GitHub device-code SSO (<code>--mode sso</code> and <code>--mode device</code> are the same flow).</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>Those four are the <em>built-in</em> providers, with first-class auth flows and curated model lists. But you are not limited to them: beyond the built-ins, you can register <strong>any OpenAI-compatible HTTP endpoint</strong> as a named provider and mix it into the same workflows — see <a class="link" href="#byo">Bring your own provider</a> below.</p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 660 220" role="img" aria-label="One workflow run fanning three steps across three different providers">
+        <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+          <path class="d-arrow" d="M0,0 L7,3 L0,6 Z"></path></marker></defs>
+
+        <rect class="d-box-accent" x="20" y="86" width="160" height="48" rx="10"></rect>
+        <text class="d-label" x="100" y="108" text-anchor="middle">workflow</text>
+        <text class="d-sub" x="100" y="124" text-anchor="middle">one run</text>
+
+        <line class="d-edge" x1="180" y1="110" x2="435" y2="42" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="180" y1="110" x2="435" y2="110" marker-end="url(#ar)"></line>
+        <line class="d-edge" x1="180" y1="110" x2="435" y2="178" marker-end="url(#ar)"></line>
+
+        <rect class="d-box" x="440" y="18" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="40" text-anchor="middle">planner</text>
+        <text class="d-sub" x="540" y="56" text-anchor="middle">anthropic · claude-sonnet</text>
+
+        <rect class="d-box" x="440" y="86" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="108" text-anchor="middle">reviewer</text>
+        <text class="d-sub" x="540" y="124" text-anchor="middle">openai · gpt-5</text>
+
+        <rect class="d-box" x="440" y="154" width="200" height="48" rx="10"></rect>
+        <text class="d-label" x="540" y="176" text-anchor="middle">searcher</text>
+        <text class="d-sub" x="540" y="192" text-anchor="middle">gemini · gemini-2.5-pro</text>
+      </svg>
+      <figcaption>Mixed providers in one run — each step authenticates with its own credential.</figcaption>
+    </figure>
+
+    <h2 id="accounts">Accounts vs. vendor kind</h2>
+    <p>A provider name used to mean two things at once: which credential to use and which vendor client to build. They are now split:</p>
+    <ul>
+      <li><strong>Account</strong> — the identity. A freeform name (<code class="inline">anthropic</code>, <code class="inline">anthropic-work</code>, <code class="inline">openai-lab</code>) that holds its own credential, including its own SSO token. It is what an agent's <code class="inline">provider:</code> field names.</li>
+      <li><strong><code class="inline">kind</code></strong> — the vendor client that authenticates the account: <code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>, <code class="inline">openai-compatible</code> (or, for SCM and trackers, <code class="inline">github</code>, <code class="inline">gitlab</code>, <code class="inline">linear</code>, <code class="inline">jira</code>).</li>
+    </ul>
+    <p>A bare vendor name needs no <code class="inline">kind</code> — the account name <em>is</em> the vendor, so single-account setups work unchanged. To hold a second account of the same vendor (a work and a personal identity, say), give it a distinct name and its vendor with <code class="inline">--kind</code> the first time you log in:</p>
+    <pre class="code">rupu auth login <span class="k">--account</span> anthropic-work     <span class="k">--kind</span> anthropic <span class="k">--mode</span> sso
+rupu auth login <span class="k">--account</span> anthropic-personal <span class="k">--kind</span> anthropic <span class="k">--mode</span> sso</pre>
+    <p>The first login with <code class="inline">--kind</code> writes <code class="inline">[providers.&lt;account&gt;] kind = "&lt;kind&gt;"</code> into <code class="inline">~/.rupu/config.toml</code>, so later resolution (agent frontmatter, <code class="inline">rupu auth status</code>, token refresh, <code class="inline">rupu models</code>, pricing) knows the account's vendor; after that the kind is inferred. Point an agent at an account with <code class="inline">provider: anthropic-work</code>. A <code class="inline">github</code> / <code class="inline">gitlab</code> account lands in <code class="inline">[scm.&lt;account&gt;]</code> instead — see <a class="link" href="/docs/integrations.html#multi-account">Integrations</a>. <code class="inline">--provider</code> remains an alias for <code class="inline">--account</code>.</p>
+    <p>For CI, <code class="inline">RUPU_&lt;ACCOUNT&gt;_API_KEY</code> is read as a fallback when no credential is stored (never when SSO was explicitly requested). Non-alphanumeric characters map to <code class="inline">_</code>, so <code class="inline">anthropic-work</code> reads <code class="inline">RUPU_ANTHROPIC_WORK_API_KEY</code> — pick account names that stay distinct once mangled.</p>
+
+    <h2>Choosing a provider/model per agent</h2>
+    <p>Provider and model are agent-level decisions. An agent file is Markdown with a YAML frontmatter block; the relevant fields are <code class="inline">provider</code>, <code class="inline">model</code>, and the optional <code class="inline">auth</code>:</p>
+
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="v">refactor</span>
+<span class="k">description</span>: <span class="s">Suggest minimal-diff refactors.</span>
+<span class="k">provider</span>: <span class="v">anthropic</span>
+<span class="k">auth</span>: <span class="v">sso</span>
+<span class="k">model</span>: <span class="v">claude-sonnet-4-6</span>
+<span class="c">---</span>
+
+<span class="s">You suggest minimal-diff refactors. Be concise.</span></pre>
+
+    <p>If you omit <code class="inline">model</code>, rupu falls back to the provider's <code class="inline">default_model</code> from <code class="inline">~/.rupu/config.toml</code>. If you omit <code class="inline">auth</code>, the credential resolver applies a default precedence (SSO if present and refreshable, then API key).</p>
+
+    <p>Model resolution runs <strong>most-specific-wins</strong>: the agent's (or step's) <code class="inline">model:</code> first, then the resolved provider's own <code class="inline">[providers.&lt;name&gt;].default_model</code>, then the global top-level <code class="inline">default_model</code> in <code class="inline">config.toml</code>, then a baked-in fallback. So a <strong>provider-scoped <code class="inline">default_model</code> beats the global one</strong> — an agent pinned to a custom endpoint with no <code class="inline">model:</code> of its own gets that provider's model, not the global default (which the custom endpoint would typically reject as unknown).</p>
+
+    <div class="callout"><strong>Note.</strong> Workflow steps inherit the provider/model/auth of the agent they invoke, and a step can override them — so the same agent can run on different models in different workflows without editing the agent file.</div>
+
+    <h2>Authentication</h2>
+    <p>Under the hood rupu has three neutral auth modes: <code class="inline">api-key</code>, <code class="inline">sso</code> and <code class="inline">device</code>. The SSO mode resolves to the right OAuth flow per vendor (a localhost browser callback for Anthropic / OpenAI / Gemini / GitLab, or a GitHub device code for Copilot and GitHub), and <code class="inline">device</code> is the login for a machine with no browser.</p>
+
+    <h3 id="auth-matrix">Provider &times; auth-mode matrix</h3>
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>API key</th><th>SSO</th><th>Device</th><th>SSO flow</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>anthropic</code></td><td>&#10003;</td><td>&#10003;</td><td>&#10003; (paste the code)</td><td>Browser callback</td><td>Console API key OR Claude.ai SSO.</td></tr>
+        <tr><td><code>openai</code></td><td>&#10003;</td><td>&#10003;</td><td>&#10003; (Codex device auth)</td><td>Browser callback</td><td>Platform API key OR ChatGPT SSO. Different endpoints under the hood.</td></tr>
+        <tr><td><code>gemini</code></td><td>&#10003;</td><td>&#10003;</td><td>&#10003; (paste the code)</td><td>Browser callback</td><td>API key via Google AI Studio (<code>AIzaSy…</code>). SSO is the Gemini CLI / Antigravity login (Cloud Code Assist, not Vertex); its Google Cloud project is set up at login.</td></tr>
+        <tr><td><code>copilot</code></td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td><td>Device code</td><td>API-key path uses a GitHub PAT (<code>GITHUB_TOKEN</code>). Requires paid Copilot.</td></tr>
+        <tr><td><code>openai-compatible</code></td><td>&#10003;</td><td>&mdash;</td><td>&mdash;</td><td>&mdash;</td><td>Generic adapter for any <code>/v1/chat/completions</code> endpoint (vLLM, Oracle GenAI, Together, …).</td></tr>
+        <tr><td><code>github</code> (SCM)</td><td>&#10003;</td><td>&#10003;</td><td>&#10003;</td><td>Device code</td><td>Personal access token OR <code>gh</code>-style device-code login; <code>--mode device</code> is the same flow. An SCM account, declared under <code>[scm.&lt;account&gt;]</code>; see <a class="link" href="/docs/integrations.html">Integrations</a>.</td></tr>
+        <tr><td><code>gitlab</code> (SCM)</td><td>&#10003;</td><td>&#10003;</td><td>&#10003; (GitLab 17.9+)</td><td>Browser callback</td><td>Personal access token OR glab's PKCE login; <code>--mode device</code> is GitLab's device authorization grant. gitlab.com or self-managed (<code>[scm.&lt;account&gt;] base_url</code> + <code>oauth_client_id</code>); see <a class="link" href="/docs/integrations.html">Integrations</a>.</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Device</strong> is <code class="inline">--mode device</code>, the login for a machine with no browser; see <a class="link" href="#device-login">Device login</a>. <code class="inline">linear</code>, <code class="inline">jira</code>, <code class="inline">local</code> and <code class="inline">openai-compatible</code> accounts have no SSO or device login. Anthropic remains the most exercised provider; Copilot's API-key path is most reliable for users who already have <code class="inline">gh auth login</code> configured.</p>
+
+    <table>
+      <thead>
+        <tr><th>Mode</th><th>CLI flag</th><th>How it works</th><th>Vendors</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>API key</td>
+          <td><code>--mode api-key</code></td>
+          <td>Paste the secret with <code>--key</code> or pipe it on stdin. Stored under <code>&lt;account&gt;/api-key</code> in <code>~/.rupu/auth.json</code>.</td>
+          <td>every vendor</td>
+        </tr>
+        <tr>
+          <td>SSO, browser callback</td>
+          <td><code>--mode sso</code></td>
+          <td>Binds a localhost listener, opens the vendor's authorize URL with a PKCE challenge, validates <code>state</code>, exchanges the code for tokens. On a Linux machine with neither <code>DISPLAY</code> nor <code>BROWSER</code> set it refuses before binding a listener and points you at <code>--mode device</code>; rupu never switches modes on its own.</td>
+          <td>anthropic, openai, gemini, gitlab</td>
+        </tr>
+        <tr>
+          <td>SSO, device code</td>
+          <td><code>--mode sso</code></td>
+          <td>Prints a code + URL; you authorize from any browser anywhere while rupu polls. Works headless / over SSH.</td>
+          <td>copilot, github</td>
+        </tr>
+        <tr>
+          <td>Device login</td>
+          <td><code>--mode device</code></td>
+          <td>rupu prints what to open, you finish the login in a browser on any other machine, and the result is stored in the account's <code>sso</code> entry. See <a class="link" href="#device-login">Device login</a>.</td>
+          <td>anthropic, openai, gemini, copilot, github, gitlab</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p>SSO access tokens (typically ~1 hour) are refreshed pre-emptively — the resolver refreshes when <code class="inline">expires_at - now &lt; 60s</code> on a credential read, using the stored refresh token. There is no automatic fall-back from SSO to API key: if you chose SSO, a refresh failure names the account and points you back at <code class="inline">rupu auth login</code>.</p>
+
+    <h3>OAuth refresh across processes</h3>
+    <p>Several rupu processes — a <code class="inline">cp serve</code>, a workflow, a second terminal — can share one login safely. Logins, logouts and every token refresh hold a lock file beside the store (<code class="inline">auth.json.lock</code>):</p>
+    <ul>
+      <li><strong>One refresh at a time.</strong> A process that finds a token near expiry takes the lock, re-reads the stored credential, and only asks the provider for a new token if another process hasn't already done so. New tokens are written to a temporary file and renamed into place, so a reader never sees a half-written file.</li>
+      <li><strong>Bounded waits.</strong> Waiting for the lock gives up after 30 seconds with an error naming the lock file, rather than hanging.</li>
+      <li><strong>Rotated tokens are not lost.</strong> If a refreshed token can't be saved (read-only directory, full disk), the process keeps using it in memory, says so on stderr, and retries the write later. On exit — including SIGTERM — rupu waits up to 10 seconds for a credential write still in flight.</li>
+    </ul>
+
+    <h3>How credentials are stored</h3>
+    <p>There is <strong>one</strong> credential backend: a JSON file. The OS keychain backend was retired — a bare CLI binary's keychain access requirement is cdhash-bound, so every rebuild invalidated it and the next read failed silently ("my credentials vanished after an update"). Peer CLIs — <code class="inline">gh</code>, <code class="inline">aws</code>, <code class="inline">gcloud</code>, <code class="inline">kubectl</code>, <code class="inline">terraform</code> — store credentials in files for the same reason.</p>
+    <ul>
+      <li><strong>The store — <code class="inline">~/.rupu/auth.json</code>, mode 0600.</strong> A flat JSON object of <code class="inline">&lt;provider&gt;/&lt;mode&gt;</code> keys (e.g. <code class="inline">anthropic/api-key</code>, <code class="inline">gemini/sso</code>) to secret payloads. Permissions are re-applied to <code class="inline">0600</code> on every write, so a previously loose file is tightened the next time you log in; a wider mode on read logs a warning rather than refusing — refusing would block recovery on a misconfigured machine.</li>
+      <li><strong>Plaintext, so the file mode is the protection.</strong> Secrets are not encrypted at rest and are never printed back by <code class="inline">rupu auth status</code>. Keep <code class="inline">~/.rupu</code> out of backups you would not trust with an API key.</li>
+      <li><strong>Relocatable — <code class="inline">RUPU_AUTH_FILE</code> and <code class="inline">RUPU_HOME</code>.</strong> <code class="inline">RUPU_AUTH_FILE</code> points at an exact file; <code class="inline">RUPU_HOME</code> moves the whole rupu directory (<code class="inline">$RUPU_HOME/auth.json</code>). These select a <em>path</em> — nothing selects a backend any more, and the old <code class="inline">RUPU_AUTH_BACKEND</code> variable no longer diverts storage.</li>
+      <li><strong>Global only.</strong> <code class="inline">auth.json</code> is never read from a project directory — credentials live at the user level.</li>
+    </ul>
+
+    <div class="callout"><strong>Breaking change — upgrading from a keychain build.</strong> Credentials written by an older rupu are still sitting in the macOS keychain and are <strong>no longer read</strong>. <code class="inline">rupu auth login</code> probes for them (read-only, it never reads a secret or prompts for access) and prints a notice naming the affected providers — built-ins and your own openai-compatible ones alike. The remedy is to re-authenticate: <code class="inline">rupu auth login --provider &lt;name&gt; --mode api-key|sso</code>, which writes to the file store. Nothing is imported or deleted automatically; the old entries stay untouched and you can clear each one with <code class="inline">security delete-generic-password -s rupu -a &lt;account&gt;</code>.</div>
+
+    <h2 id="device-login">Device login (<code class="inline">--mode device</code>)</h2>
+    <pre class="code">rupu auth login <span class="k">--account</span> &lt;name&gt; <span class="k">--mode</span> device</pre>
+    <p>For a machine with no browser (a server, a VM, an SSH session): rupu prints what to open, you complete the login in a browser on any other machine, and rupu stores the result. The credential is the same one <code class="inline">--mode sso</code> stores and lands in the account's <code class="inline">sso</code> entry, so <code class="inline">rupu auth status</code> shows <code class="inline">sso</code>, an agent's <code class="inline">auth: sso</code> picks it, it refreshes like any SSO token, and <code class="inline">rupu auth logout --mode device</code> removes it (the same entry as <code class="inline">--mode sso</code>).</p>
+    <p>Vendors with a device login:</p>
+    <ul>
+      <li><strong>anthropic</strong>: Claude Code's paste-the-code login (<a class="link" href="#device-anthropic">below</a>).</li>
+      <li><strong>openai</strong>: Codex CLI's device auth (<a class="link" href="#device-openai">below</a>).</li>
+      <li><strong>gemini</strong>: Gemini CLI's paste-the-code login (<a class="link" href="#device-gemini">below</a>).</li>
+      <li><strong>copilot</strong>, <strong>github</strong>: the GitHub device-code flow, the same flow as their <code class="inline">--mode sso</code>.</li>
+      <li><strong>gitlab</strong>: GitLab's device authorization grant (<a class="link" href="#device-gitlab">below</a>).</li>
+    </ul>
+    <p>Any other vendor refuses with <code class="inline">&lt;kind&gt; has no device login; use --mode api-key</code> (an <code class="inline">openai-compatible</code> account is refused earlier, by <code class="inline">openai-compatible providers only support --mode api-key</code>). <code class="inline">--mode sso</code> itself, on a Linux machine with neither <code class="inline">DISPLAY</code> nor <code class="inline">BROWSER</code> set, refuses before it binds a listener with <code class="inline">SSO requires a desktop browser. Run with --mode device to log in from any browser, or --mode api-key.</code>; rupu never switches modes on its own.</p>
+    <p><strong>What you see, and where.</strong> Every prompt and progress line (the URL, the code, <code class="inline">Waiting for approval…</code>, <code class="inline">Paste the code the page shows:</code>) goes to <strong>stderr</strong>. The only line on <strong>stdout</strong> is the result, <code class="inline">rupu: stored &lt;account&gt; sso credential</code>, so a script can capture stdout and still show the operator the instructions. The paste prompt (Anthropic, Gemini) reads one line from <strong>stdin</strong> whether or not stdin is a terminal, so the code can arrive through a pipe or a here-string as well as by typing; it has to be the code the page shows for the URL <em>this</em> run printed, since each run makes a new one. A pasted or entered code is never echoed back or logged.</p>
+    <p><strong>Stored as <code class="inline">sso</code>.</strong> <code class="inline">device</code> is a way to log in, not a storage slot. The credential lands in the account's <code class="inline">sso</code> entry of <code class="inline">~/.rupu/auth.json</code>, so everything downstream treats it as an SSO login: <code class="inline">rupu auth status</code> shows <code class="inline">sso</code>, an agent's <code class="inline">auth: sso</code> picks it (and the default precedence prefers it over an API key), it refreshes through the same per-vendor path as a browser login, and <code class="inline">rupu auth logout --account &lt;name&gt; --mode device</code> removes the same entry as <code class="inline">--mode sso</code>.</p>
+    <p><strong>Polling (GitHub, Copilot, GitLab).</strong> These are RFC 8628 device-code flows. rupu polls the token endpoint at the interval the vendor's reply names, else every 5 seconds, never faster than once a second. A <code class="inline">slow_down</code> reply adds 5 seconds to the interval unless it names a new one; <code class="inline">authorization_pending</code> keeps polling. The wait ends at the server's <code class="inline">expires_in</code> (GitLab's codes expire after five minutes, GitHub's after fifteen), or after 15 minutes when the reply names none, with <code class="inline">device-code flow timed out</code>; any other error (<code class="inline">expired_token</code>, <code class="inline">access_denied</code>) ends the login with <code class="inline">device-code flow error: &lt;error&gt;</code>. OpenAI's flow is not RFC 8628 (see <a class="link" href="#device-openai">OpenAI</a> below): it polls at the interval OpenAI's reply names (5 seconds when it names none), treats a 403 or 404 while polling as "not yet", and gives up 15 minutes after the first poll with <code class="inline">device login timed out</code>.</p>
+
+    <h3 id="device-anthropic">Anthropic</h3>
+    <pre class="code">rupu auth login <span class="k">--account</span> anthropic <span class="k">--mode</span> device
+<span class="c"># Open this URL in any browser and sign in:</span>
+<span class="c">#</span>
+<span class="c">#   https://claude.ai/oauth/authorize?…</span>
+<span class="c">#</span>
+<span class="c"># Paste the code the page shows: &lt;paste, then Enter&gt;</span>
+<span class="c"># rupu: stored anthropic sso credential</span></pre>
+    <ol>
+      <li>Open the URL rupu prints in a browser on any machine and sign in with your Claude account (the login Claude Code runs when it can't reach a browser).</li>
+      <li>The page (<code class="inline">platform.claude.com/oauth/code/callback</code>) shows a code of the form <code class="inline">code#state</code>. Copy all of it and paste it at the prompt of the run that printed the URL (each run makes a new one); the page's full address, or the code alone, is accepted too.</li>
+      <li>rupu exchanges the code for tokens and stores them as <code class="inline">--mode sso</code> does.</li>
+    </ol>
+    <p>A pasted state that isn't this login's ends it with <code class="inline">pasted state does not match this login; start again</code>. The code expires within minutes and works once: if the exchange fails, rupu shows Anthropic's message and stores nothing; run the command again for a new URL.</p>
+
+    <h3 id="device-gemini">Gemini</h3>
+    <pre class="code">rupu auth login <span class="k">--account</span> gemini <span class="k">--mode</span> device
+<span class="c"># Open this URL in any browser and sign in:</span>
+<span class="c">#</span>
+<span class="c">#   https://accounts.google.com/o/oauth2/v2/auth?…</span>
+<span class="c">#</span>
+<span class="c"># Paste the code the page shows: &lt;paste, then Enter&gt;</span>
+<span class="c"># rupu: stored gemini sso credential</span></pre>
+    <ol>
+      <li>Open the URL rupu prints in a browser on any machine and sign in with your Google account (the login Gemini CLI runs with <code class="inline">NO_BROWSER</code> set).</li>
+      <li>Google's page (<code class="inline">codeassist.google.com/authcode</code>) shows an authorization code. Paste it at the prompt of the run that printed the URL (each run makes a new one); the page's full address is accepted too.</li>
+      <li>rupu exchanges the code for tokens, stores them as <code class="inline">--mode sso</code> does and sets up the account's Code Assist project (see <a class="link" href="#gemini">Gemini</a> below).</li>
+    </ol>
+    <p>The URL asks Google to show its consent screen on every device login, so that Google always issues a refresh token (without it, an account that had already consented once would get a one-hour token). If Google still returns no refresh token, rupu says <code class="inline">Google returned no refresh token. Revoke "Gemini CLI" at https://myaccount.google.com/permissions and log in again, or use --mode api-key</code> and stores nothing. The code works once and expires within minutes; if the exchange fails, run the command again for a new URL.</p>
+
+    <h3 id="device-openai">OpenAI</h3>
+    <pre class="code">rupu auth login <span class="k">--account</span> openai <span class="k">--mode</span> device
+<span class="c"># Visit https://auth.openai.com/codex/device and enter code: ABCD-1234</span>
+<span class="c"># Only continue if you started this login yourself. The code expires in 15 minutes.</span>
+<span class="c"># Waiting for approval…</span>
+<span class="c"># rupu: stored openai sso credential</span></pre>
+    <ol>
+      <li>rupu asks <code class="inline">auth.openai.com</code> for a one-time code (the login Codex CLI runs for <code class="inline">codex login --device-auth</code>).</li>
+      <li>Open <code class="inline">https://auth.openai.com/codex/device</code> in a browser on any machine, sign in with your ChatGPT account and enter the code.</li>
+      <li>rupu polls until you approve it, then exchanges the approval for tokens and stores them as <code class="inline">--mode sso</code> does. A login nobody approves ends after 15 minutes with <code class="inline">device login timed out</code>; a reply other than "approved" or "not yet" (a 403 or 404) ends it with <code class="inline">device login failed with status &lt;code&gt;</code>.</li>
+    </ol>
+    <p>Device login is off by default for a ChatGPT account. If rupu says <code class="inline">device login is not enabled for this ChatGPT account. Turn it on in ChatGPT settings &rarr; Security (a workspace admin does it under workspace permissions), then retry; or log in from a desktop with --mode sso</code> (OpenAI answers the code request with a 404), do that and retry.</p>
+    <p>Only enter a code from a login you started yourself: whoever started the login gets the account the code is approved for.</p>
+
+    <h3 id="device-gitlab">GitLab</h3>
+    <pre class="code">rupu auth login <span class="k">--account</span> gitlab <span class="k">--mode</span> device
+<span class="c"># Visit https://gitlab.com/oauth/device and enter code: 0A44L90H</span>
+<span class="c"># Waiting for approval…</span>
+<span class="c"># rupu: stored gitlab sso credential</span></pre>
+    <ol>
+      <li>rupu asks the account's instance (<code class="inline">POST &lt;instance&gt;/oauth/authorize_device</code>) for a code, as the application <code class="inline">--mode sso</code> uses: glab's on gitlab.com, else the <code class="inline">[scm.&lt;account&gt;] oauth_client_id</code> the instance needs (see <a class="link" href="/docs/integrations.html">Integrations</a>).</li>
+      <li>Open the URL rupu prints in a browser on any machine, sign in and enter the code.</li>
+      <li>rupu polls until you approve it and stores the tokens as <code class="inline">--mode sso</code> does; they refresh the same way. A code nobody approves expires after five minutes.</li>
+    </ol>
+    <p>The device grant needs GitLab 17.9 or later. An older instance answers with a 404, and rupu says <code class="inline">this GitLab does not offer device login (it needs GitLab 17.9 or later)</code>: log in from a desktop with <code class="inline">--mode sso</code>, or use <code class="inline">--mode api-key</code> with a personal access token.</p>
+
+    <h3 id="device-github">GitHub and Copilot</h3>
+    <p>For GitHub (the SCM account) and Copilot, <code class="inline">--mode device</code> runs exactly the same GitHub device-code flow as their <code class="inline">--mode sso</code> (rupu prints <code class="inline">Visit https://github.com/login/device and enter code: …</code> and polls until you approve) and stores the same <code class="inline">sso</code> credential; for these two vendors the mode words are interchangeable. The flow needs no browser on the machine running rupu, so it works headless and over SSH. It follows the polling rules above (GitHub's codes expire after fifteen minutes).</p>
+    <pre class="code">rupu auth login <span class="k">--provider</span> github <span class="k">--mode</span> device
+rupu auth login <span class="k">--provider</span> copilot <span class="k">--mode</span> device</pre>
+
+    <h2>The <code class="inline">rupu auth</code> CLI</h2>
+    <p>The <code class="inline">rupu auth</code> subcommand manages stored credentials:</p>
+    <ul>
+      <li><code class="inline">rupu auth login</code> — store credentials for an account (<code class="inline">--account</code> / <code class="inline">--provider</code>, <code class="inline">--kind</code> the first time a new account name is used, <code class="inline">--mode api-key|sso|device</code>, optional <code class="inline">--key</code>). Also where the stranded-keychain notice fires.</li>
+      <li><code class="inline">rupu auth logout</code> — remove a stored credential (<code class="inline">--account</code> [<code class="inline">--mode</code>], or <code class="inline">--all</code> [<code class="inline">--yes</code>]).</li>
+      <li><code class="inline">rupu auth status</code> — show which accounts have an API key or SSO credential stored; never prints secrets.</li>
+      <li><code class="inline">rupu auth backend</code> — report <em>where</em> credentials live. It no longer switches anything: <code class="inline">--use file</code> is the only accepted value (and is already in effect), and <code class="inline">--use keychain</code> fails with an explanation rather than silently writing to a file you did not choose.</li>
+    </ul>
+
+    <pre class="code"><span class="c"># API key: pass it inline, or pipe it on stdin</span>
+rupu auth login <span class="k">--provider</span> anthropic <span class="k">--mode</span> api-key <span class="k">--key</span> sk-ant-XXX
+echo -n <span class="s">"$KEY"</span> | rupu auth login <span class="k">--provider</span> openai <span class="k">--mode</span> api-key
+
+<span class="c"># SSO (browser callback or device code, chosen per provider)</span>
+rupu auth login <span class="k">--provider</span> copilot <span class="k">--mode</span> sso
+
+<span class="c"># No browser on this machine: finish the login from a browser elsewhere</span>
+rupu auth login <span class="k">--provider</span> openai <span class="k">--mode</span> device
+
+<span class="c"># A second account of a vendor you already use</span>
+rupu auth login <span class="k">--account</span> openai-lab <span class="k">--kind</span> openai <span class="k">--mode</span> api-key
+
+<span class="c"># Inspect and clean up</span>
+rupu auth status
+rupu auth logout <span class="k">--provider</span> gemini <span class="k">--mode</span> sso
+rupu auth logout <span class="k">--all</span> <span class="k">--yes</span>
+
+<span class="c"># Report where credentials live (there is only one backend)</span>
+rupu auth backend
+
+<span class="c"># Store the file somewhere else</span>
+export RUPU_AUTH_FILE=/secure/volume/rupu-auth.json</pre>
+
+    <p>Models are discovered separately with <code class="inline">rupu models</code>: <code class="inline">rupu models list</code> shows the catalog for the built-in vendors and every declared account (with a <code class="inline">--provider</code> filter that also takes an account name), including each model's input limit, output cap, source and fetch age; <code class="inline">rupu models refresh</code> re-fetches the live lists, per account, with that account's own credential. Every run resolves its model's real input limit and output cap — agent frontmatter, then <code class="inline">[[providers.&lt;name&gt;.models]]</code>, then the live list — and records where each came from. See <a class="link" href="/docs/reliability.html">Recovery &amp; reliability → Model limits discovery</a>.</p>
+
+    <h3 id="model-discovery">Model discovery notes</h3>
+    <ul>
+      <li><strong>OpenAI with an API key</strong> also sends the key, as a Bearer token, to <code class="inline">chatgpt.com/backend-api/codex/models</code> (the only endpoint beyond <code class="inline">api.openai.com</code>) to read the Codex catalog's limits. That first call has its own 3-second timeout, so the fallback still fits the 10-second listing budget: if it fails, times out or lists nothing usable, rupu falls back to the ids-only <code class="inline">GET /v1/models</code>.</li>
+      <li><strong>The Codex catalog is versioned.</strong> rupu requests it as <code class="inline">/backend-api/codex/models?client_version=0.166.0</code>. The server filters the catalog by each model's minimum client version, so the pin is protocol compatibility with the Codex CLI release rupu verified against, not rupu's own version, and needs no Codex installation; an older pin (0.50.0) returned an empty catalog even for a valid login.</li>
+      <li><strong>Hidden models are dropped.</strong> A Codex catalog entry whose <code class="inline">visibility</code> is anything but <code class="inline">list</code> is left out (an entry with no <code class="inline">visibility</code> field is kept, as the public <code class="inline">/v1/models</code> and gateways have none), and with an API key an entry marked <code class="inline">supported_in_api: false</code> is left out too. A model that works in your ChatGPT app but that the catalog hides therefore never appears in <code class="inline">rupu models list --provider openai</code>; to use it, add it under <code class="inline">[[providers.openai.models]]</code> (the id is still sent as written) and declare its limits there.</li>
+      <li><strong>Gemini CLI / Code Assist login</strong> exposes no model limits. Declare them yourself with <code class="inline">[[providers.gemini.models]]</code> (or pin <code class="inline">contextWindowTokens</code> / <code class="inline">maxTokens</code> on the agent); with that login, <code class="inline">rupu models refresh --provider gemini</code> reports that there is no listing rather than pretending to fetch one.</li>
+    </ul>
+    <p><strong>In the control plane.</strong> Settings &rarr; Models lists every provider's cached models, with a <strong>Refetch</strong> button per provider and a <strong>Refetch all</strong> button, backed by <code class="inline">GET /api/models</code> and <code class="inline">POST /api/models/refresh</code> (body <code class="inline">{}</code> for all providers, or <code class="inline">{"provider": "&lt;name&gt;"}</code> for one); it refreshes the control-plane machine's cache only. Reading the responses: <code class="inline">GET /api/models</code> reads the cache only (no network) and answers one entry per provider, <code class="inline">{"provider", "fetched_at", "stale", "models": [{"id", "input_tokens", "output_tokens", "source"}]}</code>. <code class="inline">stale: true</code> means the cached list is older than its hour; <code class="inline">fetched_at: null</code> together with <code class="inline">stale: false</code> means the provider was never fetched (nothing is cached, so nothing is stale), not that it is fresh. <code class="inline">POST /api/models/refresh</code> answers <strong>200 whenever the refresh ran</strong>, with one <code class="inline">{"provider", "ok", "count", "error"?}</code> per provider targeted; a provider that could not be refreshed is reported as <code class="inline">ok: false</code> with its <code class="inline">error</code> inside that 200, so check each provider's <code class="inline">ok</code>, not the status code. A body naming an unknown provider, or a malformed body, is a 400; an empty body refreshes every provider. Routes: <a class="link" href="/docs/api.html#config-models-and-tools">HTTP API</a>.</p>
+
+    <h2>Per-provider notes</h2>
+
+    <h3 id="anthropic">Anthropic</h3>
+    <p>Console API keys start with <code class="inline">sk-ant-</code> and are shown only once — copy at creation. SSO authenticates via Claude.ai's OAuth (<code class="inline">claude.ai/oauth/authorize</code>), good for Claude Pro subscribers. Access tokens last ~1 hour and refresh automatically. On a machine with no browser, <code class="inline">--mode device</code> prints the same authorize URL and waits for the <code class="inline">code#state</code> the callback page shows; see <a class="link" href="#device-anthropic">Device login</a>.</p>
+    <p><strong>Prompt caching is on by default.</strong> Every Anthropic request carries at most two <code class="inline">cache_control</code> breakpoints (5-minute TTL): one caches the tool definitions and system prompt, the other sits on the end of the conversation and moves forward each turn, so prior turns are re-read from the cache. Cache reads and writes show up in usage as <code class="inline">cached_tokens</code> / <code class="inline">cache_write_tokens</code> and are priced at the model's cache rates. Turn it off per account with <code class="inline">prompt_cache = false</code> under <code class="inline">[providers.&lt;name&gt;]</code> (for a gateway that rejects <code class="inline">cache_control</code>), or per agent with <code class="inline">anthropicPromptCache: false</code>.</p>
+    <p>On API-key auth, rupu also opts current Claude models into Anthropic's <strong>server-side fallback</strong> — see <a class="link" href="/docs/reliability.html">Recovery &amp; reliability</a>.</p>
+
+    <h3 id="openai">OpenAI</h3>
+    <p>Two paths hit different endpoints: a <strong>Platform API key</strong> (<code class="inline">sk-...</code>) targets <code class="inline">api.openai.com/v1/responses</code> and is billed via OpenAI; <strong>ChatGPT SSO</strong> targets the ChatGPT backend and is covered by a Plus/Pro subscription. rupu detects the <code class="inline">chatgpt_account_id</code> claim and routes accordingly. Org-scoped keys need <code class="inline">org_id</code> in config. Only the newer Responses API is supported — pre-Responses models won't work. Without a browser, <code class="inline">--mode device</code> runs Codex CLI's device auth and stores the same ChatGPT credential; it has to be enabled on the ChatGPT account first (see <a class="link" href="#device-openai">Device login</a>).</p>
+
+    <h3 id="openai-daybreak">OpenAI Daybreak cyber access</h3>
+    <p>OpenAI's <a class="link" href="https://developers.openai.com/api/docs/guides/daybreak" target="_blank" rel="noopener">Daybreak</a> program gates its cyber-capable models (<code class="inline">gpt-5.6-cyber</code>, for example) behind an <em>access program</em> the caller selects per request. rupu selects it with <code class="inline">cyber</code>, which it sends on the Responses API request body as <code class="inline">access_programs: { cyber: &lt;value&gt; }</code>:</p>
+    <ul>
+      <li><code class="inline">standard</code>: the ordinary access tier (no cyber program).</li>
+      <li><code class="inline">daybreak_blue</code>: the Daybreak defensive program.</li>
+      <li><code class="inline">daybreak_red</code>: the Daybreak offensive program.</li>
+    </ul>
+    <p>Setting <code class="inline">cyber</code> selects a program; it does not grant access. Your organization and project must already be approved for it, and the value must match the model. rupu passes the value through unchanged, so a wrong pairing comes back as OpenAI's <code class="inline">invalid_access_program</code> error on the request rather than a rupu error.</p>
+    <p><strong>Which logins carry it.</strong> Both. The request body is built the same way for the platform API (<code class="inline">api.openai.com/v1/responses</code>, API key) and the ChatGPT endpoint (<code class="inline">chatgpt.com/backend-api/codex/responses</code>, SSO or device login), so the program rides on either; whether OpenAI honours it is the approval of the account the request authenticates as. Only the OpenAI client sends it: an agent on <code class="inline">provider: openai</code> (or an account declared with <code class="inline">kind = "openai"</code>, <code class="inline">"openai_codex"</code> or <code class="inline">"codex"</code>, all the same client). Every other provider ignores the value.</p>
+    <p><strong>Organization and project.</strong> With an API key, <code class="inline">[providers.openai] org_id</code> is sent as the <code class="inline">OpenAI-Organization</code> header on the platform API only (never on the ChatGPT endpoint, which is scoped by the account). rupu sends no <code class="inline">OpenAI-Project</code> header, so the project is the one the API key belongs to: create the key inside the project OpenAI approved for the program. With a ChatGPT login there is no organization or project header at all; the approval is the ChatGPT account's.</p>
+    <p><strong>Where to set it, highest first.</strong></p>
+    <ol>
+      <li><code class="inline">rupu run &lt;agent&gt; --cyber &lt;program&gt;</code> overrides everything for that run. <code class="inline">rupu run --continue &lt;id&gt;</code> restores it with the rest of the original command; a <code class="inline">--cyber</code> given on the continue replaces it.</li>
+      <li>The agent's <code class="inline">cyber:</code> frontmatter (<a class="link" href="/docs/agents.html">Agents</a>). An unknown value there is a parse error: the agent does not load.</li>
+      <li>A <code class="inline">cyber</code> on the <code class="inline">[[providers.openai.models]]</code> entry whose <code class="inline">id</code> is the run's model (<a class="link" href="/docs/configuration.html">Configuration</a>). An unknown value there is ignored with a warning in the log, not an error.</li>
+    </ol>
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="v">exploit-verifier</span>
+<span class="k">provider</span>: <span class="v">openai</span>
+<span class="k">model</span>: <span class="v">gpt-5.6-cyber</span>
+<span class="k">cyber</span>: <span class="v">daybreak_red</span>
+<span class="c">---</span></pre>
+    <pre class="code">rupu run exploit-verifier <span class="k">--cyber</span> daybreak_red</pre>
+    <p><strong>Behaviour notes.</strong></p>
+    <ul>
+      <li>A fallback hop keeps the program only while the model stays the same; a hop to another model or provider drops it, since the right value is model-specific. A chain entry that names another model therefore runs without a program.</li>
+      <li>The compaction summariser call never carries it: only the turn requests do.</li>
+      <li>A session freezes the program from the agent at <code class="inline">rupu session start</code> and sends it on every turn; a session settings override of the provider or model clears it (the override's model may not take the same program). <code class="inline">rupu session start</code> has no <code class="inline">--cyber</code> flag.</li>
+      <li><code class="inline">--cyber</code> is not sent to remote placed units (<code class="inline">host:</code> / <code class="inline">distribute:</code>): the coordinator's flag stays on the coordinator. A placed unit runs the agent file installed on that host, so put <code class="inline">cyber:</code> in that file (or in that host's config) to run it under a program.</li>
+      <li><code class="inline">provider: openai-codex</code> (with a hyphen) is only the display id rupu uses in transcripts and pricing, not a built-in provider name; it works only as a declared account, <code class="inline">[providers.openai-codex] kind = "openai_codex"</code>, logged in under that name.</li>
+    </ul>
+
+    <h3 id="gemini">Gemini</h3>
+    <p>Two different Google APIs sit behind one <code class="inline">gemini</code> provider:</p>
+    <ul>
+      <li><strong>API key</strong> (<code class="inline">--mode api-key</code>) — a Google AI Studio key (<code class="inline">AIzaSy…</code>). AI Studio publishes a model list with per-model token limits.</li>
+      <li><strong>SSO</strong> (<code class="inline">--mode sso</code>) — the Gemini CLI / Antigravity Google sign-in, used against <strong>Cloud Code Assist</strong>, the backend the Gemini CLI talks to. No Vertex AI setup is involved, and the <code class="inline">region</code> key is unused. Code Assist has no model listing, so declare limits in <code class="inline">[[providers.gemini.models]]</code> (or pin them on the agent).</li>
+    </ul>
+    <p><strong>Code Assist project.</strong> Every Code Assist request names the Google Cloud project Google meters the account's usage against. rupu sets it up the way the Gemini CLI does — asking Google for the account's tier and project, onboarding a new free-tier account (Google provisions a managed project) — once at <code class="inline">rupu auth login --provider gemini --mode sso</code>, and stores the result in the credential so later runs skip the setup. A paid (standard-tier) account needs its own project: set <code class="inline">GOOGLE_CLOUD_PROJECT</code> (or <code class="inline">GOOGLE_CLOUD_PROJECT_ID</code>) to its project ID. If no project can be found, the request fails before anything is sent, with an error naming <code class="inline">GOOGLE_CLOUD_PROJECT</code> and the API-key alternative.</p>
+    <p><strong>Without a browser</strong>, <code class="inline">rupu auth login --provider gemini --mode device</code> prints a Google sign-in URL, reads the code Google's page (<code class="inline">codeassist.google.com/authcode</code>) shows from stdin, stores the result as the account's <code class="inline">sso</code> credential exactly as <code class="inline">--mode sso</code> does, and sets up the Code Assist project afterwards. The URL carries <code class="inline">prompt=consent</code> and <code class="inline">access_type=offline</code> so Google always returns a refresh token; if it returns none, nothing is stored. See <a class="link" href="#device-gemini">Device login</a>.</p>
+
+    <h3 id="copilot">Copilot</h3>
+    <p>Requires a paid Copilot Pro / Business / Enterprise subscription — a free GitHub account can't invoke the API even with a valid token. The simplest path is a GitHub PAT (<code class="inline">ghp_...</code>), or pick it up from <code class="inline">GITHUB_TOKEN</code> when <code class="inline">--key</code> is omitted. The SSO flow is the same device-code flow <code class="inline">gh auth login</code> uses: rupu prints <code class="inline">Visit https://github.com/login/device and enter code: ABCD-1234</code>, you authorize from any browser anywhere (no browser is needed on the machine running rupu, so it works headless and over SSH), and rupu polls until you do, then exchanges the GitHub token for a Copilot API token. <code class="inline">rupu auth login --provider copilot --mode device</code> runs exactly the same flow and stores the same <code class="inline">sso</code> credential; for Copilot and GitHub the two mode words are interchangeable. The other vendors have their own device logins now (<code class="inline">--mode device</code> for Anthropic, OpenAI, Gemini and GitLab), so this is no longer the only headless SSO; see <a class="link" href="#device-login">Device login</a> for what each prints and how long it waits. The exchanged Copilot token expires faster than the GitHub PAT; rupu re-mints it internally.</p>
+
+    <h3 id="github-gitlab">GitHub and GitLab (SCM accounts)</h3>
+    <p>Both SCM vendors share the credential store and the same three mode words. <strong>GitHub</strong> logs in with <code class="inline">--mode api-key</code> (a personal access token), <code class="inline">--mode sso</code> (the device-code flow above) or <code class="inline">--mode device</code> (that same flow under the mode word every other vendor's headless login uses); the credential is stored as the account's <code class="inline">sso</code> entry either way. <strong>GitLab</strong> logs in with a personal access token, glab's PKCE browser login (<code class="inline">--mode sso</code>) or GitLab's device authorization grant (<code class="inline">--mode device</code>, GitLab 17.9 or later); a self-managed instance needs <code class="inline">[scm.&lt;account&gt;] base_url</code> and <code class="inline">oauth_client_id</code>. Scopes, the <code class="inline">[scm.&lt;account&gt;]</code> declaration and routing are on <a class="link" href="/docs/integrations.html">Integrations</a>; the polling rules are under <a class="link" href="#device-login">Device login</a>.</p>
+    <pre class="code">rupu auth login <span class="k">--provider</span> github <span class="k">--mode</span> device
+rupu auth login <span class="k">--provider</span> gitlab <span class="k">--mode</span> device</pre>
+
+    <h2 id="byo">Bring your own provider (OpenAI-compatible)</h2>
+    <p>The four built-ins are not the boundary. With the <code class="inline">openai-compatible</code> provider kind you can register <strong>any HTTP server that speaks the OpenAI <code class="inline">/v1/chat/completions</code> API</strong> as a named provider, then use it from agents exactly like a built-in — and mix it with the built-ins in one workflow. That covers:</p>
+    <ul>
+      <li><strong>Local models</strong> — vLLM, llama.cpp, or Ollama running on your own machine or a GPU box.</li>
+      <li><strong>Gateways &amp; aggregators</strong> — OpenRouter, Together, Groq, Fireworks, and similar OpenAI-shaped endpoints.</li>
+      <li><strong>Private / enterprise endpoints</strong> — a hosted enterprise model service or an internal company gateway.</li>
+    </ul>
+    <p>Authentication is a single static <strong>Bearer API key</strong> per provider — there is no SSO flow for openai-compatible providers. The model catalog is what you declare in config plus whatever the server's <code class="inline">/v1/models</code> reports, which <code class="inline">rupu models refresh</code> fetches with the account's key.</p>
+
+    <h3>Configure it</h3>
+    <p>Add a <code class="inline">[providers.&lt;name&gt;]</code> table to <code class="inline">~/.rupu/config.toml</code> with <code class="inline">kind = "openai-compatible"</code>. <code class="inline">base_url</code> and <code class="inline">default_model</code> are <strong>required</strong>; <code class="inline">stream</code> is optional (defaults to <code class="inline">true</code>; set <code class="inline">false</code> for servers without an SSE endpoint). Add one <code class="inline">[[providers.&lt;name&gt;.models]]</code> block per private or fine-tuned model you want to select.</p>
+
+    <pre class="code"><span class="k">default_provider</span> = <span class="s">"gpubox"</span>
+
+<span class="v">[providers.gpubox]</span>
+<span class="k">kind</span> = <span class="s">"openai-compatible"</span>
+<span class="k">base_url</span> = <span class="s">"http://gpu-box.internal:8000"</span>
+<span class="k">default_model</span> = <span class="s">"acme/coder-32b"</span>
+<span class="k">stream</span> = <span class="v">true</span>   <span class="c"># set false if the server has no SSE endpoint</span>
+
+  <span class="v">[[providers.gpubox.models]]</span>
+  <span class="k">id</span> = <span class="s">"acme/coder-32b"</span>
+  <span class="k">context_window</span> = <span class="v">131072</span>
+  <span class="k">max_output</span> = <span class="v">8192</span></pre>
+
+    <p><code class="inline">base_url</code> may include or omit a trailing <code class="inline">/v1</code> — rupu normalises both to <code class="inline">&lt;root&gt;/v1/chat/completions</code>. Each <code class="inline">[[providers.&lt;name&gt;.models]]</code> entry requires <code class="inline">id</code>; <code class="inline">context_window</code> and <code class="inline">max_output</code> are optional. When omitted, rupu reads <code class="inline">max_model_len</code> from the server's <code class="inline">/v1/models</code>; if that's missing too, the limits are unknown and the run says so — there are no made-up defaults. Name the provider anything you like — <code class="inline">gpubox</code>, <code class="inline">vllm</code>, <code class="inline">together</code> — except a <strong>reserved built-in name</strong> (<code class="inline">anthropic</code>, <code class="inline">openai</code>, <code class="inline">gemini</code>, <code class="inline">copilot</code>); rupu rejects the config otherwise.</p>
+
+    <h3>Authenticate</h3>
+    <p>Supply the static Bearer key with <code class="inline">rupu auth login</code> (stored in <code class="inline">~/.rupu/auth.json</code> under <code class="inline">&lt;name&gt;/api-key</code>, same as the built-ins), or — for CI and ephemeral environments — set the env var <code class="inline">RUPU_&lt;UPPERCASED_PROVIDER_NAME&gt;_API_KEY</code> and rupu reads it automatically.</p>
+
+    <pre class="code"><span class="c"># Interactive prompt (the key is not echoed), or pipe it on stdin</span>
+rupu auth login <span class="k">--provider</span> gpubox <span class="k">--mode</span> api-key
+
+<span class="c"># Or set the env var directly — pattern: RUPU_&lt;PROVIDER&gt;_API_KEY</span>
+export RUPU_GPUBOX_API_KEY=sk-...</pre>
+
+    <h3>Use it from an agent</h3>
+    <p>Point an <a class="link" href="/docs/agents.html">agent</a> at the provider by name; the <code class="inline">model:</code> can be any id the endpoint serves, including the custom <code class="inline">[[providers.&lt;name&gt;.models]]</code> entries that make private or fine-tuned models selectable.</p>
+
+    <pre class="code"><span class="c">---</span>
+<span class="k">name</span>: <span class="v">local-codereview</span>
+<span class="k">description</span>: <span class="s">Code review on a self-hosted model.</span>
+<span class="k">provider</span>: <span class="v">gpubox</span>
+<span class="k">model</span>: <span class="v">acme/coder-32b</span>
+<span class="c">---</span>
+
+<span class="s">You review code changes for correctness, style, and missing tests.</span></pre>
+
+    <p>Then run it like any other agent, and confirm the custom catalog with <code class="inline">rupu models list --provider gpubox</code> (entries show source <code class="inline">custom</code>):</p>
+
+    <pre class="code">rupu run local-codereview</pre>
+
+    <h3>Example endpoints</h3>
+    <p>Any of these can be dropped into the <code class="inline">base_url</code> above. When a path detail is unknown for your deployment, the generic <code class="inline">http://host:port/v1</code> shape is a safe starting point.</p>
+
+    <table>
+      <thead>
+        <tr><th>Target</th><th>Rough <code>base_url</code></th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Ollama (local)</td><td><code>http://localhost:11434/v1</code></td></tr>
+        <tr><td>vLLM (self-hosted)</td><td><code>http://host:8000/v1</code></td></tr>
+        <tr><td>llama.cpp server</td><td><code>http://host:8080/v1</code></td></tr>
+        <tr><td>OpenRouter</td><td><code>https://openrouter.ai/api/v1</code></td></tr>
+        <tr><td>Together</td><td><code>https://api.together.xyz/v1</code></td></tr>
+        <tr><td>Groq</td><td><code>https://api.groq.com/openai/v1</code></td></tr>
+        <tr><td>Fireworks</td><td><code>https://api.fireworks.ai/inference/v1</code></td></tr>
+        <tr><td>Internal gateway</td><td><code>http://host:port</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout"><strong>Pricing.</strong> openai-compatible providers have no built-in price table, so they report <code class="inline">$0.00</code> until you give them a price — <code class="inline">[pricing.&lt;account&gt;."&lt;model&gt;"]</code> or a per-agent <code class="inline">[pricing.agents.&lt;agent&gt;]</code> (see below).</div>
+
+    <h2 id="usage">Usage &amp; pricing</h2>
+    <p>Every LLM call a run makes — every turn, compaction summary, retry, dispatched sub-agent and fan-out unit, in-flight or cancelled — is appended to the run's own usage ledger (<code class="inline">usage.jsonl</code> next to the run record) as it happens. That ledger is the single definition of a run's usage: the control plane shows a running run's tokens and cost within seconds of each turn (runs on SSH and tunnel hosts too; bucket hosts follow their poll interval), and <code class="inline">rupu usage</code>, <code class="inline">rupu workflow runs</code> and the CLI live view all fold the same rows.</p>
+    <p>Tokens become dollars through <code class="inline">[pricing]</code>: a user override, then a built-in table of each vendor's standard-tier list rates, then a per-agent fallback for endpoints with no public price. Named accounts price through their <code class="inline">kind</code>, with an account-level override beating the vendor one. Anthropic cache reads and writes are priced at their own rates.</p>
+    <pre class="code"><span class="v">[pricing.anthropic."claude-sonnet-4-6"]</span>
+<span class="k">input_per_mtok</span> = <span class="v">3.0</span>
+<span class="k">output_per_mtok</span> = <span class="v">15.0</span>
+<span class="k">cached_input_per_mtok</span> = <span class="v">0.30</span>   <span class="c"># optional</span>
+<span class="k">cache_write_per_mtok</span> = <span class="v">3.75</span>    <span class="c"># optional</span>
+
+<span class="v">[pricing.agents.local-codereview]</span>     <span class="c"># an endpoint with no public price</span>
+<span class="k">input_per_mtok</span> = <span class="v">0.5</span>
+<span class="k">output_per_mtok</span> = <span class="v">1.5</span></pre>
+
+    <div class="doc-nav">
+      <a href="/docs/profiles.html">&#8592; Engagement profiles</a>
+      <a href="/docs/reliability.html">Recovery &amp; reliability &#8594;</a>
+    </div>
+  </main>
+</div>
+</body>
+</html>
