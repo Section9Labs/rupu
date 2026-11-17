@@ -1,5 +1,7 @@
 #[path = "session_orchestration.rs"]
 mod orchestration;
+#[path = "session_runtime_observation.rs"]
+pub(super) mod runtime_observation;
 
 use crate::api::host_fanout::{fan_out_sessions, sort_values_newest_first};
 use crate::{
@@ -56,7 +58,9 @@ pub(crate) struct SessionDto {
     model: String,
     #[serde(default)]
     provider_name: String,
-    /// Accepts whatever enum variant the serialiser produces.
+    /// Accepts whatever enum variant the serialiser produces. Local read
+    /// projections may report a proven orphan as failed; runtime_observation
+    /// retains its original recorded status and exact active-run identity.
     #[serde(default)]
     status: serde_json::Value,
     #[serde(default)]
@@ -97,14 +101,26 @@ pub(crate) struct SessionDto {
     )]
     customer: crate::customers::RecordedField,
     /// The recorded turns — read for [`session_usage`], never serialized
-    /// (the list/detail wire shape is unchanged; `/api/sessions/:id/runs`
-    /// serves the turns). Parsed leniently: an unexpected shape reads as no
+    /// (`/api/sessions/:id/runs` serves the turns). Parsed leniently: an unexpected shape reads as no
     /// turns, never as a session that fails to load.
     #[serde(default, skip_serializing, deserialize_with = "lenient_runs")]
     runs: Vec<SessionRunEntry>,
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    runtime_observation: Option<runtime_observation::Observation>,
 }
 
 impl SessionDto {
+    fn observe_runtime(&mut self, dir: &std::path::Path, text: &str) {
+        if self.status != "running" || self.active_run_id.is_none() {
+            return;
+        }
+        if let Some(observation) = runtime_observation::observe(dir, text) {
+            self.status = serde_json::json!("failed");
+            self.active_run_id = None;
+            self.last_error = Some(runtime_observation::EXITED.into());
+            self.runtime_observation = Some(observation);
+        }
+    }
     /// The session's status when it is a plain word (`running`, `stopped`, …).
     pub(crate) fn status_word(&self) -> String {
         match &self.status {
@@ -147,6 +163,15 @@ where
 /// - `Ok(Some)`  — file exists and parsed successfully
 /// - `Err(_)`    — file exists but could not be read or parsed (→ 500)
 pub(crate) fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionDto>, ApiError> {
+    load_session_file_with_observation(dir, false)
+}
+
+// Mutation eligibility continues to use the recorded state. Observation is an
+// explicitly selected read projection, never authority to enable a mutation.
+fn load_session_file_with_observation(
+    dir: &std::path::Path,
+    observe: bool,
+) -> Result<Option<SessionDto>, ApiError> {
     let path = dir.join("session.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -159,7 +184,12 @@ pub(crate) fn load_session_file(dir: &std::path::Path) -> Result<Option<SessionD
         }
     };
     match serde_json::from_str::<SessionDto>(&text) {
-        Ok(dto) => Ok(Some(dto)),
+        Ok(mut dto) => {
+            if observe {
+                dto.observe_runtime(dir, &text);
+            }
+            Ok(Some(dto))
+        }
         Err(e) => Err(ApiError::internal(format!(
             "failed to parse {}: {e}",
             path.display()
@@ -225,7 +255,10 @@ fn try_load_session(dir: &std::path::Path) -> Option<SessionDto> {
         }
     };
     match serde_json::from_str::<SessionDto>(&text) {
-        Ok(dto) => Some(dto),
+        Ok(mut dto) => {
+            dto.observe_runtime(dir, &text);
+            Some(dto)
+        }
         Err(e) => {
             tracing::warn!(path = %path.display(), error = %e, "skipping unparseable session.json");
             None
@@ -906,7 +939,7 @@ async fn get_session(
 
     // load_session_file distinguishes missing (Ok(None)→404) from IO/parse
     // errors on an existing file (Err→500).
-    let dto = match load_session_file(&dir)? {
+    let dto = match load_session_file_with_observation(&dir, true)? {
         Some(dto) => dto,
         None => return Err(ApiError::not_found(format!("session {id} not found"))),
     };
@@ -1090,6 +1123,8 @@ struct SessionRunRow {
     tokens_cached: u64,
     duration_ms: u64,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_observation: Option<runtime_observation::Observation>,
 }
 
 impl From<SessionRunChatRecord> for SessionRunRow {
@@ -1111,6 +1146,7 @@ impl From<SessionRunChatRecord> for SessionRunRow {
             tokens_cached: r.total_tokens_cached,
             duration_ms: r.duration_ms,
             error: r.error,
+            runtime_observation: None,
         }
     }
 }
@@ -1130,6 +1166,9 @@ fn session_runs_from_json(text: &str) -> Result<Vec<SessionRunRow>, serde_json::
 /// With `?host=<remote-id>`: proxies to the owning host and forwards the
 /// response verbatim. Local/absent: resolves active dir first, then archive;
 /// 404 when neither exists or `session.json` is missing; 500 on a parse error.
+/// A proven exited local worker projects only its exact incomplete run as an
+/// error, preserving recorded state in runtime_observation. No file is changed
+/// and no completion timestamp is synthesized.
 async fn get_session_runs(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -1170,8 +1209,19 @@ async fn get_session_runs(
             )));
         }
     };
-    let rows = session_runs_from_json(&text)
+    let mut rows = session_runs_from_json(&text)
         .map_err(|e| ApiError::internal(format!("failed to parse {}: {e}", path.display())))?;
+    if let Some(observation) = runtime_observation::observe(&dir, &text) {
+        for row in &mut rows {
+            if row.run_id == observation.recorded_active_run_id
+                && row.transcript_path == observation.transcript_path
+            {
+                row.status = Some("error".into());
+                row.error = Some(runtime_observation::EXITED.into());
+                row.runtime_observation = Some(observation.clone());
+            }
+        }
+    }
     let v = serde_json::to_value(rows).map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(v))
 }
@@ -1852,6 +1902,7 @@ pub(crate) mod tests {
             workspace_id: "w".into(),
             codename: None,
             runs: Vec::new(),
+            runtime_observation: None,
             customer: None,
         };
         let u = session_usage_from_totals(&dto, &rupu_config::PricingConfig::default());
@@ -2006,6 +2057,7 @@ pub(crate) mod tests {
         };
         let dto = SessionDto {
             codename: None,
+            runtime_observation: None,
             session_id: "s1".into(),
             agent_name: "a".into(),
             model: "claude-sonnet-4-6".into(),
