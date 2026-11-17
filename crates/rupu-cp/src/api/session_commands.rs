@@ -44,13 +44,23 @@ fn record(s: &AppState, id: &str, host: Option<&str>) -> ApiResult<Value> {
     crate::api::runs::validate_id(id)?;
     crate::api::fleet::require_local(host, "session commands")?;
     active_session(s, id, "commands")?;
-    let record: Value = serde_json::from_slice(
-        &std::fs::read(s.global_dir.join("sessions").join(id).join("session.json"))
-            .map_err(|e| ApiError::internal(e.to_string()))?,
-    )
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let dir = s.global_dir.join("sessions").join(id);
+    let text = std::fs::read_to_string(dir.join("session.json"))
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut record: Value =
+        serde_json::from_str(&text).map_err(|e| ApiError::internal(e.to_string()))?;
     if record["session_id"].as_str() != Some(id) {
         return Err(ApiError::conflict("session record identity mismatch"));
+    }
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_observation");
+    // Controls preserve the recorded run for compare-and-check mutations,
+    // while explaining why a proven exited worker cannot accept cancellation.
+    if let Some(observation) = super::sessions::runtime_observation::observe(&dir, &text) {
+        record["runtime_observation"] =
+            serde_json::to_value(observation).map_err(|e| ApiError::internal(e.to_string()))?;
     }
     Ok(record)
 }
@@ -71,6 +81,7 @@ fn capabilities(s: &AppState, id: &str, record: &Value) -> ApiResult<Vec<Capabil
         } else if c.name == "cancel" {
             match run {
                 None => Some("no active run".into()),
+                Some(_) if record["runtime_observation"]["state"] == "exited" => Some(super::sessions::runtime_observation::EXITED.into()),
                 Some(run) if !rupu_runtime::session_cancel::available(&dir, run, record["active_pid"].as_u64().and_then(|p| u32::try_from(p).ok()), rupu_launch::proc::process_alive) => Some("active worker does not support cooperative cancellation; restart it after this turn".into()),
                 Some(_) => None,
             }
@@ -103,7 +114,11 @@ async fn controls(
 ) -> ApiResult<Json<Value>> {
     crate::api::runs::blocking(move || {
         let record = record(&s, &id, q.host.as_deref())?;
-        Ok(Json(json!({"session_id":id,"host_id":"local","active_run_id":record["active_run_id"],"commands":capabilities(&s,&id,&record)?})))
+        let mut response = json!({"session_id":id,"host_id":"local","active_run_id":record["active_run_id"],"commands":capabilities(&s,&id,&record)?});
+        if let Some(observation) = record.get("runtime_observation") {
+            response["runtime_observation"] = observation.clone();
+        }
+        Ok(Json(response))
     }).await
 }
 async fn execute(
@@ -502,6 +517,136 @@ mod tests {
                 .unwrap()["available"],
             false
         );
+    }
+    #[tokio::test]
+    async fn orphan_session_reads_agree_without_mutating_record_or_dispatching() {
+        let (tmp, s, calls) = fixture();
+        let s = s.with_launcher(Some(Arc::new(Launcher)));
+        let dir = tmp.path().join("sessions/ses_test");
+        // Well-formed positive PID, outside the kernel's allocated PID range.
+        let dead = 2_000_000_000_u32;
+        assert!(!rupu_launch::proc::pid_is_running(dead));
+        let original = json!({"session_id":"ses_test","status":"running","active_run_id":"run_current",
+            "active_pid":dead,"worker_pid":dead,"active_transcript_path":"/fixture/current.jsonl",
+            "updated_at":"2026-01-01T00:00:00Z","message_history":[{"content":"retained"}],
+            "runs":[{"run_id":"run_previous","status":"ok","transcript_path":"/fixture/previous.jsonl"},
+                    {"run_id":"run_current","status":null,"transcript_path":"/fixture/current.jsonl"}]}).to_string();
+        std::fs::write(dir.join("session.json"), &original).unwrap();
+        let (code, detail) = request(
+            s.clone(),
+            "GET",
+            "/api/sessions/ses_test?host=local",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(detail["status"], "failed");
+        assert!(detail["active_run_id"].is_null());
+        assert_eq!(
+            detail["runtime_observation"]["recorded_active_run_id"],
+            "run_current"
+        );
+        assert_eq!(detail["runtime_observation"]["recorded_status"], "running");
+        assert_eq!(detail["updated_at"], "2026-01-01T00:00:00Z");
+        let (code, list) = request(s.clone(), "GET", "/api/sessions?host=local", Value::Null).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(list[0]["status"], detail["status"]);
+        assert_eq!(
+            list[0]["runtime_observation"],
+            detail["runtime_observation"]
+        );
+        let (code, runs) = request(
+            s.clone(),
+            "GET",
+            "/api/sessions/ses_test/runs?host=local",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(runs[0]["status"], "ok");
+        assert!(runs[0].get("runtime_observation").is_none());
+        assert_eq!(runs[1]["status"], "error");
+        assert!(
+            runs[1]["completed_at"].is_null(),
+            "observation must not invent completion time"
+        );
+        assert_eq!(
+            runs[1]["runtime_observation"],
+            detail["runtime_observation"]
+        );
+        let (code, controls) = request(
+            s.clone(),
+            "GET",
+            "/api/sessions/ses_test/controls",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(controls["active_run_id"], "run_current");
+        let cancel = controls["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "cancel")
+            .unwrap();
+        assert_eq!(cancel["available"], false);
+        assert_eq!(
+            cancel["reason"],
+            super::super::sessions::runtime_observation::EXITED
+        );
+        // A read projection does not bypass the original mutation guard.
+        let (code, _) = request(
+            s.clone(),
+            "POST",
+            "/api/sessions/ses_test/compact",
+            json!({}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        let (code, _) = request(
+            s,
+            "POST",
+            "/api/sessions/ses_test/commands",
+            json!({"command":"/cancel","expected_run_id":"run_current"}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("session.json")).unwrap(),
+            original
+        );
+        assert!(!dir.join("cancel-run_current.request").exists());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn live_and_archived_sessions_do_not_inherit_orphan_observations() {
+        let (tmp, s, _) = fixture();
+        let record = json!({"session_id":"ses_test","status":"running","active_run_id":"run_current",
+            "active_pid":std::process::id(),"worker_pid":std::process::id(),"active_transcript_path":"/fixture/current.jsonl",
+            "runtime_observation":{"state":"exited"},
+            "runs":[{"run_id":"run_current","transcript_path":"/fixture/current.jsonl"}]}).to_string();
+        let dir = tmp.path().join("sessions/ses_test");
+        std::fs::write(dir.join("session.json"), &record).unwrap();
+        let (_, detail) = request(s.clone(), "GET", "/api/sessions/ses_test", Value::Null).await;
+        assert_eq!(detail["status"], "running");
+        assert!(detail.get("runtime_observation").is_none());
+        let (_, controls) = request(
+            s.clone(),
+            "GET",
+            "/api/sessions/ses_test/controls",
+            Value::Null,
+        )
+        .await;
+        assert!(controls["runtime_observation"].is_null());
+        std::fs::create_dir_all(tmp.path().join("sessions-archive")).unwrap();
+        std::fs::rename(&dir, tmp.path().join("sessions-archive/ses_test")).unwrap();
+        let (_, archived) = request(s.clone(), "GET", "/api/sessions/ses_test", Value::Null).await;
+        assert_eq!(archived["status"], "running");
+        assert!(archived.get("runtime_observation").is_none());
+        let (_, runs) = request(s, "GET", "/api/sessions/ses_test/runs", Value::Null).await;
+        assert!(runs[0]["status"].is_null());
+        assert!(runs[0].get("runtime_observation").is_none());
     }
     #[tokio::test]
     async fn lifecycle_and_client_commands_keep_their_existing_behavior() {
